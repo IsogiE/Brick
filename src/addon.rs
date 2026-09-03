@@ -32,7 +32,7 @@ const FEED_UNAVAILABLE_MESSAGE: &str =
     "No signed addon feed is available yet. Brick will check again automatically.";
 const SETTINGS_FILE: &str = "settings.json";
 const LOG_FILE: &str = "logs.jsonl";
-const SYNC_INTERVAL_SECS: u64 = 15 * 60;
+const SYNC_INTERVAL_SECS: u64 = 5 * 60;
 const ALLOWED_FOLDERS: &[&str] = &[
     "AdvanceRaidTools",
     "AdvanceRaidTools_Libraries",
@@ -184,16 +184,6 @@ pub enum LogLevel {
     Info,
     Warn,
     Error,
-}
-
-impl LogLevel {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Info => "info",
-            Self::Warn => "warn",
-            Self::Error => "error",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

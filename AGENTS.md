@@ -8,6 +8,8 @@ Read this before changing Brick. This repo is the private source app. The public
 - Binary/package name: `brick`
 - App identifier: `dev.isogi.brick`
 - UI stack: native Rust with `eframe`/`egui`; do not reintroduce a webview UI.
+- User-facing UI should stay single-screen and consumer-simple: no Logs tab, no watcher/feed/debug wording, no manual update-manager framing.
+- Default window size is intentionally compact at `740x560`, with `640x520` as the minimum.
 - Public app release repo: `IsogiE/Brick-Releases`
 - Public addon feed release: `IsogiE/Brick-Releases` tag `addon-feed`
 - Managed addon folders: `AdvanceRaidTools`, `AdvanceRaidTools_Libraries`, `AdvanceRaidTools_Options`
