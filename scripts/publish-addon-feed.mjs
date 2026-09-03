@@ -114,8 +114,8 @@ function readSourceMetadata() {
   const commit = git(['rev-parse', 'HEAD']);
   const shortHash = git(['rev-parse', '--short=7', 'HEAD']);
   const commitDate = git(['show', '-s', '--format=%cI', 'HEAD']);
-  const describe = git(['describe', '--tags', '--long', '--always']);
-  const exactTag = gitMaybe(['describe', '--tags', '--exact-match', 'HEAD']);
+  const describe = git(['describe', '--tags', '--match', 'v[0-9]*', '--long', '--always']);
+  const exactTag = gitMaybe(['describe', '--tags', '--match', 'v[0-9]*', '--exact-match', 'HEAD']);
 
   return {
     commit,

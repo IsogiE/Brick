@@ -37,6 +37,16 @@ jobs:
         with:
           node-version: 22
 
+      - name: Ignore non-version addon tags
+        run: |
+          set -euo pipefail
+          git -C "$GITHUB_WORKSPACE/addon-source" tag --list | while read -r tag; do
+            case "$tag" in
+              v[0-9]*) ;;
+              *) git -C "$GITHUB_WORKSPACE/addon-source" tag -d "$tag" ;;
+            esac
+          done
+
       - name: Package addon from GitHub source
         env:
           BRICK_PACKAGER_SCRIPT_SHA256: 49bcf94d977478a6f18ead7f0285f193853bf1f9a23ba7d84d08b979d802a734
