@@ -97,11 +97,7 @@ jobs:
           else
             tag="${GITHUB_REF_NAME}"
           fi
-          notes="Automated Brick app release.
-
-          Windows users should install the MSI package.
-          Linux users can use the AppImage on Arch/CachyOS and most desktop distros, the deb on Ubuntu/Debian, or the pacman package on Arch-style distros."
-          gh release view "$tag" --repo "$repo" >/dev/null 2>&1 || gh release create "$tag" --repo "$repo" --title "Brick $tag" --notes "$notes"
+          gh release view "$tag" --repo "$repo" >/dev/null 2>&1 || gh release create "$tag" --repo "$repo" --title "Brick $tag" --notes ""
           while IFS= read -r -d '' file; do
             gh release upload "$tag" "$file" --repo "$repo" --clobber
           done < <(find release-assets -type f -print0)
