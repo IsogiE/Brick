@@ -216,16 +216,39 @@ function signManifest(manifestJson, privateKeyB64) {
 }
 
 function ensureFeedRelease(ghToken) {
+  let releaseExists = false;
   try {
     gh(['release', 'view', feedTag, '--repo', feedRepo], ghToken, 'ignore');
-    return;
+    releaseExists = true;
   } catch {
     // The feed release is addressed by a fixed tag so clients have a stable URL.
   }
 
-  const createArgs = [
+  if (!releaseExists) {
+    const createArgs = [
+      'release',
+      'create',
+      feedTag,
+      '--repo',
+      feedRepo,
+      '--title',
+      'Brick Addon Feed',
+      '--notes',
+      'Signed machine-readable addon feed used by Brick clients.',
+      '--prerelease',
+      '--latest=false'
+    ];
+
+    try {
+      gh(createArgs, ghToken);
+    } catch {
+      gh(createArgs.filter((arg) => arg !== '--latest=false'), ghToken);
+    }
+  }
+
+  const editArgs = [
     'release',
-    'create',
+    'edit',
     feedTag,
     '--repo',
     feedRepo,
@@ -238,9 +261,9 @@ function ensureFeedRelease(ghToken) {
   ];
 
   try {
-    gh(createArgs, ghToken);
+    gh(editArgs, ghToken, 'ignore');
   } catch {
-    gh(createArgs.filter((arg) => arg !== '--latest=false'), ghToken);
+    gh(editArgs.filter((arg) => arg !== '--latest=false'), ghToken, 'ignore');
   }
 }
 
