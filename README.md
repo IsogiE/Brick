@@ -30,13 +30,11 @@ Supported client folders:
 
 ## Release Setup
 
-The Brick source repo can stay private, but updater binaries and the addon feed need to be reachable without GitHub auth. The addon feed is published to the public `IsogiE/AdvanceRaidTools` repo under the fixed `brick-feed` release tag.
-
-The app release workflow currently publishes installer/AppImage artifacts to `IsogiE/Brick-Releases`; create that public release-only repo or adjust `.github/workflows/release.yml` before publishing app binaries.
+The Brick source repo can stay private, but updater binaries and the addon feed need to be reachable without GitHub auth. The addon feed and app release artifacts are published to the public release-only repo `IsogiE/Brick-Releases`.
 
 Push this Brick folder to its private GitHub repo, then add these GitHub secrets to that private Brick repo:
 
-- `BRICK_RELEASE_TOKEN`: fine-grained GitHub token with Contents read/write for `IsogiE/AdvanceRaidTools`, plus the app release repo if app binaries are published there.
+- `BRICK_RELEASE_TOKEN`: fine-grained GitHub token with Contents read/write for `IsogiE/Brick-Releases`.
 - `BRICK_ADDON_PUBLIC_KEY_B64`: raw 32-byte Ed25519 public key embedded into Brick.
 - `BRICK_ADDON_PRIVATE_KEY_B64`: PKCS#8 Ed25519 private key used by the Brick feed workflow to sign `addon-manifest.json`.
 
@@ -68,7 +66,7 @@ The release workflow publishes to `IsogiE/Brick-Releases` and builds:
 The `Addon feed` workflow in this repo checks out the latest public `IsogiE/AdvanceRaidTools` source, runs the pinned BigWigs packager in no-upload mode, signs the package metadata, and publishes the current package to:
 
 ```text
-https://github.com/IsogiE/AdvanceRaidTools/releases/download/brick-feed/
+https://github.com/IsogiE/Brick-Releases/releases/download/addon-feed/
 ```
 
 It publishes:

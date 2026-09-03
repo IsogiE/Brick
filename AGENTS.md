@@ -9,7 +9,7 @@ Read this before changing Brick. This repo is the private source app. The public
 - App identifier: `dev.isogi.brick`
 - UI stack: native Rust with `eframe`/`egui`; do not reintroduce a webview UI.
 - Public app release repo: `IsogiE/Brick-Releases`
-- Public addon feed release: `IsogiE/AdvanceRaidTools` tag `brick-feed`
+- Public addon feed release: `IsogiE/Brick-Releases` tag `addon-feed`
 - Managed addon folders: `AdvanceRaidTools`, `AdvanceRaidTools_Libraries`, `AdvanceRaidTools_Options`
 - Local staging folder inside each WoW AddOns folder: `.brick-staging`
 
@@ -32,7 +32,7 @@ On launch, Brick should check the signed addon feed when automation is enabled. 
 - ART public addon source: `/home/lucas/Documents/GitHub/AdvanceRaidTools`
 - ART publishes packaged addon builds through the normal BigWigs packager flow to addon platforms.
 - Brick's private `Addon feed` workflow checks out the latest public ART source, packages it with a pinned BigWigs packager commit in no-upload mode, and signs `addon-manifest.json`.
-- The signed addon feed publishes assets to the public `IsogiE/AdvanceRaidTools` `brick-feed` release. Brick app releases still publish to `IsogiE/Brick-Releases` unless the release workflow is changed.
+- The signed addon feed and Brick app releases publish assets to the public `IsogiE/Brick-Releases` repo. Do not change ART workflow/repo plumbing for Brick unless Lucas explicitly asks.
 - Current BigWigs packager pin: `20a3713ec537df54db5c0d8b4822d88ee63c70e8`; `release.sh` SHA-256: `49bcf94d977478a6f18ead7f0285f193853bf1f9a23ba7d84d08b979d802a734`.
 
 ## Local Linux Testing
@@ -92,7 +92,7 @@ Private Brick repo:
 Public ART repo:
 
 - No Brick updater secrets are required.
-- The `brick-feed` GitHub release is created/updated by the private Brick workflow.
+- Brick uses ART as a public source checkout only.
 
 Generate the addon feed signing key with:
 

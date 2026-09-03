@@ -20,14 +20,14 @@ use zip::ZipArchive;
 
 const APP_ID: &str = "dev.isogi.brick";
 const FEED_OWNER: &str = "IsogiE";
-const FEED_REPO: &str = "AdvanceRaidTools";
-const FEED_TAG: &str = "brick-feed";
+const FEED_REPO: &str = "Brick-Releases";
+const FEED_TAG: &str = "addon-feed";
 const PACKAGE_ID: &str = "AdvanceRaidTools";
 const FEED_URL: &str =
-    "https://github.com/IsogiE/AdvanceRaidTools/releases/download/brick-feed/addon-manifest.json";
+    "https://github.com/IsogiE/Brick-Releases/releases/download/addon-feed/addon-manifest.json";
 const FEED_SIG_URL: &str =
-    "https://github.com/IsogiE/AdvanceRaidTools/releases/download/brick-feed/addon-manifest.json.sig";
-const APP_USER_AGENT: &str = "Brick/0.1 (+https://github.com/IsogiE/AdvanceRaidTools)";
+    "https://github.com/IsogiE/Brick-Releases/releases/download/addon-feed/addon-manifest.json.sig";
+const APP_USER_AGENT: &str = "Brick/0.1 (+https://github.com/IsogiE/Brick-Releases)";
 const FEED_UNAVAILABLE_MESSAGE: &str =
     "No signed addon feed is available yet. Brick will check again automatically.";
 const SETTINGS_FILE: &str = "settings.json";

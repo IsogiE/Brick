@@ -3,8 +3,8 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 
-const feedRepo = process.env.BRICK_FEED_REPO || 'IsogiE/AdvanceRaidTools';
-const feedTag = process.env.BRICK_FEED_TAG || 'brick-feed';
+const feedRepo = process.env.BRICK_FEED_REPO || 'IsogiE/Brick-Releases';
+const feedTag = process.env.BRICK_FEED_TAG || 'addon-feed';
 const sourceRepo = process.env.BRICK_ADDON_GITHUB_REPO || 'IsogiE/AdvanceRaidTools';
 const sourceDir = resolve(process.env.BRICK_ADDON_SOURCE_DIR || '../AdvanceRaidTools');
 const releaseDir = resolve(process.env.BRICK_ADDON_RELEASE_DIR || join(sourceDir, '.release'));
