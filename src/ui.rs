@@ -277,35 +277,70 @@ impl BrickApp {
 
     fn draw_status_panel(&self, ui: &mut egui::Ui) {
         let status = self.display_status();
+        let row_height = if status.detail.is_empty() { 34.0 } else { 54.0 };
 
         panel_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                status_dot(ui, status.accent);
-                ui.add_space(6.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(status.title)
-                            .size(22.0)
-                            .strong()
-                            .color(primary_text()),
-                    );
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), row_height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    status_dot(ui, status.accent);
+                    ui.add_space(6.0);
+
+                    let right_width = if status.version.is_some() {
+                        134.0
+                    } else {
+                        28.0
+                    };
+                    let text_width = (ui.available_width() - right_width).max(180.0);
+
                     if !status.detail.is_empty() {
-                        ui.add(
-                            egui::Label::new(RichText::new(status.detail).color(secondary_text()))
-                                .wrap(),
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(text_width, row_height),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new(status.title.as_str())
+                                            .size(22.0)
+                                            .strong()
+                                            .color(primary_text()),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(status.detail.as_str())
+                                                .color(secondary_text()),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                            },
+                        );
+                    } else {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(text_width, row_height),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    RichText::new(status.title.as_str())
+                                        .size(22.0)
+                                        .strong()
+                                        .color(primary_text()),
+                                );
+                            },
                         );
                     }
-                });
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(version) = status.version {
-                        capsule(ui, &version, primary_text(), status.accent_soft);
-                    }
-                    if self.sync_rx.is_some() {
-                        ui.add(egui::Spinner::new().size(18.0).color(status.accent));
-                    }
-                });
-            });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(version) = status.version.as_deref() {
+                            capsule(ui, version, primary_text(), status.accent_soft);
+                        }
+                        if self.sync_rx.is_some() {
+                            ui.add(egui::Spinner::new().size(18.0).color(status.accent));
+                        }
+                    });
+                },
+            );
         });
     }
 
@@ -413,25 +448,33 @@ impl BrickApp {
         ui.add_space(8.0);
 
         panel_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let text_width = (ui.available_width() - 74.0).max(180.0);
-                ui.vertical(|ui| {
-                    ui.set_width(text_width);
-                    ui.label(
-                        RichText::new("Open at login")
-                            .strong()
-                            .color(primary_text()),
-                    );
-                });
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 34.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let text_width = (ui.available_width() - 74.0).max(180.0);
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let enabled =
-                        self.view.settings.startup_enabled && self.view.settings.watcher_enabled;
-                    if toggle(ui, enabled) {
-                        self.set_automation(!enabled);
-                    }
-                });
-            });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(text_width, 34.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                RichText::new("Open at login")
+                                    .strong()
+                                    .color(primary_text()),
+                            );
+                        },
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let enabled = self.view.settings.startup_enabled
+                            && self.view.settings.watcher_enabled;
+                        if toggle(ui, enabled) {
+                            self.set_automation(!enabled);
+                        }
+                    });
+                },
+            );
         });
     }
 
