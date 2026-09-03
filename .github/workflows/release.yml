@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            formats: nsis
+          - os: ubuntu-22.04
+            formats: appimage,deb,rpm,pacman
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev patchelf rpm
+
+      - name: Install Cargo Packager
+        run: cargo install cargo-packager --locked
+
+      - name: Configure version
+        run: node scripts/set-app-version.mjs
+
+      - name: Build package
+        env:
+          BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
+          NO_STRIP: 1
+        run: cargo packager --release --formats ${{ matrix.formats }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brick-${{ runner.os }}
+          path: dist/packages/**
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.BRICK_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          repo="IsogiE/Brick-Releases"
+          tag="${GITHUB_REF_NAME}"
+          notes="Automated Brick app release.
+
+          Windows users should install the NSIS setup exe.
+          Linux users can use the AppImage on Arch/CachyOS and most desktop distros, the deb on Ubuntu/Debian, the rpm on Fedora-style distros, or the pacman package on Arch-style distros."
+          gh release view "$tag" --repo "$repo" >/dev/null 2>&1 || gh release create "$tag" --repo "$repo" --title "Brick $tag" --notes "$notes"
+          while IFS= read -r -d '' file; do
+            gh release upload "$tag" "$file" --repo "$repo" --clobber
+          done < <(find release-assets -type f -print0)

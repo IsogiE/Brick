@@ -1,0 +1,19 @@
+{
+  "name": "brick",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "cargo run",
+    "build": "cargo build --release",
+    "check": "cargo check",
+    "fmt": "cargo fmt --check",
+    "build:local-appimage": "NO_STRIP=1 cargo packager --release --formats appimage",
+    "install:local-appimage": "node scripts/local-appimage-install.mjs",
+    "remove:local-appimage": "node scripts/local-appimage-remove.mjs",
+    "version:release": "node scripts/set-app-version.mjs",
+    "keys:addon": "node scripts/generate-addon-signing-key.mjs",
+    "feed:publish": "node scripts/publish-addon-feed.mjs",
+    "feed:latest": "node scripts/publish-addon-feed.mjs --latest"
+  }
+}

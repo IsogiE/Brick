@@ -1,0 +1,59 @@
+name: Addon feed
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+concurrency:
+  group: addon-feed
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Brick source
+        uses: actions/checkout@v4
+
+      - name: Checkout addon source
+        uses: actions/checkout@v4
+        with:
+          repository: IsogiE/AdvanceRaidTools
+          path: addon-source
+          fetch-depth: 0
+
+      - name: Checkout pinned BigWigs packager
+        uses: actions/checkout@v4
+        with:
+          repository: BigWigsMods/packager
+          ref: 20a3713ec537df54db5c0d8b4822d88ee63c70e8
+          path: bigwigs-packager
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Package addon from GitHub source
+        env:
+          BRICK_PACKAGER_SCRIPT_SHA256: 49bcf94d977478a6f18ead7f0285f193853bf1f9a23ba7d84d08b979d802a734
+        run: |
+          set -euo pipefail
+          echo "$BRICK_PACKAGER_SCRIPT_SHA256  bigwigs-packager/release.sh" | sha256sum -c -
+          ./bigwigs-packager/release.sh -d -r "$GITHUB_WORKSPACE/.release/addon" -t "$GITHUB_WORKSPACE/addon-source"
+
+      - name: Publish signed addon feed
+        env:
+          BRICK_ADDON_PRIVATE_KEY_B64: ${{ secrets.BRICK_ADDON_PRIVATE_KEY_B64 }}
+          GH_TOKEN: ${{ secrets.BRICK_RELEASE_TOKEN }}
+          BRICK_FEED_REPO: IsogiE/AdvanceRaidTools
+          BRICK_FEED_TAG: brick-feed
+          BRICK_ADDON_GITHUB_REPO: IsogiE/AdvanceRaidTools
+          BRICK_ADDON_SOURCE_DIR: ${{ github.workspace }}/addon-source
+          BRICK_ADDON_RELEASE_DIR: ${{ github.workspace }}/.release/addon
+          BRICK_PACKAGER_COMMIT: 20a3713ec537df54db5c0d8b4822d88ee63c70e8
+          BRICK_PACKAGER_SCRIPT_SHA256: 49bcf94d977478a6f18ead7f0285f193853bf1f9a23ba7d84d08b979d802a734
+        run: node scripts/publish-addon-feed.mjs

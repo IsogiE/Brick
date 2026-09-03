@@ -1,0 +1,36 @@
+[package]
+name = "brick"
+version = "0.1.0"
+description = "Advance"
+authors = ["Advance Raid Tools"]
+license = "All rights reserved"
+repository = "https://github.com/IsogiE/AdvanceRaidTools"
+edition = "2021"
+
+[dependencies]
+auto-launch = "0.5"
+base64 = "0.22"
+ed25519-dalek = "2"
+eframe = "=0.33.3"
+hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rfd = "0.16"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+time = { version = "0.3", features = ["formatting"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", features = ["blocking"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+tray-icon = { version = "0.24", default-features = false }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "z"
