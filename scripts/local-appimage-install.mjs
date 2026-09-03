@@ -1,4 +1,4 @@
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -7,8 +7,10 @@ const home = homedir();
 const bundleDir = resolve('dist/packages');
 const installPath = join(home, '.local/bin/Brick.AppImage');
 const tempInstallPath = join(home, '.local/bin/Brick.AppImage.tmp');
-const desktopPath = join(home, '.local/share/applications/brick.desktop');
-const iconPath = join(home, '.local/share/icons/hicolor/256x256/apps/brick.png');
+const desktopPath = join(home, '.local/share/applications/dev.isogi.brick.desktop');
+const legacyDesktopPath = join(home, '.local/share/applications/brick.desktop');
+const iconPath = join(home, '.local/share/icons/hicolor/256x256/apps/dev.isogi.brick.png');
+const legacyIconPath = join(home, '.local/share/icons/hicolor/256x256/apps/brick.png');
 
 if (!existsSync(bundleDir)) {
   throw new Error('No AppImage bundle folder found. Run `npm run build:local-appimage` first.');
@@ -30,19 +32,27 @@ copyFileSync(appImage, tempInstallPath);
 chmodSync(tempInstallPath, 0o755);
 renameSync(tempInstallPath, installPath);
 copyFileSync(resolve('src/assets/brick.png'), iconPath);
+copyFileSync(resolve('src/assets/brick.png'), legacyIconPath);
+if (existsSync(legacyDesktopPath)) {
+  rmSync(legacyDesktopPath, { force: true });
+}
 
 writeFileSync(desktopPath, `[Desktop Entry]
 Type=Application
 Name=Brick
-Comment=Advance
+Comment=Advance Raid Tools
 Exec="${installPath}"
-Icon=brick
+Icon=dev.isogi.brick
 Terminal=false
 Categories=Utility;
-StartupWMClass=Brick
+StartupNotify=true
+StartupWMClass=dev.isogi.brick
 `);
 
 spawnSync('update-desktop-database', [join(home, '.local/share/applications')], {
+  stdio: 'ignore'
+});
+spawnSync('gtk-update-icon-cache', ['-f', '-t', join(home, '.local/share/icons/hicolor')], {
   stdio: 'ignore'
 });
 

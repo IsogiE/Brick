@@ -1,8 +1,8 @@
 # Brick
 
-Small in-house updater for Advance.
+Small in-house updater for Advance Raid Tools.
 
-Brick is intentionally not a general addon manager. After first setup it runs at login, checks the single signed guild feed on GitHub, and installs the latest published package into every configured WoW client folder without asking users to click an update button.
+Brick is intentionally not a general addon manager. After first setup it runs at login, checks the single signed guild feed on GitHub, and installs the latest published package into every configured WoW client folder automatically.
 
 Brick is a native Rust desktop app. It does not use Electron, Tauri, WebView2, WebKitGTK, or an embedded browser/webpreview for its UI.
 

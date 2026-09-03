@@ -9,7 +9,7 @@ Read this before changing Brick. This repo is the private source app. The public
 - App identifier: `dev.isogi.brick`
 - UI stack: native Rust with `eframe`/`egui`; do not reintroduce a webview UI.
 - User-facing UI should stay single-screen and consumer-simple: no Logs tab, no watcher/feed/debug wording, no manual update-manager framing.
-- Default window size is intentionally compact at `740x560`, with `640x520` as the minimum.
+- Default window size is intentionally comfortable at `980x720`, with `720x560` as the minimum.
 - Public app release repo: `IsogiE/Brick-Releases`
 - Public addon feed release: `IsogiE/Brick-Releases` tag `addon-feed`
 - Managed addon folders: `AdvanceRaidTools`, `AdvanceRaidTools_Libraries`, `AdvanceRaidTools_Options`
@@ -60,8 +60,8 @@ The local AppImage installer copies the newest `*.AppImage` with `brick` in the 
 It also writes:
 
 ```text
-~/.local/share/applications/brick.desktop
-~/.local/share/icons/hicolor/256x256/apps/brick.png
+~/.local/share/applications/dev.isogi.brick.desktop
+~/.local/share/icons/hicolor/256x256/apps/dev.isogi.brick.png
 ```
 
 If startup automation has been enabled, Brick may also create:

@@ -7,7 +7,9 @@ const home = homedir();
 const purge = process.argv.includes('--purge');
 const paths = [
   join(home, '.local/bin/Brick.AppImage'),
+  join(home, '.local/share/applications/dev.isogi.brick.desktop'),
   join(home, '.local/share/applications/brick.desktop'),
+  join(home, '.local/share/icons/hicolor/256x256/apps/dev.isogi.brick.png'),
   join(home, '.local/share/icons/hicolor/256x256/apps/brick.png'),
   join(home, '.config/autostart/Brick.desktop'),
   join(home, '.config/autostart/dev.isogi.brick.desktop')
@@ -27,6 +29,9 @@ for (const path of paths) {
 }
 
 spawnSync('update-desktop-database', [join(home, '.local/share/applications')], {
+  stdio: 'ignore'
+});
+spawnSync('gtk-update-icon-cache', ['-f', '-t', join(home, '.local/share/icons/hicolor')], {
   stdio: 'ignore'
 });
 

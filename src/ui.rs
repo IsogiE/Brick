@@ -271,7 +271,6 @@ impl BrickApp {
                         .strong()
                         .color(Color32::from_rgb(244, 247, 251)),
                 );
-                ui.label(RichText::new("Advance").color(muted_text()));
             });
         });
     }
@@ -290,10 +289,12 @@ impl BrickApp {
                             .strong()
                             .color(primary_text()),
                     );
-                    ui.add(
-                        egui::Label::new(RichText::new(status.detail).color(secondary_text()))
-                            .wrap(),
-                    );
+                    if !status.detail.is_empty() {
+                        ui.add(
+                            egui::Label::new(RichText::new(status.detail).color(secondary_text()))
+                                .wrap(),
+                        );
+                    }
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -333,7 +334,7 @@ impl BrickApp {
                     );
                     ui.add(
                         egui::Label::new(
-                            RichText::new("Brick needs this once so it knows where Advance goes.")
+                            RichText::new("Select your World of Warcraft folder.")
                                 .color(secondary_text()),
                         )
                         .wrap(),
@@ -372,7 +373,7 @@ impl BrickApp {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(client.flavor.label())
+                        RichText::new(client.display_label())
                             .strong()
                             .color(primary_text()),
                     );
@@ -383,22 +384,16 @@ impl BrickApp {
                     });
                 });
                 path_label(ui, &client.path);
-                capsule(
-                    ui,
-                    &client_version_label(client),
-                    secondary_text(),
-                    Color32::from_rgb(37, 41, 49),
-                );
             });
             return;
         }
 
         ui.horizontal(|ui| {
-            let detail_width = (ui.available_width() - 210.0).max(180.0);
+            let detail_width = (ui.available_width() - 100.0).max(180.0);
             ui.vertical(|ui| {
                 ui.set_width(detail_width);
                 ui.label(
-                    RichText::new(client.flavor.label())
+                    RichText::new(client.display_label())
                         .strong()
                         .color(primary_text()),
                 );
@@ -409,12 +404,6 @@ impl BrickApp {
                 if danger_button(ui, "Remove").clicked() {
                     self.remove_client(&client.id);
                 }
-                capsule(
-                    ui,
-                    &client_version_label(client),
-                    secondary_text(),
-                    Color32::from_rgb(37, 41, 49),
-                );
             });
         });
     }
@@ -432,13 +421,6 @@ impl BrickApp {
                         RichText::new("Open at login")
                             .strong()
                             .color(primary_text()),
-                    );
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new("Keeps Advance current without asking.")
-                                .color(secondary_text()),
-                        )
-                        .wrap(),
                     );
                 });
 
@@ -459,7 +441,7 @@ impl BrickApp {
         if self.view.setup_required || self.view.settings.clients.is_empty() {
             return DisplayStatus {
                 title: "Setup needed".to_string(),
-                detail: "Select your World of Warcraft folder to start.".to_string(),
+                detail: "Select your World of Warcraft folder.".to_string(),
                 accent: warning_accent(),
                 accent_soft: Color32::from_rgb(61, 47, 30),
                 version,
@@ -469,7 +451,7 @@ impl BrickApp {
         if self.sync_rx.is_some() {
             return DisplayStatus {
                 title: "Checking for updates".to_string(),
-                detail: "Advance will be ready in a moment.".to_string(),
+                detail: String::new(),
                 accent: info_accent(),
                 accent_soft: Color32::from_rgb(29, 48, 62),
                 version,
@@ -489,7 +471,7 @@ impl BrickApp {
         if !(self.view.settings.startup_enabled && self.view.settings.watcher_enabled) {
             return DisplayStatus {
                 title: "Automatic updates are off".to_string(),
-                detail: "Turn on Open at login to keep Advance current.".to_string(),
+                detail: String::new(),
                 accent: warning_accent(),
                 accent_soft: Color32::from_rgb(61, 47, 30),
                 version,
@@ -499,11 +481,8 @@ impl BrickApp {
         let status_lower = self.status.to_ascii_lowercase();
         if status_lower.starts_with("installed ") {
             return DisplayStatus {
-                title: "Advance updated".to_string(),
-                detail: format!(
-                    "Ready in {}.",
-                    install_count_text(self.view.settings.clients.len())
-                ),
+                title: "Advance Raid Tools updated".to_string(),
+                detail: String::new(),
                 accent: success_accent(),
                 accent_soft: Color32::from_rgb(26, 59, 42),
                 version,
@@ -511,11 +490,8 @@ impl BrickApp {
         }
 
         DisplayStatus {
-            title: "Advance is up to date".to_string(),
-            detail: format!(
-                "Ready in {}.",
-                install_count_text(self.view.settings.clients.len())
-            ),
+            title: "Advance Raid Tools is up to date".to_string(),
+            detail: String::new(),
             accent: success_accent(),
             accent_soft: Color32::from_rgb(26, 59, 42),
             version,
@@ -718,13 +694,6 @@ fn current_version(clients: &[WowClient]) -> Option<String> {
     }
 }
 
-fn client_version_label(client: &WowClient) -> String {
-    client
-        .last_installed_version
-        .clone()
-        .unwrap_or_else(|| "Pending".to_string())
-}
-
 fn status_needs_attention(status: &str) -> bool {
     let status = status.to_ascii_lowercase();
     status.contains("failed")
@@ -750,15 +719,7 @@ fn friendly_problem(status: &str) -> String {
     } else if lower.contains("tray") {
         "Brick is running, but the system tray is not available on this desktop.".to_string()
     } else {
-        "Brick could not update Advance. It will try again automatically.".to_string()
-    }
-}
-
-fn install_count_text(count: usize) -> String {
-    if count == 1 {
-        "1 install".to_string()
-    } else {
-        format!("{count} installs")
+        "Brick could not update Advance Raid Tools. It will try again automatically.".to_string()
     }
 }
 

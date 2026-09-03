@@ -78,9 +78,21 @@ pub struct WowClient {
     pub id: String,
     pub flavor: Flavor,
     pub path: String,
+    #[serde(default)]
+    pub game_version: Option<String>,
     pub last_installed_version: Option<String>,
     pub last_installed_sha256: Option<String>,
     pub last_sync_at: Option<String>,
+}
+
+impl WowClient {
+    pub fn display_label(&self) -> String {
+        let Some(version) = self.game_version.as_deref().and_then(short_game_version) else {
+            return self.flavor.label().to_string();
+        };
+
+        format!("{} {version}", self.flavor.label())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -101,7 +113,7 @@ impl Flavor {
         match self {
             Self::Retail => "Retail",
             Self::Ptr => "PTR",
-            Self::Xptr => "Encrypted PTR",
+            Self::Xptr => "PTR",
             Self::Beta => "Beta",
             Self::Classic => "Classic",
             Self::ClassicEra => "Classic Era",
@@ -221,6 +233,9 @@ struct ManifestArtifact {
 pub fn load_view() -> Result<AppView, String> {
     let mut settings = load_settings()?;
     maybe_auto_detect_clients(&mut settings)?;
+    if refresh_client_metadata(&mut settings.clients) {
+        save_settings(&settings)?;
+    }
     view_from_settings(settings)
 }
 
@@ -264,6 +279,7 @@ pub fn add_wow_paths(paths: &[PathBuf]) -> Result<AppView, String> {
 
     settings.watcher_enabled = true;
     settings.startup_enabled = true;
+    refresh_client_metadata(&mut settings.clients);
     sort_clients(&mut settings.clients);
     save_settings(&settings)?;
 
@@ -372,6 +388,7 @@ fn run_sync_if_enabled(sync_lock: &Arc<Mutex<()>>) -> Result<(), String> {
 fn run_sync() -> Result<SyncSummary, String> {
     let mut settings = load_settings()?;
     maybe_auto_detect_clients(&mut settings)?;
+    refresh_client_metadata(&mut settings.clients);
 
     let checked_at = now_stamp();
     if settings.clients.is_empty() {
@@ -688,10 +705,12 @@ fn resolve_wow_clients(selected: &Path) -> Result<Vec<WowClient>, String> {
 
 fn client_from_flavor_dir(info: &FlavorInfo, flavor_root: &Path) -> WowClient {
     let path = normalize_path(flavor_root);
+    let game_version = detect_game_version(&path, info.flavor);
     WowClient {
         id: stable_client_id(info.flavor, &path),
         flavor: info.flavor,
         path: path.to_string_lossy().to_string(),
+        game_version,
         last_installed_version: None,
         last_installed_sha256: None,
         last_sync_at: None,
@@ -714,6 +733,112 @@ fn flavor_info_from_path(path: &Path) -> Option<&'static FlavorInfo> {
 
 fn sort_clients(clients: &mut [WowClient]) {
     clients.sort_by_key(|client| (client.flavor.rank(), client.path.clone()));
+}
+
+fn refresh_client_metadata(clients: &mut [WowClient]) -> bool {
+    let mut changed = false;
+
+    for client in clients {
+        let game_version = detect_game_version(Path::new(&client.path), client.flavor);
+        if client.game_version != game_version {
+            client.game_version = game_version;
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn detect_game_version(flavor_root: &Path, flavor: Flavor) -> Option<String> {
+    let wow_root = flavor_root.parent()?;
+    let build_versions = read_build_versions(wow_root)?;
+    let mut products = Vec::new();
+
+    if let Some(product) = read_product_flavor(flavor_root) {
+        products.push(product);
+    }
+    products.extend(
+        product_candidates(flavor)
+            .iter()
+            .map(|product| product.to_string()),
+    );
+
+    for product in products {
+        if let Some(version) = build_versions
+            .iter()
+            .find_map(|(build_product, version)| (build_product == &product).then_some(version))
+        {
+            return Some(version.clone());
+        }
+    }
+
+    None
+}
+
+fn read_product_flavor(flavor_root: &Path) -> Option<String> {
+    let contents = fs::read_to_string(flavor_root.join(".flavor.info")).ok()?;
+    contents
+        .lines()
+        .skip(1)
+        .find_map(|line| line.split('|').next())
+        .map(str::trim)
+        .filter(|product| !product.is_empty())
+        .map(str::to_string)
+}
+
+fn read_build_versions(wow_root: &Path) -> Option<Vec<(String, String)>> {
+    let contents = fs::read_to_string(wow_root.join(".build.info")).ok()?;
+    let mut lines = contents.lines();
+    let headers = lines.next()?.split('|').collect::<Vec<_>>();
+    let product_index = headers
+        .iter()
+        .position(|header| header.split('!').next() == Some("Product"))?;
+    let version_index = headers
+        .iter()
+        .position(|header| header.split('!').next() == Some("Version"))?;
+    let mut versions = Vec::new();
+
+    for line in lines {
+        let columns = line.split('|').collect::<Vec<_>>();
+        let Some(product) = columns.get(product_index).map(|value| value.trim()) else {
+            continue;
+        };
+        let Some(version) = columns.get(version_index).map(|value| value.trim()) else {
+            continue;
+        };
+        if !product.is_empty() && !version.is_empty() {
+            versions.push((product.to_string(), version.to_string()));
+        }
+    }
+
+    Some(versions)
+}
+
+fn product_candidates(flavor: Flavor) -> &'static [&'static str] {
+    match flavor {
+        Flavor::Retail => &["wow"],
+        Flavor::Ptr => &["wowt", "wow_ptr", "wowptr"],
+        Flavor::Xptr => &["wowxptr", "wow_xptr", "wowt", "wow_ptr", "wowptr"],
+        Flavor::Beta => &["wow_beta", "wowbeta"],
+        Flavor::Classic => &["wow_classic", "wow_classic_ptr"],
+        Flavor::ClassicEra => &["wow_classic_era", "wow_classic_era_ptr"],
+        Flavor::ClassicPtr => &["wow_classic_ptr"],
+        Flavor::ClassicBeta => &["wow_classic_beta"],
+    }
+}
+
+fn short_game_version(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let parts = value.split('.').collect::<Vec<_>>();
+    if parts.len() >= 3 {
+        Some(parts[..3].join("."))
+    } else {
+        Some(value.to_string())
+    }
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
