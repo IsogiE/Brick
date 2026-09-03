@@ -8,7 +8,7 @@ Brick is a native Rust desktop app. It does not use Electron, Tauri, WebView2, W
 
 ## Targets
 
-- Windows: NSIS setup exe, installed per-user so it does not require admin rights by default.
+- Windows: MSI installer.
 - Linux: AppImage for Arch/CachyOS and other desktop distros, plus deb/rpm/pacman artifacts for Ubuntu/Debian/Fedora/Arch-style installs.
 
 ## First Setup
@@ -53,13 +53,17 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
+You can also run the `Release` workflow manually and provide a SemVer version. In both cases, the private Brick repo builds the app and publishes only the installer/package assets to the public `IsogiE/Brick-Releases` repo.
+
 The release workflow publishes to `IsogiE/Brick-Releases` and builds:
 
-- Windows NSIS installer
+- Windows MSI installer
 - Linux AppImage
 - Linux deb
 - Linux rpm
 - Linux pacman package
+
+The published app packages are separate from the addon feed. Installed Brick clients update Advance Raid Tools automatically from the signed addon feed; Brick app binary self-updates require a separate signed app-update flow.
 
 ## Addon Feed
 

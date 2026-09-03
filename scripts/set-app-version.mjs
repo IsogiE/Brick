@@ -1,10 +1,12 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-const rawVersion =
+const versionInput =
   process.env.BRICK_APP_VERSION
   || process.env.GITHUB_REF_NAME?.replace(/^v/, '')
   || null;
+
+const rawVersion = versionInput?.replace(/^v/, '') || null;
 
 if (!rawVersion) {
   if (process.env.CI) {

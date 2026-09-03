@@ -1,6 +1,12 @@
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'SemVer version to publish, for example 0.1.0'
+        required: true
+        default: '0.1.0'
   push:
     tags:
       - 'v*'
@@ -12,7 +18,7 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            formats: nsis
+            formats: wix
           - os: ubuntu-22.04
             formats: appimage,deb,rpm,pacman
     runs-on: ${{ matrix.os }}
@@ -32,6 +38,8 @@ jobs:
         run: cargo install cargo-packager --locked
 
       - name: Configure version
+        env:
+          BRICK_APP_VERSION: ${{ inputs.version }}
         run: node scripts/set-app-version.mjs
 
       - name: Build package
@@ -59,13 +67,18 @@ jobs:
       - name: Publish release assets
         env:
           GH_TOKEN: ${{ secrets.BRICK_RELEASE_TOKEN }}
+          BRICK_APP_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           repo="IsogiE/Brick-Releases"
-          tag="${GITHUB_REF_NAME}"
+          if [[ -n "${BRICK_APP_VERSION:-}" ]]; then
+            tag="v${BRICK_APP_VERSION#v}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
           notes="Automated Brick app release.
 
-          Windows users should install the NSIS setup exe.
+          Windows users should install the MSI package.
           Linux users can use the AppImage on Arch/CachyOS and most desktop distros, the deb on Ubuntu/Debian, the rpm on Fedora-style distros, or the pacman package on Arch-style distros."
           gh release view "$tag" --repo "$repo" >/dev/null 2>&1 || gh release create "$tag" --repo "$repo" --title "Brick $tag" --notes "$notes"
           while IFS= read -r -d '' file; do
