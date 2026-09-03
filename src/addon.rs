@@ -741,7 +741,7 @@ fn same_path(a: &str, b: &str) -> bool {
 fn fetch_verified_manifest() -> Result<AddonManifest, String> {
     let client = http_client()?;
     let manifest_response = client
-        .get(FEED_URL)
+        .get(cache_busted_url(FEED_URL)?)
         .send()
         .map_err(|error| format!("Failed to download addon manifest: {error}"))?;
     if manifest_response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -755,7 +755,7 @@ fn fetch_verified_manifest() -> Result<AddonManifest, String> {
         .to_vec();
 
     let sig_response = client
-        .get(FEED_SIG_URL)
+        .get(cache_busted_url(FEED_SIG_URL)?)
         .send()
         .map_err(|error| format!("Failed to download addon manifest signature: {error}"))?;
     if sig_response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -775,9 +775,10 @@ fn fetch_verified_manifest() -> Result<AddonManifest, String> {
 
 fn fetch_verified_package(manifest: &AddonManifest) -> Result<Vec<u8>, String> {
     validate_github_release_url(&manifest.artifact.url)?;
+    let package_url = cache_busted_url(&manifest.artifact.url)?;
 
     let package = http_client()?
-        .get(&manifest.artifact.url)
+        .get(package_url)
         .send()
         .map_err(|error| format!("Failed to download addon package: {error}"))?
         .error_for_status()
@@ -811,6 +812,13 @@ fn http_client() -> Result<reqwest::blocking::Client, String> {
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .map_err(|error| format!("Failed to create HTTP client: {error}"))
+}
+
+fn cache_busted_url(value: &str) -> Result<String, String> {
+    let mut url = Url::parse(value).map_err(|error| format!("Invalid download URL: {error}"))?;
+    url.query_pairs_mut()
+        .append_pair("brickCache", &Uuid::new_v4().to_string());
+    Ok(url.to_string())
 }
 
 fn verify_manifest_signature(

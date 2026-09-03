@@ -56,7 +56,7 @@ async function main() {
   const ghToken = requiredEnvAny(['GH_TOKEN', 'GITHUB_TOKEN']);
   const zip = readFileSync(packagePath);
   const sha256 = createHash('sha256').update(zip).digest('hex');
-  const artifactUrl = `https://github.com/${feedRepo}/releases/download/${feedTag}/${artifactName}`;
+  const artifactUrl = `https://github.com/${feedRepo}/releases/download/${feedTag}/${artifactName}?brickSource=${source.commit}`;
   const sourceInfo = {
     provider: 'github-packager',
     repo: sourceRepo,
