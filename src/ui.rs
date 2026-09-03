@@ -3,14 +3,14 @@ use std::{
     path::PathBuf,
     sync::{mpsc, Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use eframe::egui::{self, Color32, RichText, Stroke, TextureHandle};
 
 use crate::{
     addon::{self, AppView, LogLevel, SyncSummary, WowClient},
-    autostart, tray,
+    autostart, single_instance, tray,
 };
 
 const ICON_BYTES: &[u8] = include_bytes!("assets/brick.png");
@@ -24,6 +24,8 @@ pub struct BrickApp {
     tray: Option<tray::TrayState>,
     tray_attempted: bool,
     quit_requested: bool,
+    last_show_request: Option<String>,
+    last_view_refresh: Instant,
 }
 
 struct DisplayStatus {
@@ -42,6 +44,7 @@ impl BrickApp {
     ) -> Self {
         configure_style(&cc.egui_ctx);
         let brick_texture = load_texture(&cc.egui_ctx);
+        spawn_show_request_wake(&cc.egui_ctx);
 
         let (view, status) = match addon::load_view() {
             Ok(view) => (view, "Ready".to_string()),
@@ -60,6 +63,8 @@ impl BrickApp {
             tray: None,
             tray_attempted: false,
             quit_requested: false,
+            last_show_request: single_instance::read_show_request().ok().flatten(),
+            last_view_refresh: Instant::now(),
         };
 
         app.reconcile_autostart();
@@ -75,8 +80,30 @@ impl BrickApp {
 
     fn refresh_view(&mut self) {
         match addon::load_view() {
-            Ok(view) => self.view = view,
+            Ok(view) => {
+                self.view = view;
+                self.last_view_refresh = Instant::now();
+            }
             Err(error) => self.status = error,
+        }
+    }
+
+    fn refresh_view_if_stale(&mut self) {
+        if self.sync_rx.is_some() || self.last_view_refresh.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+
+        self.refresh_view();
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.refresh_view();
+
+        if !self.view.setup_required && self.view.settings.watcher_enabled {
+            self.start_sync();
         }
     }
 
@@ -226,9 +253,7 @@ impl BrickApp {
         for command in tray.drain_commands() {
             match command {
                 tray::TrayCommand::Show => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.show_window(ctx);
                 }
                 tray::TrayCommand::Hide => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -239,6 +264,19 @@ impl BrickApp {
                 }
             }
         }
+    }
+
+    fn handle_show_request(&mut self, ctx: &egui::Context) {
+        let Ok(Some(token)) = single_instance::read_show_request() else {
+            return;
+        };
+
+        if self.last_show_request.as_deref() == Some(token.as_str()) {
+            return;
+        }
+
+        self.last_show_request = Some(token);
+        self.show_window(ctx);
     }
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
@@ -555,8 +593,10 @@ impl eframe::App for BrickApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_tray();
         self.handle_tray(ctx);
+        self.handle_show_request(ctx);
         self.handle_close_request(ctx);
         self.poll_sync();
+        self.refresh_view_if_stale();
 
         egui::CentralPanel::default()
             .frame(
@@ -589,6 +629,22 @@ fn load_texture(ctx: &egui::Context) -> Option<TextureHandle> {
     let size = [width as usize, height as usize];
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &image.into_raw());
     Some(ctx.load_texture("brick-icon", color_image, egui::TextureOptions::LINEAR))
+}
+
+fn spawn_show_request_wake(ctx: &egui::Context) {
+    let ctx = ctx.clone();
+    thread::spawn(move || {
+        let mut last_token = single_instance::read_show_request().ok().flatten();
+
+        loop {
+            thread::sleep(Duration::from_millis(250));
+            let token = single_instance::read_show_request().ok().flatten();
+            if token != last_token {
+                last_token = token;
+                ctx.request_repaint();
+            }
+        }
+    });
 }
 
 fn configure_style(ctx: &egui::Context) {

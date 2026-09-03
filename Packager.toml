@@ -12,7 +12,7 @@ out-dir = "dist/packages"
 binaries-dir = "target/release"
 before-packaging-command = "cargo build --release"
 binaries = [{ path = "brick", main = true }]
-icons = ["src/assets/brick.png"]
+icons = ["src/assets/brick.ico", "src/assets/brick.png"]
 formats = ["appimage"]
 
 [linux]

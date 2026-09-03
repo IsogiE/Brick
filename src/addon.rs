@@ -32,7 +32,7 @@ const FEED_UNAVAILABLE_MESSAGE: &str =
     "No signed addon feed is available yet. Brick will check again automatically.";
 const SETTINGS_FILE: &str = "settings.json";
 const LOG_FILE: &str = "logs.jsonl";
-const SYNC_INTERVAL_SECS: u64 = 5 * 60;
+const SYNC_INTERVAL_SECS: u64 = 30;
 const ALLOWED_FOLDERS: &[&str] = &[
     "AdvanceRaidTools",
     "AdvanceRaidTools_Libraries",
@@ -563,7 +563,7 @@ fn logs_path() -> Result<PathBuf, String> {
     Ok(config_dir()?.join(LOG_FILE))
 }
 
-fn config_dir() -> Result<PathBuf, String> {
+pub(crate) fn config_dir() -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     {
         if let Some(appdata) = env::var_os("APPDATA").or_else(|| env::var_os("LOCALAPPDATA")) {

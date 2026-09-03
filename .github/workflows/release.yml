@@ -22,6 +22,9 @@ jobs:
           - os: ubuntu-22.04
             formats: appimage,deb,pacman
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
@@ -63,11 +66,66 @@ jobs:
           BRICK_APP_VERSION: ${{ inputs.version }}
         run: node scripts/set-app-version.mjs
 
+      - name: Build Windows binary for signing
+        if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
+        env:
+          BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
+        run: cargo build --release
+
+      - name: Azure login for Windows signing
+        if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows binary
+        if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ secrets.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files: ${{ github.workspace }}\target\release\brick.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Prepare signed Windows package config
+        if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
+        shell: pwsh
+        run: |
+          Get-Content Packager.toml |
+            Where-Object { $_ -notmatch '^before-packaging-command\s*=' } |
+            Set-Content Packager.signed.toml
+
       - name: Build package
+        if: runner.os != 'Windows' || vars.BRICK_WINDOWS_SIGNING != 'artifact-signing'
         env:
           BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
           NO_STRIP: 1
         run: cargo packager --release --formats ${{ matrix.formats }}
+
+      - name: Build signed Windows package
+        if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
+        env:
+          NO_STRIP: 1
+        run: cargo packager --config Packager.signed.toml --formats ${{ matrix.formats }}
+
+      - name: Sign Windows installer
+        if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ secrets.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files-folder: ${{ github.workspace }}\dist\packages
+          files-folder-filter: '*.msi'
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - uses: actions/upload-artifact@v4
         with:

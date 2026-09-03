@@ -17,7 +17,7 @@ Read this before changing Brick. This repo is the private source app. The public
 
 Brick is not a normal addon manager. Its purpose is to install the current in-house guild package automatically after the first WoW path setup.
 
-On launch, Brick should check the signed addon feed when automation is enabled. If every configured client already has the signed SHA installed and the managed folders exist, it should skip downloading the zip. The periodic watcher is only the follow-up check after launch.
+On launch, Brick should check the signed addon feed when automation is enabled. If every configured client already has the signed SHA installed and the managed folders exist, it should skip downloading the zip. The periodic watcher is only the follow-up check after launch and should poll every 30 seconds.
 
 ## Security Rules
 
@@ -34,10 +34,12 @@ On launch, Brick should check the signed addon feed when automation is enabled. 
 - ART public addon source: `/home/lucas/Documents/GitHub/AdvanceRaidTools`
 - ART publishes packaged addon builds through the normal BigWigs packager flow to addon platforms.
 - Brick's private `Addon feed` workflow checks out the latest public ART source, packages it with a pinned BigWigs packager commit in no-upload mode, and signs `addon-manifest.json`.
+- GitHub scheduled workflows have a five-minute minimum interval. Keep the addon feed workflow on an offset five-minute cron, not `*/5`, because scheduled runs can be delayed or dropped at heavily loaded minutes.
 - The signed addon feed and Brick app releases publish assets to the public `IsogiE/Brick-Releases` repo. Do not change ART workflow/repo plumbing for Brick unless Lucas explicitly asks.
 - The `Release` workflow builds public-test app packages from private Brick source and publishes them to `IsogiE/Brick-Releases`; Windows packaging uses WiX/MSI.
 - The `Release` workflow uses GitHub Actions cache entries for Rust dependencies, the cargo target directory, and the `cargo-packager` binary to reduce future cold-start packaging time.
 - Public Brick app releases should have an empty release body; keep installer guidance out of the GitHub release text.
+- Windows release signing is opt-in with repo variable `BRICK_WINDOWS_SIGNING=artifact-signing` and Azure Artifact Signing secrets. When enabled, the Release workflow signs `target/release/brick.exe` before MSI packaging and signs the final MSI before upload.
 - Brick currently auto-updates Advance Raid Tools, not the Brick app binary itself. Add signed app-update metadata before claiming installed Brick clients self-update.
 - The feed workflow prunes non-`v*` tags from its local ART checkout before packaging. This prevents feed/release-only tags from changing BigWigs package versions.
 - Current BigWigs packager pin: `20a3713ec537df54db5c0d8b4822d88ee63c70e8`; `release.sh` SHA-256: `49bcf94d977478a6f18ead7f0285f193853bf1f9a23ba7d84d08b979d802a734`.

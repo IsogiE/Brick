@@ -38,6 +38,15 @@ Push this Brick folder to its private GitHub repo, then add these GitHub secrets
 - `BRICK_ADDON_PUBLIC_KEY_B64`: raw 32-byte Ed25519 public key embedded into Brick.
 - `BRICK_ADDON_PRIVATE_KEY_B64`: PKCS#8 Ed25519 private key used by the Brick feed workflow to sign `addon-manifest.json`.
 
+Optional Windows signing setup:
+
+- Set repo variable `BRICK_WINDOWS_SIGNING` to `artifact-signing`.
+- Add secrets `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID` for the GitHub OIDC app registration.
+- Add secrets `AZURE_ARTIFACT_SIGNING_ENDPOINT`, `AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME`, and `AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME`.
+- Assign that Azure identity the Artifact Signing Certificate Profile Signer role.
+
+When enabled, the release workflow signs `brick.exe` before MSI packaging and signs the final MSI before publishing.
+
 The public AdvanceRaidTools addon repo does not need Brick feed scripts or Brick signing secrets.
 
 Generate the addon feed key with:
@@ -78,7 +87,7 @@ It publishes:
 - `addon-manifest.json`
 - `addon-manifest.json.sig`
 
-Because the workflow packages the current Git commit, untagged commits become alpha-style builds such as `v1.7.10-17-g2f772b5`, while tagged commits become release builds. The workflow ignores non-`v*` tags in its local checkout so release-only feed tags cannot affect addon package versions. The BigWigs packager is pinned to commit `20a3713ec537df54db5c0d8b4822d88ee63c70e8`, and the workflow verifies the `release.sh` SHA-256 before running it.
+Because the workflow packages the current Git commit, untagged commits become alpha-style builds such as `v1.7.10-17-g2f772b5`, while tagged commits become release builds. The workflow ignores non-`v*` tags in its local checkout so release-only feed tags cannot affect addon package versions. The BigWigs packager is pinned to commit `20a3713ec537df54db5c0d8b4822d88ee63c70e8`, and the workflow verifies the `release.sh` SHA-256 before running it. GitHub scheduled workflows have a five-minute minimum interval; installed Brick clients poll the signed feed every 30 seconds.
 
 Brick clients download from that public release, verify the Ed25519 manifest signature, verify the zip SHA-256 from the signed manifest, delete the managed addon folders, and replace them with the verified package. If the feed has not been published yet, clients show a waiting state and retry automatically.
 

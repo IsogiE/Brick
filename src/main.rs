@@ -5,6 +5,7 @@
 
 mod addon;
 mod autostart;
+mod single_instance;
 mod tray;
 mod ui;
 
@@ -17,6 +18,20 @@ use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
     let startup_mode = env::args().any(|arg| arg == "--startup");
+    let _instance_guard = match single_instance::acquire() {
+        Ok(guard) => Some(guard),
+        Err(single_instance::InstanceLockError::AlreadyRunning) => {
+            if !startup_mode {
+                let _ = single_instance::request_show();
+            }
+            return Ok(());
+        }
+        Err(single_instance::InstanceLockError::Other(error)) => {
+            eprintln!("{error}");
+            None
+        }
+    };
+
     let sync_lock = Arc::new(Mutex::new(()));
     addon::spawn_watcher(sync_lock.clone());
 
