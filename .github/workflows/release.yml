@@ -28,6 +28,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-packager
+            ~/.cargo/bin/cargo-packager.exe
+            ~/.cargo/git/db
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            target
+          key: brick-${{ runner.os }}-${{ matrix.formats }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            brick-${{ runner.os }}-${{ matrix.formats }}-
+            brick-${{ runner.os }}-
+
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -35,7 +50,13 @@ jobs:
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev patchelf
 
       - name: Install Cargo Packager
-        run: cargo install cargo-packager --locked
+        shell: bash
+        run: |
+          if command -v cargo-packager >/dev/null 2>&1; then
+            cargo-packager --version
+          else
+            cargo install cargo-packager --locked
+          fi
 
       - name: Configure version
         env:

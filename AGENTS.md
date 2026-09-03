@@ -36,6 +36,7 @@ On launch, Brick should check the signed addon feed when automation is enabled. 
 - Brick's private `Addon feed` workflow checks out the latest public ART source, packages it with a pinned BigWigs packager commit in no-upload mode, and signs `addon-manifest.json`.
 - The signed addon feed and Brick app releases publish assets to the public `IsogiE/Brick-Releases` repo. Do not change ART workflow/repo plumbing for Brick unless Lucas explicitly asks.
 - The `Release` workflow builds public-test app packages from private Brick source and publishes them to `IsogiE/Brick-Releases`; Windows packaging uses WiX/MSI.
+- The `Release` workflow uses GitHub Actions cache entries for Rust dependencies, the cargo target directory, and the `cargo-packager` binary to reduce future cold-start packaging time.
 - Brick currently auto-updates Advance Raid Tools, not the Brick app binary itself. Add signed app-update metadata before claiming installed Brick clients self-update.
 - The feed workflow prunes non-`v*` tags from its local ART checkout before packaging. This prevents feed/release-only tags from changing BigWigs package versions.
 - Current BigWigs packager pin: `20a3713ec537df54db5c0d8b4822d88ee63c70e8`; `release.sh` SHA-256: `49bcf94d977478a6f18ead7f0285f193853bf1f9a23ba7d84d08b979d802a734`.
