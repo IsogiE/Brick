@@ -47,10 +47,10 @@ Add this GitHub repo variable to the private Brick repo:
 Configure that Discord application as a public OAuth2 client and add this redirect URL:
 
 ```text
-http://127.0.0.1:53631/discord/callback
+https://brick.lusaggo.com/discord/callback
 ```
 
-Brick uses Discord OAuth scopes `identify` and `guilds.members.read` to read only the signed-in user's guild member object. The Advance guild and allowed role IDs are built in:
+Brick uses Discord OAuth scopes `identify` and `guilds.members.read` to read only the signed-in user's guild member object. Browser login redirects to the Brick Presence API, which holds the one-time authorization code briefly until the matching Brick client polls for it. The desktop app still exchanges the code itself with PKCE and stores the user's Discord session locally. The Advance guild and allowed role IDs are built in:
 
 - Guild: `1166119057993515100`
 - Officer: `1167061441023582258`

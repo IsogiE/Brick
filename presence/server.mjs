@@ -25,9 +25,12 @@ const heartbeatRetentionSeconds = parsePositiveInt(
 );
 const requesterCacheSeconds = parsePositiveInt(process.env.REQUESTER_CACHE_SECONDS, 5 * 60);
 const requesterStaleSeconds = parsePositiveInt(process.env.REQUESTER_STALE_SECONDS, 60 * 60);
+const oauthHandoffTtlSeconds = parsePositiveInt(process.env.OAUTH_HANDOFF_TTL_SECONDS, 3 * 60);
+const oauthHandoffMaxEntries = parsePositiveInt(process.env.OAUTH_HANDOFF_MAX_ENTRIES, 512);
 const gatewayEnabled = process.env.DISCORD_GATEWAY_ENABLED?.trim().toLowerCase() !== "false";
 
 let rosterCache = null;
+const oauthHandoffs = new Map();
 const requesterCache = new Map();
 const requesterInFlight = new Map();
 let heartbeatWriteQueue = Promise.resolve();
@@ -60,6 +63,14 @@ function sendJson(response, status, payload) {
   response.end(JSON.stringify(payload));
 }
 
+function sendHtml(response, status, body) {
+  response.writeHead(status, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  response.end(body);
+}
+
 function bearerToken(request) {
   const auth = request.headers.authorization || "";
   const match = auth.match(/^Bearer\s+(.+)$/i);
@@ -68,6 +79,10 @@ function bearerToken(request) {
 
 function requestUrl(request) {
   return new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+}
+
+function callbackPage(title, body) {
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title><style>body{margin:0;background:#15171c;color:#f1f4f8;font:16px system-ui,sans-serif;display:grid;place-items:center;height:100vh}main{border:1px solid #2f343d;border-radius:10px;background:#1d2026;padding:28px 34px;box-shadow:0 24px 60px rgba(0,0,0,.35)}h1{margin:0 0 8px;font-size:24px}p{margin:0;color:#b7c2d0}</style></head><body><main><h1>${title}</h1><p>${body}</p></main></body></html>`;
 }
 
 async function readJsonBody(request) {
@@ -283,6 +298,100 @@ function optionalText(value, maxLength) {
   return trimmed;
 }
 
+function pruneOauthHandoffs(now = Date.now()) {
+  for (const [state, entry] of oauthHandoffs) {
+    if (entry.expiresAt <= now) {
+      oauthHandoffs.delete(state);
+    }
+  }
+}
+
+function saveOauthHandoff(state, payload) {
+  const now = Date.now();
+  pruneOauthHandoffs(now);
+
+  while (oauthHandoffs.size >= oauthHandoffMaxEntries) {
+    const oldest = oauthHandoffs.keys().next().value;
+    if (!oldest) {
+      break;
+    }
+    oauthHandoffs.delete(oldest);
+  }
+
+  oauthHandoffs.set(state, {
+    ...payload,
+    expiresAt: now + oauthHandoffTtlSeconds * 1000,
+  });
+}
+
+function takeOauthHandoff(state) {
+  pruneOauthHandoffs();
+  const entry = oauthHandoffs.get(state) || null;
+  if (entry) {
+    oauthHandoffs.delete(state);
+  }
+  return entry;
+}
+
+function handleDiscordCallback(url, response) {
+  const state = optionalText(url.searchParams.get("state"), 256);
+  if (!state) {
+    sendHtml(
+      response,
+      400,
+      callbackPage("Brick login failed", "Return to Brick and try again."),
+    );
+    return;
+  }
+
+  const error = optionalText(url.searchParams.get("error_description"), 1024)
+    || optionalText(url.searchParams.get("error"), 256);
+  if (error) {
+    saveOauthHandoff(state, { error });
+    sendHtml(
+      response,
+      200,
+      callbackPage("Brick login failed", "Return to Brick and try again."),
+    );
+    return;
+  }
+
+  const code = optionalText(url.searchParams.get("code"), 2048);
+  if (!code) {
+    saveOauthHandoff(state, { error: "Discord did not return an authorization code." });
+    sendHtml(
+      response,
+      400,
+      callbackPage("Brick login failed", "Return to Brick and try again."),
+    );
+    return;
+  }
+
+  saveOauthHandoff(state, { code });
+  sendHtml(response, 200, callbackPage("Brick login complete", "You can return to Brick."));
+}
+
+function handleAuthCallbackPoll(url, response) {
+  const state = optionalText(url.searchParams.get("state"), 256);
+  if (!state) {
+    sendJson(response, 400, { error: "Missing OAuth state." });
+    return;
+  }
+
+  const handoff = takeOauthHandoff(state);
+  if (!handoff) {
+    sendJson(response, 202, { status: "pending" });
+    return;
+  }
+
+  if (handoff.error) {
+    sendJson(response, 400, { error: `Discord rejected the login: ${handoff.error}` });
+    return;
+  }
+
+  sendJson(response, 200, { code: handoff.code });
+}
+
 async function handleHeartbeat(request, response) {
   const requester = await verifyRequester(request);
   const body = await readJsonBody(request);
@@ -416,8 +525,18 @@ async function handleRoster(request, response) {
 async function handleRequest(request, response) {
   const url = requestUrl(request);
 
+  if (request.method === "GET" && url.pathname === "/discord/callback") {
+    handleDiscordCallback(url, response);
+    return;
+  }
+
   if (request.method === "GET" && url.pathname === "/health") {
     sendJson(response, 200, { ok: true, service: "brick-presence", time: new Date().toISOString() });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/v1/auth/callback") {
+    handleAuthCallbackPoll(url, response);
     return;
   }
 

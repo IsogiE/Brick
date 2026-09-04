@@ -103,6 +103,7 @@ jobs:
         env:
           BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
           BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+          BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
           BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
         run: cargo build --release
 
@@ -139,6 +140,7 @@ jobs:
         env:
           BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
           BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+          BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
           BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
           NO_STRIP: 1
         run: cargo packager --release --formats ${{ matrix.formats }}
@@ -147,6 +149,7 @@ jobs:
         if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
         env:
           BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+          BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
           BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
           NO_STRIP: 1
         run: cargo packager --config Packager.signed.toml --formats ${{ matrix.formats }}

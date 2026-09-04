@@ -6,6 +6,8 @@ fn main() {
         "BRICK_DISCORD_ALLOWED_ROLE_IDS",
         "BRICK_DISCORD_GUILD_NAME",
         "BRICK_DISCORD_ALLOWED_ROLE_LABEL",
+        "BRICK_DISCORD_REDIRECT_URI",
+        "BRICK_PRESENCE_API_URL",
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }

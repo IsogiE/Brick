@@ -1,8 +1,7 @@
 use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
-    io::{Read, Write},
-    net::TcpListener,
+    io::Write,
     path::PathBuf,
     process::Command,
     thread,
@@ -13,7 +12,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use url::{form_urlencoded, Url};
+use url::Url;
 use uuid::Uuid;
 
 use crate::addon;
@@ -21,10 +20,11 @@ use crate::addon;
 const API_BASE: &str = "https://discord.com/api/v10";
 const AUTHORIZE_URL: &str = "https://discord.com/oauth2/authorize";
 const APP_USER_AGENT: &str = "Brick/0.2 (+https://github.com/IsogiE/Brick-Releases)";
-const REDIRECT_PORT: u16 = 53631;
 const REDIRECT_PATH: &str = "/discord/callback";
+const AUTH_CALLBACK_POLL_PATH: &str = "/v1/auth/callback";
 const SESSION_FILE: &str = "discord-auth.json";
 const LOGIN_TIMEOUT_SECS: u64 = 180;
+const LOGIN_POLL_INTERVAL_MS: u64 = 750;
 const EXPIRY_SAFETY_SECS: u64 = 60;
 const ADVANCE_GUILD_ID: &str = "1166119057993515100";
 const OFFICER_ROLE_ID: &str = "1167061441023582258";
@@ -49,6 +49,14 @@ const DISCORD_GUILD_NAME: &str = match option_env!("BRICK_DISCORD_GUILD_NAME") {
 const DISCORD_ALLOWED_ROLE_LABEL: &str = match option_env!("BRICK_DISCORD_ALLOWED_ROLE_LABEL") {
     Some(value) => value,
     None => "Raider or Officer",
+};
+const PRESENCE_API_URL: &str = match option_env!("BRICK_PRESENCE_API_URL") {
+    Some(value) => value,
+    None => "",
+};
+const DISCORD_REDIRECT_URI: &str = match option_env!("BRICK_DISCORD_REDIRECT_URI") {
+    Some(value) => value,
+    None => "",
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +123,12 @@ struct DiscordErrorResponse {
     message: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AuthCallbackResponse {
+    code: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct AuthConfig {
     client_id: String,
@@ -157,9 +171,8 @@ pub fn saved_session_status() -> Result<SessionStatus, String> {
 pub fn login_with_browser() -> Result<AuthorizedUser, String> {
     let config = auth_config()?;
     let request = login_request(&config)?;
-    let listener = bind_callback_listener()?;
     open_browser(&request.authorize_url)?;
-    let code = wait_for_callback(listener, &request.state)?;
+    let code = wait_for_remote_callback(&request.state)?;
     let token = exchange_code(&config, &code, &request.verifier)?;
     let session = verified_session_from_token(&config, token)?;
     save_session(&session)?;
@@ -254,6 +267,7 @@ fn auth_config() -> Result<AuthConfig, String> {
                 .to_string(),
         );
     }
+    redirect_uri()?;
 
     Ok(AuthConfig {
         client_id: client_id.to_string(),
@@ -276,12 +290,13 @@ fn login_request(config: &AuthConfig) -> Result<LoginRequest, String> {
     let state = random_token();
     let verifier = format!("{}{}", random_token(), random_token());
     let challenge = pkce_challenge(&verifier);
+    let redirect = redirect_uri()?;
     let mut url = Url::parse(AUTHORIZE_URL)
         .map_err(|error| format!("Failed to build Discord login URL: {error}"))?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", &config.client_id)
-        .append_pair("redirect_uri", &redirect_uri())
+        .append_pair("redirect_uri", &redirect)
         .append_pair("scope", "identify guilds.members.read")
         .append_pair("state", &state)
         .append_pair("code_challenge", &challenge)
@@ -294,95 +309,57 @@ fn login_request(config: &AuthConfig) -> Result<LoginRequest, String> {
     })
 }
 
-fn bind_callback_listener() -> Result<TcpListener, String> {
-    let listener = TcpListener::bind(("127.0.0.1", REDIRECT_PORT)).map_err(|error| {
-        format!(
-            "Brick could not open the local Discord login callback port {REDIRECT_PORT}: {error}"
-        )
-    })?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| format!("Failed to configure Discord login callback: {error}"))?;
-    Ok(listener)
-}
-
-fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<String, String> {
+fn wait_for_remote_callback(expected_state: &str) -> Result<String, String> {
     let deadline = Instant::now() + Duration::from_secs(LOGIN_TIMEOUT_SECS);
+    let client = http_client()?;
+    let mut last_error = None;
 
     loop {
         if Instant::now() >= deadline {
-            return Err("Discord login timed out.".to_string());
+            return Err(last_error.unwrap_or_else(|| "Discord login timed out.".to_string()));
         }
 
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let result = read_callback_code(&mut stream, expected_state);
-                let page = if result.is_ok() {
-                    callback_page("Brick login complete", "You can return to Brick.")
-                } else {
-                    callback_page("Brick login failed", "Return to Brick and try again.")
-                };
-                let _ = write_http_response(&mut stream, &page);
-                return result;
+        let url = auth_callback_url(expected_state)?;
+        let response = match client.get(url).send() {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(format!("Discord login callback check failed: {error}"));
+                thread::sleep(Duration::from_millis(LOGIN_POLL_INTERVAL_MS));
+                continue;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => return Err(format!("Discord login callback failed: {error}")),
+        };
+        let status = response.status();
+        let body = response
+            .bytes()
+            .map_err(|error| format!("Discord login callback check failed: {error}"))?;
+
+        if status.as_u16() == 202 {
+            thread::sleep(Duration::from_millis(LOGIN_POLL_INTERVAL_MS));
+            continue;
         }
+
+        if status.is_success() {
+            let callback: AuthCallbackResponse = serde_json::from_slice(&body)
+                .map_err(|error| format!("Discord login callback was invalid: {error}"))?;
+            if let Some(error) = callback.error.filter(|value| !value.trim().is_empty()) {
+                return Err(error);
+            }
+            return callback
+                .code
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    "Discord login callback did not include an authorization code.".to_string()
+                });
+        }
+
+        let message = discord_error_message(status.as_u16(), &body);
+        if status.is_server_error() {
+            last_error = Some(format!("Discord login callback check failed: {message}"));
+            thread::sleep(Duration::from_millis(LOGIN_POLL_INTERVAL_MS));
+            continue;
+        }
+        return Err(format!("Discord login callback check failed: {message}"));
     }
-}
-
-fn read_callback_code(
-    stream: &mut std::net::TcpStream,
-    expected_state: &str,
-) -> Result<String, String> {
-    let mut buffer = [0_u8; 8192];
-    let count = stream
-        .read(&mut buffer)
-        .map_err(|error| format!("Failed to read Discord login callback: {error}"))?;
-    let request = String::from_utf8_lossy(&buffer[..count]);
-    let first_line = request
-        .lines()
-        .next()
-        .ok_or_else(|| "Discord login callback was empty.".to_string())?;
-    let target = first_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "Discord login callback was malformed.".to_string())?;
-
-    let callback_url = Url::parse(&format!("http://127.0.0.1{target}"))
-        .map_err(|error| format!("Discord login callback URL was invalid: {error}"))?;
-
-    if callback_url.path() != REDIRECT_PATH {
-        return Err("Discord login callback path did not match Brick.".to_string());
-    }
-
-    let params = callback_url
-        .query()
-        .map(|query| {
-            form_urlencoded::parse(query.as_bytes())
-                .into_owned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    if let Some((_, error)) = params.iter().find(|(key, _)| key == "error") {
-        return Err(format!("Discord rejected the login: {error}"));
-    }
-
-    let state = params
-        .iter()
-        .find_map(|(key, value)| (key == "state").then_some(value.as_str()))
-        .ok_or_else(|| "Discord login callback did not include state.".to_string())?;
-    if state != expected_state {
-        return Err("Discord login state did not match.".to_string());
-    }
-
-    params
-        .iter()
-        .find_map(|(key, value)| (key == "code").then(|| value.clone()))
-        .ok_or_else(|| "Discord login callback did not include an authorization code.".to_string())
 }
 
 fn exchange_code(
@@ -390,7 +367,7 @@ fn exchange_code(
     code: &str,
     verifier: &str,
 ) -> Result<DiscordTokenResponse, String> {
-    let redirect_uri = redirect_uri();
+    let redirect_uri = redirect_uri()?;
     let params = [
         ("client_id", config.client_id.as_str()),
         ("grant_type", "authorization_code"),
@@ -667,8 +644,42 @@ fn discord_error_message(status: u16, body: &[u8]) -> String {
     format!("HTTP {status}")
 }
 
-fn redirect_uri() -> String {
-    format!("http://127.0.0.1:{REDIRECT_PORT}{REDIRECT_PATH}")
+fn redirect_uri() -> Result<String, String> {
+    let explicit = DISCORD_REDIRECT_URI.trim();
+    if !explicit.is_empty() {
+        validate_https_url(explicit, "Discord redirect URL")?;
+        return Ok(explicit.to_string());
+    }
+
+    Ok(service_endpoint_url(REDIRECT_PATH)?.to_string())
+}
+
+fn auth_callback_url(state: &str) -> Result<Url, String> {
+    let mut url = service_endpoint_url(AUTH_CALLBACK_POLL_PATH)?;
+    url.query_pairs_mut().append_pair("state", state);
+    Ok(url)
+}
+
+fn service_endpoint_url(path: &str) -> Result<Url, String> {
+    let base = PRESENCE_API_URL.trim();
+    if base.is_empty() {
+        return Err("Discord login needs BRICK_PRESENCE_API_URL.".to_string());
+    }
+
+    validate_https_url(base, "Brick presence API URL")?;
+    let parsed =
+        Url::parse(base).map_err(|error| format!("Invalid Brick presence API URL: {error}"))?;
+    parsed
+        .join(path)
+        .map_err(|error| format!("Invalid Brick service endpoint: {error}"))
+}
+
+fn validate_https_url(value: &str, label: &str) -> Result<(), String> {
+    let parsed = Url::parse(value).map_err(|error| format!("Invalid {label}: {error}"))?;
+    if parsed.scheme() != "https" && parsed.host_str() != Some("127.0.0.1") {
+        return Err(format!("{label} must use HTTPS."));
+    }
+    Ok(())
 }
 
 fn random_token() -> String {
@@ -678,23 +689,6 @@ fn random_token() -> String {
 fn pkce_challenge(verifier: &str) -> String {
     let digest = Sha256::digest(verifier.as_bytes());
     URL_SAFE_NO_PAD.encode(digest)
-}
-
-fn callback_page(title: &str, body: &str) -> String {
-    format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title><style>body{{margin:0;background:#15171c;color:#f1f4f8;font:16px system-ui,sans-serif;display:grid;place-items:center;height:100vh}}main{{border:1px solid #2f343d;border-radius:10px;background:#1d2026;padding:28px 34px;box-shadow:0 24px 60px rgba(0,0,0,.35)}}h1{{margin:0 0 8px;font-size:24px}}p{{margin:0;color:#b7c2d0}}</style></head><body><main><h1>{title}</h1><p>{body}</p></main></body></html>"
-    )
-}
-
-fn write_http_response(stream: &mut std::net::TcpStream, body: &str) -> Result<(), String> {
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream
-        .write_all(response.as_bytes())
-        .map_err(|error| format!("Failed to write Discord login callback response: {error}"))
 }
 
 fn open_browser(url: &str) -> Result<(), String> {

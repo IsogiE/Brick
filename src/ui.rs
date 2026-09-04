@@ -788,10 +788,10 @@ impl BrickApp {
         let (title, detail, button_text, button_enabled) = login_copy(&state);
         let panel_width = canvas.width().clamp(320.0, 420.0);
         let panel_height = match state {
-            AuthUiState::Denied(_) => 320.0,
-            AuthUiState::Checking => 300.0,
-            AuthUiState::ConfigMissing(_) => 320.0,
-            _ => 284.0,
+            AuthUiState::Denied(_) => 350.0,
+            AuthUiState::Checking => 340.0,
+            AuthUiState::ConfigMissing(_) => 340.0,
+            _ => 300.0,
         };
         let panel_top = (canvas.center().y - panel_height * 0.55)
             .clamp(canvas.top() + 28.0, canvas.bottom() - panel_height - 28.0);
@@ -838,13 +838,15 @@ impl BrickApp {
 
                 if button_enabled {
                     if ui
-                        .add_sized(egui::vec2(236.0, 42.0), login_button(button_text))
+                        .add_sized(egui::vec2(236.0, 46.0), login_button(button_text))
                         .clicked()
                     {
                         self.start_discord_login();
                     }
                 } else {
-                    ui.add_enabled(false, login_button(button_text));
+                    ui.add_enabled_ui(false, |ui| {
+                        ui.add_sized(egui::vec2(236.0, 46.0), login_button(button_text));
+                    });
                 }
 
                 if matches!(state, AuthUiState::Denied(_)) {
@@ -1331,7 +1333,7 @@ fn login_button(text: &str) -> egui::Button<'_> {
     egui::Button::new(RichText::new(text).strong().color(primary_text()))
         .corner_radius(egui::CornerRadius::same(8))
         .fill(Color32::from_rgb(82, 103, 235))
-        .min_size(egui::vec2(236.0, 42.0))
+        .min_size(egui::vec2(236.0, 46.0))
 }
 
 fn login_secondary_button(text: &str) -> egui::Button<'_> {
@@ -1655,11 +1657,11 @@ fn duration_label(seconds: u64) -> String {
 }
 
 fn login_content_height(state: &AuthUiState) -> f32 {
-    let base = 52.0 + 18.0 + 30.0 + 6.0 + 20.0 + 24.0 + 42.0;
+    let base = 52.0 + 18.0 + 30.0 + 6.0 + 20.0 + 24.0 + 46.0;
     if matches!(state, AuthUiState::Checking) {
-        base + 36.0
-    } else if matches!(state, AuthUiState::Denied(_)) {
         base + 44.0
+    } else if matches!(state, AuthUiState::Denied(_)) {
+        base + 52.0
     } else {
         base
     }
