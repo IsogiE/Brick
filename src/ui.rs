@@ -368,17 +368,27 @@ impl BrickApp {
     }
 
     fn draw_header(&self, ui: &mut egui::Ui) {
+        let app_version = concat!("v", env!("CARGO_PKG_VERSION"));
+
         ui.horizontal(|ui| {
             draw_icon(ui, self.brick_texture.as_ref(), 44.0);
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.add_space(1.0);
-                ui.label(
-                    RichText::new("Brick")
-                        .heading()
-                        .strong()
-                        .color(Color32::from_rgb(244, 247, 251)),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Brick")
+                            .heading()
+                            .strong()
+                            .color(Color32::from_rgb(244, 247, 251)),
+                    );
+                    capsule(
+                        ui,
+                        app_version,
+                        Color32::from_rgb(215, 223, 234),
+                        Color32::from_rgb(38, 42, 50),
+                    );
+                });
             });
         });
     }

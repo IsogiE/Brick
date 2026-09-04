@@ -136,10 +136,13 @@ fn launch_windows_nsis_installer(update: &PreparedAppUpdate) -> Result<(), Strin
     if !cfg!(target_os = "windows") {
         return Err("Brick NSIS updates are only supported on Windows.".to_string());
     }
-    Command::new(&update.installer_path)
-        .arg("/S")
-        .arg("/R")
-        .arg("/NS")
+    let mut command = Command::new(&update.installer_path);
+    command.arg("/S").arg("/R").arg("/NS");
+    if let Some(install_dir) = current_user_windows_install_dir() {
+        command.arg(format!("/D={}", install_dir.display()));
+    }
+
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -531,6 +534,16 @@ fn current_appimage_path() -> Option<PathBuf> {
     }
 
     Some(path)
+}
+
+#[cfg(target_os = "windows")]
+fn current_user_windows_install_dir() -> Option<PathBuf> {
+    env::var_os("LOCALAPPDATA").map(|path| PathBuf::from(path).join("Brick"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn current_user_windows_install_dir() -> Option<PathBuf> {
+    None
 }
 
 fn safe_path_part(value: &str) -> String {
