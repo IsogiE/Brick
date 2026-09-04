@@ -565,6 +565,7 @@ dependencies = [
  "hex",
  "image",
  "ksni",
+ "raw-window-handle",
  "reqwest",
  "rfd",
  "serde",
@@ -574,6 +575,7 @@ dependencies = [
  "tray-icon",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
  "winresource",
  "zip",
 ]

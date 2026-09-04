@@ -6,6 +6,54 @@ pub enum TrayCommand {
     Quit,
 }
 
+#[cfg(target_os = "windows")]
+mod native_window {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows_sys::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{IsWindow, SetForegroundWindow, ShowWindowAsync, SW_RESTORE},
+    };
+
+    static MAIN_WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+    pub fn remember(frame: &eframe::Frame) {
+        let Ok(handle) = frame.window_handle() else {
+            return;
+        };
+
+        if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+            MAIN_WINDOW.store(handle.hwnd.get(), Ordering::SeqCst);
+        }
+    }
+
+    pub fn show() {
+        let hwnd = MAIN_WINDOW.load(Ordering::SeqCst);
+        if hwnd == 0 {
+            return;
+        }
+
+        let hwnd = hwnd as HWND;
+        unsafe {
+            if IsWindow(hwnd) == 0 {
+                return;
+            }
+
+            ShowWindowAsync(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn remember_main_window(frame: &eframe::Frame) {
+    native_window::remember(frame);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn remember_main_window(_frame: &eframe::Frame) {}
+
 #[cfg(target_os = "linux")]
 mod platform {
     use std::{
@@ -172,10 +220,23 @@ mod platform {
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let command = match event.id.as_ref() {
                 "show" => Some(TrayCommand::Show),
-                "quit" => Some(TrayCommand::Quit),
+                "quit" => {
+                    #[cfg(target_os = "windows")]
+                    {
+                        std::process::exit(0);
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        Some(TrayCommand::Quit)
+                    }
+                }
                 _ => None,
             };
             if let Some(command) = command {
+                if matches!(command, TrayCommand::Show) {
+                    #[cfg(target_os = "windows")]
+                    super::native_window::show();
+                }
                 let _ = menu_tx.send(command);
                 menu_ctx.request_repaint();
             }
@@ -196,6 +257,8 @@ mod platform {
                 }
             );
             if show {
+                #[cfg(target_os = "windows")]
+                super::native_window::show();
                 let _ = tray_tx.send(TrayCommand::Show);
                 tray_ctx.request_repaint();
             }

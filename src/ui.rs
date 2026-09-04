@@ -1386,7 +1386,8 @@ impl BrickApp {
 }
 
 impl eframe::App for BrickApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        tray::remember_main_window(frame);
         self.ensure_tray(ctx);
         self.handle_tray(ctx);
         self.handle_show_request(ctx);
