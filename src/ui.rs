@@ -751,11 +751,12 @@ impl BrickApp {
                 empty_panel_message(ui, "Roster unavailable", &error);
             }
             PresenceUiState::Ready(roster) => {
-                let max_height = ui.available_height().max(260.0);
+                let max_height = ui.available_height().max(0.0);
                 egui::ScrollArea::vertical()
                     .id_salt("guild-roster")
                     .auto_shrink([false, true])
                     .max_height(max_height)
+                    .min_scrolled_height(0.0)
                     .show(ui, |ui| {
                         let content_width = (ui.available_width() - 18.0).max(260.0);
                         ui.set_width(content_width);
@@ -1539,8 +1540,9 @@ fn draw_roster_member_row(ui: &mut egui::Ui, member: &RosterMember) {
     };
     let dot_center = egui::pos2(row_rect.left() + 8.0, row_rect.center().y);
     if ui.is_rect_visible(row_rect) {
-        ui.painter().circle_filled(dot_center, 6.0, dot_color);
-        ui.painter().circle_stroke(
+        let painter = ui.painter_at(row_rect);
+        painter.circle_filled(dot_center, 6.0, dot_color);
+        painter.circle_stroke(
             dot_center,
             7.0,
             Stroke::new(
@@ -1569,7 +1571,7 @@ fn draw_roster_member_row(ui: &mut egui::Ui, member: &RosterMember) {
             .max_rect(name_rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
         |ui| {
-            ui.set_clip_rect(name_rect);
+            ui.shrink_clip_rect(name_rect);
             ui.add(
                 egui::Label::new(
                     RichText::new(member.name.as_str())
@@ -1588,7 +1590,7 @@ fn draw_roster_member_row(ui: &mut egui::Ui, member: &RosterMember) {
             .max_rect(status_rect)
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
         |ui| {
-            ui.set_clip_rect(status_rect);
+            ui.shrink_clip_rect(status_rect);
             ui.add(
                 egui::Label::new(
                     RichText::new(status.as_str())
