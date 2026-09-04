@@ -169,7 +169,11 @@ fn launch_linux_appimage(update: &PreparedAppUpdate) -> Result<(), String> {
         )
     })?;
 
-    Command::new(replacement_path)
+    Command::new("sh")
+        .arg("-c")
+        .arg("sleep 0.8; exec \"$1\"")
+        .arg("brick-restart")
+        .arg(replacement_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

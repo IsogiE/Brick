@@ -86,7 +86,6 @@ pub struct AuthSession {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct DiscordTokenResponse {
     access_token: String,
     token_type: String,
@@ -709,7 +708,7 @@ fn open_browser(url: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_allowed_role_ids, pkce_challenge, token_expired};
+    use super::{parse_allowed_role_ids, pkce_challenge, token_expired, DiscordTokenResponse};
 
     #[test]
     fn parses_allowed_role_ids() {
@@ -736,5 +735,24 @@ mod tests {
         assert!(!challenge.contains('+'));
         assert!(!challenge.contains('/'));
         assert!(!challenge.contains('='));
+    }
+
+    #[test]
+    fn parses_discord_token_response() {
+        let token: DiscordTokenResponse = serde_json::from_str(
+            r#"{
+                "access_token": "access",
+                "token_type": "Bearer",
+                "expires_in": 604800,
+                "refresh_token": "refresh",
+                "scope": "identify guilds.members.read"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(token.access_token, "access");
+        assert_eq!(token.token_type, "Bearer");
+        assert_eq!(token.expires_in, 604800);
+        assert_eq!(token.refresh_token.as_deref(), Some("refresh"));
     }
 }

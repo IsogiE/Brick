@@ -521,39 +521,13 @@ impl BrickApp {
     }
 
     fn draw_login_screen(&mut self, ui: &mut egui::Ui) {
-        let canvas = ui.max_rect();
-        if ui.is_rect_visible(canvas) {
-            let painter = ui.painter();
-            painter.rect_filled(
-                egui::Rect::from_min_size(canvas.min, egui::vec2(canvas.width(), 7.0)),
-                egui::CornerRadius::ZERO,
-                Color32::from_rgb(236, 161, 54),
-            );
-            painter.rect_filled(
-                egui::Rect::from_min_size(
-                    egui::pos2(canvas.left(), canvas.top() + 7.0),
-                    egui::vec2(canvas.width() * 0.34, 3.0),
-                ),
-                egui::CornerRadius::ZERO,
-                Color32::from_rgb(69, 211, 127),
-            );
-            painter.rect_filled(
-                egui::Rect::from_min_size(
-                    egui::pos2(canvas.right() - canvas.width() * 0.28, canvas.top() + 7.0),
-                    egui::vec2(canvas.width() * 0.28, 3.0),
-                ),
-                egui::CornerRadius::ZERO,
-                Color32::from_rgb(94, 168, 224),
-            );
-        }
-
         let available_height = ui.available_height();
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), available_height),
             egui::Layout::top_down(egui::Align::Center),
             |ui| {
-                ui.add_space(((available_height - 430.0) * 0.45).clamp(12.0, 92.0));
-                ui.set_max_width(560.0);
+                ui.add_space(((available_height - 320.0) * 0.42).clamp(28.0, 112.0));
+                ui.set_max_width(420.0);
 
                 let state = self.auth_state.clone();
                 let (title, detail, button_text, button_enabled) = login_copy(&state);
@@ -562,73 +536,63 @@ impl BrickApp {
                     .fill(panel_background())
                     .stroke(Stroke::new(1.0_f32, panel_stroke()))
                     .corner_radius(egui::CornerRadius::same(8))
-                    .inner_margin(egui::Margin::symmetric(28, 26))
+                    .inner_margin(egui::Margin::symmetric(34, 32))
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
-                            draw_icon(ui, self.brick_texture.as_ref(), 60.0);
-                            ui.add_space(12.0);
-                            ui.label(
-                                RichText::new("Advance")
-                                    .size(28.0)
-                                    .strong()
-                                    .color(primary_text()),
-                            );
-                            ui.label(
-                                RichText::new("Guild access")
-                                    .size(16.0)
-                                    .strong()
-                                    .color(secondary_text()),
-                            );
-                            ui.add_space(12.0);
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                                capsule(
-                                    ui,
-                                    discord_auth::guild_name(),
-                                    primary_text(),
-                                    Color32::from_rgb(38, 42, 50),
-                                );
-                                capsule(
-                                    ui,
-                                    discord_auth::role_label(),
-                                    Color32::from_rgb(22, 18, 12),
-                                    Color32::from_rgb(236, 161, 54),
-                                );
-                            });
-                            ui.add_space(24.0);
+                            draw_icon(ui, self.brick_texture.as_ref(), 52.0);
+                            ui.add_space(18.0);
                             ui.label(
                                 RichText::new(title)
-                                    .size(22.0)
+                                    .size(24.0)
                                     .strong()
                                     .color(primary_text()),
                             );
+                            ui.add_space(6.0);
                             ui.add(
                                 egui::Label::new(RichText::new(detail).color(secondary_text()))
                                     .wrap(),
                             );
-                            ui.add_space(22.0);
+                            ui.add_space(24.0);
 
                             if matches!(state, AuthUiState::Checking) {
                                 ui.add(egui::Spinner::new().size(24.0).color(info_accent()));
-                                ui.add_space(8.0);
+                                ui.add_space(12.0);
                             }
 
-                            if button_enabled {
-                                if discord_button(ui, button_text).clicked() {
-                                    self.start_discord_login();
+                            ui.horizontal_centered(|ui| {
+                                if button_enabled {
+                                    if ui
+                                        .add_sized(
+                                            egui::vec2(236.0, 42.0),
+                                            login_button(button_text),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.start_discord_login();
+                                    }
+                                } else {
+                                    ui.add_enabled_ui(false, |ui| {
+                                        ui.add_sized(
+                                            egui::vec2(236.0, 42.0),
+                                            login_button(button_text),
+                                        );
+                                    });
                                 }
-                            } else {
-                                ui.add_enabled(false, login_button(button_text));
-                            }
+                            });
 
-                            if let AuthUiState::Denied(error) = state {
-                                ui.add_space(10.0);
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(error).small().color(muted_text()),
-                                    )
-                                    .wrap(),
-                                );
+                            if matches!(state, AuthUiState::Denied(_)) {
+                                ui.add_space(8.0);
+                                ui.horizontal_centered(|ui| {
+                                    if ui
+                                        .add_sized(
+                                            egui::vec2(236.0, 36.0),
+                                            login_secondary_button("Log out"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.sign_out();
+                                    }
+                                });
                             }
                         });
                     });
@@ -886,7 +850,7 @@ impl BrickApp {
                 );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if secondary_button(ui, "Sign out").clicked() {
+                    if secondary_button(ui, "Log out").clicked() {
                         self.sign_out();
                     }
                 });
@@ -1107,15 +1071,19 @@ fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     )
 }
 
-fn discord_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(login_button(text))
-}
-
 fn login_button(text: &str) -> egui::Button<'_> {
     egui::Button::new(RichText::new(text).strong().color(primary_text()))
         .corner_radius(egui::CornerRadius::same(8))
-        .fill(Color32::from_rgb(73, 92, 224))
-        .min_size(egui::vec2(260.0, 42.0))
+        .fill(Color32::from_rgb(82, 103, 235))
+        .min_size(egui::vec2(236.0, 42.0))
+}
+
+fn login_secondary_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(text).strong().color(secondary_text()))
+        .corner_radius(egui::CornerRadius::same(8))
+        .fill(Color32::from_rgb(31, 34, 40))
+        .stroke(Stroke::new(1.0_f32, panel_stroke()))
+        .min_size(egui::vec2(236.0, 36.0))
 }
 
 fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
@@ -1213,36 +1181,27 @@ fn settings_toggle_row(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
 
 fn login_copy(state: &AuthUiState) -> (&'static str, String, &'static str, bool) {
     match state {
-        AuthUiState::ConfigMissing(error) => (
-            "Login is not configured",
-            error.clone(),
-            "Discord unavailable",
-            false,
-        ),
+        AuthUiState::ConfigMissing(error) => ("Setup needed", error.clone(), "Unavailable", false),
         AuthUiState::SignedOut => (
-            "Sign in to Brick",
-            format!(
-                "Use Discord to verify {} access in {}.",
-                discord_auth::role_label(),
-                discord_auth::guild_name()
-            ),
-            "Sign in with Discord",
+            "Sign in",
+            "Use Discord to continue.".to_string(),
+            "Continue with Discord",
             true,
         ),
         AuthUiState::Checking => (
-            "Checking Discord",
-            "Finish the Discord prompt in your browser.".to_string(),
             "Waiting for Discord",
+            "Complete the prompt in your browser.".to_string(),
+            "Waiting...",
             false,
         ),
         AuthUiState::Authorized(user) => (
-            "Access verified",
+            "Ready",
             format!("Signed in as {}.", user.display_name),
             "Continue",
             false,
         ),
         AuthUiState::Denied(error) => (
-            "Access not available",
+            "Could not verify access",
             friendly_auth_problem(error),
             "Try again",
             true,
