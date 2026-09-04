@@ -88,10 +88,16 @@ jobs:
           BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
         run: node -e "if (!process.env.BRICK_ADDON_PUBLIC_KEY_B64) throw new Error('BRICK_ADDON_PUBLIC_KEY_B64 is required.');"
 
+      - name: Verify Discord login config
+        env:
+          BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+        run: node -e "if (!/^[0-9]+$/.test(process.env.BRICK_DISCORD_CLIENT_ID || '')) throw new Error('BRICK_DISCORD_CLIENT_ID repository variable is required.');"
+
       - name: Build Windows binary for signing
         if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
         env:
           BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
+          BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
         run: cargo build --release
 
       - name: Azure login for Windows signing
@@ -126,12 +132,14 @@ jobs:
         if: runner.os != 'Windows' || vars.BRICK_WINDOWS_SIGNING != 'artifact-signing'
         env:
           BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
+          BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
           NO_STRIP: 1
         run: cargo packager --release --formats ${{ matrix.formats }}
 
       - name: Build signed Windows package
         if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
         env:
+          BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
           NO_STRIP: 1
         run: cargo packager --config Packager.signed.toml --formats ${{ matrix.formats }}
 

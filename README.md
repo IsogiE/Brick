@@ -14,8 +14,9 @@ Brick is a native Rust desktop app. It does not use Electron, Tauri, WebView2, W
 ## First Setup
 
 1. Run Brick.
-2. Select the World of Warcraft folder, or a specific client folder such as `_retail_`, `_ptr_`, or `_xptr_`.
-3. Brick enables startup automation and immediately syncs the current package.
+2. Sign in with Discord. Brick allows members with the Advance Raider or Officer role.
+3. Select the World of Warcraft folder, or a specific client folder such as `_retail_`, `_ptr_`, or `_xptr_`.
+4. Brick enables startup automation and immediately syncs the current package.
 
 Supported client folders:
 
@@ -37,6 +38,22 @@ Push this Brick folder to its private GitHub repo, then add these GitHub secrets
 - `BRICK_RELEASE_TOKEN`: fine-grained GitHub token with Contents read/write for `IsogiE/Brick-Releases`.
 - `BRICK_ADDON_PUBLIC_KEY_B64`: raw 32-byte Ed25519 public key embedded into Brick for addon and app update feeds.
 - `BRICK_ADDON_PRIVATE_KEY_B64`: PKCS#8 Ed25519 private key used by Brick workflows to sign `addon-manifest.json` and `app-manifest.json`.
+
+Add this GitHub repo variable to the private Brick repo:
+
+- `BRICK_DISCORD_CLIENT_ID`: Discord application/client ID for the Brick login app.
+
+Configure that Discord application as a public OAuth2 client and add this redirect URL:
+
+```text
+http://127.0.0.1:53631/discord/callback
+```
+
+Brick uses Discord OAuth scopes `identify` and `guilds.members.read` to read only the signed-in user's guild member object. The Advance guild and allowed role IDs are built in:
+
+- Guild: `1166119057993515100`
+- Officer: `1167061441023582258`
+- Raider: `1199377026168143872`
 
 Optional Windows signing setup:
 
@@ -81,6 +98,8 @@ The published app packages are separate from the addon feed. After publishing th
 Installed Brick clients with app self-update support check the signed app feed on startup and periodically while running. On Windows, Brick downloads the newest NSIS installer, verifies the manifest signature and installer SHA-256, runs it silently in the current-user install location, and exits so the installer can restart Brick. This does not require UAC when Brick is installed under the user's profile. Silent NSIS updates force `%LOCALAPPDATA%\Brick` so future updates stay in the current-user install location. On Linux AppImage installs, Brick downloads the newest AppImage, verifies the manifest signature and AppImage SHA-256, atomically replaces the current AppImage, restarts Brick, and exits the old process. Deb and pacman installs are system-package style artifacts and may require elevation, so they are not the preferred self-update path. Brick clients older than the self-update baseline need one more installer install to receive this capability.
 
 Brick enables login startup by default after setup. Login launches pass `--startup`; Brick starts hidden/minimized by default and exposes a Settings toggle to let users open the full window at login instead.
+
+Brick keeps Discord login valid until the access token expires. If the cached access token is still current, Brick opens without another Discord prompt. When it expires, Brick uses the saved refresh token to get a fresh token, rechecks the user's Advance roles, and only asks for browser login again if Discord rejects the saved session or the user no longer has an allowed role.
 
 ## Addon Feed
 
@@ -136,4 +155,4 @@ To remove the local launcher install plus Brick config/cache:
 npm run remove:local-appimage -- --purge
 ```
 
-The app must be built with `BRICK_ADDON_PUBLIC_KEY_B64` set before it can trust the public addon feed. Local builds without that key still open the UI, but sync will refuse to install packages.
+The app must be built with `BRICK_ADDON_PUBLIC_KEY_B64` set before it can trust the public addon feed. Local builds without that key still open the UI, but sync will refuse to install packages. Local builds without `BRICK_DISCORD_CLIENT_ID` show the Discord login configuration screen.

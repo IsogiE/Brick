@@ -11,7 +11,9 @@ use eframe::egui::{self, Color32, RichText, Stroke, TextureHandle};
 use crate::{
     addon::{self, AppView, LogLevel, SyncSummary, WowClient},
     app_update::{self, PreparedAppUpdate},
-    autostart, single_instance, tray,
+    autostart,
+    discord_auth::{self, AuthorizedUser, SessionStatus},
+    single_instance, tray,
 };
 
 const ICON_BYTES: &[u8] = include_bytes!("assets/brick.png");
@@ -21,15 +23,33 @@ pub struct BrickApp {
     view: AppView,
     status: String,
     sync_lock: Arc<Mutex<()>>,
+    auth_state: AuthUiState,
     sync_rx: Option<mpsc::Receiver<Result<SyncSummary, String>>>,
+    auth_rx: Option<mpsc::Receiver<Result<AuthorizedUser, String>>>,
     app_update_rx: Option<mpsc::Receiver<Result<Option<PreparedAppUpdate>, String>>>,
     brick_texture: Option<TextureHandle>,
     tray: Option<tray::TrayState>,
     tray_attempted: bool,
     quit_requested: bool,
     last_show_request: Option<String>,
+    last_auth_check: Instant,
     last_view_refresh: Instant,
     last_app_update_check: Instant,
+}
+
+#[derive(Debug, Clone)]
+enum AuthUiState {
+    ConfigMissing(String),
+    SignedOut,
+    Checking,
+    Authorized(AuthorizedUser),
+    Denied(String),
+}
+
+impl AuthUiState {
+    fn is_authorized(&self) -> bool {
+        matches!(self, Self::Authorized(_))
+    }
 }
 
 struct DisplayStatus {
@@ -58,24 +78,43 @@ impl BrickApp {
             }
         };
 
+        let auth_state = match discord_auth::saved_session_status() {
+            Ok(SessionStatus::ConfigMissing(error)) => AuthUiState::ConfigMissing(error),
+            Ok(SessionStatus::SignedOut) => AuthUiState::SignedOut,
+            Ok(SessionStatus::NeedsRefresh) => AuthUiState::Checking,
+            Ok(SessionStatus::Authorized(user)) => AuthUiState::Authorized(user),
+            Err(error) => AuthUiState::Denied(error),
+        };
+
         let mut app = Self {
             view,
             status,
             sync_lock,
+            auth_state,
             sync_rx: None,
+            auth_rx: None,
             app_update_rx: None,
             brick_texture,
             tray: None,
             tray_attempted: false,
             quit_requested: false,
             last_show_request: single_instance::read_show_request().ok().flatten(),
+            last_auth_check: Instant::now(),
             last_view_refresh: Instant::now(),
             last_app_update_check: Instant::now(),
         };
 
+        if matches!(app.auth_state, AuthUiState::Checking) {
+            app.start_auth_refresh();
+        }
         app.start_app_update_check();
-        app.reconcile_autostart();
-        if !app.view.setup_required && app.view.settings.watcher_enabled {
+        if app.auth_state.is_authorized() {
+            app.reconcile_autostart();
+        }
+        if app.auth_state.is_authorized()
+            && !app.view.setup_required
+            && app.view.settings.watcher_enabled
+        {
             app.start_sync();
         }
         if startup_mode {
@@ -205,7 +244,102 @@ impl BrickApp {
         }
     }
 
+    fn start_discord_login(&mut self) {
+        if self.auth_rx.is_some() {
+            return;
+        }
+
+        self.auth_state = AuthUiState::Checking;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = discord_auth::login_with_browser();
+            let _ = tx.send(result);
+        });
+        self.auth_rx = Some(rx);
+        self.status = "Waiting for Discord.".to_string();
+    }
+
+    fn start_auth_refresh(&mut self) {
+        if self.auth_rx.is_some() {
+            return;
+        }
+
+        self.auth_state = AuthUiState::Checking;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = discord_auth::refresh_saved_session();
+            let _ = tx.send(result);
+        });
+        self.auth_rx = Some(rx);
+        self.status = "Checking Discord session.".to_string();
+    }
+
+    fn poll_auth(&mut self) {
+        let Some(rx) = self.auth_rx.as_ref() else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok(Ok(user)) => {
+                self.auth_state = AuthUiState::Authorized(user);
+                self.auth_rx = None;
+                self.status = "Discord access verified.".to_string();
+                self.refresh_view();
+                self.reconcile_autostart();
+                if !self.view.setup_required && self.view.settings.watcher_enabled {
+                    self.start_sync();
+                }
+            }
+            Ok(Err(error)) => {
+                self.auth_state = AuthUiState::Denied(error.clone());
+                self.auth_rx = None;
+                self.status = error;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let error = "Discord login stopped unexpectedly.".to_string();
+                self.auth_state = AuthUiState::Denied(error.clone());
+                self.auth_rx = None;
+                self.status = error;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    fn refresh_auth_if_expired(&mut self) {
+        if self.auth_rx.is_some() || self.last_auth_check.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_auth_check = Instant::now();
+
+        let should_refresh = match &self.auth_state {
+            AuthUiState::Authorized(user) => discord_auth::session_expired(user.expires_at_unix),
+            _ => false,
+        };
+
+        if should_refresh {
+            self.start_auth_refresh();
+        }
+    }
+
+    fn sign_out(&mut self) {
+        match discord_auth::clear_session() {
+            Ok(()) => {
+                self.auth_state = AuthUiState::SignedOut;
+                self.sync_rx = None;
+                self.status = "Signed out of Discord.".to_string();
+            }
+            Err(error) => {
+                self.auth_state = AuthUiState::Denied(error.clone());
+                self.status = error;
+            }
+        }
+    }
+
     fn start_sync(&mut self) {
+        if !self.auth_state.is_authorized() {
+            return;
+        }
+
         if self.sync_rx.is_some() {
             return;
         }
@@ -372,6 +506,11 @@ impl BrickApp {
     }
 
     fn draw_content(&mut self, ui: &mut egui::Ui) {
+        if !self.auth_state.is_authorized() {
+            self.draw_login_screen(ui);
+            return;
+        }
+
         self.draw_header(ui);
         ui.add_space(18.0);
         self.draw_status_panel(ui);
@@ -379,6 +518,122 @@ impl BrickApp {
         self.draw_installs_section(ui);
         ui.add_space(18.0);
         self.draw_settings_panel(ui);
+    }
+
+    fn draw_login_screen(&mut self, ui: &mut egui::Ui) {
+        let canvas = ui.max_rect();
+        if ui.is_rect_visible(canvas) {
+            let painter = ui.painter();
+            painter.rect_filled(
+                egui::Rect::from_min_size(canvas.min, egui::vec2(canvas.width(), 7.0)),
+                egui::CornerRadius::ZERO,
+                Color32::from_rgb(236, 161, 54),
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(canvas.left(), canvas.top() + 7.0),
+                    egui::vec2(canvas.width() * 0.34, 3.0),
+                ),
+                egui::CornerRadius::ZERO,
+                Color32::from_rgb(69, 211, 127),
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(canvas.right() - canvas.width() * 0.28, canvas.top() + 7.0),
+                    egui::vec2(canvas.width() * 0.28, 3.0),
+                ),
+                egui::CornerRadius::ZERO,
+                Color32::from_rgb(94, 168, 224),
+            );
+        }
+
+        let available_height = ui.available_height();
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), available_height),
+            egui::Layout::top_down(egui::Align::Center),
+            |ui| {
+                ui.add_space(((available_height - 430.0) * 0.45).clamp(12.0, 92.0));
+                ui.set_max_width(560.0);
+
+                let state = self.auth_state.clone();
+                let (title, detail, button_text, button_enabled) = login_copy(&state);
+
+                egui::Frame::NONE
+                    .fill(panel_background())
+                    .stroke(Stroke::new(1.0_f32, panel_stroke()))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(28, 26))
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            draw_icon(ui, self.brick_texture.as_ref(), 60.0);
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new("Advance")
+                                    .size(28.0)
+                                    .strong()
+                                    .color(primary_text()),
+                            );
+                            ui.label(
+                                RichText::new("Guild access")
+                                    .size(16.0)
+                                    .strong()
+                                    .color(secondary_text()),
+                            );
+                            ui.add_space(12.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                                capsule(
+                                    ui,
+                                    discord_auth::guild_name(),
+                                    primary_text(),
+                                    Color32::from_rgb(38, 42, 50),
+                                );
+                                capsule(
+                                    ui,
+                                    discord_auth::role_label(),
+                                    Color32::from_rgb(22, 18, 12),
+                                    Color32::from_rgb(236, 161, 54),
+                                );
+                            });
+                            ui.add_space(24.0);
+                            ui.label(
+                                RichText::new(title)
+                                    .size(22.0)
+                                    .strong()
+                                    .color(primary_text()),
+                            );
+                            ui.add(
+                                egui::Label::new(RichText::new(detail).color(secondary_text()))
+                                    .wrap(),
+                            );
+                            ui.add_space(22.0);
+
+                            if matches!(state, AuthUiState::Checking) {
+                                ui.add(egui::Spinner::new().size(24.0).color(info_accent()));
+                                ui.add_space(8.0);
+                            }
+
+                            if button_enabled {
+                                if discord_button(ui, button_text).clicked() {
+                                    self.start_discord_login();
+                                }
+                            } else {
+                                ui.add_enabled(false, login_button(button_text));
+                            }
+
+                            if let AuthUiState::Denied(error) = state {
+                                ui.add_space(10.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(error).small().color(muted_text()),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                        });
+                    });
+            },
+        );
     }
 
     fn draw_header(&self, ui: &mut egui::Ui) {
@@ -592,7 +847,51 @@ impl BrickApp {
             if settings_toggle_row(ui, "Start minimized", startup_minimized) {
                 self.set_startup_minimized(!startup_minimized);
             }
+
+            if let AuthUiState::Authorized(user) = self.auth_state.clone() {
+                ui.separator();
+                self.draw_discord_settings_row(ui, &user);
+            }
         });
+    }
+
+    fn draw_discord_settings_row(&mut self, ui: &mut egui::Ui, user: &AuthorizedUser) {
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 44.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                let action_width = 94.0;
+                let detail_width = (ui.available_width() - action_width).max(180.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(detail_width, 44.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new("Discord").strong().color(primary_text()));
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(user.display_name.as_str())
+                                        .small()
+                                        .color(secondary_text()),
+                                );
+                                capsule(
+                                    ui,
+                                    user.role_label.as_str(),
+                                    primary_text(),
+                                    Color32::from_rgb(38, 42, 50),
+                                );
+                            });
+                        });
+                    },
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if secondary_button(ui, "Sign out").clicked() {
+                        self.sign_out();
+                    }
+                });
+            },
+        );
     }
 
     fn display_status(&self) -> DisplayStatus {
@@ -687,11 +986,15 @@ impl eframe::App for BrickApp {
         self.ensure_tray();
         self.handle_tray(ctx);
         self.handle_show_request(ctx);
+        self.poll_auth();
+        self.refresh_auth_if_expired();
         self.poll_app_update(ctx);
         self.start_periodic_app_update_check();
         self.handle_close_request(ctx);
-        self.poll_sync();
-        self.refresh_view_if_stale();
+        if self.auth_state.is_authorized() {
+            self.poll_sync();
+            self.refresh_view_if_stale();
+        }
 
         egui::CentralPanel::default()
             .frame(
@@ -804,6 +1107,17 @@ fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     )
 }
 
+fn discord_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(login_button(text))
+}
+
+fn login_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(text).strong().color(primary_text()))
+        .corner_radius(egui::CornerRadius::same(8))
+        .fill(Color32::from_rgb(73, 92, 224))
+        .min_size(egui::vec2(260.0, 42.0))
+}
+
 fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).strong().color(primary_text()))
@@ -895,6 +1209,64 @@ fn settings_toggle_row(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
         },
     );
     clicked
+}
+
+fn login_copy(state: &AuthUiState) -> (&'static str, String, &'static str, bool) {
+    match state {
+        AuthUiState::ConfigMissing(error) => (
+            "Login is not configured",
+            error.clone(),
+            "Discord unavailable",
+            false,
+        ),
+        AuthUiState::SignedOut => (
+            "Sign in to Brick",
+            format!(
+                "Use Discord to verify {} access in {}.",
+                discord_auth::role_label(),
+                discord_auth::guild_name()
+            ),
+            "Sign in with Discord",
+            true,
+        ),
+        AuthUiState::Checking => (
+            "Checking Discord",
+            "Finish the Discord prompt in your browser.".to_string(),
+            "Waiting for Discord",
+            false,
+        ),
+        AuthUiState::Authorized(user) => (
+            "Access verified",
+            format!("Signed in as {}.", user.display_name),
+            "Continue",
+            false,
+        ),
+        AuthUiState::Denied(error) => (
+            "Access not available",
+            friendly_auth_problem(error),
+            "Try again",
+            true,
+        ),
+    }
+}
+
+fn friendly_auth_problem(status: &str) -> String {
+    let lower = status.to_ascii_lowercase();
+    if lower.contains("does not have") || lower.contains("role") {
+        format!(
+            "This Discord account needs {} in {}.",
+            discord_auth::role_label(),
+            discord_auth::guild_name()
+        )
+    } else if lower.contains("timed out") {
+        "Discord login timed out. Try again when the browser prompt is ready.".to_string()
+    } else if lower.contains("invalid_client") || lower.contains("configured") {
+        "Brick could not use its Discord app configuration.".to_string()
+    } else if lower.contains("401") || lower.contains("unauthorized") || lower.contains("revoked") {
+        "The saved Discord session expired or was revoked.".to_string()
+    } else {
+        "Discord could not verify access right now.".to_string()
+    }
 }
 
 fn current_version(clients: &[WowClient]) -> Option<String> {

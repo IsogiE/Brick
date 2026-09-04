@@ -14,10 +14,13 @@ Read this before changing Brick. This repo is the private source app. The public
 - Public addon feed release: `IsogiE/Brick-Releases` tag `addon-feed`
 - Managed addon folders: `AdvanceRaidTools`, `AdvanceRaidTools_Libraries`, `AdvanceRaidTools_Options`
 - Local staging folder inside each WoW AddOns folder: `.brick-staging`
+- Discord gate: Advance guild `1166119057993515100`; allowed role IDs are Officer `1167061441023582258` and Raider `1199377026168143872`.
 
 Brick is not a normal addon manager. Its purpose is to install the current in-house guild package automatically after the first WoW path setup.
 
 On launch, Brick should check the signed addon feed when automation is enabled. If every configured client already has the signed SHA installed and the managed folders exist, it should skip downloading the zip. The periodic watcher is only the follow-up check after launch and should poll every 30 seconds.
+
+Before syncing the addon, Brick requires Discord OAuth login. It uses the public desktop OAuth flow with the fixed redirect URL `http://127.0.0.1:53631/discord/callback`, requests `identify guilds.members.read`, reads the current user's member roles in the Advance guild, and unlocks only if the cached or freshly refreshed session has the Raider or Officer role ID. A still-current access token should unlock without a network role recheck; when the token expires, refresh the token and recheck the roles. Clearing or failing refresh sends the user back to the login screen.
 
 ## Security Rules
 
@@ -26,6 +29,7 @@ On launch, Brick should check the signed addon feed when automation is enabled. 
 - Keep addon installation limited to the three managed addon folders.
 - Keep signed manifest verification and zip SHA-256 verification.
 - Keep app binary updates on signed release metadata. Do not run downloaded scripts or Git commands.
+- Keep Discord auth as an OAuth user-token check; do not embed bot tokens or Discord client secrets in Brick.
 - Existing managed addon folders are deleted and replaced after verification. Do not add backups unless Lucas asks for that again.
 
 ## Repo Split
@@ -41,6 +45,7 @@ On launch, Brick should check the signed addon feed when automation is enabled. 
 - The `Release` workflow uses GitHub Actions cache entries for Rust dependencies, the cargo target directory, and the `cargo-packager` binary to reduce future cold-start packaging time.
 - Public Brick app releases should have an empty release body; keep installer guidance out of the GitHub release text.
 - Windows release signing is opt-in with repo variable `BRICK_WINDOWS_SIGNING=artifact-signing` and Azure Artifact Signing secrets. When enabled, the Release workflow signs `target/release/brick.exe` before Windows packaging and signs the final Windows installers before upload.
+- Public Brick app releases require repo variable `BRICK_DISCORD_CLIENT_ID` for the Discord login app. The Advance guild and allowed role IDs are built into the client, with build-time env overrides available if they ever change.
 - Brick auto-updates Advance Raid Tools from the signed addon feed. Brick app self-updates use the signed `app-feed` manifest. Windows downloads a versioned NSIS installer from `IsogiE/Brick-Releases`, verifies its SHA-256, launches it silently with restart/no-shortcut flags, and exits. This is intended for current-user installs under `%LOCALAPPDATA%` so it does not need UAC. Silent NSIS updates force `%LOCALAPPDATA%\Brick` so future updates stay in the current-user install location. Linux AppImage installs download a versioned AppImage, verify its SHA-256, atomically replace the current AppImage, restart Brick, and exit the old process. Deb/pacman style installs may require elevation and are not the preferred self-update path. The addon feed and app feed currently use the same Ed25519 signing key. Brick clients older than the self-update baseline still need one bridge installer.
 - Brick starts at login with `--startup` when automation is enabled. The user-facing "Start minimized" setting defaults on; when disabled, `--startup` launches the full window instead of hiding it.
 - The feed workflow prunes non-`v*` tags from its local ART checkout before packaging. This prevents feed/release-only tags from changing BigWigs package versions.
@@ -99,6 +104,7 @@ Private Brick repo:
 - `BRICK_RELEASE_TOKEN`
 - `BRICK_ADDON_PUBLIC_KEY_B64`
 - `BRICK_ADDON_PRIVATE_KEY_B64`
+- Repo variable `BRICK_DISCORD_CLIENT_ID`
 
 Public ART repo:
 
