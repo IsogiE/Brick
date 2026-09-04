@@ -38,6 +38,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let sync_lock = Arc::new(Mutex::new(()));
     addon::spawn_watcher(sync_lock.clone());
+    presence::spawn_heartbeat_watcher();
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Brick")

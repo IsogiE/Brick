@@ -19,12 +19,17 @@ use crate::{
 
 const ICON_BYTES: &[u8] = include_bytes!("assets/brick.png");
 const APP_UPDATE_CHECK_INTERVAL_SECS: u64 = 60;
-const PRESENCE_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 const ROSTER_REFRESH_INTERVAL_SECS: u64 = 30;
+const AUTH_REFRESH_CHECK_INTERVAL_SECS: u64 = 60;
+const VIEW_REFRESH_INTERVAL_SECS: u64 = 60;
+const SHOW_REQUEST_POLL_INTERVAL_SECS: u64 = 1;
+const ACTIVE_REPAINT_INTERVAL_MS: u64 = 100;
+const IDLE_REPAINT_MAX_SECS: u64 = 60;
 
 pub struct BrickApp {
     view: AppView,
     status: String,
+    egui_ctx: egui::Context,
     sync_lock: Arc<Mutex<()>>,
     auth_state: AuthUiState,
     presence_state: PresenceUiState,
@@ -33,7 +38,6 @@ pub struct BrickApp {
     auth_rx: Option<mpsc::Receiver<Result<AuthorizedUser, String>>>,
     app_update_rx: Option<mpsc::Receiver<Result<Option<AvailableAppUpdate>, String>>>,
     app_update_install_rx: Option<mpsc::Receiver<Result<Option<PreparedAppUpdate>, String>>>,
-    presence_heartbeat_rx: Option<mpsc::Receiver<Result<(), String>>>,
     roster_rx: Option<mpsc::Receiver<Result<Roster, String>>>,
     app_update_state: AppUpdateUiState,
     brick_texture: Option<TextureHandle>,
@@ -45,7 +49,6 @@ pub struct BrickApp {
     last_auth_check: Instant,
     last_view_refresh: Instant,
     last_app_update_check: Instant,
-    last_presence_heartbeat: Instant,
     last_roster_refresh: Instant,
     roster_notice: Option<String>,
 }
@@ -128,6 +131,7 @@ impl BrickApp {
         let mut app = Self {
             view,
             status,
+            egui_ctx: cc.egui_ctx.clone(),
             sync_lock,
             auth_state,
             presence_state: initial_presence_state(),
@@ -136,7 +140,6 @@ impl BrickApp {
             auth_rx: None,
             app_update_rx: None,
             app_update_install_rx: None,
-            presence_heartbeat_rx: None,
             roster_rx: None,
             app_update_state: AppUpdateUiState::Idle,
             brick_texture,
@@ -148,9 +151,6 @@ impl BrickApp {
             last_auth_check: now,
             last_view_refresh: now,
             last_app_update_check: now,
-            last_presence_heartbeat: now
-                .checked_sub(Duration::from_secs(PRESENCE_HEARTBEAT_INTERVAL_SECS))
-                .unwrap_or(now),
             last_roster_refresh: now
                 .checked_sub(Duration::from_secs(ROSTER_REFRESH_INTERVAL_SECS))
                 .unwrap_or(now),
@@ -170,9 +170,6 @@ impl BrickApp {
         {
             app.start_sync();
         }
-        if app.auth_state.is_authorized() {
-            app.start_presence_heartbeat();
-        }
         if startup_mode {
             app.status = "Ready".to_string();
         }
@@ -191,7 +188,9 @@ impl BrickApp {
     }
 
     fn refresh_view_if_stale(&mut self) {
-        if self.sync_rx.is_some() || self.last_view_refresh.elapsed() < Duration::from_secs(2) {
+        if self.sync_rx.is_some()
+            || self.last_view_refresh.elapsed() < Duration::from_secs(VIEW_REFRESH_INTERVAL_SECS)
+        {
             return;
         }
 
@@ -307,9 +306,11 @@ impl BrickApp {
 
         self.auth_state = AuthUiState::Checking;
         let (tx, rx) = mpsc::channel();
+        let ctx = self.egui_ctx.clone();
         thread::spawn(move || {
             let result = discord_auth::login_with_browser();
             let _ = tx.send(result);
+            ctx.request_repaint();
         });
         self.auth_rx = Some(rx);
         self.status = "Waiting for Discord.".to_string();
@@ -322,9 +323,11 @@ impl BrickApp {
 
         self.auth_state = AuthUiState::Checking;
         let (tx, rx) = mpsc::channel();
+        let ctx = self.egui_ctx.clone();
         thread::spawn(move || {
             let result = discord_auth::refresh_saved_session();
             let _ = tx.send(result);
+            ctx.request_repaint();
         });
         self.auth_rx = Some(rx);
         self.status = "Checking Discord session.".to_string();
@@ -345,7 +348,6 @@ impl BrickApp {
                 if !self.view.setup_required && self.view.settings.watcher_enabled {
                     self.start_sync();
                 }
-                self.start_presence_heartbeat();
             }
             Ok(Err(error)) => {
                 self.auth_state = AuthUiState::Denied(error.clone());
@@ -363,7 +365,10 @@ impl BrickApp {
     }
 
     fn refresh_auth_if_expired(&mut self) {
-        if self.auth_rx.is_some() || self.last_auth_check.elapsed() < Duration::from_secs(5) {
+        if self.auth_rx.is_some()
+            || self.last_auth_check.elapsed()
+                < Duration::from_secs(AUTH_REFRESH_CHECK_INTERVAL_SECS)
+        {
             return;
         }
         self.last_auth_check = Instant::now();
@@ -384,7 +389,6 @@ impl BrickApp {
                 self.confirm_logout = false;
                 self.auth_state = AuthUiState::SignedOut;
                 self.sync_rx = None;
-                self.presence_heartbeat_rx = None;
                 self.roster_rx = None;
                 self.presence_state = initial_presence_state();
                 self.roster_notice = None;
@@ -401,56 +405,6 @@ impl BrickApp {
         self.confirm_logout = true;
     }
 
-    fn start_presence_heartbeat(&mut self) {
-        if self.presence_heartbeat_rx.is_some()
-            || !self.auth_state.is_authorized()
-            || !presence::configured()
-        {
-            return;
-        }
-
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let result = discord_auth::current_access_token()
-                .and_then(|access_token| presence::send_heartbeat(&access_token));
-            let _ = tx.send(result);
-        });
-        self.presence_heartbeat_rx = Some(rx);
-        self.last_presence_heartbeat = Instant::now();
-    }
-
-    fn start_periodic_presence_heartbeat(&mut self) {
-        if self.last_presence_heartbeat.elapsed()
-            >= Duration::from_secs(PRESENCE_HEARTBEAT_INTERVAL_SECS)
-        {
-            self.start_presence_heartbeat();
-        }
-    }
-
-    fn poll_presence_heartbeat(&mut self) {
-        let Some(rx) = self.presence_heartbeat_rx.as_ref() else {
-            return;
-        };
-
-        match rx.try_recv() {
-            Ok(Ok(())) => {
-                self.presence_heartbeat_rx = None;
-            }
-            Ok(Err(error)) => {
-                let _ = addon::record_log(LogLevel::Warn, error);
-                self.presence_heartbeat_rx = None;
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                let _ = addon::record_log(
-                    LogLevel::Warn,
-                    "Roster heartbeat stopped unexpectedly.".to_string(),
-                );
-                self.presence_heartbeat_rx = None;
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-    }
-
     fn start_roster_refresh(&mut self) {
         if self.roster_rx.is_some() || !self.auth_state.is_authorized() {
             return;
@@ -465,10 +419,12 @@ impl BrickApp {
         }
 
         let (tx, rx) = mpsc::channel();
+        let ctx = self.egui_ctx.clone();
         thread::spawn(move || {
             let result = discord_auth::current_access_token()
                 .and_then(|access_token| presence::fetch_roster(&access_token));
             let _ = tx.send(result);
+            ctx.request_repaint();
         });
         self.roster_rx = Some(rx);
         self.last_roster_refresh = Instant::now();
@@ -535,9 +491,11 @@ impl BrickApp {
         self.status = "Checking for updates.".to_string();
         let lock = self.sync_lock.clone();
         let (tx, rx) = mpsc::channel();
+        let ctx = self.egui_ctx.clone();
         thread::spawn(move || {
             let result = addon::run_sync_with_lock(&lock);
             let _ = tx.send(result);
+            ctx.request_repaint();
         });
         self.sync_rx = Some(rx);
     }
@@ -548,9 +506,11 @@ impl BrickApp {
         }
 
         let (tx, rx) = mpsc::channel();
+        let ctx = self.egui_ctx.clone();
         thread::spawn(move || {
             let result = app_update::check_available_update();
             let _ = tx.send(result);
+            ctx.request_repaint();
         });
         self.app_update_rx = Some(rx);
         self.app_update_state = AppUpdateUiState::Checking;
@@ -568,9 +528,11 @@ impl BrickApp {
         };
 
         let (tx, rx) = mpsc::channel();
+        let ctx = self.egui_ctx.clone();
         thread::spawn(move || {
             let result = app_update::prepare_available_update();
             let _ = tx.send(result);
+            ctx.request_repaint();
         });
         self.app_update_install_rx = Some(rx);
         self.app_update_state = AppUpdateUiState::Installing(version.clone());
@@ -702,13 +664,13 @@ impl BrickApp {
         }
     }
 
-    fn ensure_tray(&mut self) {
+    fn ensure_tray(&mut self, ctx: &egui::Context) {
         if self.tray_attempted {
             return;
         }
 
         self.tray_attempted = true;
-        match catch_unwind(AssertUnwindSafe(tray::create)) {
+        match catch_unwind(AssertUnwindSafe(|| tray::create(ctx.clone()))) {
             Ok(Ok(tray)) => self.tray = Some(tray),
             Ok(Err(error)) => {
                 let _ = addon::record_log(LogLevel::Warn, error.clone());
@@ -731,9 +693,6 @@ impl BrickApp {
             match command {
                 tray::TrayCommand::Show => {
                     self.show_window(ctx);
-                }
-                tray::TrayCommand::Hide => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 }
                 tray::TrayCommand::Quit => {
                     self.quit_requested = true;
@@ -1381,11 +1340,54 @@ impl BrickApp {
             self.add_wow_folders(paths);
         }
     }
+
+    fn has_pending_work(&self) -> bool {
+        self.sync_rx.is_some()
+            || self.auth_rx.is_some()
+            || self.app_update_rx.is_some()
+            || self.app_update_install_rx.is_some()
+            || self.roster_rx.is_some()
+    }
+
+    fn next_repaint_after(&self) -> Duration {
+        if self.has_pending_work() {
+            return Duration::from_millis(ACTIVE_REPAINT_INTERVAL_MS);
+        }
+
+        let mut next = Duration::from_secs(IDLE_REPAINT_MAX_SECS);
+        next = next.min(time_until(
+            self.last_app_update_check,
+            APP_UPDATE_CHECK_INTERVAL_SECS,
+        ));
+
+        if self.auth_state.is_authorized() {
+            next = next.min(time_until(
+                self.last_auth_check,
+                AUTH_REFRESH_CHECK_INTERVAL_SECS,
+            ));
+            next = next.min(time_until(
+                self.last_view_refresh,
+                VIEW_REFRESH_INTERVAL_SECS,
+            ));
+            if self.active_tab == MainTab::Roster {
+                next = next.min(time_until(
+                    self.last_roster_refresh,
+                    ROSTER_REFRESH_INTERVAL_SECS,
+                ));
+            }
+        }
+
+        if next.is_zero() {
+            Duration::from_millis(ACTIVE_REPAINT_INTERVAL_MS)
+        } else {
+            next.min(Duration::from_secs(IDLE_REPAINT_MAX_SECS))
+        }
+    }
 }
 
 impl eframe::App for BrickApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.ensure_tray();
+        self.ensure_tray(ctx);
         self.handle_tray(ctx);
         self.handle_show_request(ctx);
         self.poll_auth();
@@ -1395,8 +1397,6 @@ impl eframe::App for BrickApp {
         self.handle_close_request(ctx);
         if self.auth_state.is_authorized() {
             self.poll_sync();
-            self.poll_presence_heartbeat();
-            self.start_periodic_presence_heartbeat();
             self.poll_roster();
             self.start_roster_refresh_if_stale();
             self.refresh_view_if_stale();
@@ -1414,7 +1414,7 @@ impl eframe::App for BrickApp {
             });
         self.draw_logout_confirmation(ctx);
 
-        ctx.request_repaint_after(Duration::from_millis(500));
+        ctx.request_repaint_after(self.next_repaint_after());
     }
 }
 
@@ -1442,7 +1442,7 @@ fn spawn_show_request_wake(ctx: &egui::Context) {
         let mut last_token = single_instance::read_show_request().ok().flatten();
 
         loop {
-            thread::sleep(Duration::from_millis(250));
+            thread::sleep(Duration::from_secs(SHOW_REQUEST_POLL_INTERVAL_SECS));
             let token = single_instance::read_show_request().ok().flatten();
             if token != last_token {
                 last_token = token;
@@ -1450,6 +1450,10 @@ fn spawn_show_request_wake(ctx: &egui::Context) {
             }
         }
     });
+}
+
+fn time_until(last: Instant, interval_secs: u64) -> Duration {
+    Duration::from_secs(interval_secs).saturating_sub(last.elapsed())
 }
 
 fn configure_style(ctx: &egui::Context) {

@@ -1,5 +1,5 @@
 use std::{
-    env,
+    env, thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -7,8 +7,11 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::discord_auth;
+
 const APP_USER_AGENT: &str = "Brick/0.2 (+https://github.com/IsogiE/Brick-Releases)";
 const REQUEST_TIMEOUT_SECS: u64 = 20;
+const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 const PRESENCE_API_URL: &str = match option_env!("BRICK_PRESENCE_API_URL") {
     Some(value) => value,
     None => "",
@@ -73,6 +76,20 @@ pub fn send_heartbeat(access_token: &str) -> Result<(), String> {
         .map_err(|error| format!("Roster heartbeat failed: {error}"))?;
 
     expect_success(response, "Roster heartbeat failed")
+}
+
+pub fn spawn_heartbeat_watcher() {
+    if !configured() {
+        return;
+    }
+
+    thread::spawn(move || loop {
+        if let Ok(Some(access_token)) = discord_auth::current_or_refreshed_access_token() {
+            let _ = send_heartbeat(&access_token);
+        }
+
+        thread::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+    });
 }
 
 pub fn fetch_roster(access_token: &str) -> Result<Roster, String> {

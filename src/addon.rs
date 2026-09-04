@@ -18,6 +18,8 @@ use url::Url;
 use uuid::Uuid;
 use zip::ZipArchive;
 
+use crate::discord_auth;
+
 const APP_ID: &str = "dev.isogi.brick";
 const FEED_OWNER: &str = "IsogiE";
 const FEED_REPO: &str = "Brick-Releases";
@@ -32,7 +34,8 @@ const FEED_UNAVAILABLE_MESSAGE: &str =
     "No signed addon feed is available yet. Brick will check again automatically.";
 const SETTINGS_FILE: &str = "settings.json";
 const LOG_FILE: &str = "logs.jsonl";
-const SYNC_INTERVAL_SECS: u64 = 30;
+const MAX_LOG_ENTRIES: usize = 80;
+const SYNC_INTERVAL_SECS: u64 = 300;
 const ALLOWED_FOLDERS: &[&str] = &[
     "AdvanceRaidTools",
     "AdvanceRaidTools_Libraries",
@@ -405,8 +408,13 @@ pub fn spawn_watcher(sync_lock: Arc<Mutex<()>>) {
 
 fn run_sync_if_enabled(sync_lock: &Arc<Mutex<()>>) -> Result<(), String> {
     let settings = load_settings()?;
-    if !settings.watcher_enabled {
+    if !settings.watcher_enabled || settings.clients.is_empty() {
         return Ok(());
+    }
+
+    match discord_auth::current_or_refreshed_access_token() {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => return Ok(()),
     }
 
     run_sync_with_lock(sync_lock).map(|_| ())
@@ -415,10 +423,13 @@ fn run_sync_if_enabled(sync_lock: &Arc<Mutex<()>>) -> Result<(), String> {
 fn run_sync() -> Result<SyncSummary, String> {
     let mut settings = load_settings()?;
     maybe_auto_detect_clients(&mut settings)?;
-    refresh_client_metadata(&mut settings.clients);
+    let mut settings_changed = refresh_client_metadata(&mut settings.clients);
 
     let checked_at = now_stamp();
     if settings.clients.is_empty() {
+        if settings_changed {
+            save_settings(&settings)?;
+        }
         let summary = SyncSummary {
             version: None,
             checked_at,
@@ -426,13 +437,15 @@ fn run_sync() -> Result<SyncSummary, String> {
             skipped: 0,
             message: "No WoW install configured yet.".to_string(),
         };
-        record_log(LogLevel::Warn, summary.message.clone())?;
         return Ok(summary);
     }
 
     let manifest = match fetch_verified_manifest() {
         Ok(manifest) => manifest,
         Err(error) if error == FEED_UNAVAILABLE_MESSAGE => {
+            if settings_changed {
+                save_settings(&settings)?;
+            }
             let summary = SyncSummary {
                 version: None,
                 checked_at,
@@ -440,7 +453,6 @@ fn run_sync() -> Result<SyncSummary, String> {
                 skipped: settings.clients.len(),
                 message: error,
             };
-            record_log(LogLevel::Warn, summary.message.clone())?;
             return Ok(summary);
         }
         Err(error) => return Err(error),
@@ -468,7 +480,6 @@ fn run_sync() -> Result<SyncSummary, String> {
 
         if !client_needs_install(client, &manifest) {
             skipped += 1;
-            client.last_sync_at = Some(checked_at.clone());
             continue;
         }
 
@@ -486,6 +497,7 @@ fn run_sync() -> Result<SyncSummary, String> {
                 client.last_installed_version = Some(manifest.version.clone());
                 client.last_installed_sha256 = Some(manifest.artifact.sha256.clone());
                 client.last_sync_at = Some(checked_at.clone());
+                settings_changed = true;
             }
             Err(error) => {
                 errors.push(format!("{}: {error}", client.path));
@@ -493,7 +505,9 @@ fn run_sync() -> Result<SyncSummary, String> {
         }
     }
 
-    save_settings(&settings)?;
+    if settings_changed {
+        save_settings(&settings)?;
+    }
 
     let mut message = if installed > 0 {
         format!(
@@ -508,7 +522,7 @@ fn run_sync() -> Result<SyncSummary, String> {
         let joined = errors.join("; ");
         message = format!("{message} {joined}");
         record_log(LogLevel::Error, message.clone())?;
-    } else {
+    } else if installed > 0 {
         record_log(LogLevel::Info, message.clone())?;
     }
 
@@ -575,11 +589,31 @@ fn read_logs() -> Result<Vec<LogEntry>, String> {
         }
     }
 
-    if logs.len() > 80 {
-        logs.drain(0..logs.len() - 80);
+    if logs.len() > MAX_LOG_ENTRIES {
+        let overflow = logs.len() - MAX_LOG_ENTRIES;
+        logs.drain(0..overflow);
+        rewrite_logs(&logs)?;
     }
 
     Ok(logs)
+}
+
+fn rewrite_logs(logs: &[LogEntry]) -> Result<(), String> {
+    let path = logs_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
+    }
+
+    let mut file = fs::File::create(&path)
+        .map_err(|error| format!("Failed to compact {}: {error}", path.display()))?;
+    for entry in logs {
+        let line = serde_json::to_string(entry)
+            .map_err(|error| format!("Failed to serialize log entry: {error}"))?;
+        writeln!(file, "{line}")
+            .map_err(|error| format!("Failed to write {}: {error}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn settings_path() -> Result<PathBuf, String> {

@@ -1,7 +1,8 @@
+use eframe::egui;
+
 #[derive(Debug, Clone, Copy)]
 pub enum TrayCommand {
     Show,
-    Hide,
     Quit,
 }
 
@@ -15,6 +16,7 @@ mod platform {
     use ksni::{blocking::TrayMethods, menu::StandardItem, Category, Icon, MenuItem, Status, Tray};
 
     use super::TrayCommand;
+    use eframe::egui;
 
     const ICON_BYTES: &[u8] = include_bytes!("assets/brick.png");
 
@@ -54,11 +56,13 @@ mod platform {
 
     struct BrickTray {
         tx: mpsc::Sender<TrayCommand>,
+        ctx: egui::Context,
     }
 
     impl BrickTray {
         fn send(&self, command: TrayCommand) {
             let _ = self.tx.send(command);
+            self.ctx.request_repaint();
         }
     }
 
@@ -94,20 +98,14 @@ mod platform {
         fn menu(&self) -> Vec<MenuItem<Self>> {
             vec![
                 StandardItem {
-                    label: "Show Brick".to_string(),
+                    label: "Open Brick".to_string(),
                     activate: Box::new(|tray: &mut Self| tray.send(TrayCommand::Show)),
-                    ..Default::default()
-                }
-                .into(),
-                StandardItem {
-                    label: "Hide".to_string(),
-                    activate: Box::new(|tray: &mut Self| tray.send(TrayCommand::Hide)),
                     ..Default::default()
                 }
                 .into(),
                 MenuItem::Separator,
                 StandardItem {
-                    label: "Quit".to_string(),
+                    label: "Quit Brick".to_string(),
                     activate: Box::new(|tray: &mut Self| tray.send(TrayCommand::Quit)),
                     ..Default::default()
                 }
@@ -116,9 +114,9 @@ mod platform {
         }
     }
 
-    pub fn create() -> Result<TrayState, String> {
+    pub fn create(ctx: egui::Context) -> Result<TrayState, String> {
         let (tx, rx) = mpsc::channel();
-        let tray = BrickTray { tx };
+        let tray = BrickTray { tx, ctx };
         let handle = tray
             .assume_sni_available(true)
             .spawn()
@@ -134,59 +132,84 @@ mod platform {
 
 #[cfg(not(target_os = "linux"))]
 mod platform {
+    use std::sync::mpsc;
+
     use tray_icon::{
         menu::{Menu, MenuEvent, MenuItem},
-        Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
+        Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     };
 
     use super::TrayCommand;
+    use eframe::egui;
 
     const ICON_BYTES: &[u8] = include_bytes!("assets/brick.png");
 
     pub struct TrayState {
         _tray: TrayIcon,
+        rx: mpsc::Receiver<TrayCommand>,
     }
 
     impl TrayState {
         pub fn drain_commands(&self) -> Vec<TrayCommand> {
             let mut commands = Vec::new();
-
-            while let Ok(event) = MenuEvent::receiver().try_recv() {
-                match event.id.as_ref() {
-                    "show" => commands.push(TrayCommand::Show),
-                    "hide" => commands.push(TrayCommand::Hide),
-                    "quit" => commands.push(TrayCommand::Quit),
-                    _ => {}
-                }
+            while let Ok(command) = self.rx.try_recv() {
+                commands.push(command);
             }
-
-            while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                if matches!(event, TrayIconEvent::Click { .. }) {
-                    commands.push(TrayCommand::Show);
-                }
-            }
-
             commands
         }
     }
 
-    pub fn create() -> Result<TrayState, String> {
+    pub fn create(ctx: egui::Context) -> Result<TrayState, String> {
+        let (tx, rx) = mpsc::channel();
         let menu = Menu::new();
-        let show = MenuItem::with_id("show", "Show Brick", true, None);
-        let hide = MenuItem::with_id("hide", "Hide", true, None);
-        let quit = MenuItem::with_id("quit", "Quit", true, None);
-        menu.append_items(&[&show, &hide, &quit])
+        let show = MenuItem::with_id("show", "Open Brick", true, None);
+        let quit = MenuItem::with_id("quit", "Quit Brick", true, None);
+        menu.append_items(&[&show, &quit])
             .map_err(|error| format!("Failed to build tray menu: {error}"))?;
+
+        let menu_tx = tx.clone();
+        let menu_ctx = ctx.clone();
+        MenuEvent::set_event_handler(Some(move |event| {
+            let command = match event.id.as_ref() {
+                "show" => Some(TrayCommand::Show),
+                "quit" => Some(TrayCommand::Quit),
+                _ => None,
+            };
+            if let Some(command) = command {
+                let _ = menu_tx.send(command);
+                menu_ctx.request_repaint();
+            }
+        }));
+
+        let tray_tx = tx.clone();
+        let tray_ctx = ctx.clone();
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            let show = matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } | TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                }
+            );
+            if show {
+                let _ = tray_tx.send(TrayCommand::Show);
+                tray_ctx.request_repaint();
+            }
+        }));
 
         let tray = TrayIconBuilder::new()
             .with_tooltip("Brick")
             .with_icon(tray_icon()?)
             .with_menu(Box::new(menu))
-            .with_menu_on_left_click(true)
+            .with_menu_on_left_click(false)
             .build()
             .map_err(|error| format!("Failed to create tray icon: {error}"))?;
 
-        Ok(TrayState { _tray: tray })
+        Ok(TrayState { _tray: tray, rx })
     }
 
     fn tray_icon() -> Result<Icon, String> {
@@ -200,8 +223,8 @@ mod platform {
     }
 }
 
-pub fn create() -> Result<TrayState, String> {
-    platform::create()
+pub fn create(ctx: egui::Context) -> Result<TrayState, String> {
+    platform::create(ctx)
 }
 
 pub use platform::TrayState;

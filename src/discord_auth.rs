@@ -4,6 +4,7 @@ use std::{
     io::Write,
     path::PathBuf,
     process::Command,
+    sync::{LazyLock, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -58,6 +59,8 @@ const DISCORD_REDIRECT_URI: &str = match option_env!("BRICK_DISCORD_REDIRECT_URI
     Some(value) => value,
     None => "",
 };
+
+static SESSION_REFRESH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -181,6 +184,9 @@ pub fn login_with_browser() -> Result<AuthorizedUser, String> {
 
 pub fn refresh_saved_session() -> Result<AuthorizedUser, String> {
     let config = auth_config()?;
+    let _guard = SESSION_REFRESH_LOCK
+        .lock()
+        .map_err(|_| "Discord session refresh lock was poisoned.".to_string())?;
     let Some(session) = load_session()? else {
         return Err("Please sign in with Discord.".to_string());
     };
@@ -236,6 +242,44 @@ pub fn current_access_token() -> Result<String, String> {
     }
 
     Ok(session.access_token)
+}
+
+pub fn current_or_refreshed_access_token() -> Result<Option<String>, String> {
+    let config = auth_config()?;
+    let _guard = SESSION_REFRESH_LOCK
+        .lock()
+        .map_err(|_| "Discord session refresh lock was poisoned.".to_string())?;
+    let Some(session) = load_session()? else {
+        return Ok(None);
+    };
+
+    if !session_matches_config(&session, &config) {
+        clear_session()?;
+        return Ok(None);
+    }
+
+    if session_is_current(&session) {
+        return Ok(Some(session.access_token));
+    }
+
+    let token = match refresh_token(&config, &session.refresh_token) {
+        Ok(token) => token,
+        Err(error) => {
+            let _ = clear_session();
+            return Err(error);
+        }
+    };
+
+    let session = match verified_session_from_token(&config, token) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = clear_session();
+            return Err(error);
+        }
+    };
+    let access_token = session.access_token.clone();
+    save_session(&session)?;
+    Ok(Some(access_token))
 }
 
 pub fn role_label() -> &'static str {
