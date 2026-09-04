@@ -10,7 +10,7 @@ use eframe::egui::{self, Color32, RichText, Stroke, TextureHandle};
 
 use crate::{
     addon::{self, AppView, LogLevel, SyncSummary, WowClient},
-    app_update::{self, PreparedAppUpdate},
+    app_update::{self, AvailableAppUpdate, PreparedAppUpdate},
     autostart,
     discord_auth::{self, AuthorizedUser, SessionStatus},
     presence::{self, Roster, RosterMember},
@@ -31,13 +31,16 @@ pub struct BrickApp {
     active_tab: MainTab,
     sync_rx: Option<mpsc::Receiver<Result<SyncSummary, String>>>,
     auth_rx: Option<mpsc::Receiver<Result<AuthorizedUser, String>>>,
-    app_update_rx: Option<mpsc::Receiver<Result<Option<PreparedAppUpdate>, String>>>,
+    app_update_rx: Option<mpsc::Receiver<Result<Option<AvailableAppUpdate>, String>>>,
+    app_update_install_rx: Option<mpsc::Receiver<Result<Option<PreparedAppUpdate>, String>>>,
     presence_heartbeat_rx: Option<mpsc::Receiver<Result<(), String>>>,
     roster_rx: Option<mpsc::Receiver<Result<Roster, String>>>,
+    app_update_state: AppUpdateUiState,
     brick_texture: Option<TextureHandle>,
     tray: Option<tray::TrayState>,
     tray_attempted: bool,
     quit_requested: bool,
+    confirm_logout: bool,
     last_show_request: Option<String>,
     last_auth_check: Instant,
     last_view_refresh: Instant,
@@ -74,6 +77,16 @@ enum PresenceUiState {
     Idle,
     Loading,
     Ready(Roster),
+    Error(String),
+}
+
+#[derive(Debug, Clone)]
+enum AppUpdateUiState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(String),
+    Installing(String),
     Error(String),
 }
 
@@ -122,12 +135,15 @@ impl BrickApp {
             sync_rx: None,
             auth_rx: None,
             app_update_rx: None,
+            app_update_install_rx: None,
             presence_heartbeat_rx: None,
             roster_rx: None,
+            app_update_state: AppUpdateUiState::Idle,
             brick_texture,
             tray: None,
             tray_attempted: false,
             quit_requested: false,
+            confirm_logout: false,
             last_show_request: single_instance::read_show_request().ok().flatten(),
             last_auth_check: now,
             last_view_refresh: now,
@@ -365,6 +381,7 @@ impl BrickApp {
     fn sign_out(&mut self) {
         match discord_auth::clear_session() {
             Ok(()) => {
+                self.confirm_logout = false;
                 self.auth_state = AuthUiState::SignedOut;
                 self.sync_rx = None;
                 self.presence_heartbeat_rx = None;
@@ -378,6 +395,10 @@ impl BrickApp {
                 self.status = error;
             }
         }
+    }
+
+    fn request_sign_out(&mut self) {
+        self.confirm_logout = true;
     }
 
     fn start_presence_heartbeat(&mut self) {
@@ -522,20 +543,48 @@ impl BrickApp {
     }
 
     fn start_app_update_check(&mut self) {
-        if self.app_update_rx.is_some() {
+        if self.app_update_rx.is_some() || self.app_update_install_rx.is_some() {
             return;
         }
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = app_update::check_available_update();
+            let _ = tx.send(result);
+        });
+        self.app_update_rx = Some(rx);
+        self.app_update_state = AppUpdateUiState::Checking;
+        self.last_app_update_check = Instant::now();
+    }
+
+    fn start_app_update_install(&mut self) {
+        if self.app_update_rx.is_some() || self.app_update_install_rx.is_some() {
+            return;
+        }
+
+        let version = match &self.app_update_state {
+            AppUpdateUiState::Available(version) => version.clone(),
+            _ => return,
+        };
 
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let result = app_update::prepare_available_update();
             let _ = tx.send(result);
         });
-        self.app_update_rx = Some(rx);
-        self.last_app_update_check = Instant::now();
+        self.app_update_install_rx = Some(rx);
+        self.app_update_state = AppUpdateUiState::Installing(version.clone());
+        self.status = format!("Preparing Brick {version}.");
     }
 
     fn start_periodic_app_update_check(&mut self) {
+        if matches!(
+            self.app_update_state,
+            AppUpdateUiState::Available(_) | AppUpdateUiState::Installing(_)
+        ) {
+            return;
+        }
+
         if self.last_app_update_check.elapsed()
             >= Duration::from_secs(APP_UPDATE_CHECK_INTERVAL_SECS)
         {
@@ -571,40 +620,83 @@ impl BrickApp {
 
     fn poll_app_update(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.app_update_rx.as_ref() else {
+            self.poll_app_update_install(ctx);
             return;
         };
 
         match rx.try_recv() {
             Ok(Ok(Some(update))) => {
-                let message = format!("Installing Brick {}.", update.version);
+                self.app_update_state = AppUpdateUiState::Available(update.version.clone());
+                self.status = format!("Brick {} is available.", update.version);
+                self.app_update_rx = None;
+            }
+            Ok(Ok(None)) => {
+                self.app_update_state = AppUpdateUiState::UpToDate;
+                self.app_update_rx = None;
+            }
+            Ok(Err(error)) => {
+                let _ = addon::record_log(LogLevel::Warn, error.clone());
+                self.app_update_state =
+                    AppUpdateUiState::Error(friendly_app_update_problem(&error));
+                self.app_update_rx = None;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let message = "Brick app update check stopped unexpectedly.".to_string();
+                let _ = addon::record_log(LogLevel::Warn, message.clone());
+                self.app_update_state =
+                    AppUpdateUiState::Error(friendly_app_update_problem(&message));
+                self.app_update_rx = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        self.poll_app_update_install(ctx);
+    }
+
+    fn poll_app_update_install(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.app_update_install_rx.as_ref() else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok(Ok(Some(update))) => {
+                let version = update.version.clone();
+                let message = format!("Installing Brick {version}.");
                 match app_update::launch_installer(&update) {
                     Ok(()) => {
                         let _ = addon::record_log(LogLevel::Info, message.clone());
                         self.status = message;
-                        self.app_update_rx = None;
+                        self.app_update_state = AppUpdateUiState::Installing(version);
+                        self.app_update_install_rx = None;
                         self.quit_requested = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     Err(error) => {
                         let _ = addon::record_log(LogLevel::Error, error.clone());
                         self.status = error;
-                        self.app_update_rx = None;
+                        self.app_update_state =
+                            AppUpdateUiState::Error("Update failed".to_string());
+                        self.app_update_install_rx = None;
                     }
                 }
             }
             Ok(Ok(None)) => {
-                self.app_update_rx = None;
+                self.status = "Brick is up to date.".to_string();
+                self.app_update_state = AppUpdateUiState::UpToDate;
+                self.app_update_install_rx = None;
             }
             Ok(Err(error)) => {
-                let _ = addon::record_log(LogLevel::Warn, error);
-                self.app_update_rx = None;
+                let _ = addon::record_log(LogLevel::Error, error.clone());
+                self.status = error;
+                self.app_update_state = AppUpdateUiState::Error("Update failed".to_string());
+                self.app_update_install_rx = None;
             }
             Err(mpsc::TryRecvError::Disconnected) => {
-                let _ = addon::record_log(
-                    LogLevel::Warn,
-                    "Brick app update check stopped unexpectedly.".to_string(),
-                );
-                self.app_update_rx = None;
+                let message = "Brick app update stopped unexpectedly.".to_string();
+                let _ = addon::record_log(LogLevel::Error, message.clone());
+                self.status = message;
+                self.app_update_state = AppUpdateUiState::Error("Update failed".to_string());
+                self.app_update_install_rx = None;
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
@@ -855,21 +947,21 @@ impl BrickApp {
                         .add_sized(egui::vec2(236.0, 36.0), login_secondary_button("Log out"))
                         .clicked()
                     {
-                        self.sign_out();
+                        self.request_sign_out();
                     }
                 }
             },
         );
     }
 
-    fn draw_header(&self, ui: &mut egui::Ui) {
+    fn draw_header(&mut self, ui: &mut egui::Ui) {
         let app_version = concat!("v", env!("CARGO_PKG_VERSION"));
 
         ui.horizontal(|ui| {
             draw_icon(ui, self.brick_texture.as_ref(), 44.0);
             ui.add_space(8.0);
             ui.vertical(|ui| {
-                ui.add_space(1.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("Brick")
@@ -884,7 +976,49 @@ impl BrickApp {
                         Color32::from_rgb(38, 42, 50),
                     );
                 });
+                self.draw_app_update_control(ui);
             });
+        });
+    }
+
+    fn draw_app_update_control(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let available = matches!(self.app_update_state, AppUpdateUiState::Available(_));
+            let busy = self.app_update_rx.is_some() || self.app_update_install_rx.is_some();
+            let button_text = if available {
+                "Update now"
+            } else {
+                "Check for updates"
+            };
+            let button_width = if available { 90.0 } else { 126.0 };
+
+            let response = ui
+                .add_enabled_ui(!busy, |ui| {
+                    ui.add_sized(
+                        egui::vec2(button_width, 22.0),
+                        compact_update_button(button_text, available),
+                    )
+                })
+                .inner;
+
+            if response.clicked() {
+                if available {
+                    self.start_app_update_install();
+                } else {
+                    self.start_app_update_check();
+                }
+            }
+
+            if busy {
+                ui.add(egui::Spinner::new().size(12.0).color(info_accent()));
+            }
+
+            let status = app_update_status_text(&self.app_update_state);
+            if !status.is_empty() {
+                ui.add(
+                    egui::Label::new(RichText::new(status).small().color(muted_text())).truncate(),
+                );
+            }
         });
     }
 
@@ -1105,11 +1239,50 @@ impl BrickApp {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if secondary_button(ui, "Log out").clicked() {
-                        self.sign_out();
+                        self.request_sign_out();
                     }
                 });
             },
         );
+    }
+
+    fn draw_logout_confirmation(&mut self, ctx: &egui::Context) {
+        if !self.confirm_logout {
+            return;
+        }
+
+        let mut open = self.confirm_logout;
+        let mut confirm = false;
+        let mut cancel = false;
+
+        egui::Window::new("Log out")
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size(egui::vec2(320.0, 138.0))
+            .frame(panel_frame())
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Are you sure you want to log out?")
+                        .strong()
+                        .color(primary_text()),
+                );
+                ui.add_space(18.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if danger_button(ui, "Yes").clicked() {
+                        confirm = true;
+                    }
+                    if secondary_button(ui, "No").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        self.confirm_logout = open && !cancel;
+        if confirm {
+            self.sign_out();
+        }
     }
 
     fn display_status(&self) -> DisplayStatus {
@@ -1228,6 +1401,7 @@ impl eframe::App for BrickApp {
                 ui.set_width(ui.available_width());
                 self.draw_content(ui);
             });
+        self.draw_logout_confirmation(ctx);
 
         ctx.request_repaint_after(Duration::from_millis(500));
     }
@@ -1350,6 +1524,24 @@ fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
             .corner_radius(egui::CornerRadius::same(8))
             .fill(Color32::from_rgb(38, 42, 50)),
     )
+}
+
+fn compact_update_button(text: &str, available: bool) -> egui::Button<'_> {
+    let fill = if available {
+        Color32::from_rgb(236, 161, 54)
+    } else {
+        Color32::from_rgb(38, 42, 50)
+    };
+    let text_color = if available {
+        Color32::from_rgb(22, 18, 12)
+    } else {
+        secondary_text()
+    };
+
+    egui::Button::new(RichText::new(text).small().strong().color(text_color))
+        .corner_radius(egui::CornerRadius::same(7))
+        .fill(fill)
+        .stroke(Stroke::new(1.0_f32, panel_stroke()))
 }
 
 fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
@@ -1734,6 +1926,28 @@ fn friendly_roster_problem(status: &str) -> String {
             .to_string()
     } else {
         "Brick could not reach the roster service. It will try again automatically.".to_string()
+    }
+}
+
+fn app_update_status_text(state: &AppUpdateUiState) -> String {
+    match state {
+        AppUpdateUiState::Idle => String::new(),
+        AppUpdateUiState::Checking => "Checking".to_string(),
+        AppUpdateUiState::UpToDate => "Up to date".to_string(),
+        AppUpdateUiState::Available(version) => format!("v{version} available"),
+        AppUpdateUiState::Installing(version) => format!("Installing v{version}"),
+        AppUpdateUiState::Error(message) => message.clone(),
+    }
+}
+
+fn friendly_app_update_problem(status: &str) -> String {
+    let lower = status.to_ascii_lowercase();
+    if lower.contains("signature") || lower.contains("sha") || lower.contains("mismatch") {
+        "Update not trusted".to_string()
+    } else if lower.contains("supported") {
+        "No installer for this device".to_string()
+    } else {
+        "Could not check updates".to_string()
     }
 }
 

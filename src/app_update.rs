@@ -41,6 +41,11 @@ pub struct PreparedAppUpdate {
     kind: UpdateKind,
 }
 
+#[derive(Debug, Clone)]
+pub struct AvailableAppUpdate {
+    pub version: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateKind {
     WindowsNsis,
@@ -89,7 +94,34 @@ enum VersionPart {
     Text(String),
 }
 
+pub fn check_available_update() -> Result<Option<AvailableAppUpdate>, String> {
+    let Some((manifest, _artifact_index)) = find_available_update()? else {
+        return Ok(None);
+    };
+
+    Ok(Some(AvailableAppUpdate {
+        version: manifest.version,
+    }))
+}
+
 pub fn prepare_available_update() -> Result<Option<PreparedAppUpdate>, String> {
+    let Some((manifest, artifact_index)) = find_available_update()? else {
+        return Ok(None);
+    };
+    let artifact = &manifest.artifacts[artifact_index];
+    let package = fetch_verified_artifact(artifact)?;
+    let prepared_package = write_installer(&manifest.version, artifact, &package)?;
+
+    Ok(Some(PreparedAppUpdate {
+        version: manifest.version,
+        installer_path: prepared_package.installer_path,
+        replacement_path: prepared_package.replacement_path,
+        kind: target_update_kind()
+            .ok_or_else(|| "Brick app updates are not supported for this install.".to_string())?,
+    }))
+}
+
+fn find_available_update() -> Result<Option<(AppUpdateManifest, usize)>, String> {
     let Some(update_kind) = target_update_kind() else {
         return Ok(None);
     };
@@ -108,21 +140,22 @@ pub fn prepare_available_update() -> Result<Option<PreparedAppUpdate>, String> {
         return Ok(None);
     }
 
-    let artifact = select_artifact(&manifest, &update_kind).ok_or_else(|| {
-        format!(
-            "Brick {} is available, but no supported installer was published.",
-            manifest.version
-        )
-    })?;
-    let package = fetch_verified_artifact(artifact)?;
-    let prepared_package = write_installer(&manifest.version, artifact, &package)?;
-
-    Ok(Some(PreparedAppUpdate {
-        version: manifest.version,
-        installer_path: prepared_package.installer_path,
-        replacement_path: prepared_package.replacement_path,
-        kind: update_kind,
-    }))
+    let artifact_index = manifest
+        .artifacts
+        .iter()
+        .position(|artifact| {
+            artifact.os == update_kind.os()
+                && artifact.arch == target_arch()
+                && artifact.kind == update_kind.artifact_kind()
+                && update_kind.file_name_matches(&artifact.file_name)
+        })
+        .ok_or_else(|| {
+            format!(
+                "Brick {} is available, but no supported installer was published.",
+                manifest.version
+            )
+        })?;
+    Ok(Some((manifest, artifact_index)))
 }
 
 pub fn launch_installer(update: &PreparedAppUpdate) -> Result<(), String> {

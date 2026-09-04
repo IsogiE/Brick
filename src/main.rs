@@ -41,8 +41,8 @@ fn main() -> Result<(), eframe::Error> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Brick")
-        .with_inner_size([980.0, 720.0])
-        .with_min_inner_size([720.0, 560.0])
+        .with_inner_size([980.0, 760.0])
+        .with_min_inner_size([760.0, 640.0])
         .with_app_id("dev.isogi.brick");
 
     if let Some(icon) = ui::load_window_icon() {
