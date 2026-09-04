@@ -47,7 +47,9 @@ Optional Windows signing setup:
 
 When enabled, the release workflow signs `brick.exe` before MSI packaging and signs the final MSI before publishing.
 
-The public AdvanceRaidTools addon repo does not need Brick feed scripts or Brick signing secrets.
+The public AdvanceRaidTools addon repo does not need Brick feed scripts or Brick signing secrets. For near-immediate feed publishing, it does need one dispatch-only secret:
+
+- `BRICK_WORKFLOW_TOKEN`: fine-grained GitHub token scoped to `IsogiE/Brick` with Actions write access. ART uses it after the normal BigWigs packager step succeeds to dispatch Brick's private `Addon feed` workflow for that exact ART commit.
 
 Generate the addon feed key with:
 
@@ -75,7 +77,7 @@ The published app packages are separate from the addon feed. Installed Brick cli
 
 ## Addon Feed
 
-The `Addon feed` workflow in this repo checks out the latest public `IsogiE/AdvanceRaidTools` source, runs the pinned BigWigs packager in no-upload mode, signs the package metadata, and publishes the current package to:
+The `Addon feed` workflow in this repo checks out public `IsogiE/AdvanceRaidTools` source, runs the pinned BigWigs packager in no-upload mode, signs the package metadata, and publishes the current package to:
 
 ```text
 https://github.com/IsogiE/Brick-Releases/releases/download/addon-feed/
@@ -87,7 +89,9 @@ It publishes:
 - `addon-manifest.json`
 - `addon-manifest.json.sig`
 
-Because the workflow packages the current Git commit, untagged commits become alpha-style builds such as `v1.7.10-17-g2f772b5`, while tagged commits become release builds. The workflow ignores non-`v*` tags in its local checkout so release-only feed tags cannot affect addon package versions. The BigWigs packager is pinned to commit `20a3713ec537df54db5c0d8b4822d88ee63c70e8`, and the workflow verifies the `release.sh` SHA-256 before running it. GitHub scheduled workflows have a five-minute minimum interval; installed Brick clients poll the signed feed every 30 seconds.
+ART's normal `Package addon` workflow dispatches this workflow with the exact ART commit SHA after Wago/Curse packaging succeeds, so the public Brick feed can update within seconds without shipping a new Brick client. A plain five-minute schedule remains as a fallback for missed dispatches.
+
+Because the workflow packages the current Git commit, untagged commits become alpha-style builds such as `v1.7.10-17-g2f772b5`, while tagged commits become release builds. The workflow ignores non-`v*` tags in its local checkout so release-only feed tags cannot affect addon package versions. The BigWigs packager is pinned to commit `20a3713ec537df54db5c0d8b4822d88ee63c70e8`, and the workflow verifies the `release.sh` SHA-256 before running it. Installed Brick clients poll the signed feed every 30 seconds.
 
 Brick clients download from that public release, verify the Ed25519 manifest signature, verify the zip SHA-256 from the signed manifest, delete the managed addon folders, and replace them with the verified package. If the feed has not been published yet, clients show a waiting state and retry automatically.
 

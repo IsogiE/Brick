@@ -33,8 +33,9 @@ On launch, Brick should check the signed addon feed when automation is enabled. 
 - Brick private source: `/home/lucas/Documents/GitHub/Brick`
 - ART public addon source: `/home/lucas/Documents/GitHub/AdvanceRaidTools`
 - ART publishes packaged addon builds through the normal BigWigs packager flow to addon platforms.
-- Brick's private `Addon feed` workflow checks out the latest public ART source, packages it with a pinned BigWigs packager commit in no-upload mode, and signs `addon-manifest.json`.
-- GitHub scheduled workflows have a five-minute minimum interval. Keep the addon feed workflow on an offset five-minute cron, not `*/5`, because scheduled runs can be delayed or dropped at heavily loaded minutes.
+- Brick's private `Addon feed` workflow packages ART with a pinned BigWigs packager commit in no-upload mode and signs `addon-manifest.json`.
+- Fast addon feed updates come from ART's normal `Package addon` workflow after the BigWigs packager step succeeds. ART dispatches Brick's private `Addon feed` workflow with the exact ART commit SHA in `addon_ref`.
+- The addon feed workflow keeps a plain five-minute cron only as a fallback. Do not rely on cron for fast guild updates; GitHub scheduled workflows can be delayed or dropped.
 - The signed addon feed and Brick app releases publish assets to the public `IsogiE/Brick-Releases` repo. Do not change ART workflow/repo plumbing for Brick unless Lucas explicitly asks.
 - The `Release` workflow builds public-test app packages from private Brick source and publishes them to `IsogiE/Brick-Releases`; Windows packaging uses WiX/MSI.
 - The `Release` workflow uses GitHub Actions cache entries for Rust dependencies, the cargo target directory, and the `cargo-packager` binary to reduce future cold-start packaging time.
@@ -100,8 +101,9 @@ Private Brick repo:
 
 Public ART repo:
 
-- No Brick updater secrets are required.
-- Brick uses ART as a public source checkout only.
+- `BRICK_WORKFLOW_TOKEN`: fine-grained GitHub token that can dispatch the private Brick `Addon feed` workflow.
+
+Do not use a broad personal token for `BRICK_WORKFLOW_TOKEN` unless Lucas explicitly approves the wider blast radius. Prefer a fine-grained token scoped only to `IsogiE/Brick` with Actions write access.
 
 Generate the addon feed signing key with:
 

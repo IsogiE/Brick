@@ -2,6 +2,11 @@ name: Addon feed
 
 on:
   workflow_dispatch:
+    inputs:
+      addon_ref:
+        description: 'AdvanceRaidTools commit, branch, or tag to package'
+        required: false
+        default: 'main'
   schedule:
     - cron: '*/5 * * * *'
 
@@ -25,6 +30,7 @@ jobs:
           repository: IsogiE/AdvanceRaidTools
           path: addon-source
           fetch-depth: 0
+          ref: ${{ github.event.inputs.addon_ref || 'main' }}
 
       - name: Checkout pinned BigWigs packager
         uses: actions/checkout@v4
