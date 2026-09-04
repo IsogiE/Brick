@@ -5,7 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Cursor, Write},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     thread,
     time::Duration,
 };
@@ -42,6 +42,14 @@ const ALLOWED_FOLDERS: &[&str] = &[
     "AdvanceRaidTools_Libraries",
     "AdvanceRaidTools_Options",
 ];
+
+static HTTP_CLIENT: LazyLock<Result<reqwest::blocking::Client, String>> = LazyLock::new(|| {
+    reqwest::blocking::Client::builder()
+        .user_agent(APP_USER_AGENT)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|error| format!("Failed to create HTTP client: {error}"))
+});
 
 const ADDON_PUBLIC_KEY_B64: &str = match option_env!("BRICK_ADDON_PUBLIC_KEY_B64") {
     Some(value) => value,
@@ -1015,11 +1023,10 @@ fn fetch_verified_package(manifest: &AddonManifest) -> Result<Vec<u8>, String> {
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .user_agent(APP_USER_AGENT)
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .map_err(|error| format!("Failed to create HTTP client: {error}"))
+    match &*HTTP_CLIENT {
+        Ok(client) => Ok(client.clone()),
+        Err(error) => Err(error.clone()),
+    }
 }
 
 fn cache_busted_url(value: &str) -> Result<String, String> {

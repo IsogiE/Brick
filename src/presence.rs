@@ -1,5 +1,7 @@
 use std::{
-    env, thread,
+    env,
+    sync::LazyLock,
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -16,6 +18,15 @@ const PRESENCE_API_URL: &str = match option_env!("BRICK_PRESENCE_API_URL") {
     Some(value) => value,
     None => "",
 };
+
+static HTTP_CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
+    Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(APP_USER_AGENT)
+        .build()
+        .map_err(|error| format!("Failed to create roster HTTP client: {error}"))
+});
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,12 +166,10 @@ fn endpoint_url(path: &str) -> Result<Url, String> {
 }
 
 fn http_client() -> Result<Client, String> {
-    Client::builder()
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(APP_USER_AGENT)
-        .build()
-        .map_err(|error| format!("Failed to create roster HTTP client: {error}"))
+    match &*HTTP_CLIENT {
+        Ok(client) => Ok(client.clone()),
+        Err(error) => Err(error.clone()),
+    }
 }
 
 fn now_unix_secs() -> u64 {

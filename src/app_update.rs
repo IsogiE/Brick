@@ -4,6 +4,7 @@ use std::{
     env, fs,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::LazyLock,
 };
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -32,6 +33,14 @@ const APP_UPDATE_PUBLIC_KEY_B64: &str = match option_env!("BRICK_ADDON_PUBLIC_KE
     Some(value) => value,
     None => "",
 };
+
+static HTTP_CLIENT: LazyLock<Result<reqwest::blocking::Client, String>> = LazyLock::new(|| {
+    reqwest::blocking::Client::builder()
+        .user_agent(APP_UPDATE_USER_AGENT)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|error| format!("Failed to create HTTP client: {error}"))
+});
 
 #[derive(Debug, Clone)]
 pub struct PreparedAppUpdate {
@@ -140,22 +149,24 @@ fn find_available_update() -> Result<Option<(AppUpdateManifest, usize)>, String>
         return Ok(None);
     }
 
-    let artifact_index = manifest
-        .artifacts
-        .iter()
-        .position(|artifact| {
-            artifact.os == update_kind.os()
-                && artifact.arch == target_arch()
-                && artifact.kind == update_kind.artifact_kind()
-                && update_kind.file_name_matches(&artifact.file_name)
-        })
-        .ok_or_else(|| {
-            format!(
-                "Brick {} is available, but no supported installer was published.",
-                manifest.version
-            )
-        })?;
+    let artifact_index = select_artifact_index(&manifest, &update_kind).ok_or_else(|| {
+        format!(
+            "Brick {} is available, but no supported installer was published.",
+            manifest.version
+        )
+    })?;
     Ok(Some((manifest, artifact_index)))
+}
+
+fn select_artifact_index(manifest: &AppUpdateManifest, update_kind: &UpdateKind) -> Option<usize> {
+    let arch = target_arch();
+
+    manifest.artifacts.iter().position(|artifact| {
+        artifact.os == update_kind.os()
+            && artifact.arch == arch
+            && artifact.kind == update_kind.artifact_kind()
+            && update_kind.file_name_matches(&artifact.file_name)
+    })
 }
 
 pub fn launch_installer(update: &PreparedAppUpdate) -> Result<(), String> {
@@ -364,18 +375,12 @@ fn validate_manifest(manifest: &AppUpdateManifest) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn select_artifact<'a>(
     manifest: &'a AppUpdateManifest,
     update_kind: &UpdateKind,
 ) -> Option<&'a AppUpdateArtifact> {
-    let arch = target_arch();
-
-    manifest.artifacts.iter().find(|artifact| {
-        artifact.os == update_kind.os()
-            && artifact.arch == arch
-            && artifact.kind == update_kind.artifact_kind()
-            && update_kind.file_name_matches(&artifact.file_name)
-    })
+    select_artifact_index(manifest, update_kind).map(|index| &manifest.artifacts[index])
 }
 
 impl UpdateKind {
@@ -621,11 +626,10 @@ fn validate_github_release_url(value: &str) -> Result<(), String> {
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .user_agent(APP_UPDATE_USER_AGENT)
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .map_err(|error| format!("Failed to create HTTP client: {error}"))
+    match &*HTTP_CLIENT {
+        Ok(client) => Ok(client.clone()),
+        Err(error) => Err(error.clone()),
+    }
 }
 
 fn cache_busted_url(value: &str) -> Result<String, String> {

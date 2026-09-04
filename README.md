@@ -100,7 +100,7 @@ Installed Brick clients with app self-update support check the signed app feed o
 
 Brick enables login startup by default after setup. Login launches pass `--startup`; Brick starts hidden/minimized by default and exposes a Settings toggle to let users open the full window at login instead.
 
-Brick keeps Discord login valid until the access token expires. If the cached access token is still current, Brick opens without another Discord prompt. When it expires, Brick uses the saved refresh token to get a fresh token, rechecks the user's Advance roles, and only asks for browser login again if Discord rejects the saved session or the user no longer has an allowed role.
+Brick keeps Discord login cached for up to 30 days. If the cached access token is still current and the local session is still inside that window, Brick opens without another Discord prompt. When the access token expires, Brick uses the saved refresh token to get a fresh token, rechecks the user's Advance roles, and only asks for browser login again if Discord rejects the saved session, the local 30-day session window has elapsed, or the user no longer has an allowed role. On Windows, the cached Discord session is stored as a DPAPI-protected `discord-auth.dat` file instead of plaintext JSON; old `discord-auth.json` files are migrated and removed on the next successful read.
 
 ## Presence API
 

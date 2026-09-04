@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{LazyLock, Mutex},
     thread,
@@ -22,13 +22,20 @@ const AUTHORIZE_URL: &str = "https://discord.com/oauth2/authorize";
 const APP_USER_AGENT: &str = "Brick/0.2 (+https://github.com/IsogiE/Brick-Releases)";
 const REDIRECT_PATH: &str = "/discord/callback";
 const AUTH_CALLBACK_POLL_PATH: &str = "/v1/auth/callback";
-const SESSION_FILE: &str = "discord-auth.json";
+const SESSION_FILE: &str = "discord-auth.dat";
+const LEGACY_SESSION_FILE: &str = "discord-auth.json";
+const SESSION_SCHEMA: u32 = 2;
 const LOGIN_TIMEOUT_SECS: u64 = 180;
 const LOGIN_POLL_INTERVAL_MS: u64 = 750;
 const EXPIRY_SAFETY_SECS: u64 = 60;
+const MAX_SESSION_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+const SESSION_RENEWAL_MESSAGE: &str = "Saved Discord login expired. Please sign in again.";
 const ADVANCE_GUILD_ID: &str = "1166119057993515100";
 const OFFICER_ROLE_ID: &str = "1167061441023582258";
 const RAIDER_ROLE_ID: &str = "1199377026168143872";
+
+#[cfg(target_os = "windows")]
+const PROTECTED_SESSION_PREFIX: &[u8] = b"BRICK-DISCORD-AUTH-DPAPI-v1\n";
 
 const DISCORD_CLIENT_ID: &str = match option_env!("BRICK_DISCORD_CLIENT_ID") {
     Some(value) => value,
@@ -60,6 +67,14 @@ const DISCORD_REDIRECT_URI: &str = match option_env!("BRICK_DISCORD_REDIRECT_URI
 };
 
 static SESSION_REFRESH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static HTTP_CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
+    Client::builder()
+        .timeout(Duration::from_secs(25))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent(APP_USER_AGENT)
+        .build()
+        .map_err(|error| format!("Failed to create Discord HTTP client: {error}"))
+});
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -77,6 +92,7 @@ pub struct AuthorizedUser {
     pub guild_name: String,
     pub role_label: String,
     pub expires_at_unix: u64,
+    pub created_at_unix: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +104,8 @@ pub struct AuthSession {
     access_token: String,
     refresh_token: String,
     expires_at_unix: u64,
+    #[serde(default)]
+    created_at_unix: u64,
     user_id: String,
     username: String,
     global_name: Option<String>,
@@ -161,7 +179,13 @@ pub fn saved_session_status() -> Result<SessionStatus, String> {
         return Ok(SessionStatus::SignedOut);
     }
 
-    if session_is_current(&session) {
+    let now = now_unix_secs();
+    if session_age_expired(&session, now) {
+        clear_session()?;
+        return Ok(SessionStatus::SignedOut);
+    }
+
+    if session_access_token_current(&session, now) {
         return Ok(SessionStatus::Authorized(authorized_user(
             &session, &config,
         )));
@@ -176,7 +200,7 @@ pub fn login_with_browser() -> Result<AuthorizedUser, String> {
     open_browser(&request.authorize_url)?;
     let code = wait_for_remote_callback(&request.state)?;
     let token = exchange_code(&config, &code, &request.verifier)?;
-    let session = verified_session_from_token(&config, token)?;
+    let session = verified_session_from_token(&config, token, None)?;
     save_session(&session)?;
     Ok(authorized_user(&session, &config))
 }
@@ -190,9 +214,22 @@ pub fn refresh_saved_session() -> Result<AuthorizedUser, String> {
         return Err("Please sign in with Discord.".to_string());
     };
 
-    if session_matches_config(&session, &config) && session_is_current(&session) {
+    if !session_matches_config(&session, &config) {
+        clear_session()?;
+        return Err("Please sign in with Discord.".to_string());
+    }
+
+    let now = now_unix_secs();
+    if session_age_expired(&session, now) {
+        clear_session()?;
+        return Err(SESSION_RENEWAL_MESSAGE.to_string());
+    }
+
+    if session_access_token_current(&session, now) {
         return Ok(authorized_user(&session, &config));
     }
+
+    let created_at_unix = session_created_at_unix(&session);
 
     let token = match refresh_token(&config, &session.refresh_token) {
         Ok(token) => token,
@@ -202,7 +239,7 @@ pub fn refresh_saved_session() -> Result<AuthorizedUser, String> {
         }
     };
 
-    let session = match verified_session_from_token(&config, token) {
+    let session = match verified_session_from_token(&config, token, Some(created_at_unix)) {
         Ok(session) => session,
         Err(error) => {
             let _ = clear_session();
@@ -216,15 +253,18 @@ pub fn refresh_saved_session() -> Result<AuthorizedUser, String> {
 
 pub fn clear_session() -> Result<(), String> {
     let path = session_path()?;
-    if path.exists() {
-        fs::remove_file(&path)
-            .map_err(|error| format!("Failed to remove {}: {error}", path.display()))?;
-    }
+    remove_session_file(&path)?;
+    let legacy_path = legacy_session_path()?;
+    remove_session_file(&legacy_path)?;
     Ok(())
 }
 
 pub fn session_expired(expires_at_unix: u64) -> bool {
     token_expired(expires_at_unix, now_unix_secs())
+}
+
+pub fn session_renewal_due(created_at_unix: u64) -> bool {
+    session_age_expired_at(created_at_unix, now_unix_secs())
 }
 
 pub fn current_access_token() -> Result<String, String> {
@@ -236,7 +276,12 @@ pub fn current_access_token() -> Result<String, String> {
     if !session_matches_config(&session, &config) {
         return Err("Discord session does not match this Brick build.".to_string());
     }
-    if !session_is_current(&session) {
+    let now = now_unix_secs();
+    if session_age_expired(&session, now) {
+        clear_session()?;
+        return Err(SESSION_RENEWAL_MESSAGE.to_string());
+    }
+    if !session_access_token_current(&session, now) {
         return Err("Discord session needs refresh.".to_string());
     }
 
@@ -257,9 +302,17 @@ pub fn current_or_refreshed_access_token() -> Result<Option<String>, String> {
         return Ok(None);
     }
 
-    if session_is_current(&session) {
+    let now = now_unix_secs();
+    if session_age_expired(&session, now) {
+        clear_session()?;
+        return Ok(None);
+    }
+
+    if session_access_token_current(&session, now) {
         return Ok(Some(session.access_token));
     }
+
+    let created_at_unix = session_created_at_unix(&session);
 
     let token = match refresh_token(&config, &session.refresh_token) {
         Ok(token) => token,
@@ -269,7 +322,7 @@ pub fn current_or_refreshed_access_token() -> Result<Option<String>, String> {
         }
     };
 
-    let session = match verified_session_from_token(&config, token) {
+    let session = match verified_session_from_token(&config, token, Some(created_at_unix)) {
         Ok(session) => session,
         Err(error) => {
             let _ = clear_session();
@@ -476,6 +529,7 @@ fn post_token_request(
 fn verified_session_from_token(
     config: &AuthConfig,
     token: DiscordTokenResponse,
+    created_at_unix: Option<u64>,
 ) -> Result<AuthSession, String> {
     let user = fetch_user(&token.access_token)?;
     let member = fetch_member(config, &token.access_token)?;
@@ -495,12 +549,13 @@ fn verified_session_from_token(
 
     let now = now_unix_secs();
     Ok(AuthSession {
-        schema: 1,
+        schema: SESSION_SCHEMA,
         client_id: config.client_id.clone(),
         guild_id: config.guild_id.clone(),
         access_token: token.access_token,
         refresh_token: token.refresh_token.unwrap_or_default(),
         expires_at_unix: now.saturating_add(token.expires_in),
+        created_at_unix: created_at_unix.filter(|value| *value > 0).unwrap_or(now),
         user_id: user.id,
         username: user.username,
         global_name: user.global_name,
@@ -566,6 +621,7 @@ fn authorized_user(session: &AuthSession, config: &AuthConfig) -> AuthorizedUser
         guild_name: config.guild_name.clone(),
         role_label: authorized_role_label(&session.authorized_role_ids, config),
         expires_at_unix: session.expires_at_unix,
+        created_at_unix: session_created_at_unix(session),
     }
 }
 
@@ -580,7 +636,7 @@ fn authorized_role_label(role_ids: &[String], config: &AuthConfig) -> String {
 }
 
 fn session_matches_config(session: &AuthSession, config: &AuthConfig) -> bool {
-    session.schema == 1
+    (session.schema == 1 || session.schema == SESSION_SCHEMA)
         && session.client_id == config.client_id
         && session.guild_id == config.guild_id
         && session
@@ -589,8 +645,24 @@ fn session_matches_config(session: &AuthSession, config: &AuthConfig) -> bool {
             .any(|role_id| config.allowed_role_ids.contains(role_id))
 }
 
-fn session_is_current(session: &AuthSession) -> bool {
-    !token_expired(session.expires_at_unix, now_unix_secs())
+fn session_access_token_current(session: &AuthSession, now: u64) -> bool {
+    !token_expired(session.expires_at_unix, now)
+}
+
+fn session_age_expired(session: &AuthSession, now: u64) -> bool {
+    session_age_expired_at(session_created_at_unix(session), now)
+}
+
+fn session_age_expired_at(created_at_unix: u64, now: u64) -> bool {
+    created_at_unix == 0 || created_at_unix.saturating_add(MAX_SESSION_AGE_SECS) <= now
+}
+
+fn session_created_at_unix(session: &AuthSession) -> u64 {
+    if session.created_at_unix == 0 {
+        session.authorized_at_unix
+    } else {
+        session.created_at_unix
+    }
 }
 
 fn token_expired(expires_at_unix: u64, now: u64) -> bool {
@@ -606,15 +678,25 @@ fn now_unix_secs() -> u64 {
 
 fn load_session() -> Result<Option<AuthSession>, String> {
     let path = session_path()?;
-    if !path.exists() {
-        return Ok(None);
+    if path.exists() {
+        let loaded = load_session_file(&path)?;
+        if loaded.needs_resave || loaded.session.schema != SESSION_SCHEMA {
+            save_session(&loaded.session)?;
+        } else {
+            remove_legacy_session_file()?;
+        }
+        return Ok(Some(loaded.session));
     }
 
-    let contents = fs::read_to_string(&path)
-        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-    let session = serde_json::from_str(&contents)
-        .map_err(|error| format!("Failed to parse {}: {error}", path.display()))?;
-    Ok(Some(session))
+    let legacy_path = legacy_session_path()?;
+    if legacy_path.exists() {
+        let loaded = load_session_file(&legacy_path)?;
+        save_session(&loaded.session)?;
+        remove_session_file(&legacy_path)?;
+        return Ok(Some(loaded.session));
+    }
+
+    Ok(None)
 }
 
 fn save_session(session: &AuthSession) -> Result<(), String> {
@@ -624,12 +706,52 @@ fn save_session(session: &AuthSession) -> Result<(), String> {
             .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
     }
 
-    let json = serde_json::to_string_pretty(session)
+    let mut session = session.clone();
+    session.schema = SESSION_SCHEMA;
+    if session.created_at_unix == 0 {
+        session.created_at_unix = session.authorized_at_unix;
+    }
+
+    let mut json = serde_json::to_vec_pretty(&session)
         .map_err(|error| format!("Failed to serialize Discord session: {error}"))?;
-    write_private_file(&path, &json)
+    json.push(b'\n');
+    let payload = session_payload_for_write(&json)?;
+    write_private_bytes(&path, &payload)?;
+    remove_legacy_session_file()
 }
 
-fn write_private_file(path: &PathBuf, contents: &str) -> Result<(), String> {
+struct LoadedSession {
+    session: AuthSession,
+    needs_resave: bool,
+}
+
+fn load_session_file(path: &Path) -> Result<LoadedSession, String> {
+    let contents =
+        fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let needs_resave = session_file_needs_resave(&contents);
+    let plaintext = session_plaintext_bytes(&contents)?;
+    let session = serde_json::from_slice(&plaintext)
+        .map_err(|error| format!("Failed to parse {}: {error}", path.display()))?;
+    Ok(LoadedSession {
+        session,
+        needs_resave,
+    })
+}
+
+fn remove_legacy_session_file() -> Result<(), String> {
+    let legacy_path = legacy_session_path()?;
+    remove_session_file(&legacy_path)
+}
+
+fn remove_session_file(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Failed to remove {}: {error}", path.display())),
+    }
+}
+
+fn write_private_bytes(path: &Path, contents: &[u8]) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -642,31 +764,172 @@ fn write_private_file(path: &PathBuf, contents: &str) -> Result<(), String> {
             .mode(0o600)
             .open(path)
             .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
-        file.write_all(contents.as_bytes())
-            .map_err(|error| format!("Failed to write {}: {error}", path.display()))?;
-        file.write_all(b"\n")
+        file.write_all(contents)
             .map_err(|error| format!("Failed to write {}: {error}", path.display()))?;
         return Ok(());
     }
 
     #[cfg(not(unix))]
     {
-        fs::write(path, format!("{contents}\n"))
+        fs::write(path, contents)
             .map_err(|error| format!("Failed to write {}: {error}", path.display()))
     }
+}
+
+#[cfg(target_os = "windows")]
+fn session_payload_for_write(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    use std::{ptr, slice};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::Cryptography::{CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB},
+    };
+
+    let input_len = u32::try_from(plaintext.len())
+        .map_err(|_| "Discord session is too large to encrypt.".to_string())?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: input_len,
+        pbData: plaintext.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let ok = unsafe {
+        CryptProtectData(
+            &input,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+
+    if ok == 0 {
+        return Err(format!(
+            "Failed to encrypt Discord session with Windows DPAPI: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let encrypted = if output.pbData.is_null() || output.cbData == 0 {
+        Vec::new()
+    } else {
+        unsafe { slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() }
+    };
+    if !output.pbData.is_null() {
+        unsafe {
+            LocalFree(output.pbData.cast());
+        }
+    }
+
+    let mut payload = Vec::with_capacity(PROTECTED_SESSION_PREFIX.len() + encrypted.len());
+    payload.extend_from_slice(PROTECTED_SESSION_PREFIX);
+    payload.extend_from_slice(&encrypted);
+    Ok(payload)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn session_payload_for_write(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    Ok(plaintext.to_vec())
+}
+
+#[cfg(target_os = "windows")]
+fn session_plaintext_bytes(contents: &[u8]) -> Result<Vec<u8>, String> {
+    if contents.starts_with(PROTECTED_SESSION_PREFIX) {
+        return unprotect_session_payload(&contents[PROTECTED_SESSION_PREFIX.len()..]);
+    }
+
+    Ok(contents.to_vec())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn session_plaintext_bytes(contents: &[u8]) -> Result<Vec<u8>, String> {
+    Ok(contents.to_vec())
+}
+
+#[cfg(target_os = "windows")]
+fn session_file_needs_resave(contents: &[u8]) -> bool {
+    !contents.starts_with(PROTECTED_SESSION_PREFIX)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn session_file_needs_resave(_contents: &[u8]) -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn unprotect_session_payload(encrypted: &[u8]) -> Result<Vec<u8>, String> {
+    use std::{ptr, slice};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::Cryptography::{
+            CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+        },
+    };
+
+    if encrypted.is_empty() {
+        return Err("Saved Discord session is empty.".to_string());
+    }
+
+    let input_len = u32::try_from(encrypted.len())
+        .map_err(|_| "Saved Discord session is too large to decrypt.".to_string())?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: input_len,
+        pbData: encrypted.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let mut description: windows_sys::core::PWSTR = ptr::null_mut();
+    let ok = unsafe {
+        CryptUnprotectData(
+            &input,
+            &mut description,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+
+    if !description.is_null() {
+        unsafe {
+            LocalFree(description.cast());
+        }
+    }
+
+    if ok == 0 {
+        return Err(format!(
+            "Failed to decrypt Discord session with Windows DPAPI: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let plaintext = if output.pbData.is_null() || output.cbData == 0 {
+        Vec::new()
+    } else {
+        unsafe { slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() }
+    };
+    if !output.pbData.is_null() {
+        unsafe {
+            LocalFree(output.pbData.cast());
+        }
+    }
+
+    Ok(plaintext)
 }
 
 fn session_path() -> Result<PathBuf, String> {
     Ok(addon::config_dir()?.join(SESSION_FILE))
 }
 
+fn legacy_session_path() -> Result<PathBuf, String> {
+    Ok(addon::config_dir()?.join(LEGACY_SESSION_FILE))
+}
+
 fn http_client() -> Result<Client, String> {
-    Client::builder()
-        .timeout(Duration::from_secs(25))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent(APP_USER_AGENT)
-        .build()
-        .map_err(|error| format!("Failed to create Discord HTTP client: {error}"))
+    match &*HTTP_CLIENT {
+        Ok(client) => Ok(client.clone()),
+        Err(error) => Err(error.clone()),
+    }
 }
 
 fn discord_error_message(status: u16, body: &[u8]) -> String {
@@ -777,8 +1040,8 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        authorized_role_label, parse_allowed_role_ids, pkce_challenge, token_expired, AuthConfig,
-        DiscordTokenResponse,
+        authorized_role_label, parse_allowed_role_ids, pkce_challenge, session_age_expired_at,
+        token_expired, AuthConfig, DiscordTokenResponse,
     };
 
     fn test_config() -> AuthConfig {
@@ -806,6 +1069,19 @@ mod tests {
         assert!(!token_expired(1_200, 1_000));
         assert!(token_expired(1_060, 1_000));
         assert!(token_expired(1_000, 1_000));
+    }
+
+    #[test]
+    fn expires_saved_login_after_max_age() {
+        assert!(!session_age_expired_at(
+            1_000,
+            1_000 + super::MAX_SESSION_AGE_SECS - 1
+        ));
+        assert!(session_age_expired_at(
+            1_000,
+            1_000 + super::MAX_SESSION_AGE_SECS
+        ));
+        assert!(session_age_expired_at(0, 1_000));
     }
 
     #[test]

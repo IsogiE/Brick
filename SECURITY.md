@@ -11,7 +11,7 @@ Brick has one high-risk job: it writes files onto guild members' computers autom
 - Only these folders are managed: `AdvanceRaidTools`, `AdvanceRaidTools_Libraries`, and `AdvanceRaidTools_Options`.
 - Existing managed folders are deleted and replaced after verification, matching normal addon-manager behavior.
 - App binary releases are produced from the native Rust binary with Cargo Packager. App self-updates use release metadata signed by the existing Brick Ed25519 feed key, verify the downloaded NSIS installer or AppImage SHA-256, and must not execute downloaded scripts.
-- Brick uses Discord OAuth user tokens for login and must not embed a bot token or Discord client secret. Browser login redirects through the Brick Presence API, which stores only the short-lived one-time authorization code until the matching Brick client polls for it. Cached Discord sessions are stored under the user's Brick config directory.
+- Brick uses Discord OAuth user tokens for login and must not embed a bot token or Discord client secret. Browser login redirects through the Brick Presence API, which stores only the short-lived one-time authorization code until the matching Brick client polls for it. Cached Discord sessions are stored under the user's Brick config directory, expire locally after 30 days, and are DPAPI-protected on Windows in `discord-auth.dat` instead of plaintext JSON.
 - Client PCs do not get GitHub, CurseForge, or Wago tokens.
 - The addon feed worker lives in the private Brick repo. It packages public ART source in GitHub Actions, then publishes signed public feed assets to `IsogiE/Brick-Releases`.
 - The public addon repo should not contain Brick signing keys or feed publishing scripts.

@@ -377,7 +377,10 @@ impl BrickApp {
         self.last_auth_check = Instant::now();
 
         let should_refresh = match &self.auth_state {
-            AuthUiState::Authorized(user) => discord_auth::session_expired(user.expires_at_unix),
+            AuthUiState::Authorized(user) => {
+                discord_auth::session_expired(user.expires_at_unix)
+                    || discord_auth::session_renewal_due(user.created_at_unix)
+            }
             _ => false,
         };
 
