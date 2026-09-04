@@ -757,14 +757,15 @@ impl BrickApp {
                     .auto_shrink([false, true])
                     .max_height(max_height)
                     .show(ui, |ui| {
+                        let content_width = (ui.available_width() - 18.0).max(260.0);
+                        ui.set_width(content_width);
+
                         if let Some(notice) = self.roster_notice.as_deref() {
                             roster_notice(ui, notice);
                             ui.add_space(14.0);
                         }
                         draw_roster_group(ui, "Officers", &roster.officers);
-                        ui.add_space(14.0);
-                        ui.separator();
-                        ui.add_space(14.0);
+                        ui.add_space(18.0);
                         draw_roster_group(ui, "Raiders", &roster.raiders);
                         ui.add_space(12.0);
                         ui.label(
@@ -1527,55 +1528,80 @@ fn draw_roster_group(ui: &mut egui::Ui, title: &str, members: &[RosterMember]) {
 
 fn draw_roster_member_row(ui: &mut egui::Ui, member: &RosterMember) {
     let row_height = 36.0;
-    let row_width = (ui.available_width() - 28.0).max(260.0);
-    ui.allocate_ui_with_layout(
-        egui::vec2(row_width, row_height),
-        egui::Layout::left_to_right(egui::Align::Center),
+    let row_width = ui.available_width().max(260.0);
+    let (row_rect, _) =
+        ui.allocate_exact_size(egui::vec2(row_width, row_height), egui::Sense::hover());
+
+    let dot_color = if member.online {
+        success_accent()
+    } else {
+        Color32::from_rgb(87, 95, 108)
+    };
+    let dot_center = egui::pos2(row_rect.left() + 8.0, row_rect.center().y);
+    if ui.is_rect_visible(row_rect) {
+        ui.painter().circle_filled(dot_center, 6.0, dot_color);
+        ui.painter().circle_stroke(
+            dot_center,
+            7.0,
+            Stroke::new(
+                1.0_f32,
+                Color32::from_rgba_unmultiplied(dot_color.r(), dot_color.g(), dot_color.b(), 70),
+            ),
+        );
+    }
+
+    let name_left = row_rect.left() + 34.0;
+    let status_width = if row_width < 520.0 { 148.0 } else { 220.0 };
+    let status_rect = egui::Rect::from_min_max(
+        egui::pos2(row_rect.right() - status_width, row_rect.top()),
+        row_rect.right_bottom(),
+    );
+    let name_rect = egui::Rect::from_min_max(
+        egui::pos2(name_left, row_rect.top()),
+        egui::pos2(
+            (status_rect.left() - 16.0).max(name_left),
+            row_rect.bottom(),
+        ),
+    );
+
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(name_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
         |ui| {
-            let dot_color = if member.online {
-                success_accent()
-            } else {
-                Color32::from_rgb(87, 95, 108)
-            };
-            status_dot(ui, dot_color);
-            ui.add_space(8.0);
+            ui.set_clip_rect(name_rect);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(member.name.as_str())
+                        .strong()
+                        .color(primary_text()),
+                )
+                .truncate(),
+            )
+            .on_hover_text(format!("{} - {}", member.role, member.user_id));
+        },
+    );
 
-            let status_width = if row_width < 540.0 { 112.0 } else { 192.0 };
-            let name_width = (ui.available_width() - status_width - 10.0).max(96.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(name_width, row_height),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(member.name.as_str())
-                                .strong()
-                                .color(primary_text()),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text(format!("{} - {}", member.role, member.user_id));
-                },
-            );
-
-            let status = roster_member_status(member);
-            ui.allocate_ui_with_layout(
-                egui::vec2(status_width, row_height),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    ui.add(
-                        egui::Label::new(RichText::new(status.as_str()).small().color(
-                            if member.online {
-                                secondary_text()
-                            } else {
-                                muted_text()
-                            },
-                        ))
-                        .truncate(),
-                    )
-                    .on_hover_text(status);
-                },
-            );
+    let status = roster_member_status(member);
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(status_rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        |ui| {
+            ui.set_clip_rect(status_rect);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(status.as_str())
+                        .small()
+                        .color(if member.online {
+                            secondary_text()
+                        } else {
+                            muted_text()
+                        }),
+                )
+                .truncate(),
+            )
+            .on_hover_text(status);
         },
     );
 }
