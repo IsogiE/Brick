@@ -1,6 +1,7 @@
 import http from "node:http";
 import path from "node:path";
 import { promises as fs } from "node:fs";
+import { createHash } from "node:crypto";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const MAX_BODY_BYTES = 32 * 1024;
@@ -22,9 +23,13 @@ const heartbeatRetentionSeconds = parsePositiveInt(
   process.env.HEARTBEAT_RETENTION_SECONDS,
   14 * 24 * 60 * 60,
 );
+const requesterCacheSeconds = parsePositiveInt(process.env.REQUESTER_CACHE_SECONDS, 5 * 60);
+const requesterStaleSeconds = parsePositiveInt(process.env.REQUESTER_STALE_SECONDS, 60 * 60);
 const gatewayEnabled = process.env.DISCORD_GATEWAY_ENABLED?.trim().toLowerCase() !== "false";
 
 let rosterCache = null;
+const requesterCache = new Map();
+const requesterInFlight = new Map();
 let heartbeatWriteQueue = Promise.resolve();
 
 function requireEnv(name) {
@@ -109,8 +114,16 @@ async function discordJson(pathname, authorization) {
 
   if (!response.ok) {
     const message = body?.message || `Discord returned HTTP ${response.status}`;
-    const status = response.status === 401 || response.status === 403 ? response.status : 502;
-    throw new HttpError(status, `Discord request failed: ${message}`);
+    const retryAfter = Number(body?.retry_after);
+    const detail =
+      response.status === 429 && Number.isFinite(retryAfter)
+        ? `${message} Retry after ${retryAfter} seconds.`
+        : message;
+    const status =
+      response.status === 401 || response.status === 403 || response.status === 429
+        ? response.status
+        : 502;
+    throw new HttpError(status, `Discord request failed: ${detail}`);
   }
 
   return body;
@@ -146,22 +159,73 @@ async function verifyRequester(request) {
     throw new HttpError(401, "Missing Discord authorization token.");
   }
 
+  const cacheKey = tokenCacheKey(token);
+  const cached = requesterCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) {
+    return cached.user;
+  }
+
+  if (requesterInFlight.has(cacheKey)) {
+    return requesterInFlight.get(cacheKey);
+  }
+
+  const verification = verifyRequesterFromDiscord(token, cacheKey, cached, now).finally(() => {
+    requesterInFlight.delete(cacheKey);
+  });
+  requesterInFlight.set(cacheKey, verification);
+  return verification;
+}
+
+async function verifyRequesterFromDiscord(token, cacheKey, cached, now) {
   const authorization = `Bearer ${token}`;
-  const [user, member] = await Promise.all([
-    discordJson("/users/@me", authorization),
-    discordJson(`/users/@me/guilds/${guildId}/member`, authorization),
-  ]);
+  let user;
+  let member;
+  try {
+    [user, member] = await Promise.all([
+      discordJson("/users/@me", authorization),
+      discordJson(`/users/@me/guilds/${guildId}/member`, authorization),
+    ]);
+  } catch (error) {
+    if (error instanceof HttpError && error.status === 429 && cached?.staleUntil > now) {
+      console.error(`Discord requester verification rate limited; using stale user ${cached.user.id}`);
+      return cached.user;
+    }
+    requesterCache.delete(cacheKey);
+    throw error;
+  }
 
   const role = roleFromIds(member?.roles);
   if (!role) {
+    requesterCache.delete(cacheKey);
     throw new HttpError(403, "Discord user does not have the required guild role.");
   }
 
-  return {
+  const verified = {
     id: user.id,
     name: displayName(member, user),
     role,
   };
+  requesterCache.set(cacheKey, {
+    user: verified,
+    expiresAt: now + requesterCacheSeconds * 1000,
+    staleUntil: now + requesterStaleSeconds * 1000,
+  });
+  pruneRequesterCache(now);
+
+  return verified;
+}
+
+function tokenCacheKey(token) {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function pruneRequesterCache(now) {
+  for (const [cacheKey, cached] of requesterCache) {
+    if (cached.staleUntil <= now) {
+      requesterCache.delete(cacheKey);
+    }
+  }
 }
 
 async function loadHeartbeats() {
@@ -247,6 +311,23 @@ async function fetchRosterMembers() {
     return rosterCache.members;
   }
 
+  try {
+    const members = await fetchRosterMembersFromDiscord();
+    rosterCache = {
+      expiresAt: Date.now() + rosterCacheSeconds * 1000,
+      members,
+    };
+    return members;
+  } catch (error) {
+    if (rosterCache?.members?.length) {
+      console.error(`Discord roster refresh failed; serving stale roster: ${error.message}`);
+      return rosterCache.members;
+    }
+    throw error;
+  }
+}
+
+async function fetchRosterMembersFromDiscord() {
   const members = [];
   let after = "0";
 
@@ -269,10 +350,6 @@ async function fetchRosterMembers() {
     after = lastUserId;
   }
 
-  rosterCache = {
-    expiresAt: Date.now() + rosterCacheSeconds * 1000,
-    members,
-  };
   return members;
 }
 

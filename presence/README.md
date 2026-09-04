@@ -8,6 +8,9 @@ It does two jobs:
 - keeps short-lived client heartbeats so the roster can show online/offline state
 - keeps the Discord bot connected to the Gateway so the bot appears online
 
+Verified Discord access tokens are cached briefly server-side so roster refreshes
+and heartbeats do not hammer Discord.
+
 The Discord bot token lives only on the VPS. Do not put it in the desktop app.
 
 ## DNS
