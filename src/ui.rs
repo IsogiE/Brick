@@ -962,13 +962,15 @@ impl BrickApp {
                         .strong()
                         .color(Color32::from_rgb(244, 247, 251)),
                 );
-                ui.add_space(2.0);
-                capsule(
+                ui.add_space(12.0);
+                header_chip(
                     ui,
                     app_version,
+                    56.0,
                     Color32::from_rgb(215, 223, 234),
                     Color32::from_rgb(38, 42, 50),
                 );
+                ui.add_space(10.0);
                 self.draw_app_update_control(ui);
             },
         );
@@ -982,9 +984,8 @@ impl BrickApp {
         } else {
             "Check for updates"
         };
-        let button_width = if available { 92.0 } else { 132.0 };
+        let button_width = if available { 104.0 } else { 144.0 };
 
-        ui.add_space(4.0);
         let status = app_update_status_text(&self.app_update_state);
         if !status.is_empty() {
             let color = if available {
@@ -992,20 +993,19 @@ impl BrickApp {
             } else {
                 muted_text()
             };
-            ui.add_sized(
-                egui::vec2(92.0, 22.0),
-                egui::Label::new(RichText::new(status).small().color(color)).truncate(),
-            );
+            header_status_text(ui, status.as_str(), color);
+            ui.add_space(10.0);
         }
 
         if busy {
             ui.add(egui::Spinner::new().size(12.0).color(info_accent()));
+            ui.add_space(10.0);
         }
 
         let response = ui
             .add_enabled_ui(!busy, |ui| {
                 ui.add_sized(
-                    egui::vec2(button_width, 24.0),
+                    egui::vec2(button_width, 26.0),
                     compact_update_button(button_text, available),
                 )
             })
@@ -1540,6 +1540,45 @@ fn compact_update_button(text: &str, available: bool) -> egui::Button<'_> {
         .corner_radius(egui::CornerRadius::same(7))
         .fill(fill)
         .stroke(Stroke::new(1.0_f32, panel_stroke()))
+}
+
+fn header_chip(ui: &mut egui::Ui, text: &str, width: f32, text_color: Color32, fill: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(7), fill);
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::same(7),
+            Stroke::new(1.0_f32, panel_stroke()),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::proportional(11.0),
+            text_color,
+        );
+    }
+}
+
+fn header_status_text(ui: &mut egui::Ui, text: &str, color: Color32) {
+    let width = match text {
+        "Up to date" => 68.0,
+        "Checking" => 60.0,
+        _ => 132.0,
+    };
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter().text(
+            rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            text,
+            egui::FontId::proportional(11.0),
+            color,
+        );
+    }
 }
 
 fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
