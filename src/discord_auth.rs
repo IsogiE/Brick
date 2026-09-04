@@ -1,7 +1,6 @@
 use std::{
     collections::HashSet,
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::PathBuf,
     process::Command,
     sync::{LazyLock, Mutex},
@@ -634,6 +633,7 @@ fn write_private_file(path: &PathBuf, contents: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        use std::{fs::OpenOptions, io::Write};
 
         let mut file = OpenOptions::new()
             .create(true)

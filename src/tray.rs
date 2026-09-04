@@ -169,7 +169,7 @@ mod platform {
 
         let menu_tx = tx.clone();
         let menu_ctx = ctx.clone();
-        MenuEvent::set_event_handler(Some(move |event| {
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let command = match event.id.as_ref() {
                 "show" => Some(TrayCommand::Show),
                 "quit" => Some(TrayCommand::Quit),
@@ -183,7 +183,7 @@ mod platform {
 
         let tray_tx = tx.clone();
         let tray_ctx = ctx.clone();
-        TrayIconEvent::set_event_handler(Some(move |event| {
+        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
             let show = matches!(
                 event,
                 TrayIconEvent::Click {
