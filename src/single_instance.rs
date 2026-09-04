@@ -10,6 +10,8 @@ use crate::addon;
 
 const LOCK_FILE: &str = "brick.lock";
 const SHOW_REQUEST_FILE: &str = "show-request";
+#[cfg(target_os = "windows")]
+const WINDOW_HANDLE_FILE: &str = "main-window";
 
 pub enum InstanceLockError {
     AlreadyRunning,
@@ -55,6 +57,11 @@ pub fn acquire() -> Result<InstanceGuard, InstanceLockError> {
 }
 
 pub fn request_show() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    if show_saved_main_window()? {
+        return Ok(());
+    }
+
     let dir = addon::config_dir()?;
     fs::create_dir_all(&dir)
         .map_err(|error| format!("Failed to create {}: {error}", dir.display()))?;
@@ -78,4 +85,44 @@ pub fn read_show_request() -> Result<Option<String>, String> {
     } else {
         Ok(Some(token))
     }
+}
+
+#[cfg(target_os = "windows")]
+pub fn remember_main_window_handle(hwnd: isize) -> Result<(), String> {
+    let dir = addon::config_dir()?;
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create {}: {error}", dir.display()))?;
+    fs::write(dir.join(WINDOW_HANDLE_FILE), hwnd.to_string())
+        .map_err(|error| format!("Failed to remember Brick window: {error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn show_saved_main_window() -> Result<bool, String> {
+    use windows_sys::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{IsWindow, SetForegroundWindow, ShowWindowAsync, SW_RESTORE},
+    };
+
+    let path = addon::config_dir()?.join(WINDOW_HANDLE_FILE);
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return Ok(false);
+    };
+    let Ok(hwnd) = contents.trim().parse::<isize>() else {
+        return Ok(false);
+    };
+    if hwnd == 0 {
+        return Ok(false);
+    }
+
+    unsafe {
+        let hwnd = hwnd as HWND;
+        if IsWindow(hwnd) == 0 {
+            return Ok(false);
+        }
+
+        ShowWindowAsync(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+    }
+
+    Ok(true)
 }

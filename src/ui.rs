@@ -22,7 +22,8 @@ const APP_UPDATE_CHECK_INTERVAL_SECS: u64 = 60;
 const ROSTER_REFRESH_INTERVAL_SECS: u64 = 30;
 const AUTH_REFRESH_CHECK_INTERVAL_SECS: u64 = 60;
 const VIEW_REFRESH_INTERVAL_SECS: u64 = 60;
-const SHOW_REQUEST_POLL_INTERVAL_SECS: u64 = 1;
+#[cfg(not(target_os = "windows"))]
+const SHOW_REQUEST_POLL_INTERVAL_SECS: u64 = 5;
 const ACTIVE_REPAINT_INTERVAL_MS: u64 = 100;
 const IDLE_REPAINT_MAX_SECS: u64 = 60;
 
@@ -45,6 +46,7 @@ pub struct BrickApp {
     tray_attempted: bool,
     quit_requested: bool,
     confirm_logout: bool,
+    show_request_rx: mpsc::Receiver<String>,
     last_show_request: Option<String>,
     last_auth_check: Instant,
     last_view_refresh: Instant,
@@ -109,7 +111,7 @@ impl BrickApp {
     ) -> Self {
         configure_style(&cc.egui_ctx);
         let brick_texture = load_texture(&cc.egui_ctx);
-        spawn_show_request_wake(&cc.egui_ctx);
+        let show_request_rx = spawn_show_request_wake(&cc.egui_ctx);
 
         let (view, status) = match addon::load_view() {
             Ok(view) => (view, "Ready".to_string()),
@@ -147,6 +149,7 @@ impl BrickApp {
             tray_attempted: false,
             quit_requested: false,
             confirm_logout: false,
+            show_request_rx,
             last_show_request: single_instance::read_show_request().ok().flatten(),
             last_auth_check: now,
             last_view_refresh: now,
@@ -703,16 +706,19 @@ impl BrickApp {
     }
 
     fn handle_show_request(&mut self, ctx: &egui::Context) {
-        let Ok(Some(token)) = single_instance::read_show_request() else {
-            return;
-        };
+        let mut should_show = false;
+        while let Ok(token) = self.show_request_rx.try_recv() {
+            if self.last_show_request.as_deref() == Some(token.as_str()) {
+                continue;
+            }
 
-        if self.last_show_request.as_deref() == Some(token.as_str()) {
-            return;
+            self.last_show_request = Some(token);
+            should_show = true;
         }
 
-        self.last_show_request = Some(token);
-        self.show_window(ctx);
+        if should_show {
+            self.show_window(ctx);
+        }
     }
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
@@ -1437,20 +1443,37 @@ fn load_texture(ctx: &egui::Context) -> Option<TextureHandle> {
     Some(ctx.load_texture("brick-icon", color_image, egui::TextureOptions::LINEAR))
 }
 
-fn spawn_show_request_wake(ctx: &egui::Context) {
-    let ctx = ctx.clone();
-    thread::spawn(move || {
-        let mut last_token = single_instance::read_show_request().ok().flatten();
+fn spawn_show_request_wake(ctx: &egui::Context) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
 
-        loop {
-            thread::sleep(Duration::from_secs(SHOW_REQUEST_POLL_INTERVAL_SECS));
-            let token = single_instance::read_show_request().ok().flatten();
-            if token != last_token {
-                last_token = token;
-                ctx.request_repaint();
+    #[cfg(not(target_os = "windows"))]
+    {
+        let tx = tx.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let mut last_token = single_instance::read_show_request().ok().flatten();
+
+            loop {
+                thread::sleep(Duration::from_secs(SHOW_REQUEST_POLL_INTERVAL_SECS));
+                let token = single_instance::read_show_request().ok().flatten();
+                if token != last_token {
+                    last_token = token.clone();
+                    if let Some(token) = token {
+                        let _ = tx.send(token);
+                    }
+                    ctx.request_repaint();
+                }
             }
-        }
-    });
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = ctx;
+        let _ = tx;
+    }
+
+    rx
 }
 
 fn time_until(last: Instant, interval_secs: u64) -> Duration {

@@ -24,7 +24,10 @@ mod native_window {
         };
 
         if let RawWindowHandle::Win32(handle) = handle.as_raw() {
-            MAIN_WINDOW.store(handle.hwnd.get(), Ordering::SeqCst);
+            let hwnd = handle.hwnd.get();
+            if MAIN_WINDOW.swap(hwnd, Ordering::SeqCst) != hwnd {
+                let _ = crate::single_instance::remember_main_window_handle(hwnd);
+            }
         }
     }
 

@@ -36,6 +36,7 @@ const SETTINGS_FILE: &str = "settings.json";
 const LOG_FILE: &str = "logs.jsonl";
 const MAX_LOG_ENTRIES: usize = 80;
 const SYNC_INTERVAL_SECS: u64 = 300;
+const CLIENT_METADATA_REFRESH_INTERVAL_SECS: i64 = 300;
 const ALLOWED_FOLDERS: &[&str] = &[
     "AdvanceRaidTools",
     "AdvanceRaidTools_Libraries",
@@ -63,6 +64,8 @@ pub struct Settings {
     pub startup_enabled: bool,
     #[serde(default = "default_true")]
     pub startup_minimized: bool,
+    #[serde(default)]
+    pub client_metadata_refreshed_at: Option<i64>,
     pub clients: Vec<WowClient>,
 }
 
@@ -73,6 +76,7 @@ impl Default for Settings {
             watcher_enabled: true,
             startup_enabled: true,
             startup_minimized: true,
+            client_metadata_refreshed_at: None,
             clients: Vec::new(),
         }
     }
@@ -243,7 +247,7 @@ struct ManifestArtifact {
 pub fn load_view() -> Result<AppView, String> {
     let mut settings = load_settings()?;
     maybe_auto_detect_clients(&mut settings)?;
-    if refresh_client_metadata(&mut settings.clients) {
+    if refresh_client_metadata_if_due(&mut settings) {
         save_settings(&settings)?;
     }
     view_from_settings(settings)
@@ -295,7 +299,7 @@ pub fn add_wow_paths(paths: &[PathBuf]) -> Result<AppView, String> {
 
     settings.watcher_enabled = true;
     settings.startup_enabled = true;
-    refresh_client_metadata(&mut settings.clients);
+    refresh_client_metadata_now(&mut settings);
     sort_clients(&mut settings.clients);
     save_settings(&settings)?;
 
@@ -423,7 +427,7 @@ fn run_sync_if_enabled(sync_lock: &Arc<Mutex<()>>) -> Result<(), String> {
 fn run_sync() -> Result<SyncSummary, String> {
     let mut settings = load_settings()?;
     maybe_auto_detect_clients(&mut settings)?;
-    let mut settings_changed = refresh_client_metadata(&mut settings.clients);
+    let mut settings_changed = refresh_client_metadata_if_due(&mut settings);
 
     let checked_at = now_stamp();
     if settings.clients.is_empty() {
@@ -794,6 +798,34 @@ fn flavor_info_from_path(path: &Path) -> Option<&'static FlavorInfo> {
 
 fn sort_clients(clients: &mut [WowClient]) {
     clients.sort_by_key(|client| (client.flavor.rank(), client.path.clone()));
+}
+
+fn refresh_client_metadata_if_due(settings: &mut Settings) -> bool {
+    if settings.clients.is_empty() {
+        return false;
+    }
+
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let Some(last_refresh) = settings.client_metadata_refreshed_at else {
+        return refresh_client_metadata_at(settings, now);
+    };
+
+    if now.saturating_sub(last_refresh) < CLIENT_METADATA_REFRESH_INTERVAL_SECS {
+        return false;
+    }
+
+    refresh_client_metadata_at(settings, now)
+}
+
+fn refresh_client_metadata_now(settings: &mut Settings) -> bool {
+    refresh_client_metadata_at(settings, time::OffsetDateTime::now_utc().unix_timestamp())
+}
+
+fn refresh_client_metadata_at(settings: &mut Settings, refreshed_at: i64) -> bool {
+    let metadata_changed = refresh_client_metadata(&mut settings.clients);
+    let timestamp_changed = settings.client_metadata_refreshed_at != Some(refreshed_at);
+    settings.client_metadata_refreshed_at = Some(refreshed_at);
+    metadata_changed || timestamp_changed
 }
 
 fn refresh_client_metadata(clients: &mut [WowClient]) -> bool {
