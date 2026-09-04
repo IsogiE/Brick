@@ -700,6 +700,7 @@ impl BrickApp {
                 tray::TrayCommand::Show => {
                     self.show_window(ctx);
                 }
+                #[cfg(not(target_os = "windows"))]
                 tray::TrayCommand::Quit => {
                     self.quit_requested = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);

@@ -35,10 +35,16 @@ jobs:
         run: cargo fmt --check
 
       - name: Check
+        env:
+          RUSTFLAGS: -D warnings
         run: cargo check
 
       - name: Test
+        env:
+          RUSTFLAGS: -D warnings
         run: cargo test
 
       - name: Build release binary
+        env:
+          RUSTFLAGS: -D warnings
         run: cargo build --release

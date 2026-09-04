@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "brick"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "auto-launch",
  "base64",

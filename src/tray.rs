@@ -3,6 +3,7 @@ use eframe::egui;
 #[derive(Debug, Clone, Copy)]
 pub enum TrayCommand {
     Show,
+    #[cfg(not(target_os = "windows"))]
     Quit,
 }
 
