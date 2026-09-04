@@ -93,11 +93,17 @@ jobs:
           BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
         run: node -e "if (!/^[0-9]+$/.test(process.env.BRICK_DISCORD_CLIENT_ID || '')) throw new Error('BRICK_DISCORD_CLIENT_ID repository variable is required.');"
 
+      - name: Verify presence API config
+        env:
+          BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
+        run: node -e "const url = process.env.BRICK_PRESENCE_API_URL || ''; const parsed = new URL(url); if (parsed.protocol !== 'https:') throw new Error('BRICK_PRESENCE_API_URL repository variable must be an https URL.');"
+
       - name: Build Windows binary for signing
         if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
         env:
           BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
           BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+          BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
         run: cargo build --release
 
       - name: Azure login for Windows signing
@@ -133,6 +139,7 @@ jobs:
         env:
           BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
           BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+          BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
           NO_STRIP: 1
         run: cargo packager --release --formats ${{ matrix.formats }}
 
@@ -140,6 +147,7 @@ jobs:
         if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
         env:
           BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+          BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
           NO_STRIP: 1
         run: cargo packager --config Packager.signed.toml --formats ${{ matrix.formats }}
 

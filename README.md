@@ -42,6 +42,7 @@ Push this Brick folder to its private GitHub repo, then add these GitHub secrets
 Add this GitHub repo variable to the private Brick repo:
 
 - `BRICK_DISCORD_CLIENT_ID`: Discord application/client ID for the Brick login app.
+- `BRICK_PRESENCE_API_URL`: HTTPS URL for the Brick Presence API, currently `https://brick.lusaggo.com`.
 
 Configure that Discord application as a public OAuth2 client and add this redirect URL:
 
@@ -100,6 +101,27 @@ Installed Brick clients with app self-update support check the signed app feed o
 Brick enables login startup by default after setup. Login launches pass `--startup`; Brick starts hidden/minimized by default and exposes a Settings toggle to let users open the full window at login instead.
 
 Brick keeps Discord login valid until the access token expires. If the cached access token is still current, Brick opens without another Discord prompt. When it expires, Brick uses the saved refresh token to get a fresh token, rechecks the user's Advance roles, and only asks for browser login again if Discord rejects the saved session or the user no longer has an allowed role.
+
+## Presence API
+
+Brick's roster tab uses a small HTTPS service in `presence/`.
+
+- Clients send a heartbeat after Discord login and periodically while open.
+- The server verifies each heartbeat with Discord using the user's OAuth access token.
+- The server uses the Discord bot token to list guild members and groups them as Officer first, then Raider.
+- The desktop app never contains the Discord bot token.
+
+For `lusaggo.com`, DNS should point the Brick API subdomain at the VPS:
+
+```text
+Type: A
+Name: brick
+Content: 2.28.118.132
+Proxy: DNS only
+TTL: Auto
+```
+
+Deploy notes are in `presence/README.md`.
 
 ## Addon Feed
 

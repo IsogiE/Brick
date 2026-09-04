@@ -209,6 +209,22 @@ pub fn session_expired(expires_at_unix: u64) -> bool {
     token_expired(expires_at_unix, now_unix_secs())
 }
 
+pub fn current_access_token() -> Result<String, String> {
+    let config = auth_config()?;
+    let Some(session) = load_session()? else {
+        return Err("Please sign in with Discord.".to_string());
+    };
+
+    if !session_matches_config(&session, &config) {
+        return Err("Discord session does not match this Brick build.".to_string());
+    }
+    if !session_is_current(&session) {
+        return Err("Discord session needs refresh.".to_string());
+    }
+
+    Ok(session.access_token)
+}
+
 pub fn role_label() -> &'static str {
     let label = DISCORD_ALLOWED_ROLE_LABEL.trim();
     if label.is_empty() {

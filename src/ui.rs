@@ -13,20 +13,27 @@ use crate::{
     app_update::{self, PreparedAppUpdate},
     autostart,
     discord_auth::{self, AuthorizedUser, SessionStatus},
+    presence::{self, Roster, RosterMember},
     single_instance, tray,
 };
 
 const ICON_BYTES: &[u8] = include_bytes!("assets/brick.png");
 const APP_UPDATE_CHECK_INTERVAL_SECS: u64 = 30 * 60;
+const PRESENCE_HEARTBEAT_INTERVAL_SECS: u64 = 60;
+const ROSTER_REFRESH_INTERVAL_SECS: u64 = 30;
 
 pub struct BrickApp {
     view: AppView,
     status: String,
     sync_lock: Arc<Mutex<()>>,
     auth_state: AuthUiState,
+    presence_state: PresenceUiState,
+    active_tab: MainTab,
     sync_rx: Option<mpsc::Receiver<Result<SyncSummary, String>>>,
     auth_rx: Option<mpsc::Receiver<Result<AuthorizedUser, String>>>,
     app_update_rx: Option<mpsc::Receiver<Result<Option<PreparedAppUpdate>, String>>>,
+    presence_heartbeat_rx: Option<mpsc::Receiver<Result<(), String>>>,
+    roster_rx: Option<mpsc::Receiver<Result<Roster, String>>>,
     brick_texture: Option<TextureHandle>,
     tray: Option<tray::TrayState>,
     tray_attempted: bool,
@@ -35,6 +42,8 @@ pub struct BrickApp {
     last_auth_check: Instant,
     last_view_refresh: Instant,
     last_app_update_check: Instant,
+    last_presence_heartbeat: Instant,
+    last_roster_refresh: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +59,21 @@ impl AuthUiState {
     fn is_authorized(&self) -> bool {
         matches!(self, Self::Authorized(_))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainTab {
+    Updates,
+    Roster,
+}
+
+#[derive(Debug, Clone)]
+enum PresenceUiState {
+    Unavailable(String),
+    Idle,
+    Loading,
+    Ready(Roster),
+    Error(String),
 }
 
 struct DisplayStatus {
@@ -85,23 +109,34 @@ impl BrickApp {
             Ok(SessionStatus::Authorized(user)) => AuthUiState::Authorized(user),
             Err(error) => AuthUiState::Denied(error),
         };
+        let now = Instant::now();
 
         let mut app = Self {
             view,
             status,
             sync_lock,
             auth_state,
+            presence_state: initial_presence_state(),
+            active_tab: MainTab::Updates,
             sync_rx: None,
             auth_rx: None,
             app_update_rx: None,
+            presence_heartbeat_rx: None,
+            roster_rx: None,
             brick_texture,
             tray: None,
             tray_attempted: false,
             quit_requested: false,
             last_show_request: single_instance::read_show_request().ok().flatten(),
-            last_auth_check: Instant::now(),
-            last_view_refresh: Instant::now(),
-            last_app_update_check: Instant::now(),
+            last_auth_check: now,
+            last_view_refresh: now,
+            last_app_update_check: now,
+            last_presence_heartbeat: now
+                .checked_sub(Duration::from_secs(PRESENCE_HEARTBEAT_INTERVAL_SECS))
+                .unwrap_or(now),
+            last_roster_refresh: now
+                .checked_sub(Duration::from_secs(ROSTER_REFRESH_INTERVAL_SECS))
+                .unwrap_or(now),
         };
 
         if matches!(app.auth_state, AuthUiState::Checking) {
@@ -116,6 +151,9 @@ impl BrickApp {
             && app.view.settings.watcher_enabled
         {
             app.start_sync();
+        }
+        if app.auth_state.is_authorized() {
+            app.start_presence_heartbeat();
         }
         if startup_mode {
             app.status = "Ready".to_string();
@@ -289,6 +327,7 @@ impl BrickApp {
                 if !self.view.setup_required && self.view.settings.watcher_enabled {
                     self.start_sync();
                 }
+                self.start_presence_heartbeat();
             }
             Ok(Err(error)) => {
                 self.auth_state = AuthUiState::Denied(error.clone());
@@ -326,12 +365,125 @@ impl BrickApp {
             Ok(()) => {
                 self.auth_state = AuthUiState::SignedOut;
                 self.sync_rx = None;
+                self.presence_heartbeat_rx = None;
+                self.roster_rx = None;
+                self.presence_state = initial_presence_state();
                 self.status = "Signed out of Discord.".to_string();
             }
             Err(error) => {
                 self.auth_state = AuthUiState::Denied(error.clone());
                 self.status = error;
             }
+        }
+    }
+
+    fn start_presence_heartbeat(&mut self) {
+        if self.presence_heartbeat_rx.is_some()
+            || !self.auth_state.is_authorized()
+            || !presence::configured()
+        {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = discord_auth::current_access_token()
+                .and_then(|access_token| presence::send_heartbeat(&access_token));
+            let _ = tx.send(result);
+        });
+        self.presence_heartbeat_rx = Some(rx);
+        self.last_presence_heartbeat = Instant::now();
+    }
+
+    fn start_periodic_presence_heartbeat(&mut self) {
+        if self.last_presence_heartbeat.elapsed()
+            >= Duration::from_secs(PRESENCE_HEARTBEAT_INTERVAL_SECS)
+        {
+            self.start_presence_heartbeat();
+        }
+    }
+
+    fn poll_presence_heartbeat(&mut self) {
+        let Some(rx) = self.presence_heartbeat_rx.as_ref() else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                self.presence_heartbeat_rx = None;
+            }
+            Ok(Err(error)) => {
+                let _ = addon::record_log(LogLevel::Warn, error);
+                self.presence_heartbeat_rx = None;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let _ = addon::record_log(
+                    LogLevel::Warn,
+                    "Roster heartbeat stopped unexpectedly.".to_string(),
+                );
+                self.presence_heartbeat_rx = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    fn start_roster_refresh(&mut self) {
+        if self.roster_rx.is_some() || !self.auth_state.is_authorized() {
+            return;
+        }
+        if !presence::configured() {
+            self.presence_state = PresenceUiState::Unavailable(presence::configuration_error());
+            return;
+        }
+
+        if !matches!(self.presence_state, PresenceUiState::Ready(_)) {
+            self.presence_state = PresenceUiState::Loading;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = discord_auth::current_access_token()
+                .and_then(|access_token| presence::fetch_roster(&access_token));
+            let _ = tx.send(result);
+        });
+        self.roster_rx = Some(rx);
+        self.last_roster_refresh = Instant::now();
+    }
+
+    fn start_roster_refresh_if_stale(&mut self) {
+        if self.active_tab != MainTab::Roster {
+            return;
+        }
+        if matches!(self.presence_state, PresenceUiState::Idle) {
+            self.start_roster_refresh();
+            return;
+        }
+        if self.last_roster_refresh.elapsed() >= Duration::from_secs(ROSTER_REFRESH_INTERVAL_SECS) {
+            self.start_roster_refresh();
+        }
+    }
+
+    fn poll_roster(&mut self) {
+        let Some(rx) = self.roster_rx.as_ref() else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok(Ok(roster)) => {
+                self.presence_state = PresenceUiState::Ready(roster);
+                self.roster_rx = None;
+            }
+            Ok(Err(error)) => {
+                let _ = addon::record_log(LogLevel::Warn, error.clone());
+                self.presence_state = PresenceUiState::Error(friendly_roster_problem(&error));
+                self.roster_rx = None;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.presence_state =
+                    PresenceUiState::Error("Roster refresh stopped unexpectedly.".to_string());
+                self.roster_rx = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
         }
     }
 
@@ -512,12 +664,94 @@ impl BrickApp {
         }
 
         self.draw_header(ui);
+        ui.add_space(14.0);
+        self.draw_tab_bar(ui);
         ui.add_space(18.0);
+        match self.active_tab {
+            MainTab::Updates => self.draw_updates_tab(ui),
+            MainTab::Roster => self.draw_roster_tab(ui),
+        }
+    }
+
+    fn draw_updates_tab(&mut self, ui: &mut egui::Ui) {
         self.draw_status_panel(ui);
         ui.add_space(18.0);
         self.draw_installs_section(ui);
         ui.add_space(18.0);
         self.draw_settings_panel(ui);
+    }
+
+    fn draw_tab_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if tab_button(ui, "Updates", self.active_tab == MainTab::Updates).clicked() {
+                self.active_tab = MainTab::Updates;
+            }
+            if tab_button(ui, "Roster", self.active_tab == MainTab::Roster).clicked() {
+                self.active_tab = MainTab::Roster;
+                self.start_roster_refresh_if_stale();
+            }
+        });
+    }
+
+    fn draw_roster_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            section_title(ui, "Guild Roster");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if secondary_button(ui, "Refresh").clicked() {
+                    self.start_roster_refresh();
+                }
+                if self.roster_rx.is_some() {
+                    ui.add(egui::Spinner::new().size(16.0).color(info_accent()));
+                }
+            });
+        });
+        ui.add_space(8.0);
+
+        let state = self.presence_state.clone();
+        panel_frame().show(ui, |ui| match state {
+            PresenceUiState::Unavailable(error) => {
+                empty_panel_message(ui, "Roster unavailable", &friendly_roster_problem(&error));
+            }
+            PresenceUiState::Idle | PresenceUiState::Loading => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(18.0);
+                    ui.add(egui::Spinner::new().size(24.0).color(info_accent()));
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new("Loading roster")
+                            .strong()
+                            .color(primary_text()),
+                    );
+                    ui.add_space(18.0);
+                });
+            }
+            PresenceUiState::Error(error) => {
+                empty_panel_message(ui, "Roster unavailable", &error);
+            }
+            PresenceUiState::Ready(roster) => {
+                let max_height = ui.available_height().max(260.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("guild-roster")
+                    .auto_shrink([false, true])
+                    .max_height(max_height)
+                    .show(ui, |ui| {
+                        draw_roster_group(ui, "Officers", &roster.officers);
+                        ui.add_space(14.0);
+                        ui.separator();
+                        ui.add_space(14.0);
+                        draw_roster_group(ui, "Raiders", &roster.raiders);
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new(roster_refresh_label(
+                                &roster.generated_at,
+                                roster.online_window_seconds,
+                            ))
+                            .small()
+                            .color(muted_text()),
+                        );
+                    });
+            }
+        });
     }
 
     fn draw_login_screen(&mut self, ui: &mut egui::Ui) {
@@ -908,7 +1142,7 @@ impl BrickApp {
         let status_lower = self.status.to_ascii_lowercase();
         if status_lower.starts_with("installed ") {
             return DisplayStatus {
-                title: "Advance Raid Tools updated".to_string(),
+                title: "Updated".to_string(),
                 detail: String::new(),
                 accent: success_accent(),
                 accent_soft: Color32::from_rgb(26, 59, 42),
@@ -917,7 +1151,7 @@ impl BrickApp {
         }
 
         DisplayStatus {
-            title: "Advance Raid Tools is up to date".to_string(),
+            title: "Up to date".to_string(),
             detail: String::new(),
             accent: success_accent(),
             accent_soft: Color32::from_rgb(26, 59, 42),
@@ -947,6 +1181,10 @@ impl eframe::App for BrickApp {
         self.handle_close_request(ctx);
         if self.auth_state.is_authorized() {
             self.poll_sync();
+            self.poll_presence_heartbeat();
+            self.start_periodic_presence_heartbeat();
+            self.poll_roster();
+            self.start_roster_refresh_if_stale();
             self.refresh_view_if_stale();
         }
 
@@ -1169,6 +1407,177 @@ fn settings_toggle_row(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
     clicked
 }
 
+fn initial_presence_state() -> PresenceUiState {
+    if presence::configured() {
+        PresenceUiState::Idle
+    } else {
+        PresenceUiState::Unavailable(presence::configuration_error())
+    }
+}
+
+fn tab_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    let fill = if selected {
+        Color32::from_rgb(38, 42, 50)
+    } else {
+        Color32::from_rgb(24, 27, 33)
+    };
+    let stroke = if selected {
+        Stroke::new(1.0_f32, Color32::from_rgb(71, 78, 91))
+    } else {
+        Stroke::new(1.0_f32, panel_stroke())
+    };
+    let color = if selected {
+        primary_text()
+    } else {
+        secondary_text()
+    };
+
+    ui.add_sized(
+        egui::vec2(106.0, 34.0),
+        egui::Button::new(RichText::new(text).strong().color(color))
+            .corner_radius(egui::CornerRadius::same(8))
+            .fill(fill)
+            .stroke(stroke),
+    )
+}
+
+fn empty_panel_message(ui: &mut egui::Ui, title: &str, detail: &str) {
+    ui.vertical_centered(|ui| {
+        ui.add_space(18.0);
+        ui.label(
+            RichText::new(title)
+                .size(18.0)
+                .strong()
+                .color(primary_text()),
+        );
+        ui.add(egui::Label::new(RichText::new(detail).color(secondary_text())).wrap());
+        ui.add_space(18.0);
+    });
+}
+
+fn draw_roster_group(ui: &mut egui::Ui, title: &str, members: &[RosterMember]) {
+    let online_count = members.iter().filter(|member| member.online).count();
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(title)
+                .size(18.0)
+                .strong()
+                .color(primary_text()),
+        );
+        capsule(
+            ui,
+            &format!("{online_count}/{} online", members.len()),
+            secondary_text(),
+            Color32::from_rgb(38, 42, 50),
+        );
+    });
+    ui.add_space(8.0);
+
+    if members.is_empty() {
+        ui.label(
+            RichText::new(format!("No {} found.", title.to_ascii_lowercase())).color(muted_text()),
+        );
+        return;
+    }
+
+    for (index, member) in members.iter().enumerate() {
+        if index > 0 {
+            ui.separator();
+        }
+        draw_roster_member_row(ui, member);
+    }
+}
+
+fn draw_roster_member_row(ui: &mut egui::Ui, member: &RosterMember) {
+    let row_height = 36.0;
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), row_height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            let dot_color = if member.online {
+                success_accent()
+            } else {
+                Color32::from_rgb(87, 95, 108)
+            };
+            status_dot(ui, dot_color);
+
+            let right_width = 150.0;
+            let name_width = (ui.available_width() - right_width).max(120.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(name_width, row_height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(member.name.as_str())
+                                .strong()
+                                .color(primary_text()),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(format!("{} - {}", member.role, member.user_id));
+                },
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(roster_member_status(member)).small().color(
+                    if member.online {
+                        secondary_text()
+                    } else {
+                        muted_text()
+                    },
+                ));
+            });
+        },
+    );
+}
+
+fn roster_member_status(member: &RosterMember) -> String {
+    if member.online {
+        let version = member
+            .app_version
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("v{value}"));
+        let platform = member
+            .platform
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+
+        match (version, platform) {
+            (Some(version), Some(platform)) => format!("Online - {version} {platform}"),
+            (Some(version), None) => format!("Online - {version}"),
+            _ => "Online".to_string(),
+        }
+    } else if member.last_seen_at.is_some() {
+        "Offline".to_string()
+    } else {
+        "Not reporting".to_string()
+    }
+}
+
+fn roster_refresh_label(generated_at: &str, online_window_seconds: u64) -> String {
+    format!(
+        "Updated {generated_at}. Online means seen in the last {}.",
+        duration_label(online_window_seconds)
+    )
+}
+
+fn duration_label(seconds: u64) -> String {
+    if seconds >= 60 && seconds % 60 == 0 {
+        let minutes = seconds / 60;
+        if minutes == 1 {
+            "1 minute".to_string()
+        } else {
+            format!("{minutes} minutes")
+        }
+    } else if seconds == 1 {
+        "1 second".to_string()
+    } else {
+        format!("{seconds} seconds")
+    }
+}
+
 fn login_content_height(state: &AuthUiState) -> f32 {
     let base = 52.0 + 18.0 + 30.0 + 6.0 + 20.0 + 24.0 + 42.0;
     if matches!(state, AuthUiState::Checking) {
@@ -1226,6 +1635,25 @@ fn friendly_auth_problem(status: &str) -> String {
         "The saved Discord session expired or was revoked.".to_string()
     } else {
         "Discord could not verify access right now.".to_string()
+    }
+}
+
+fn friendly_roster_problem(status: &str) -> String {
+    let lower = status.to_ascii_lowercase();
+    if lower.contains("built without") || lower.contains("configured") {
+        "Roster service is not configured for this Brick build.".to_string()
+    } else if lower.contains("session") || lower.contains("authorization") || lower.contains("401")
+    {
+        "Sign in again so Brick can refresh roster access.".to_string()
+    } else if lower.contains("bot")
+        || lower.contains("discord request failed")
+        || lower.contains("server members")
+        || lower.contains("403")
+    {
+        "The roster server cannot read Discord yet. Check the bot token and Server Members Intent."
+            .to_string()
+    } else {
+        "Brick could not reach the roster service. It will try again automatically.".to_string()
     }
 }
 
