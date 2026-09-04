@@ -521,81 +521,79 @@ impl BrickApp {
     }
 
     fn draw_login_screen(&mut self, ui: &mut egui::Ui) {
-        let available_height = ui.available_height();
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), available_height),
-            egui::Layout::top_down(egui::Align::Center),
+        let canvas = ui.max_rect();
+        let state = self.auth_state.clone();
+        let (title, detail, button_text, button_enabled) = login_copy(&state);
+        let panel_width = canvas.width().clamp(320.0, 420.0);
+        let panel_height = match state {
+            AuthUiState::Denied(_) => 320.0,
+            AuthUiState::Checking => 300.0,
+            AuthUiState::ConfigMissing(_) => 320.0,
+            _ => 284.0,
+        };
+        let panel_top = (canvas.center().y - panel_height * 0.55)
+            .clamp(canvas.top() + 28.0, canvas.bottom() - panel_height - 28.0);
+        let panel_rect = egui::Rect::from_min_size(
+            egui::pos2(canvas.center().x - panel_width * 0.5, panel_top),
+            egui::vec2(panel_width, panel_height),
+        );
+
+        ui.allocate_rect(panel_rect, egui::Sense::hover());
+        ui.painter()
+            .rect_filled(panel_rect, egui::CornerRadius::same(8), panel_background());
+        ui.painter().rect_stroke(
+            panel_rect,
+            egui::CornerRadius::same(8),
+            Stroke::new(1.0_f32, panel_stroke()),
+            egui::StrokeKind::Inside,
+        );
+
+        let inner_rect = panel_rect.shrink2(egui::vec2(34.0, 32.0));
+        let content_height = login_content_height(&state);
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(inner_rect)
+                .layout(egui::Layout::top_down(egui::Align::Center)),
             |ui| {
-                ui.add_space(((available_height - 320.0) * 0.42).clamp(28.0, 112.0));
-                ui.set_max_width(420.0);
+                ui.set_clip_rect(inner_rect);
+                ui.add_space(((inner_rect.height() - content_height) * 0.5).max(0.0));
+                draw_icon(ui, self.brick_texture.as_ref(), 52.0);
+                ui.add_space(18.0);
+                ui.label(
+                    RichText::new(title)
+                        .size(24.0)
+                        .strong()
+                        .color(primary_text()),
+                );
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(RichText::new(detail).color(secondary_text())).wrap());
+                ui.add_space(24.0);
 
-                let state = self.auth_state.clone();
-                let (title, detail, button_text, button_enabled) = login_copy(&state);
+                if matches!(state, AuthUiState::Checking) {
+                    ui.add(egui::Spinner::new().size(24.0).color(info_accent()));
+                    ui.add_space(12.0);
+                }
 
-                egui::Frame::NONE
-                    .fill(panel_background())
-                    .stroke(Stroke::new(1.0_f32, panel_stroke()))
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .inner_margin(egui::Margin::symmetric(34, 32))
-                    .show(ui, |ui| {
-                        ui.vertical_centered(|ui| {
-                            draw_icon(ui, self.brick_texture.as_ref(), 52.0);
-                            ui.add_space(18.0);
-                            ui.label(
-                                RichText::new(title)
-                                    .size(24.0)
-                                    .strong()
-                                    .color(primary_text()),
-                            );
-                            ui.add_space(6.0);
-                            ui.add(
-                                egui::Label::new(RichText::new(detail).color(secondary_text()))
-                                    .wrap(),
-                            );
-                            ui.add_space(24.0);
+                if button_enabled {
+                    if ui
+                        .add_sized(egui::vec2(236.0, 42.0), login_button(button_text))
+                        .clicked()
+                    {
+                        self.start_discord_login();
+                    }
+                } else {
+                    ui.add_enabled(false, login_button(button_text));
+                }
 
-                            if matches!(state, AuthUiState::Checking) {
-                                ui.add(egui::Spinner::new().size(24.0).color(info_accent()));
-                                ui.add_space(12.0);
-                            }
-
-                            ui.horizontal_centered(|ui| {
-                                if button_enabled {
-                                    if ui
-                                        .add_sized(
-                                            egui::vec2(236.0, 42.0),
-                                            login_button(button_text),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.start_discord_login();
-                                    }
-                                } else {
-                                    ui.add_enabled_ui(false, |ui| {
-                                        ui.add_sized(
-                                            egui::vec2(236.0, 42.0),
-                                            login_button(button_text),
-                                        );
-                                    });
-                                }
-                            });
-
-                            if matches!(state, AuthUiState::Denied(_)) {
-                                ui.add_space(8.0);
-                                ui.horizontal_centered(|ui| {
-                                    if ui
-                                        .add_sized(
-                                            egui::vec2(236.0, 36.0),
-                                            login_secondary_button("Log out"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.sign_out();
-                                    }
-                                });
-                            }
-                        });
-                    });
+                if matches!(state, AuthUiState::Denied(_)) {
+                    ui.add_space(8.0);
+                    if ui
+                        .add_sized(egui::vec2(236.0, 36.0), login_secondary_button("Log out"))
+                        .clicked()
+                    {
+                        self.sign_out();
+                    }
+                }
             },
         );
     }
@@ -832,19 +830,11 @@ impl BrickApp {
                     |ui| {
                         ui.vertical(|ui| {
                             ui.label(RichText::new("Discord").strong().color(primary_text()));
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(
-                                    RichText::new(user.display_name.as_str())
-                                        .small()
-                                        .color(secondary_text()),
-                                );
-                                capsule(
-                                    ui,
-                                    user.role_label.as_str(),
-                                    primary_text(),
-                                    Color32::from_rgb(38, 42, 50),
-                                );
-                            });
+                            ui.label(
+                                RichText::new(user.display_name.as_str())
+                                    .small()
+                                    .color(secondary_text()),
+                            );
                         });
                     },
                 );
@@ -1177,6 +1167,17 @@ fn settings_toggle_row(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
         },
     );
     clicked
+}
+
+fn login_content_height(state: &AuthUiState) -> f32 {
+    let base = 52.0 + 18.0 + 30.0 + 6.0 + 20.0 + 24.0 + 42.0;
+    if matches!(state, AuthUiState::Checking) {
+        base + 36.0
+    } else if matches!(state, AuthUiState::Denied(_)) {
+        base + 44.0
+    } else {
+        base
+    }
 }
 
 fn login_copy(state: &AuthUiState) -> (&'static str, String, &'static str, bool) {

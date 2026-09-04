@@ -27,6 +27,8 @@ const SESSION_FILE: &str = "discord-auth.json";
 const LOGIN_TIMEOUT_SECS: u64 = 180;
 const EXPIRY_SAFETY_SECS: u64 = 60;
 const ADVANCE_GUILD_ID: &str = "1166119057993515100";
+const OFFICER_ROLE_ID: &str = "1167061441023582258";
+const RAIDER_ROLE_ID: &str = "1199377026168143872";
 
 const DISCORD_CLIENT_ID: &str = match option_env!("BRICK_DISCORD_CLIENT_ID") {
     Some(value) => value,
@@ -526,8 +528,18 @@ fn authorized_user(session: &AuthSession, config: &AuthConfig) -> AuthorizedUser
             .unwrap_or_else(|| session.username.clone()),
         username: session.username.clone(),
         guild_name: config.guild_name.clone(),
-        role_label: config.role_label.clone(),
+        role_label: authorized_role_label(&session.authorized_role_ids, config),
         expires_at_unix: session.expires_at_unix,
+    }
+}
+
+fn authorized_role_label(role_ids: &[String], config: &AuthConfig) -> String {
+    if role_ids.iter().any(|role_id| role_id == OFFICER_ROLE_ID) {
+        "Officer".to_string()
+    } else if role_ids.iter().any(|role_id| role_id == RAIDER_ROLE_ID) {
+        "Raider".to_string()
+    } else {
+        config.role_label.clone()
     }
 }
 
@@ -708,7 +720,22 @@ fn open_browser(url: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_allowed_role_ids, pkce_challenge, token_expired, DiscordTokenResponse};
+    use std::collections::HashSet;
+
+    use super::{
+        authorized_role_label, parse_allowed_role_ids, pkce_challenge, token_expired, AuthConfig,
+        DiscordTokenResponse,
+    };
+
+    fn test_config() -> AuthConfig {
+        AuthConfig {
+            client_id: "client".to_string(),
+            guild_id: "guild".to_string(),
+            guild_name: "Advance".to_string(),
+            role_label: "Raider or Officer".to_string(),
+            allowed_role_ids: HashSet::new(),
+        }
+    }
 
     #[test]
     fn parses_allowed_role_ids() {
@@ -754,5 +781,29 @@ mod tests {
         assert_eq!(token.token_type, "Bearer");
         assert_eq!(token.expires_in, 604800);
         assert_eq!(token.refresh_token.as_deref(), Some("refresh"));
+    }
+
+    #[test]
+    fn labels_authorized_role() {
+        let config = test_config();
+
+        assert_eq!(
+            authorized_role_label(&["1199377026168143872".to_string()], &config),
+            "Raider"
+        );
+        assert_eq!(
+            authorized_role_label(&["1167061441023582258".to_string()], &config),
+            "Officer"
+        );
+        assert_eq!(
+            authorized_role_label(
+                &[
+                    "1199377026168143872".to_string(),
+                    "1167061441023582258".to_string()
+                ],
+                &config
+            ),
+            "Officer"
+        );
     }
 }
