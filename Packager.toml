@@ -1,7 +1,7 @@
 name = "brick"
 product-name = "Brick"
 identifier = "dev.isogi.brick"
-version = "0.3.2"
+version = "0.3.3"
 authors = ["Advance Raid Tools"]
 publisher = "Advance"
 description = "Advance Raid Tools"
@@ -20,10 +20,17 @@ generate-desktop-entry = true
 
 [nsis]
 installer-mode = "currentUser"
+template = "packaging/windows/installer.nsi"
 preinstall-section = '''
-Section ForceCurrentUserSilentUpdateDir
-  IfSilent 0 force_current_user_silent_update_dir_done
+Section ForceCurrentUserInstallDir
+  !if "${INSTALLMODE}" != "currentUser"
+    Goto force_current_user_install_dir_done
+  !endif
   StrCpy $INSTDIR "$LOCALAPPDATA\${PRODUCTNAME}"
-force_current_user_silent_update_dir_done:
+  Call RestorePreviousInstallLocation
+force_current_user_install_dir_done:
 SectionEnd
 '''
+
+[windows]
+allow-downgrades = false

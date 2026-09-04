@@ -157,6 +157,11 @@ jobs:
           RUSTFLAGS: -D warnings
         run: cargo packager --config Packager.signed.toml --formats ${{ matrix.formats }}
 
+      - name: Verify Windows NSIS installer policy
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/verify-windows-installer.ps1 -RunInstallSmoke
+
       - name: Sign Windows NSIS installer
         if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
         uses: azure/artifact-signing-action@v2

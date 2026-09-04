@@ -19,16 +19,61 @@ pub enum InstanceLockError {
 }
 
 pub struct InstanceGuard {
-    file: File,
+    #[cfg(target_os = "windows")]
+    _mutex: Option<WindowsInstanceMutex>,
+    file: Option<File>,
 }
 
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        if let Some(file) = &self.file {
+            let _ = file.unlock();
+        }
     }
 }
 
 pub fn acquire() -> Result<InstanceGuard, InstanceLockError> {
+    #[cfg(target_os = "windows")]
+    {
+        let mutex = match acquire_windows_mutex() {
+            Ok(mutex) => Some(mutex),
+            Err(InstanceLockError::AlreadyRunning) => {
+                return Err(InstanceLockError::AlreadyRunning);
+            }
+            Err(InstanceLockError::Other(error)) => {
+                eprintln!("{error}");
+                None
+            }
+        };
+
+        return match acquire_file_lock() {
+            Ok(file) => Ok(InstanceGuard {
+                _mutex: mutex,
+                file: Some(file),
+            }),
+            Err(InstanceLockError::AlreadyRunning) => Err(InstanceLockError::AlreadyRunning),
+            Err(error) if mutex.is_some() => {
+                if let InstanceLockError::Other(error) = error {
+                    eprintln!("{error}");
+                }
+                Ok(InstanceGuard {
+                    _mutex: mutex,
+                    file: None,
+                })
+            }
+            Err(error) => Err(error),
+        };
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(InstanceGuard {
+            file: Some(acquire_file_lock()?),
+        })
+    }
+}
+
+fn acquire_file_lock() -> Result<File, InstanceLockError> {
     let dir = addon::config_dir().map_err(InstanceLockError::Other)?;
     fs::create_dir_all(&dir).map_err(|error| {
         InstanceLockError::Other(format!("Failed to create {}: {error}", dir.display()))
@@ -45,7 +90,7 @@ pub fn acquire() -> Result<InstanceGuard, InstanceLockError> {
         })?;
 
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(InstanceGuard { file }),
+        Ok(()) => Ok(file),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
             Err(InstanceLockError::AlreadyRunning)
         }
@@ -54,6 +99,58 @@ pub fn acquire() -> Result<InstanceGuard, InstanceLockError> {
             path.display()
         ))),
     }
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsInstanceMutex {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsInstanceMutex {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn acquire_windows_mutex() -> Result<WindowsInstanceMutex, InstanceLockError> {
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, SetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS},
+        System::Threading::CreateMutexW,
+    };
+
+    let name = "Local\\dev.isogi.brick.single-instance"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        SetLastError(0);
+    }
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        let code = error.raw_os_error().unwrap_or_default() as u32;
+        if code == ERROR_ACCESS_DENIED {
+            return Err(InstanceLockError::AlreadyRunning);
+        }
+        return Err(InstanceLockError::Other(format!(
+            "Failed to create Brick single-instance mutex: {error}"
+        )));
+    }
+
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+        return Err(InstanceLockError::AlreadyRunning);
+    }
+
+    Ok(WindowsInstanceMutex { handle })
 }
 
 pub fn request_show() -> Result<(), String> {
@@ -125,4 +222,20 @@ fn show_saved_main_window() -> Result<bool, String> {
     }
 
     Ok(true)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::{acquire, InstanceLockError};
+
+    #[test]
+    fn windows_mutex_blocks_second_instance() {
+        let _guard = match acquire() {
+            Ok(guard) => guard,
+            Err(InstanceLockError::AlreadyRunning) => return,
+            Err(InstanceLockError::Other(error)) => panic!("{error}"),
+        };
+
+        assert!(matches!(acquire(), Err(InstanceLockError::AlreadyRunning)));
+    }
 }

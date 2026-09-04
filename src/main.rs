@@ -32,7 +32,7 @@ fn main() -> Result<(), eframe::Error> {
         }
         Err(single_instance::InstanceLockError::Other(error)) => {
             eprintln!("{error}");
-            None
+            return Ok(());
         }
     };
 
