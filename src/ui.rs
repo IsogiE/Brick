@@ -775,9 +775,22 @@ impl BrickApp {
         self.draw_tab_bar(ui);
         ui.add_space(18.0);
         match self.active_tab {
-            MainTab::Updates => self.draw_updates_tab(ui),
+            MainTab::Updates => self.draw_scrollable_updates_tab(ui),
             MainTab::Roster => self.draw_roster_tab(ui),
         }
+    }
+
+    fn draw_scrollable_updates_tab(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("updates-tab")
+            .auto_shrink([false, false])
+            .max_height(ui.available_height().max(0.0))
+            .min_scrolled_height(0.0)
+            .show(ui, |ui| {
+                let content_width = (ui.available_width() - 18.0).max(260.0);
+                ui.set_width(content_width);
+                self.draw_updates_tab(ui);
+            });
     }
 
     fn draw_updates_tab(&mut self, ui: &mut egui::Ui) {
