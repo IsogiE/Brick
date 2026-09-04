@@ -18,7 +18,7 @@ use crate::{
 };
 
 const ICON_BYTES: &[u8] = include_bytes!("assets/brick.png");
-const APP_UPDATE_CHECK_INTERVAL_SECS: u64 = 30 * 60;
+const APP_UPDATE_CHECK_INTERVAL_SECS: u64 = 60;
 const PRESENCE_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 const ROSTER_REFRESH_INTERVAL_SECS: u64 = 30;
 
@@ -781,18 +781,11 @@ impl BrickApp {
     }
 
     fn draw_updates_tab(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical()
-            .id_salt("updates-tab")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.set_width((ui.available_width() - 18.0).max(0.0));
-                self.draw_status_panel(ui);
-                ui.add_space(18.0);
-                self.draw_installs_section(ui);
-                ui.add_space(18.0);
-                self.draw_settings_panel(ui);
-                ui.add_space(8.0);
-            });
+        self.draw_status_panel(ui);
+        ui.add_space(18.0);
+        self.draw_installs_section(ui);
+        ui.add_space(18.0);
+        self.draw_settings_panel(ui);
     }
 
     fn draw_tab_bar(&mut self, ui: &mut egui::Ui) {
@@ -957,69 +950,70 @@ impl BrickApp {
     fn draw_header(&mut self, ui: &mut egui::Ui) {
         let app_version = concat!("v", env!("CARGO_PKG_VERSION"));
 
-        ui.horizontal(|ui| {
+        ui.horizontal_centered(|ui| {
             draw_icon(ui, self.brick_texture.as_ref(), 44.0);
-            ui.add_space(8.0);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Brick")
-                            .heading()
-                            .strong()
-                            .color(Color32::from_rgb(244, 247, 251)),
-                    );
-                    capsule(
-                        ui,
-                        app_version,
-                        Color32::from_rgb(215, 223, 234),
-                        Color32::from_rgb(38, 42, 50),
-                    );
-                });
-                self.draw_app_update_control(ui);
-            });
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new("Brick")
+                    .size(25.0)
+                    .strong()
+                    .color(Color32::from_rgb(244, 247, 251)),
+            );
+            ui.add_space(2.0);
+            capsule(
+                ui,
+                app_version,
+                Color32::from_rgb(215, 223, 234),
+                Color32::from_rgb(38, 42, 50),
+            );
+            self.draw_app_update_control(ui);
         });
     }
 
     fn draw_app_update_control(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let available = matches!(self.app_update_state, AppUpdateUiState::Available(_));
-            let busy = self.app_update_rx.is_some() || self.app_update_install_rx.is_some();
-            let button_text = if available {
-                "Update now"
+        let available = matches!(self.app_update_state, AppUpdateUiState::Available(_));
+        let busy = self.app_update_rx.is_some() || self.app_update_install_rx.is_some();
+        let button_text = if available {
+            "Update now"
+        } else {
+            "Check for updates"
+        };
+        let button_width = if available { 92.0 } else { 132.0 };
+
+        ui.add_space(4.0);
+        let status = app_update_status_text(&self.app_update_state);
+        if !status.is_empty() {
+            let color = if available {
+                warning_accent()
             } else {
-                "Check for updates"
+                muted_text()
             };
-            let button_width = if available { 90.0 } else { 126.0 };
+            ui.add_sized(
+                egui::vec2(92.0, 22.0),
+                egui::Label::new(RichText::new(status).small().color(color)).truncate(),
+            );
+        }
 
-            let response = ui
-                .add_enabled_ui(!busy, |ui| {
-                    ui.add_sized(
-                        egui::vec2(button_width, 22.0),
-                        compact_update_button(button_text, available),
-                    )
-                })
-                .inner;
+        if busy {
+            ui.add(egui::Spinner::new().size(12.0).color(info_accent()));
+        }
 
-            if response.clicked() {
-                if available {
-                    self.start_app_update_install();
-                } else {
-                    self.start_app_update_check();
-                }
+        let response = ui
+            .add_enabled_ui(!busy, |ui| {
+                ui.add_sized(
+                    egui::vec2(button_width, 24.0),
+                    compact_update_button(button_text, available),
+                )
+            })
+            .inner;
+
+        if response.clicked() {
+            if available {
+                self.start_app_update_install();
+            } else {
+                self.start_app_update_check();
             }
-
-            if busy {
-                ui.add(egui::Spinner::new().size(12.0).color(info_accent()));
-            }
-
-            let status = app_update_status_text(&self.app_update_state);
-            if !status.is_empty() {
-                ui.add(
-                    egui::Label::new(RichText::new(status).small().color(muted_text())).truncate(),
-                );
-            }
-        });
+        }
     }
 
     fn draw_status_panel(&self, ui: &mut egui::Ui) {
@@ -1934,7 +1928,7 @@ fn app_update_status_text(state: &AppUpdateUiState) -> String {
         AppUpdateUiState::Idle => String::new(),
         AppUpdateUiState::Checking => "Checking".to_string(),
         AppUpdateUiState::UpToDate => "Up to date".to_string(),
-        AppUpdateUiState::Available(version) => format!("v{version} available"),
+        AppUpdateUiState::Available(version) => format!("v{version}"),
         AppUpdateUiState::Installing(version) => format!("Installing v{version}"),
         AppUpdateUiState::Error(message) => message.clone(),
     }
