@@ -35,8 +35,8 @@ The Brick source repo can stay private, but updater binaries and the addon feed 
 Push this Brick folder to its private GitHub repo, then add these GitHub secrets to that private Brick repo:
 
 - `BRICK_RELEASE_TOKEN`: fine-grained GitHub token with Contents read/write for `IsogiE/Brick-Releases`.
-- `BRICK_ADDON_PUBLIC_KEY_B64`: raw 32-byte Ed25519 public key embedded into Brick.
-- `BRICK_ADDON_PRIVATE_KEY_B64`: PKCS#8 Ed25519 private key used by the Brick feed workflow to sign `addon-manifest.json`.
+- `BRICK_ADDON_PUBLIC_KEY_B64`: raw 32-byte Ed25519 public key embedded into Brick for addon and app update feeds.
+- `BRICK_ADDON_PRIVATE_KEY_B64`: PKCS#8 Ed25519 private key used by Brick workflows to sign `addon-manifest.json` and `app-manifest.json`.
 
 Optional Windows signing setup:
 
@@ -73,7 +73,12 @@ The release workflow publishes to `IsogiE/Brick-Releases` and builds:
 - Linux deb
 - Linux pacman package
 
-The published app packages are separate from the addon feed. Installed Brick clients update Advance Raid Tools automatically from the signed addon feed; Brick app binary self-updates require a separate signed app-update flow.
+The published app packages are separate from the addon feed. After publishing the versioned app packages, the release workflow updates the fixed `app-feed` release with:
+
+- `app-manifest.json`
+- `app-manifest.json.sig`
+
+Installed Brick clients with app self-update support check the signed app feed on startup and periodically while running. On Windows, Brick downloads the newest MSI, verifies the manifest signature and MSI SHA-256, starts the installer in passive mode, and exits so Windows Installer can finish the update. On Linux AppImage installs, Brick downloads the newest AppImage, verifies the manifest signature and AppImage SHA-256, atomically replaces the current AppImage, restarts Brick, and exits the old process. Brick clients older than the self-update baseline need one more installer install to receive this capability.
 
 ## Addon Feed
 

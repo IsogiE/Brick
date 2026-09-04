@@ -10,22 +10,26 @@ use eframe::egui::{self, Color32, RichText, Stroke, TextureHandle};
 
 use crate::{
     addon::{self, AppView, LogLevel, SyncSummary, WowClient},
+    app_update::{self, PreparedAppUpdate},
     autostart, single_instance, tray,
 };
 
 const ICON_BYTES: &[u8] = include_bytes!("assets/brick.png");
+const APP_UPDATE_CHECK_INTERVAL_SECS: u64 = 30 * 60;
 
 pub struct BrickApp {
     view: AppView,
     status: String,
     sync_lock: Arc<Mutex<()>>,
     sync_rx: Option<mpsc::Receiver<Result<SyncSummary, String>>>,
+    app_update_rx: Option<mpsc::Receiver<Result<Option<PreparedAppUpdate>, String>>>,
     brick_texture: Option<TextureHandle>,
     tray: Option<tray::TrayState>,
     tray_attempted: bool,
     quit_requested: bool,
     last_show_request: Option<String>,
     last_view_refresh: Instant,
+    last_app_update_check: Instant,
 }
 
 struct DisplayStatus {
@@ -59,14 +63,17 @@ impl BrickApp {
             status,
             sync_lock,
             sync_rx: None,
+            app_update_rx: None,
             brick_texture,
             tray: None,
             tray_attempted: false,
             quit_requested: false,
             last_show_request: single_instance::read_show_request().ok().flatten(),
             last_view_refresh: Instant::now(),
+            last_app_update_check: Instant::now(),
         };
 
+        app.start_app_update_check();
         app.reconcile_autostart();
         if !app.view.setup_required && app.view.settings.watcher_enabled {
             app.start_sync();
@@ -199,6 +206,28 @@ impl BrickApp {
         self.sync_rx = Some(rx);
     }
 
+    fn start_app_update_check(&mut self) {
+        if self.app_update_rx.is_some() {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = app_update::prepare_available_update();
+            let _ = tx.send(result);
+        });
+        self.app_update_rx = Some(rx);
+        self.last_app_update_check = Instant::now();
+    }
+
+    fn start_periodic_app_update_check(&mut self) {
+        if self.last_app_update_check.elapsed()
+            >= Duration::from_secs(APP_UPDATE_CHECK_INTERVAL_SECS)
+        {
+            self.start_app_update_check();
+        }
+    }
+
     fn poll_sync(&mut self) {
         let Some(rx) = self.sync_rx.as_ref() else {
             return;
@@ -220,6 +249,47 @@ impl BrickApp {
                 self.status = "Update check stopped unexpectedly.".to_string();
                 self.sync_rx = None;
                 self.refresh_view();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    fn poll_app_update(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.app_update_rx.as_ref() else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok(Ok(Some(update))) => {
+                let message = format!("Installing Brick {}.", update.version);
+                match app_update::launch_installer(&update) {
+                    Ok(()) => {
+                        let _ = addon::record_log(LogLevel::Info, message.clone());
+                        self.status = message;
+                        self.app_update_rx = None;
+                        self.quit_requested = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Err(error) => {
+                        let _ = addon::record_log(LogLevel::Error, error.clone());
+                        self.status = error;
+                        self.app_update_rx = None;
+                    }
+                }
+            }
+            Ok(Ok(None)) => {
+                self.app_update_rx = None;
+            }
+            Ok(Err(error)) => {
+                let _ = addon::record_log(LogLevel::Warn, error);
+                self.app_update_rx = None;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let _ = addon::record_log(
+                    LogLevel::Warn,
+                    "Brick app update check stopped unexpectedly.".to_string(),
+                );
+                self.app_update_rx = None;
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
@@ -519,6 +589,20 @@ impl BrickApp {
     fn display_status(&self) -> DisplayStatus {
         let version = current_version(&self.view.settings.clients);
 
+        if self
+            .status
+            .to_ascii_lowercase()
+            .starts_with("installing brick ")
+        {
+            return DisplayStatus {
+                title: "Updating Brick".to_string(),
+                detail: "Brick will restart to finish.".to_string(),
+                accent: info_accent(),
+                accent_soft: Color32::from_rgb(29, 48, 62),
+                version,
+            };
+        }
+
         if self.view.setup_required || self.view.settings.clients.is_empty() {
             return DisplayStatus {
                 title: "Setup needed".to_string(),
@@ -594,6 +678,8 @@ impl eframe::App for BrickApp {
         self.ensure_tray();
         self.handle_tray(ctx);
         self.handle_show_request(ctx);
+        self.poll_app_update(ctx);
+        self.start_periodic_app_update_check();
         self.handle_close_request(ctx);
         self.poll_sync();
         self.refresh_view_if_stale();

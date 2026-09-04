@@ -41,7 +41,7 @@ On launch, Brick should check the signed addon feed when automation is enabled. 
 - The `Release` workflow uses GitHub Actions cache entries for Rust dependencies, the cargo target directory, and the `cargo-packager` binary to reduce future cold-start packaging time.
 - Public Brick app releases should have an empty release body; keep installer guidance out of the GitHub release text.
 - Windows release signing is opt-in with repo variable `BRICK_WINDOWS_SIGNING=artifact-signing` and Azure Artifact Signing secrets. When enabled, the Release workflow signs `target/release/brick.exe` before MSI packaging and signs the final MSI before upload.
-- Brick currently auto-updates Advance Raid Tools, not the Brick app binary itself. Add signed app-update metadata before claiming installed Brick clients self-update.
+- Brick auto-updates Advance Raid Tools from the signed addon feed. Brick app self-updates use the signed `app-feed` manifest. Windows downloads a versioned MSI from `IsogiE/Brick-Releases`, verifies its SHA-256, launches Windows Installer in passive mode, and exits. Linux AppImage installs download a versioned AppImage, verify its SHA-256, atomically replace the current AppImage, restart Brick, and exit the old process. The addon feed and app feed currently use the same Ed25519 signing key. Brick clients older than the self-update baseline still need one bridge installer.
 - The feed workflow prunes non-`v*` tags from its local ART checkout before packaging. This prevents feed/release-only tags from changing BigWigs package versions.
 - Current BigWigs packager pin: `20a3713ec537df54db5c0d8b4822d88ee63c70e8`; `release.sh` SHA-256: `49bcf94d977478a6f18ead7f0285f193853bf1f9a23ba7d84d08b979d802a734`.
 
@@ -118,6 +118,7 @@ cargo fmt --check
 cargo check
 node --check scripts/generate-addon-signing-key.mjs
 node --check scripts/publish-addon-feed.mjs
+node --check scripts/publish-app-feed.mjs
 node --check scripts/local-appimage-install.mjs
 node --check scripts/local-appimage-remove.mjs
 node --check scripts/set-app-version.mjs

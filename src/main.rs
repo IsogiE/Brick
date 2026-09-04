@@ -4,6 +4,7 @@
 )]
 
 mod addon;
+mod app_update;
 mod autostart;
 mod single_instance;
 mod tray;

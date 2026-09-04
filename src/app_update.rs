@@ -1,0 +1,687 @@
+use std::{
+    cmp::Ordering,
+    convert::TryInto,
+    env, fs,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
+
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use url::Url;
+use uuid::Uuid;
+
+const APP_UPDATE_OWNER: &str = "IsogiE";
+const APP_UPDATE_REPO: &str = "Brick-Releases";
+const APP_UPDATE_TAG: &str = "app-feed";
+const APP_PACKAGE_ID: &str = "Brick";
+const APP_MANIFEST_URL: &str =
+    "https://github.com/IsogiE/Brick-Releases/releases/download/app-feed/app-manifest.json";
+const APP_MANIFEST_SIG_URL: &str =
+    "https://github.com/IsogiE/Brick-Releases/releases/download/app-feed/app-manifest.json.sig";
+const APP_UPDATE_USER_AGENT: &str = concat!(
+    "Brick/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/IsogiE/Brick-Releases)"
+);
+const FEED_UNAVAILABLE_MESSAGE: &str = "No signed Brick app update feed is available yet.";
+
+const APP_UPDATE_PUBLIC_KEY_B64: &str = match option_env!("BRICK_ADDON_PUBLIC_KEY_B64") {
+    Some(value) => value,
+    None => "",
+};
+
+#[derive(Debug, Clone)]
+pub struct PreparedAppUpdate {
+    pub version: String,
+    pub installer_path: PathBuf,
+    replacement_path: Option<PathBuf>,
+    kind: UpdateKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateKind {
+    WindowsMsi,
+    LinuxAppImage,
+}
+
+struct PreparedPackage {
+    installer_path: PathBuf,
+    replacement_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateManifest {
+    schema: u32,
+    package_id: String,
+    version: String,
+    commit: String,
+    built_at: String,
+    artifacts: Vec<AppUpdateArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateArtifact {
+    os: String,
+    arch: String,
+    kind: String,
+    file_name: String,
+    url: String,
+    sha256: String,
+    size: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SemVer {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    prerelease: Vec<VersionPart>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum VersionPart {
+    Numeric(u64),
+    Text(String),
+}
+
+pub fn prepare_available_update() -> Result<Option<PreparedAppUpdate>, String> {
+    let Some(update_kind) = target_update_kind() else {
+        return Ok(None);
+    };
+    if APP_UPDATE_PUBLIC_KEY_B64.is_empty() {
+        return Ok(None);
+    }
+
+    let manifest = match fetch_verified_manifest() {
+        Ok(manifest) => manifest,
+        Err(error) if error == FEED_UNAVAILABLE_MESSAGE => return Ok(None),
+        Err(error) => return Err(error),
+    };
+
+    validate_manifest(&manifest)?;
+    if !is_newer_version(&manifest.version, env!("CARGO_PKG_VERSION"))? {
+        return Ok(None);
+    }
+
+    let artifact = select_artifact(&manifest, &update_kind).ok_or_else(|| {
+        format!(
+            "Brick {} is available, but no supported installer was published.",
+            manifest.version
+        )
+    })?;
+    let package = fetch_verified_artifact(artifact)?;
+    let prepared_package = write_installer(&manifest.version, artifact, &package)?;
+
+    Ok(Some(PreparedAppUpdate {
+        version: manifest.version,
+        installer_path: prepared_package.installer_path,
+        replacement_path: prepared_package.replacement_path,
+        kind: update_kind,
+    }))
+}
+
+pub fn launch_installer(update: &PreparedAppUpdate) -> Result<(), String> {
+    match update.kind {
+        UpdateKind::WindowsMsi => launch_windows_installer(update),
+        UpdateKind::LinuxAppImage => launch_linux_appimage(update),
+    }
+}
+
+fn launch_windows_installer(update: &PreparedAppUpdate) -> Result<(), String> {
+    if !cfg!(target_os = "windows") {
+        return Err("Brick MSI updates are only supported on Windows.".to_string());
+    }
+    Command::new("msiexec.exe")
+        .arg("/i")
+        .arg(&update.installer_path)
+        .arg("/passive")
+        .arg("/norestart")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Failed to start Brick installer: {error}"))?;
+
+    Ok(())
+}
+
+fn launch_linux_appimage(update: &PreparedAppUpdate) -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        return Err("Brick AppImage updates are only supported on Linux.".to_string());
+    }
+
+    let replacement_path = update
+        .replacement_path
+        .as_ref()
+        .ok_or_else(|| "Brick AppImage update target was not prepared.".to_string())?;
+
+    fs::rename(&update.installer_path, replacement_path).map_err(|error| {
+        format!(
+            "Failed to replace Brick AppImage {}: {error}",
+            replacement_path.display()
+        )
+    })?;
+
+    Command::new(replacement_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Failed to restart Brick: {error}"))?;
+
+    Ok(())
+}
+
+fn target_update_kind() -> Option<UpdateKind> {
+    if cfg!(target_os = "windows") {
+        Some(UpdateKind::WindowsMsi)
+    } else if cfg!(target_os = "linux") && current_appimage_path().is_some() {
+        Some(UpdateKind::LinuxAppImage)
+    } else {
+        None
+    }
+}
+
+fn fetch_verified_manifest() -> Result<AppUpdateManifest, String> {
+    let client = http_client()?;
+    let manifest_response = client
+        .get(cache_busted_url(APP_MANIFEST_URL)?)
+        .send()
+        .map_err(|error| format!("Failed to download Brick app manifest: {error}"))?;
+    if manifest_response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(FEED_UNAVAILABLE_MESSAGE.to_string());
+    }
+    let manifest_bytes = manifest_response
+        .error_for_status()
+        .map_err(|error| format!("Brick app manifest request failed: {error}"))?
+        .bytes()
+        .map_err(|error| format!("Failed to read Brick app manifest: {error}"))?
+        .to_vec();
+
+    let sig_response = client
+        .get(cache_busted_url(APP_MANIFEST_SIG_URL)?)
+        .send()
+        .map_err(|error| format!("Failed to download Brick app manifest signature: {error}"))?;
+    if sig_response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(FEED_UNAVAILABLE_MESSAGE.to_string());
+    }
+    let sig_bytes = sig_response
+        .error_for_status()
+        .map_err(|error| format!("Brick app manifest signature request failed: {error}"))?
+        .bytes()
+        .map_err(|error| format!("Failed to read Brick app manifest signature: {error}"))?
+        .to_vec();
+
+    verify_manifest_signature(&manifest_bytes, &sig_bytes)?;
+    serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("Failed to parse signed Brick app manifest: {error}"))
+}
+
+fn fetch_verified_artifact(artifact: &AppUpdateArtifact) -> Result<Vec<u8>, String> {
+    validate_github_release_url(&artifact.url)?;
+    let package = http_client()?
+        .get(cache_busted_url(&artifact.url)?)
+        .send()
+        .map_err(|error| format!("Failed to download Brick installer: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Brick installer request failed: {error}"))?
+        .bytes()
+        .map_err(|error| format!("Failed to read Brick installer: {error}"))?
+        .to_vec();
+
+    if package.len() as u64 != artifact.size {
+        return Err(format!(
+            "Brick installer size mismatch: expected {}, got {}.",
+            artifact.size,
+            package.len()
+        ));
+    }
+
+    let actual_hash = sha256_hex(&package);
+    if actual_hash != artifact.sha256 {
+        return Err(format!(
+            "Brick installer SHA-256 mismatch: expected {}, got {actual_hash}.",
+            artifact.sha256
+        ));
+    }
+
+    Ok(package)
+}
+
+fn verify_manifest_signature(
+    manifest_bytes: &[u8],
+    signature_response: &[u8],
+) -> Result<(), String> {
+    let public_key_bytes = B64
+        .decode(APP_UPDATE_PUBLIC_KEY_B64)
+        .map_err(|error| format!("Invalid embedded Brick app update public key: {error}"))?;
+    let public_key: [u8; 32] = public_key_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Embedded Brick app update public key must be 32 bytes.".to_string())?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key)
+        .map_err(|error| format!("Invalid embedded Brick app update public key: {error}"))?;
+
+    let signature_text = String::from_utf8_lossy(signature_response);
+    let signature_bytes = B64
+        .decode(signature_text.trim())
+        .map_err(|error| format!("Invalid Brick app manifest signature encoding: {error}"))?;
+    let signature: [u8; 64] = signature_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Brick app manifest signature must be 64 bytes.".to_string())?;
+    let signature = Signature::from_bytes(&signature);
+
+    verifying_key
+        .verify(manifest_bytes, &signature)
+        .map_err(|error| format!("Brick app manifest signature verification failed: {error}"))
+}
+
+fn validate_manifest(manifest: &AppUpdateManifest) -> Result<(), String> {
+    if manifest.schema != 1 {
+        return Err(format!(
+            "Unsupported Brick app manifest schema {}.",
+            manifest.schema
+        ));
+    }
+    if manifest.package_id != APP_PACKAGE_ID {
+        return Err(format!(
+            "Unexpected Brick app package id {}.",
+            manifest.package_id
+        ));
+    }
+    parse_semver(&manifest.version)?;
+    if manifest.commit.trim().is_empty() || manifest.built_at.trim().is_empty() {
+        return Err("Brick app manifest is missing build metadata.".to_string());
+    }
+    if manifest.artifacts.is_empty() {
+        return Err("Brick app manifest does not list installers.".to_string());
+    }
+
+    for artifact in &manifest.artifacts {
+        if artifact.os.trim().is_empty()
+            || artifact.arch.trim().is_empty()
+            || artifact.kind.trim().is_empty()
+            || artifact.file_name.trim().is_empty()
+        {
+            return Err("Brick app manifest contains an incomplete installer.".to_string());
+        }
+        if artifact.size == 0 {
+            return Err("Brick app manifest contains an empty installer.".to_string());
+        }
+        if artifact.sha256.len() != 64
+            || !artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("Brick app manifest contains an invalid SHA-256 hash.".to_string());
+        }
+        validate_github_release_url(&artifact.url)?;
+    }
+
+    Ok(())
+}
+
+fn select_artifact<'a>(
+    manifest: &'a AppUpdateManifest,
+    update_kind: &UpdateKind,
+) -> Option<&'a AppUpdateArtifact> {
+    let arch = target_arch();
+
+    manifest.artifacts.iter().find(|artifact| {
+        artifact.os == update_kind.os()
+            && artifact.arch == arch
+            && artifact.kind == update_kind.artifact_kind()
+            && update_kind.file_name_matches(&artifact.file_name)
+    })
+}
+
+impl UpdateKind {
+    fn os(&self) -> &'static str {
+        match self {
+            Self::WindowsMsi => "windows",
+            Self::LinuxAppImage => "linux",
+        }
+    }
+
+    fn artifact_kind(&self) -> &'static str {
+        match self {
+            Self::WindowsMsi => "msi",
+            Self::LinuxAppImage => "appimage",
+        }
+    }
+
+    fn file_name_matches(&self, file_name: &str) -> bool {
+        let file_name = file_name.to_ascii_lowercase();
+        match self {
+            Self::WindowsMsi => file_name.ends_with(".msi"),
+            Self::LinuxAppImage => file_name.ends_with(".appimage"),
+        }
+    }
+}
+
+fn target_arch() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "unknown"
+    }
+}
+
+fn is_newer_version(candidate: &str, current: &str) -> Result<bool, String> {
+    Ok(compare_semver(&parse_semver(candidate)?, &parse_semver(current)?) == Ordering::Greater)
+}
+
+fn parse_semver(value: &str) -> Result<SemVer, String> {
+    let value = value.trim().trim_start_matches('v');
+    let (core, prerelease) = value.split_once('-').unwrap_or((value, ""));
+    let mut parts = core.split('.');
+    let major = parse_version_number(parts.next(), value)?;
+    let minor = parse_version_number(parts.next(), value)?;
+    let patch = parse_version_number(parts.next(), value)?;
+
+    if parts.next().is_some() {
+        return Err(format!("Invalid Brick app version {value}."));
+    }
+
+    let prerelease = if prerelease.is_empty() {
+        Vec::new()
+    } else {
+        prerelease
+            .split('.')
+            .map(|part| {
+                if part.is_empty() {
+                    return Err(format!("Invalid Brick app version {value}."));
+                }
+                Ok(match part.parse::<u64>() {
+                    Ok(number) => VersionPart::Numeric(number),
+                    Err(_) => VersionPart::Text(part.to_ascii_lowercase()),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    };
+
+    Ok(SemVer {
+        major,
+        minor,
+        patch,
+        prerelease,
+    })
+}
+
+fn parse_version_number(part: Option<&str>, full: &str) -> Result<u64, String> {
+    let Some(part) = part else {
+        return Err(format!("Invalid Brick app version {full}."));
+    };
+    if part.is_empty() || (part.len() > 1 && part.starts_with('0')) {
+        return Err(format!("Invalid Brick app version {full}."));
+    }
+    part.parse::<u64>()
+        .map_err(|_| format!("Invalid Brick app version {full}."))
+}
+
+fn compare_semver(left: &SemVer, right: &SemVer) -> Ordering {
+    left.major
+        .cmp(&right.major)
+        .then_with(|| left.minor.cmp(&right.minor))
+        .then_with(|| left.patch.cmp(&right.patch))
+        .then_with(|| compare_prerelease(&left.prerelease, &right.prerelease))
+}
+
+fn compare_prerelease(left: &[VersionPart], right: &[VersionPart]) -> Ordering {
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
+
+    for (left, right) in left.iter().zip(right.iter()) {
+        let ordering = match (left, right) {
+            (VersionPart::Numeric(left), VersionPart::Numeric(right)) => left.cmp(right),
+            (VersionPart::Numeric(_), VersionPart::Text(_)) => Ordering::Less,
+            (VersionPart::Text(_), VersionPart::Numeric(_)) => Ordering::Greater,
+            (VersionPart::Text(left), VersionPart::Text(right)) => left.cmp(right),
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+
+    left.len().cmp(&right.len())
+}
+
+fn write_installer(
+    version: &str,
+    artifact: &AppUpdateArtifact,
+    package: &[u8],
+) -> Result<PreparedPackage, String> {
+    let (update_dir, replacement_path) = update_location(artifact)?;
+    fs::create_dir_all(&update_dir).map_err(|error| {
+        format!(
+            "Failed to create Brick update folder {}: {error}",
+            update_dir.display()
+        )
+    })?;
+
+    let installer_path = update_dir.join(format!(
+        "brick-{}-{}",
+        safe_path_part(version),
+        safe_path_part(&artifact.file_name)
+    ));
+    fs::write(&installer_path, package).map_err(|error| {
+        format!(
+            "Failed to write Brick installer {}: {error}",
+            installer_path.display()
+        )
+    })?;
+
+    mark_executable_if_needed(artifact, &installer_path)?;
+
+    Ok(PreparedPackage {
+        installer_path,
+        replacement_path,
+    })
+}
+
+fn update_location(artifact: &AppUpdateArtifact) -> Result<(PathBuf, Option<PathBuf>), String> {
+    if artifact.kind == "appimage" {
+        let replacement_path = current_appimage_path()
+            .ok_or_else(|| "Brick AppImage updates require an AppImage install.".to_string())?;
+        let update_dir = replacement_path
+            .parent()
+            .ok_or_else(|| "Brick AppImage path has no parent folder.".to_string())?
+            .to_path_buf();
+        return Ok((update_dir, Some(replacement_path)));
+    }
+
+    Ok((env::temp_dir().join("Brick").join("updates"), None))
+}
+
+#[cfg(target_os = "linux")]
+fn mark_executable_if_needed(artifact: &AppUpdateArtifact, path: &PathBuf) -> Result<(), String> {
+    if artifact.kind != "appimage" {
+        return Ok(());
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| format!("Failed to read Brick AppImage permissions: {error}"))?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)
+        .map_err(|error| format!("Failed to mark Brick AppImage executable: {error}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mark_executable_if_needed(_artifact: &AppUpdateArtifact, _path: &PathBuf) -> Result<(), String> {
+    Ok(())
+}
+
+fn current_appimage_path() -> Option<PathBuf> {
+    let path = PathBuf::from(env::var_os("APPIMAGE")?);
+    let file_name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+    if !file_name.ends_with(".appimage") {
+        return None;
+    }
+
+    Some(path)
+}
+
+fn safe_path_part(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => ch,
+            _ => '-',
+        })
+        .collect()
+}
+
+fn validate_github_release_url(value: &str) -> Result<(), String> {
+    let url = Url::parse(value).map_err(|error| format!("Invalid Brick app URL: {error}"))?;
+    if url.scheme() != "https" {
+        return Err("Brick app URL must use HTTPS.".to_string());
+    }
+    if url.host_str() != Some("github.com") {
+        return Err("Brick app URL must be hosted on github.com.".to_string());
+    }
+
+    let segments = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    if segments.len() < 6
+        || segments[0] != APP_UPDATE_OWNER
+        || segments[1] != APP_UPDATE_REPO
+        || segments[2] != "releases"
+        || segments[3] != "download"
+        || segments[4] == APP_UPDATE_TAG
+        || !segments[4].starts_with('v')
+    {
+        return Err("Brick app URL must point to a versioned Brick release asset.".to_string());
+    }
+
+    Ok(())
+}
+
+fn http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .user_agent(APP_UPDATE_USER_AGENT)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|error| format!("Failed to create HTTP client: {error}"))
+}
+
+fn cache_busted_url(value: &str) -> Result<String, String> {
+    let mut url = Url::parse(value).map_err(|error| format!("Invalid download URL: {error}"))?;
+    url.query_pairs_mut()
+        .append_pair("brickCache", &Uuid::new_v4().to_string());
+    Ok(url.to_string())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_newer_version, select_artifact, validate_github_release_url, AppUpdateArtifact,
+        AppUpdateManifest, UpdateKind,
+    };
+
+    #[test]
+    fn compares_release_versions() {
+        assert!(is_newer_version("0.1.2", "0.1.1").unwrap());
+        assert!(!is_newer_version("0.1.1", "0.1.1").unwrap());
+        assert!(!is_newer_version("0.1.0", "0.1.1").unwrap());
+        assert!(is_newer_version("0.2.0", "0.1.9").unwrap());
+    }
+
+    #[test]
+    fn handles_prerelease_precedence() {
+        assert!(is_newer_version("0.1.2", "0.1.2-beta.1").unwrap());
+        assert!(is_newer_version("0.1.2-beta.2", "0.1.2-beta.1").unwrap());
+        assert!(!is_newer_version("0.1.2-beta.1", "0.1.2").unwrap());
+    }
+
+    #[test]
+    fn accepts_only_versioned_brick_release_urls() {
+        assert!(validate_github_release_url(
+            "https://github.com/IsogiE/Brick-Releases/releases/download/v0.1.2/Brick.msi"
+        )
+        .is_ok());
+        assert!(validate_github_release_url(
+            "https://github.com/IsogiE/Brick-Releases/releases/download/app-feed/Brick.msi"
+        )
+        .is_err());
+        assert!(validate_github_release_url(
+            "https://github.com/SomeoneElse/Brick-Releases/releases/download/v0.1.2/Brick.msi"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn selects_windows_msi_artifact() {
+        let manifest = test_manifest(vec![
+            artifact("linux", "x86_64", "appimage", "brick_0.2.0_x86_64.AppImage"),
+            artifact("windows", "x86_64", "msi", "Brick_0.2.0_x64.msi"),
+        ]);
+
+        let selected = select_artifact(&manifest, &UpdateKind::WindowsMsi).unwrap();
+        assert_eq!(selected.file_name, "Brick_0.2.0_x64.msi");
+    }
+
+    #[test]
+    fn selects_linux_appimage_artifact() {
+        let manifest = test_manifest(vec![
+            artifact("windows", "x86_64", "msi", "Brick_0.2.0_x64.msi"),
+            artifact("linux", "x86_64", "appimage", "brick_0.2.0_x86_64.AppImage"),
+        ]);
+
+        let selected = select_artifact(&manifest, &UpdateKind::LinuxAppImage).unwrap();
+        assert_eq!(selected.file_name, "brick_0.2.0_x86_64.AppImage");
+    }
+
+    #[test]
+    fn accepts_appimage_release_urls() {
+        assert!(validate_github_release_url(
+            "https://github.com/IsogiE/Brick-Releases/releases/download/v0.2.0/brick_0.2.0_x86_64.AppImage"
+        )
+        .is_ok());
+    }
+
+    fn test_manifest(artifacts: Vec<AppUpdateArtifact>) -> AppUpdateManifest {
+        AppUpdateManifest {
+            schema: 1,
+            package_id: "Brick".to_string(),
+            version: "0.2.0".to_string(),
+            commit: "abc123".to_string(),
+            built_at: "2026-09-04T00:00:00Z".to_string(),
+            artifacts,
+        }
+    }
+
+    fn artifact(os: &str, arch: &str, kind: &str, file_name: &str) -> AppUpdateArtifact {
+        AppUpdateArtifact {
+            os: os.to_string(),
+            arch: arch.to_string(),
+            kind: kind.to_string(),
+            file_name: file_name.to_string(),
+            url: format!(
+                "https://github.com/IsogiE/Brick-Releases/releases/download/v0.2.0/{file_name}"
+            ),
+            sha256: "a".repeat(64),
+            size: 1,
+        }
+    }
+}

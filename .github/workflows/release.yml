@@ -31,6 +31,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust builds
@@ -67,6 +71,11 @@ jobs:
         env:
           BRICK_APP_VERSION: ${{ inputs.version }}
         run: node scripts/set-app-version.mjs
+
+      - name: Verify release keys
+        env:
+          BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
+        run: node -e "if (!process.env.BRICK_ADDON_PUBLIC_KEY_B64) throw new Error('BRICK_ADDON_PUBLIC_KEY_B64 is required.');"
 
       - name: Build Windows binary for signing
         if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
@@ -141,9 +150,20 @@ jobs:
       contents: read
 
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
+
+      - name: Verify app feed signing key
+        env:
+          BRICK_ADDON_PRIVATE_KEY_B64: ${{ secrets.BRICK_ADDON_PRIVATE_KEY_B64 }}
+        run: node -e "if (!process.env.BRICK_ADDON_PRIVATE_KEY_B64) throw new Error('BRICK_ADDON_PRIVATE_KEY_B64 is required.');"
 
       - name: Publish release assets
         env:
@@ -161,3 +181,11 @@ jobs:
           while IFS= read -r -d '' file; do
             gh release upload "$tag" "$file" --repo "$repo" --clobber
           done < <(find release-assets -type f -print0)
+
+      - name: Publish app update feed
+        env:
+          GH_TOKEN: ${{ secrets.BRICK_RELEASE_TOKEN }}
+          BRICK_APP_VERSION: ${{ inputs.version }}
+          BRICK_ADDON_PRIVATE_KEY_B64: ${{ secrets.BRICK_ADDON_PRIVATE_KEY_B64 }}
+          BRICK_RELEASE_ASSETS_DIR: release-assets
+        run: node scripts/publish-app-feed.mjs
