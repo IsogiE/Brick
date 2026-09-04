@@ -18,8 +18,8 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            formats: wix
-            cache-formats: wix
+            formats: nsis,wix
+            cache-formats: nsis-wix
           - os: ubuntu-22.04
             formats: appimage,deb,pacman
             cache-formats: appimage-deb-pacman
@@ -124,7 +124,7 @@ jobs:
           NO_STRIP: 1
         run: cargo packager --config Packager.signed.toml --formats ${{ matrix.formats }}
 
-      - name: Sign Windows installer
+      - name: Sign Windows MSI installer
         if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
         uses: azure/artifact-signing-action@v2
         with:
@@ -133,6 +133,20 @@ jobs:
           certificate-profile-name: ${{ secrets.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
           files-folder: ${{ github.workspace }}\dist\packages
           files-folder-filter: '*.msi'
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Sign Windows NSIS installer
+        if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ secrets.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files-folder: ${{ github.workspace }}\dist\packages
+          files-folder-filter: '*.exe'
           files-folder-recurse: false
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com

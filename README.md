@@ -8,7 +8,7 @@ Brick is a native Rust desktop app. It does not use Electron, Tauri, WebView2, W
 
 ## Targets
 
-- Windows: MSI installer.
+- Windows: NSIS current-user installer. MSI can be built as a legacy bridge, but it is not the preferred mass-rollout installer.
 - Linux: AppImage for Arch/CachyOS and other desktop distros, plus deb/pacman artifacts for Ubuntu/Debian/Arch-style installs.
 
 ## First Setup
@@ -45,7 +45,7 @@ Optional Windows signing setup:
 - Add secrets `AZURE_ARTIFACT_SIGNING_ENDPOINT`, `AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME`, and `AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME`.
 - Assign that Azure identity the Artifact Signing Certificate Profile Signer role.
 
-When enabled, the release workflow signs `brick.exe` before MSI packaging and signs the final MSI before publishing.
+When enabled, the release workflow signs `brick.exe` before Windows packaging and signs the final Windows installers before publishing.
 
 The public AdvanceRaidTools addon repo does not need Brick feed scripts or Brick signing secrets. For near-immediate feed publishing, it does need one dispatch-only secret:
 
@@ -68,7 +68,8 @@ You can also run the `Release` workflow manually and provide a SemVer version. I
 
 The release workflow publishes to `IsogiE/Brick-Releases` and builds:
 
-- Windows MSI installer
+- Windows NSIS current-user installer
+- Windows MSI installer as a legacy bridge artifact
 - Linux AppImage
 - Linux deb
 - Linux pacman package
@@ -78,7 +79,7 @@ The published app packages are separate from the addon feed. After publishing th
 - `app-manifest.json`
 - `app-manifest.json.sig`
 
-Installed Brick clients with app self-update support check the signed app feed on startup and periodically while running. On Windows, Brick downloads the newest MSI, verifies the manifest signature and MSI SHA-256, starts the installer in passive mode, and exits so Windows Installer can finish the update. On Linux AppImage installs, Brick downloads the newest AppImage, verifies the manifest signature and AppImage SHA-256, atomically replaces the current AppImage, restarts Brick, and exits the old process. Brick clients older than the self-update baseline need one more installer install to receive this capability.
+Installed Brick clients with app self-update support check the signed app feed on startup and periodically while running. On Windows, Brick downloads the newest NSIS installer, verifies the manifest signature and installer SHA-256, runs it silently in the current-user install location, and exits so the installer can restart Brick. This does not require UAC when Brick is installed under the user's profile. On Linux AppImage installs, Brick downloads the newest AppImage, verifies the manifest signature and AppImage SHA-256, atomically replaces the current AppImage, restarts Brick, and exits the old process. MSI, deb, and pacman installs are system-package style artifacts and may require elevation, so they are not the preferred self-update path. Brick clients older than the self-update baseline need one more installer install to receive this capability.
 
 ## Addon Feed
 

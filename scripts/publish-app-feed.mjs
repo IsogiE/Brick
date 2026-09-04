@@ -30,7 +30,7 @@ async function main() {
   const ghToken = requiredEnvAny(['GH_TOKEN', 'GITHUB_TOKEN']);
 
   if (artifacts.length === 0) {
-    throw new Error(`No Brick ${version} MSI or AppImage found under ${releaseAssetsDir}.`);
+    throw new Error(`No Brick ${version} NSIS/MSI installer or AppImage found under ${releaseAssetsDir}.`);
   }
 
   const manifest = {
@@ -79,7 +79,7 @@ function releaseVersion() {
 
 function findAppArtifacts(dir, releaseTag, version) {
   return findFiles(dir)
-    .filter((path) => /\.(msi|appimage)$/i.test(path) && fileBelongsToVersion(basename(path), version))
+    .filter((path) => /\.(exe|msi|appimage)$/i.test(path) && fileBelongsToVersion(basename(path), version))
     .map((path) => appArtifact(path, releaseTag))
     .sort((a, b) => a.fileName.localeCompare(b.fileName));
 }
@@ -95,7 +95,7 @@ function appArtifact(path, releaseTag) {
   const kind = inferKind(fileName);
 
   return {
-    os: kind === 'msi' ? 'windows' : 'linux',
+    os: kind === 'appimage' ? 'linux' : 'windows',
     arch: inferArch(fileName),
     kind,
     fileName,
@@ -106,7 +106,13 @@ function appArtifact(path, releaseTag) {
 }
 
 function inferKind(fileName) {
-  return /\.appimage$/i.test(fileName) ? 'appimage' : 'msi';
+  if (/\.appimage$/i.test(fileName)) {
+    return 'appimage';
+  }
+  if (/\.msi$/i.test(fileName)) {
+    return 'msi';
+  }
+  return 'nsis';
 }
 
 function inferArch(fileName) {

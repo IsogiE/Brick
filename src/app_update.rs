@@ -43,7 +43,7 @@ pub struct PreparedAppUpdate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateKind {
-    WindowsMsi,
+    WindowsNsis,
     LinuxAppImage,
 }
 
@@ -127,20 +127,19 @@ pub fn prepare_available_update() -> Result<Option<PreparedAppUpdate>, String> {
 
 pub fn launch_installer(update: &PreparedAppUpdate) -> Result<(), String> {
     match update.kind {
-        UpdateKind::WindowsMsi => launch_windows_installer(update),
+        UpdateKind::WindowsNsis => launch_windows_nsis_installer(update),
         UpdateKind::LinuxAppImage => launch_linux_appimage(update),
     }
 }
 
-fn launch_windows_installer(update: &PreparedAppUpdate) -> Result<(), String> {
+fn launch_windows_nsis_installer(update: &PreparedAppUpdate) -> Result<(), String> {
     if !cfg!(target_os = "windows") {
-        return Err("Brick MSI updates are only supported on Windows.".to_string());
+        return Err("Brick NSIS updates are only supported on Windows.".to_string());
     }
-    Command::new("msiexec.exe")
-        .arg("/i")
-        .arg(&update.installer_path)
-        .arg("/passive")
-        .arg("/norestart")
+    Command::new(&update.installer_path)
+        .arg("/S")
+        .arg("/R")
+        .arg("/NS")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -179,7 +178,7 @@ fn launch_linux_appimage(update: &PreparedAppUpdate) -> Result<(), String> {
 
 fn target_update_kind() -> Option<UpdateKind> {
     if cfg!(target_os = "windows") {
-        Some(UpdateKind::WindowsMsi)
+        Some(UpdateKind::WindowsNsis)
     } else if cfg!(target_os = "linux") && current_appimage_path().is_some() {
         Some(UpdateKind::LinuxAppImage)
     } else {
@@ -342,14 +341,14 @@ fn select_artifact<'a>(
 impl UpdateKind {
     fn os(&self) -> &'static str {
         match self {
-            Self::WindowsMsi => "windows",
+            Self::WindowsNsis => "windows",
             Self::LinuxAppImage => "linux",
         }
     }
 
     fn artifact_kind(&self) -> &'static str {
         match self {
-            Self::WindowsMsi => "msi",
+            Self::WindowsNsis => "nsis",
             Self::LinuxAppImage => "appimage",
         }
     }
@@ -357,7 +356,7 @@ impl UpdateKind {
     fn file_name_matches(&self, file_name: &str) -> bool {
         let file_name = file_name.to_ascii_lowercase();
         match self {
-            Self::WindowsMsi => file_name.ends_with(".msi"),
+            Self::WindowsNsis => file_name.ends_with(".exe"),
             Self::LinuxAppImage => file_name.ends_with(".appimage"),
         }
     }
@@ -631,20 +630,21 @@ mod tests {
     }
 
     #[test]
-    fn selects_windows_msi_artifact() {
+    fn selects_windows_nsis_artifact() {
         let manifest = test_manifest(vec![
             artifact("linux", "x86_64", "appimage", "brick_0.2.0_x86_64.AppImage"),
             artifact("windows", "x86_64", "msi", "Brick_0.2.0_x64.msi"),
+            artifact("windows", "x86_64", "nsis", "Brick_0.2.0_x64-setup.exe"),
         ]);
 
-        let selected = select_artifact(&manifest, &UpdateKind::WindowsMsi).unwrap();
-        assert_eq!(selected.file_name, "Brick_0.2.0_x64.msi");
+        let selected = select_artifact(&manifest, &UpdateKind::WindowsNsis).unwrap();
+        assert_eq!(selected.file_name, "Brick_0.2.0_x64-setup.exe");
     }
 
     #[test]
     fn selects_linux_appimage_artifact() {
         let manifest = test_manifest(vec![
-            artifact("windows", "x86_64", "msi", "Brick_0.2.0_x64.msi"),
+            artifact("windows", "x86_64", "nsis", "Brick_0.2.0_x64-setup.exe"),
             artifact("linux", "x86_64", "appimage", "brick_0.2.0_x86_64.AppImage"),
         ]);
 

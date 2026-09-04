@@ -2,14 +2,14 @@
 
 Brick has one high-risk job: it writes files onto guild members' computers automatically. The app is built around keeping that power narrow.
 
-- The app does not run Git, shell scripts, Lua, or downloaded executables.
+- The app does not run Git, shell scripts, Lua, or arbitrary downloaded executables. The only downloaded executable allowed is a Brick app installer from signed app-update metadata.
 - The addon feed manifest must be signed with the embedded Ed25519 public key.
 - The addon zip must match the SHA-256 hash from the signed manifest.
 - Downloads must come from the `IsogiE/Brick-Releases` `addon-feed` GitHub release URL namespace.
 - Zip entries are rejected if they escape the allowed addon folders.
 - Only these folders are managed: `AdvanceRaidTools`, `AdvanceRaidTools_Libraries`, and `AdvanceRaidTools_Options`.
 - Existing managed folders are deleted and replaced after verification, matching normal addon-manager behavior.
-- App binary releases are produced from the native Rust binary with Cargo Packager. App self-updates use release metadata signed by the existing Brick Ed25519 feed key, verify the downloaded MSI or AppImage SHA-256, and must not execute downloaded scripts.
+- App binary releases are produced from the native Rust binary with Cargo Packager. App self-updates use release metadata signed by the existing Brick Ed25519 feed key, verify the downloaded NSIS installer or AppImage SHA-256, and must not execute downloaded scripts.
 - Client PCs do not get GitHub, CurseForge, or Wago tokens.
 - The addon feed worker lives in the private Brick repo. It packages public ART source in GitHub Actions, then publishes signed public feed assets to `IsogiE/Brick-Releases`.
 - The public addon repo should not contain Brick signing keys or feed publishing scripts.
