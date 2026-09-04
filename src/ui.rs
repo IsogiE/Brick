@@ -950,24 +950,28 @@ impl BrickApp {
     fn draw_header(&mut self, ui: &mut egui::Ui) {
         let app_version = concat!("v", env!("CARGO_PKG_VERSION"));
 
-        ui.horizontal_centered(|ui| {
-            draw_icon(ui, self.brick_texture.as_ref(), 44.0);
-            ui.add_space(10.0);
-            ui.label(
-                RichText::new("Brick")
-                    .size(25.0)
-                    .strong()
-                    .color(Color32::from_rgb(244, 247, 251)),
-            );
-            ui.add_space(2.0);
-            capsule(
-                ui,
-                app_version,
-                Color32::from_rgb(215, 223, 234),
-                Color32::from_rgb(38, 42, 50),
-            );
-            self.draw_app_update_control(ui);
-        });
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 46.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                draw_icon(ui, self.brick_texture.as_ref(), 44.0);
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new("Brick")
+                        .size(25.0)
+                        .strong()
+                        .color(Color32::from_rgb(244, 247, 251)),
+                );
+                ui.add_space(2.0);
+                capsule(
+                    ui,
+                    app_version,
+                    Color32::from_rgb(215, 223, 234),
+                    Color32::from_rgb(38, 42, 50),
+                );
+                self.draw_app_update_control(ui);
+            },
+        );
     }
 
     fn draw_app_update_control(&mut self, ui: &mut egui::Ui) {
