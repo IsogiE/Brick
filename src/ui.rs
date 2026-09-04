@@ -1578,8 +1578,9 @@ fn header_chip(ui: &mut egui::Ui, text: &str, width: f32, text_color: Color32, f
 
 fn header_status_text(ui: &mut egui::Ui, text: &str, color: Color32) {
     let width = match text {
-        "Up to date" => 68.0,
-        "Checking" => 60.0,
+        "Up to date" | "Checking" => 68.0,
+        text if text.starts_with('v') => 68.0,
+        text if text.starts_with("Installing") => 112.0,
         _ => 132.0,
     };
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::hover());
