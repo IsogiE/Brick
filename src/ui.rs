@@ -91,7 +91,7 @@ enum AppUpdateUiState {
     Checking,
     UpToDate,
     Available(String),
-    Installing(String),
+    Installing,
     Error(String),
 }
 
@@ -541,14 +541,14 @@ impl BrickApp {
             ctx.request_repaint();
         });
         self.app_update_install_rx = Some(rx);
-        self.app_update_state = AppUpdateUiState::Installing(version.clone());
+        self.app_update_state = AppUpdateUiState::Installing;
         self.status = format!("Preparing Brick {version}.");
     }
 
     fn start_periodic_app_update_check(&mut self) {
         if matches!(
             self.app_update_state,
-            AppUpdateUiState::Available(_) | AppUpdateUiState::Installing(_)
+            AppUpdateUiState::Available(_) | AppUpdateUiState::Installing
         ) {
             return;
         }
@@ -634,7 +634,7 @@ impl BrickApp {
                     Ok(()) => {
                         let _ = addon::record_log(LogLevel::Info, message.clone());
                         self.status = message;
-                        self.app_update_state = AppUpdateUiState::Installing(version);
+                        self.app_update_state = AppUpdateUiState::Installing;
                         self.app_update_install_rx = None;
                         self.quit_requested = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2017,8 +2017,8 @@ fn app_update_status_text(state: &AppUpdateUiState) -> String {
         AppUpdateUiState::Idle => String::new(),
         AppUpdateUiState::Checking => "Checking".to_string(),
         AppUpdateUiState::UpToDate => "Up to date".to_string(),
-        AppUpdateUiState::Available(version) => format!("v{version}"),
-        AppUpdateUiState::Installing(version) => format!("Installing v{version}"),
+        AppUpdateUiState::Available(_) => "Update available".to_string(),
+        AppUpdateUiState::Installing => "Installing update".to_string(),
         AppUpdateUiState::Error(message) => message.clone(),
     }
 }
