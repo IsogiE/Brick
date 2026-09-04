@@ -19,6 +19,7 @@ use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
     let startup_mode = env::args().any(|arg| arg == "--startup");
+    let start_hidden = startup_mode && addon::startup_minimized_enabled();
     let _instance_guard = match single_instance::acquire() {
         Ok(guard) => Some(guard),
         Err(single_instance::InstanceLockError::AlreadyRunning) => {
@@ -45,7 +46,7 @@ fn main() -> Result<(), eframe::Error> {
     if let Some(icon) = ui::load_window_icon() {
         viewport = viewport.with_icon(icon);
     }
-    if startup_mode {
+    if start_hidden {
         viewport = viewport.with_visible(false);
     }
 

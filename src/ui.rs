@@ -191,6 +191,20 @@ impl BrickApp {
         }
     }
 
+    fn set_startup_minimized(&mut self, enabled: bool) {
+        match addon::set_startup_minimized(enabled) {
+            Ok(view) => {
+                self.view = view;
+                self.status = if enabled {
+                    "Brick will start minimized.".to_string()
+                } else {
+                    "Brick will open at login.".to_string()
+                };
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
     fn start_sync(&mut self) {
         if self.sync_rx.is_some() {
             return;
@@ -566,33 +580,18 @@ impl BrickApp {
         ui.add_space(8.0);
 
         panel_frame().show(ui, |ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), 34.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    let text_width = (ui.available_width() - 74.0).max(180.0);
+            let startup_enabled =
+                self.view.settings.startup_enabled && self.view.settings.watcher_enabled;
+            if settings_toggle_row(ui, "Open at login", startup_enabled) {
+                self.set_automation(!startup_enabled);
+            }
 
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(text_width, 34.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.label(
-                                RichText::new("Open at login")
-                                    .strong()
-                                    .color(primary_text()),
-                            );
-                        },
-                    );
+            ui.separator();
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let enabled = self.view.settings.startup_enabled
-                            && self.view.settings.watcher_enabled;
-                        if toggle(ui, enabled) {
-                            self.set_automation(!enabled);
-                        }
-                    });
-                },
-            );
+            let startup_minimized = self.view.settings.startup_minimized;
+            if settings_toggle_row(ui, "Start minimized", startup_minimized) {
+                self.set_startup_minimized(!startup_minimized);
+            }
         });
     }
 
@@ -870,6 +869,32 @@ fn toggle(ui: &mut egui::Ui, on: bool) -> bool {
             .circle_filled(egui::pos2(x, rect.center().y), 8.5, knob);
     }
     response.clicked()
+}
+
+fn settings_toggle_row(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
+    let mut clicked = false;
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), 34.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            let text_width = (ui.available_width() - 74.0).max(180.0);
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(text_width, 34.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.label(RichText::new(label).strong().color(primary_text()));
+                },
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if toggle(ui, on) {
+                    clicked = true;
+                }
+            });
+        },
+    );
+    clicked
 }
 
 fn current_version(clients: &[WowClient]) -> Option<String> {

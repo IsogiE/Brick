@@ -81,6 +81,8 @@ The published app packages are separate from the addon feed. After publishing th
 
 Installed Brick clients with app self-update support check the signed app feed on startup and periodically while running. On Windows, Brick downloads the newest NSIS installer, verifies the manifest signature and installer SHA-256, runs it silently in the current-user install location, and exits so the installer can restart Brick. This does not require UAC when Brick is installed under the user's profile. Silent NSIS updates force `%LOCALAPPDATA%\Brick` so clients that originally arrived through an MSI bridge do not try to update inside Program Files without elevation. On Linux AppImage installs, Brick downloads the newest AppImage, verifies the manifest signature and AppImage SHA-256, atomically replaces the current AppImage, restarts Brick, and exits the old process. MSI, deb, and pacman installs are system-package style artifacts and may require elevation, so they are not the preferred self-update path. Brick clients older than the self-update baseline need one more installer install to receive this capability.
 
+Brick enables login startup by default after setup. Login launches pass `--startup`; Brick starts hidden/minimized by default and exposes a Settings toggle to let users open the full window at login instead.
+
 ## Addon Feed
 
 The `Addon feed` workflow in this repo checks out public `IsogiE/AdvanceRaidTools` source, runs the pinned BigWigs packager in no-upload mode, signs the package metadata, and publishes the current package to:

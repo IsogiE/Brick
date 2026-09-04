@@ -58,6 +58,8 @@ pub struct Settings {
     pub schema: u32,
     pub watcher_enabled: bool,
     pub startup_enabled: bool,
+    #[serde(default = "default_true")]
+    pub startup_minimized: bool,
     pub clients: Vec<WowClient>,
 }
 
@@ -67,9 +69,14 @@ impl Default for Settings {
             schema: 1,
             watcher_enabled: true,
             startup_enabled: true,
+            startup_minimized: true,
             clients: Vec::new(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +246,12 @@ pub fn load_view() -> Result<AppView, String> {
     view_from_settings(settings)
 }
 
+pub fn startup_minimized_enabled() -> bool {
+    load_settings()
+        .map(|settings| settings.startup_minimized)
+        .unwrap_or(true)
+}
+
 pub fn add_wow_paths(paths: &[PathBuf]) -> Result<AppView, String> {
     let mut new_clients = Vec::new();
     let mut seen = HashSet::new();
@@ -331,6 +344,20 @@ pub fn set_automation_enabled(enabled: bool) -> Result<AppView, String> {
         format!(
             "Brick automation {}.",
             if enabled { "enabled" } else { "paused" }
+        ),
+    )?;
+    view_from_settings(settings)
+}
+
+pub fn set_startup_minimized(enabled: bool) -> Result<AppView, String> {
+    let mut settings = load_settings()?;
+    settings.startup_minimized = enabled;
+    save_settings(&settings)?;
+    record_log(
+        LogLevel::Info,
+        format!(
+            "Brick startup minimized {}.",
+            if enabled { "enabled" } else { "disabled" }
         ),
     )?;
     view_from_settings(settings)
