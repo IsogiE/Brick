@@ -67,6 +67,17 @@ jobs:
             cargo install cargo-packager --locked
           fi
 
+      - name: Download AppImage runtime
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/appimage-runtime"
+          curl -L --fail --retry 3 \
+            -o "$RUNNER_TEMP/appimage-runtime/runtime-x86_64" \
+            https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
+          echo "LDAI_RUNTIME_FILE=$RUNNER_TEMP/appimage-runtime/runtime-x86_64" >> "$GITHUB_ENV"
+
       - name: Configure version
         env:
           BRICK_APP_VERSION: ${{ inputs.version }}
