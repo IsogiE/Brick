@@ -55,7 +55,10 @@ fn main() -> Result<(), eframe::Error> {
 
     let options = eframe::NativeOptions {
         viewport,
+        #[cfg(target_os = "windows")]
         renderer: eframe::Renderer::Wgpu,
+        #[cfg(not(target_os = "windows"))]
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 

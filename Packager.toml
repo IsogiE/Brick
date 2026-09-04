@@ -1,7 +1,7 @@
 name = "brick"
 product-name = "Brick"
 identifier = "dev.isogi.brick"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["Advance Raid Tools"]
 publisher = "Advance"
 description = "Advance Raid Tools"

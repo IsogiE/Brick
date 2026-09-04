@@ -1,6 +1,6 @@
 [package]
 name = "brick"
-version = "0.3.0"
+version = "0.3.1"
 description = "Advance"
 authors = ["Advance Raid Tools"]
 license = "All rights reserved"
@@ -11,7 +11,7 @@ edition = "2021"
 auto-launch = "0.5"
 base64 = "0.22"
 ed25519-dalek = "2"
-eframe = { version = "=0.33.3", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "wayland", "web_screen_reader", "x11"] }
+eframe = { version = "=0.33.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "wgpu", "wayland", "web_screen_reader", "x11"] }
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 fs2 = "0.4"
