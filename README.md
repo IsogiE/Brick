@@ -8,7 +8,7 @@ Brick is a native Rust desktop app. It does not use Electron, Tauri, WebView2, W
 
 ## Targets
 
-- Windows: NSIS current-user installer. MSI can be built as a legacy bridge, but it is not the preferred mass-rollout installer.
+- Windows: NSIS current-user `.exe` installer.
 - Linux: AppImage for Arch/CachyOS and other desktop distros, plus deb/pacman artifacts for Ubuntu/Debian/Arch-style installs.
 
 ## First Setup
@@ -69,7 +69,6 @@ You can also run the `Release` workflow manually and provide a SemVer version. I
 The release workflow publishes to `IsogiE/Brick-Releases` and builds:
 
 - Windows NSIS current-user installer
-- Windows MSI installer as a legacy bridge artifact
 - Linux AppImage
 - Linux deb
 - Linux pacman package
@@ -79,7 +78,7 @@ The published app packages are separate from the addon feed. After publishing th
 - `app-manifest.json`
 - `app-manifest.json.sig`
 
-Installed Brick clients with app self-update support check the signed app feed on startup and periodically while running. On Windows, Brick downloads the newest NSIS installer, verifies the manifest signature and installer SHA-256, runs it silently in the current-user install location, and exits so the installer can restart Brick. This does not require UAC when Brick is installed under the user's profile. Silent NSIS updates force `%LOCALAPPDATA%\Brick` so clients that originally arrived through an MSI bridge do not try to update inside Program Files without elevation. On Linux AppImage installs, Brick downloads the newest AppImage, verifies the manifest signature and AppImage SHA-256, atomically replaces the current AppImage, restarts Brick, and exits the old process. MSI, deb, and pacman installs are system-package style artifacts and may require elevation, so they are not the preferred self-update path. Brick clients older than the self-update baseline need one more installer install to receive this capability.
+Installed Brick clients with app self-update support check the signed app feed on startup and periodically while running. On Windows, Brick downloads the newest NSIS installer, verifies the manifest signature and installer SHA-256, runs it silently in the current-user install location, and exits so the installer can restart Brick. This does not require UAC when Brick is installed under the user's profile. Silent NSIS updates force `%LOCALAPPDATA%\Brick` so future updates stay in the current-user install location. On Linux AppImage installs, Brick downloads the newest AppImage, verifies the manifest signature and AppImage SHA-256, atomically replaces the current AppImage, restarts Brick, and exits the old process. Deb and pacman installs are system-package style artifacts and may require elevation, so they are not the preferred self-update path. Brick clients older than the self-update baseline need one more installer install to receive this capability.
 
 Brick enables login startup by default after setup. Login launches pass `--startup`; Brick starts hidden/minimized by default and exposes a Settings toggle to let users open the full window at login instead.
 

@@ -629,15 +629,15 @@ mod tests {
     #[test]
     fn accepts_only_versioned_brick_release_urls() {
         assert!(validate_github_release_url(
-            "https://github.com/IsogiE/Brick-Releases/releases/download/v0.1.2/Brick.msi"
+            "https://github.com/IsogiE/Brick-Releases/releases/download/v0.1.2/Brick.exe"
         )
         .is_ok());
         assert!(validate_github_release_url(
-            "https://github.com/IsogiE/Brick-Releases/releases/download/app-feed/Brick.msi"
+            "https://github.com/IsogiE/Brick-Releases/releases/download/app-feed/Brick.exe"
         )
         .is_err());
         assert!(validate_github_release_url(
-            "https://github.com/SomeoneElse/Brick-Releases/releases/download/v0.1.2/Brick.msi"
+            "https://github.com/SomeoneElse/Brick-Releases/releases/download/v0.1.2/Brick.exe"
         )
         .is_err());
     }
@@ -646,7 +646,6 @@ mod tests {
     fn selects_windows_nsis_artifact() {
         let manifest = test_manifest(vec![
             artifact("linux", "x86_64", "appimage", "brick_0.2.0_x86_64.AppImage"),
-            artifact("windows", "x86_64", "msi", "Brick_0.2.0_x64.msi"),
             artifact("windows", "x86_64", "nsis", "Brick_0.2.0_x64-setup.exe"),
         ]);
 
