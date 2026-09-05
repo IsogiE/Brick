@@ -31,6 +31,8 @@ Before syncing the addon, Brick requires Discord OAuth login. It uses the public
 - Keep app binary updates on signed release metadata. Do not run downloaded scripts or Git commands.
 - Keep Discord auth as an OAuth user-token check; do not embed bot tokens or Discord client secrets in Brick.
 - Existing managed addon folders are deleted and replaced after verification. Do not add backups unless Lucas asks for that again.
+- After a successful addon installation, remove its staging transaction and all leftover transaction directories from interrupted runs. Do not retain old staging transactions as backups or follow staging-directory links during cleanup.
+- App-update checks also clean recognized installers in the temporary `Brick/updates` cache for the running app version and older versions, including legacy MSI downloads. Keep newer pending downloads and any running executable/AppImage; never recurse into this cache or follow links. Cleanup is best effort so locked Windows installers can be retried by a later check without blocking updates.
 
 ## Repo Split
 

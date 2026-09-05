@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     convert::TryInto,
     env, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::LazyLock,
     time::Duration,
@@ -110,6 +110,10 @@ enum VersionPart {
 }
 
 pub fn check_available_update() -> Result<Option<AvailableAppUpdate>, String> {
+    // The running version confirms installation succeeded. This also retries
+    // cleanup when Windows still held the installer open during the restart.
+    cleanup_installer_cache();
+
     let Some((manifest, _artifact_index)) = find_available_update()? else {
         return Ok(None);
     };
@@ -548,7 +552,72 @@ fn update_location(artifact: &AppUpdateArtifact) -> Result<(PathBuf, Option<Path
         return Ok((update_dir, Some(replacement_path)));
     }
 
-    Ok((env::temp_dir().join("Brick").join("updates"), None))
+    Ok((installer_cache_dir(), None))
+}
+
+fn installer_cache_dir() -> PathBuf {
+    env::temp_dir().join("Brick").join("updates")
+}
+
+fn cleanup_installer_cache() {
+    let Ok(current_version) = parse_semver(env!("CARGO_PKG_VERSION")) else {
+        return;
+    };
+    let protected_paths: Vec<_> = [env::current_exe().ok(), current_appimage_path()]
+        .into_iter()
+        .flatten()
+        .collect();
+    cleanup_completed_installers(&installer_cache_dir(), &current_version, &protected_paths);
+}
+
+fn cleanup_completed_installers(
+    directory: &Path,
+    current_version: &SemVer,
+    protected_paths: &[PathBuf],
+) {
+    // Only remove recognized, regular files in Brick's own cache. Do not follow
+    // links or recurse into directories, including a redirected cache root.
+    let Ok(metadata) = fs::symlink_metadata(directory) else {
+        return;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if protected_paths.contains(&path) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(version) = name.to_str().and_then(cached_installer_version) else {
+            continue;
+        };
+        // A newer download may be awaiting installation or a retry. Retain it
+        // until that version (or a later one) is actually running.
+        if compare_semver(&version, current_version) != Ordering::Greater {
+            let _ = fs::remove_file(path);
+        }
+    }
+    // A busy installer or an unrecognized entry simply keeps the folder alive.
+    let _ = fs::remove_dir(directory);
+}
+
+fn cached_installer_version(file_name: &str) -> Option<SemVer> {
+    let name = file_name.to_ascii_lowercase();
+    let (version, artifact_suffix) = name.strip_prefix("brick-")?.rsplit_once("-brick")?;
+    if !(artifact_suffix.ends_with(".exe")
+        || artifact_suffix.ends_with(".msi")
+        || artifact_suffix.ends_with(".appimage"))
+    {
+        return None;
+    }
+    parse_semver(version).ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -651,10 +720,136 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use super::{
-        is_newer_version, select_artifact, validate_github_release_url, AppUpdateArtifact,
-        AppUpdateManifest, UpdateKind,
+        cleanup_completed_installers, is_newer_version, parse_semver, select_artifact,
+        validate_github_release_url, AppUpdateArtifact, AppUpdateManifest, UpdateKind,
     };
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("brick-cache-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn cleanup_removes_completed_installers_but_preserves_pending_and_unrelated_files() {
+        let root = TestDirectory::new();
+        let removed = [
+            "brick-0.2.1-Brick.msi",
+            "brick-v0.3.5-brick_0.3.5_x64-setup.exe",
+            "brick-0.3.6-beta.1-Brick.exe",
+            "brick-0.3.6-brick_0.3.6_x64-setup.exe",
+        ];
+        let retained = [
+            "brick-0.3.7-beta.1-brick_0.3.7-beta.1_x64-setup.exe",
+            "brick-0.3.10-brick_0.3.10_x64-setup.exe",
+            "notes.txt",
+            "other.exe",
+            "brick-unknown-Brick.exe",
+            "brick-0.3.5-Brick.txt",
+        ];
+        for name in removed.iter().chain(retained.iter()) {
+            fs::write(root.0.join(name), b"keep until installed").unwrap();
+        }
+        let nested = root.0.join("brick-0.3.5-Brick.exe");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("keep.txt"), b"keep").unwrap();
+
+        cleanup_completed_installers(&root.0, &parse_semver("0.3.6").unwrap(), &[]);
+
+        for name in removed {
+            assert!(!root.0.join(name).exists(), "{name}");
+        }
+        for name in retained {
+            assert_eq!(
+                fs::read(root.0.join(name)).unwrap(),
+                b"keep until installed"
+            );
+        }
+        assert_eq!(fs::read(nested.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn cleanup_waits_for_the_downloaded_version_to_run_and_removes_the_empty_cache() {
+        let root = TestDirectory::new();
+        let installer = root.0.join("brick-0.3.7-Brick.exe");
+        fs::write(&installer, b"pending").unwrap();
+        cleanup_completed_installers(&root.0, &parse_semver("0.3.7-beta.1").unwrap(), &[]);
+        assert!(installer.exists());
+
+        cleanup_completed_installers(&root.0, &parse_semver("0.3.7").unwrap(), &[]);
+        assert!(!root.0.exists());
+        cleanup_completed_installers(&root.0, &parse_semver("0.3.7").unwrap(), &[]);
+    }
+
+    #[test]
+    fn cleanup_preserves_the_running_image_even_in_the_legacy_cache() {
+        let root = TestDirectory::new();
+        let image = root.0.join("brick-0.3.6-brick_0.3.6_x86_64.AppImage");
+        fs::write(&image, b"running image").unwrap();
+        cleanup_completed_installers(
+            &root.0,
+            &parse_semver("0.3.6").unwrap(),
+            std::slice::from_ref(&image),
+        );
+        assert_eq!(fs::read(image).unwrap(), b"running image");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_does_not_follow_cache_or_file_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new();
+        let outside = TestDirectory::new();
+        let name = "brick-0.3.5-Brick.exe";
+        let target = outside.0.join(name);
+        fs::write(&target, b"outside cache").unwrap();
+        symlink(&target, root.0.join(name)).unwrap();
+        cleanup_completed_installers(&root.0, &parse_semver("0.3.6").unwrap(), &[]);
+        assert!(root.0.join(name).is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"outside cache");
+
+        let linked_cache = root.0.join("updates");
+        symlink(&outside.0, &linked_cache).unwrap();
+        cleanup_completed_installers(&linked_cache, &parse_semver("0.3.6").unwrap(), &[]);
+        assert!(linked_cache.is_symlink());
+        assert_eq!(fs::read(target).unwrap(), b"outside cache");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn cleanup_retries_an_installer_after_windows_releases_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = TestDirectory::new();
+        let installer = root.0.join("brick-0.3.6-Brick.exe");
+        fs::write(&installer, b"busy installer").unwrap();
+        let open_installer = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&installer)
+            .unwrap();
+        cleanup_completed_installers(&root.0, &parse_semver("0.3.6").unwrap(), &[]);
+        assert!(installer.exists());
+
+        drop(open_installer);
+        cleanup_completed_installers(&root.0, &parse_semver("0.3.6").unwrap(), &[]);
+        assert!(!root.0.exists());
+    }
 
     #[test]
     fn compares_release_versions() {
