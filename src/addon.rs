@@ -3,7 +3,7 @@ use std::{
     convert::TryInto,
     env,
     fs::{self, OpenOptions},
-    io::{self, Cursor, Write},
+    io::{self, Cursor, Read, Write},
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
     thread,
@@ -18,7 +18,7 @@ use url::Url;
 use uuid::Uuid;
 use zip::ZipArchive;
 
-use crate::discord_auth;
+use crate::{discord_auth, download};
 
 const APP_ID: &str = "dev.isogi.brick";
 const FEED_OWNER: &str = "IsogiE";
@@ -37,6 +37,9 @@ const LOG_FILE: &str = "logs.jsonl";
 const MAX_LOG_ENTRIES: usize = 80;
 const SYNC_INTERVAL_SECS: u64 = 300;
 const CLIENT_METADATA_REFRESH_INTERVAL_SECS: i64 = 300;
+const PACKAGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const ZIP_MAX_EXPANDED_BYTES: u64 = 256 * 1024 * 1024;
+const ZIP_MAX_ENTRIES: usize = 20_000;
 const ALLOWED_FOLDERS: &[&str] = &[
     "AdvanceRaidTools",
     "AdvanceRaidTools_Libraries",
@@ -46,6 +49,8 @@ const ALLOWED_FOLDERS: &[&str] = &[
 static HTTP_CLIENT: LazyLock<Result<reqwest::blocking::Client, String>> = LazyLock::new(|| {
     reqwest::blocking::Client::builder()
         .user_agent(APP_USER_AGENT)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(180))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .map_err(|error| format!("Failed to create HTTP client: {error}"))
@@ -958,31 +963,35 @@ fn fetch_verified_manifest() -> Result<AddonManifest, String> {
     let client = http_client()?;
     let manifest_response = client
         .get(cache_busted_url(FEED_URL)?)
+        .timeout(Duration::from_secs(30))
         .send()
         .map_err(|error| format!("Failed to download addon manifest: {error}"))?;
     if manifest_response.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(FEED_UNAVAILABLE_MESSAGE.to_string());
     }
-    let manifest_bytes = manifest_response
-        .error_for_status()
-        .map_err(|error| format!("Addon manifest request failed: {error}"))?
-        .bytes()
-        .map_err(|error| format!("Failed to read addon manifest: {error}"))?
-        .to_vec();
+    let manifest_bytes = download::read_response(
+        manifest_response
+            .error_for_status()
+            .map_err(|error| format!("Addon manifest request failed: {error}"))?,
+        download::MANIFEST_MAX_BYTES,
+        "addon manifest",
+    )?;
 
     let sig_response = client
         .get(cache_busted_url(FEED_SIG_URL)?)
+        .timeout(Duration::from_secs(30))
         .send()
         .map_err(|error| format!("Failed to download addon manifest signature: {error}"))?;
     if sig_response.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(FEED_UNAVAILABLE_MESSAGE.to_string());
     }
-    let sig_bytes = sig_response
-        .error_for_status()
-        .map_err(|error| format!("Addon manifest signature request failed: {error}"))?
-        .bytes()
-        .map_err(|error| format!("Failed to read addon manifest signature: {error}"))?
-        .to_vec();
+    let sig_bytes = download::read_response(
+        sig_response
+            .error_for_status()
+            .map_err(|error| format!("Addon manifest signature request failed: {error}"))?,
+        download::SIGNATURE_MAX_BYTES,
+        "addon manifest signature",
+    )?;
 
     verify_manifest_signature(&manifest_bytes, &sig_bytes)?;
     serde_json::from_slice(&manifest_bytes)
@@ -991,25 +1000,21 @@ fn fetch_verified_manifest() -> Result<AddonManifest, String> {
 
 fn fetch_verified_package(manifest: &AddonManifest) -> Result<Vec<u8>, String> {
     validate_github_release_url(&manifest.artifact.url)?;
+    download::validate_size(manifest.artifact.size, PACKAGE_MAX_BYTES, "Addon package")?;
     let package_url = cache_busted_url(&manifest.artifact.url)?;
 
-    let package = http_client()?
+    let response = http_client()?
         .get(package_url)
         .send()
         .map_err(|error| format!("Failed to download addon package: {error}"))?
         .error_for_status()
-        .map_err(|error| format!("Addon package request failed: {error}"))?
-        .bytes()
-        .map_err(|error| format!("Failed to read addon package: {error}"))?
-        .to_vec();
-
-    if package.len() as u64 != manifest.artifact.size {
-        return Err(format!(
-            "Addon package size mismatch: expected {}, got {}.",
-            manifest.artifact.size,
-            package.len()
-        ));
-    }
+        .map_err(|error| format!("Addon package request failed: {error}"))?;
+    let package = download::read_exact_response(
+        response,
+        manifest.artifact.size,
+        PACKAGE_MAX_BYTES,
+        "Addon package",
+    )?;
 
     let actual_hash = sha256_hex(&package);
     if actual_hash != manifest.artifact.sha256 {
@@ -1091,6 +1096,7 @@ fn validate_manifest(manifest: &AddonManifest) -> Result<(), String> {
     if manifest.artifact.folders.is_empty() {
         return Err("Addon manifest does not list addon folders.".to_string());
     }
+    download::validate_size(manifest.artifact.size, PACKAGE_MAX_BYTES, "Addon package")?;
     if manifest.artifact.sha256.len() != 64
         || !manifest
             .artifact
@@ -1163,6 +1169,7 @@ fn install_package_for_client(
     }
     fs::create_dir_all(&staging_dir)
         .map_err(|error| format!("Failed to create {}: {error}", staging_dir.display()))?;
+    let _staging_cleanup = StagingCleanup(&staging_dir);
 
     extract_package(package, &staging_dir, &manifest.artifact.folders)?;
 
@@ -1202,13 +1209,41 @@ fn addons_dir_for_client(client: &WowClient) -> PathBuf {
     PathBuf::from(&client.path).join("Interface").join("AddOns")
 }
 
+struct StagingCleanup<'a>(&'a Path);
+
+impl Drop for StagingCleanup<'_> {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(self.0);
+    }
+}
+
 fn extract_package(
     package: &[u8],
     staging_dir: &Path,
     allowed_folders: &[String],
 ) -> Result<(), String> {
+    extract_package_with_limits(
+        package,
+        staging_dir,
+        allowed_folders,
+        ZIP_MAX_ENTRIES,
+        ZIP_MAX_EXPANDED_BYTES,
+    )
+}
+
+fn extract_package_with_limits(
+    package: &[u8],
+    staging_dir: &Path,
+    allowed_folders: &[String],
+    max_entries: usize,
+    max_expanded_bytes: u64,
+) -> Result<(), String> {
     let mut archive = ZipArchive::new(Cursor::new(package))
         .map_err(|error| format!("Failed to open addon zip: {error}"))?;
+    if archive.len() > max_entries {
+        return Err(format!("Addon zip exceeds the {max_entries}-entry limit."));
+    }
+    let mut expanded_bytes = 0_u64;
 
     for index in 0..archive.len() {
         let mut file = archive
@@ -1223,6 +1258,12 @@ fn extract_package(
 
         let relative_path = validate_zip_path(&enclosed_name, allowed_folders)?;
         let output_path = staging_dir.join(relative_path);
+        let entry_size = file.size();
+        if entry_size > max_expanded_bytes.saturating_sub(expanded_bytes) {
+            return Err(format!(
+                "Addon zip exceeds the {max_expanded_bytes}-byte expanded size limit."
+            ));
+        }
 
         if file.is_dir() {
             fs::create_dir_all(&output_path).map_err(|error| {
@@ -1240,8 +1281,15 @@ fn extract_package(
 
             let mut output = fs::File::create(&output_path)
                 .map_err(|error| format!("Failed to create {}: {error}", output_path.display()))?;
-            io::copy(&mut file, &mut output)
+            let copied = io::copy(&mut file.by_ref().take(entry_size + 1), &mut output)
                 .map_err(|error| format!("Failed to extract {}: {error}", output_path.display()))?;
+            if copied != entry_size {
+                return Err(format!(
+                    "Addon zip entry {} has an unexpected expanded size.",
+                    output_path.display()
+                ));
+            }
+            expanded_bytes += copied;
         }
     }
 
@@ -1372,4 +1420,127 @@ fn now_stamp() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+
+    fn package(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, contents) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn test_directory() -> PathBuf {
+        let path = env::temp_dir().join(format!("brick-archive-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn allowed_folders() -> Vec<String> {
+        vec!["AdvanceRaidTools".to_string()]
+    }
+
+    #[test]
+    fn extracts_a_managed_package_at_the_resource_limits() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let zip = package(&[
+            ("AdvanceRaidTools/a.lua", b"abc"),
+            ("AdvanceRaidTools/b.lua", b"de"),
+        ]);
+        extract_package_with_limits(&zip, &root, &allowed_folders(), 2, 5).unwrap();
+        assert_eq!(
+            fs::read(root.join("AdvanceRaidTools/a.lua")).unwrap(),
+            b"abc"
+        );
+        assert_eq!(
+            fs::read(root.join("AdvanceRaidTools/b.lua")).unwrap(),
+            b"de"
+        );
+    }
+
+    #[test]
+    fn rejects_too_many_entries_and_combined_archive_expansion() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let zip = package(&[
+            ("AdvanceRaidTools/a.lua", b"abc"),
+            ("AdvanceRaidTools/b.lua", b"de"),
+        ]);
+        let error = extract_package_with_limits(&zip, &root, &allowed_folders(), 1, 5).unwrap_err();
+        assert!(error.contains("entry limit"));
+        assert!(!root.join("AdvanceRaidTools").exists());
+
+        let error = extract_package_with_limits(&zip, &root, &allowed_folders(), 2, 4).unwrap_err();
+        assert!(error.contains("expanded size limit"));
+        assert!(!root.join("AdvanceRaidTools/b.lua").exists());
+    }
+
+    #[test]
+    fn rejects_an_entry_that_lies_about_its_expanded_size() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let mut zip = package(&[("AdvanceRaidTools/a.lua", b"abcde")]);
+        let central = zip
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        zip[central + 24..central + 28].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(extract_package_with_limits(&zip, &root, &allowed_folders(), 1, 4).is_err());
+    }
+
+    #[test]
+    fn failed_extraction_preserves_installed_addons_and_cleans_staging() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let client = WowClient {
+            id: "test".to_string(),
+            flavor: Flavor::Retail,
+            path: root.to_string_lossy().to_string(),
+            game_version: None,
+            last_installed_version: None,
+            last_installed_sha256: None,
+            last_sync_at: None,
+        };
+        let addons_dir = addons_dir_for_client(&client);
+        let installed = addons_dir.join("AdvanceRaidTools");
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(installed.join("existing.lua"), b"keep").unwrap();
+        let zip = package(&[
+            ("AdvanceRaidTools/new.lua", b"new"),
+            ("../outside.lua", b"unsafe"),
+        ]);
+        let manifest = AddonManifest {
+            schema: 1,
+            package_id: PACKAGE_ID.to_string(),
+            version: "1.0.0".to_string(),
+            commit: "test".to_string(),
+            built_at: "test".to_string(),
+            artifact: ManifestArtifact {
+                url: String::new(),
+                sha256: sha256_hex(&zip),
+                size: zip.len() as u64,
+                folders: allowed_folders(),
+                flavors: Vec::new(),
+            },
+        };
+
+        assert!(install_package_for_client(&client, &manifest, &zip).is_err());
+        assert_eq!(fs::read(installed.join("existing.lua")).unwrap(), b"keep");
+        assert!(!installed.join("new.lua").exists());
+        assert_eq!(
+            fs::read_dir(addons_dir.join(".brick-staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(!addons_dir.join("outside.lua").exists());
+    }
 }

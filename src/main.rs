@@ -7,6 +7,7 @@ mod addon;
 mod app_update;
 mod autostart;
 mod discord_auth;
+mod download;
 mod presence;
 mod single_instance;
 mod tray;

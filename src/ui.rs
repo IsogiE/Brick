@@ -24,7 +24,6 @@ const AUTH_REFRESH_CHECK_INTERVAL_SECS: u64 = 60;
 const VIEW_REFRESH_INTERVAL_SECS: u64 = 60;
 #[cfg(not(target_os = "windows"))]
 const SHOW_REQUEST_POLL_INTERVAL_SECS: u64 = 5;
-const ACTIVE_REPAINT_INTERVAL_MS: u64 = 100;
 const IDLE_REPAINT_MAX_SECS: u64 = 60;
 
 pub struct BrickApp {
@@ -44,6 +43,7 @@ pub struct BrickApp {
     brick_texture: Option<TextureHandle>,
     tray: Option<tray::TrayState>,
     tray_attempted: bool,
+    window_visible: bool,
     quit_requested: bool,
     confirm_logout: bool,
     show_request_rx: mpsc::Receiver<String>,
@@ -130,6 +130,7 @@ impl BrickApp {
         };
         let now = Instant::now();
 
+        let window_visible = !(startup_mode && view.settings.startup_minimized);
         let mut app = Self {
             view,
             status,
@@ -147,6 +148,7 @@ impl BrickApp {
             brick_texture,
             tray: None,
             tray_attempted: false,
+            window_visible,
             quit_requested: false,
             confirm_logout: false,
             show_request_rx,
@@ -181,17 +183,21 @@ impl BrickApp {
     }
 
     fn refresh_view(&mut self) {
-        match addon::load_view() {
-            Ok(view) => {
-                self.view = view;
-                self.last_view_refresh = Instant::now();
-            }
+        self.apply_view_refresh(addon::load_view());
+    }
+
+    fn apply_view_refresh(&mut self, result: Result<AppView, String>) {
+        // Failed reads must wait for the next interval too.
+        self.last_view_refresh = Instant::now();
+        match result {
+            Ok(view) => self.view = view,
             Err(error) => self.status = error,
         }
     }
 
     fn refresh_view_if_stale(&mut self) {
-        if self.sync_rx.is_some()
+        if !self.window_visible
+            || self.sync_rx.is_some()
             || self.last_view_refresh.elapsed() < Duration::from_secs(VIEW_REFRESH_INTERVAL_SECS)
         {
             return;
@@ -201,6 +207,7 @@ impl BrickApp {
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
+        self.window_visible = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -436,8 +443,16 @@ impl BrickApp {
         self.last_roster_refresh = Instant::now();
     }
 
+    fn roster_refresh_enabled(&self) -> bool {
+        self.window_visible
+            && self.auth_state.is_authorized()
+            && self.active_tab == MainTab::Roster
+            && self.roster_rx.is_none()
+            && !matches!(self.presence_state, PresenceUiState::Unavailable(_))
+    }
+
     fn start_roster_refresh_if_stale(&mut self) {
-        if self.active_tab != MainTab::Roster {
+        if !self.roster_refresh_enabled() {
             return;
         }
         if matches!(self.presence_state, PresenceUiState::Idle) {
@@ -545,11 +560,17 @@ impl BrickApp {
         self.status = format!("Preparing Brick {version}.");
     }
 
+    fn periodic_app_update_enabled(&self) -> bool {
+        self.app_update_rx.is_none()
+            && self.app_update_install_rx.is_none()
+            && !matches!(
+                self.app_update_state,
+                AppUpdateUiState::Available(_) | AppUpdateUiState::Installing
+            )
+    }
+
     fn start_periodic_app_update_check(&mut self) {
-        if matches!(
-            self.app_update_state,
-            AppUpdateUiState::Available(_) | AppUpdateUiState::Installing
-        ) {
+        if !self.periodic_app_update_enabled() {
             return;
         }
 
@@ -728,6 +749,7 @@ impl BrickApp {
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         let close_requested = ctx.input(|input| input.viewport().close_requested());
         if close_requested && !self.quit_requested && self.tray.is_some() {
+            self.window_visible = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
@@ -790,7 +812,7 @@ impl BrickApp {
                     self.start_roster_refresh();
                 }
                 if self.roster_rx.is_some() {
-                    ui.add(egui::Spinner::new().size(16.0).color(info_accent()));
+                    busy_indicator(ui, 16.0, info_accent());
                 }
             });
         });
@@ -804,7 +826,7 @@ impl BrickApp {
             PresenceUiState::Idle | PresenceUiState::Loading => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(18.0);
-                    ui.add(egui::Spinner::new().size(24.0).color(info_accent()));
+                    busy_indicator(ui, 24.0, info_accent());
                     ui.add_space(12.0);
                     ui.label(
                         RichText::new("Loading roster")
@@ -899,7 +921,7 @@ impl BrickApp {
                 ui.add_space(24.0);
 
                 if matches!(state, AuthUiState::Checking) {
-                    ui.add(egui::Spinner::new().size(24.0).color(info_accent()));
+                    busy_indicator(ui, 24.0, info_accent());
                     ui.add_space(12.0);
                 }
 
@@ -980,7 +1002,7 @@ impl BrickApp {
         }
 
         if busy {
-            ui.add(egui::Spinner::new().size(12.0).color(info_accent()));
+            busy_indicator(ui, 12.0, info_accent());
             ui.add_space(10.0);
         }
 
@@ -1063,7 +1085,7 @@ impl BrickApp {
                             capsule(ui, version, primary_text(), status.accent_soft);
                         }
                         if self.sync_rx.is_some() {
-                            ui.add(egui::Spinner::new().size(18.0).color(status.accent));
+                            busy_indicator(ui, 18.0, status.accent);
                         }
                     });
                 },
@@ -1351,35 +1373,31 @@ impl BrickApp {
         }
     }
 
-    fn has_pending_work(&self) -> bool {
-        self.sync_rx.is_some()
-            || self.auth_rx.is_some()
-            || self.app_update_rx.is_some()
-            || self.app_update_install_rx.is_some()
-            || self.roster_rx.is_some()
-    }
-
     fn next_repaint_after(&self) -> Duration {
-        if self.has_pending_work() {
-            return Duration::from_millis(ACTIVE_REPAINT_INTERVAL_MS);
+        // Workers wake egui when they finish. Only schedule work that can run;
+        // paused or in-flight checks must not leave expired deadlines spinning.
+        let mut next = Duration::from_secs(IDLE_REPAINT_MAX_SECS);
+        if self.periodic_app_update_enabled() {
+            next = next.min(time_until(
+                self.last_app_update_check,
+                APP_UPDATE_CHECK_INTERVAL_SECS,
+            ));
         }
 
-        let mut next = Duration::from_secs(IDLE_REPAINT_MAX_SECS);
-        next = next.min(time_until(
-            self.last_app_update_check,
-            APP_UPDATE_CHECK_INTERVAL_SECS,
-        ));
-
         if self.auth_state.is_authorized() {
-            next = next.min(time_until(
-                self.last_auth_check,
-                AUTH_REFRESH_CHECK_INTERVAL_SECS,
-            ));
-            next = next.min(time_until(
-                self.last_view_refresh,
-                VIEW_REFRESH_INTERVAL_SECS,
-            ));
-            if self.active_tab == MainTab::Roster {
+            if self.auth_rx.is_none() {
+                next = next.min(time_until(
+                    self.last_auth_check,
+                    AUTH_REFRESH_CHECK_INTERVAL_SECS,
+                ));
+            }
+            if self.window_visible && self.sync_rx.is_none() {
+                next = next.min(time_until(
+                    self.last_view_refresh,
+                    VIEW_REFRESH_INTERVAL_SECS,
+                ));
+            }
+            if self.roster_refresh_enabled() {
                 next = next.min(time_until(
                     self.last_roster_refresh,
                     ROSTER_REFRESH_INTERVAL_SECS,
@@ -1387,16 +1405,16 @@ impl BrickApp {
             }
         }
 
-        if next.is_zero() {
-            Duration::from_millis(ACTIVE_REPAINT_INTERVAL_MS)
-        } else {
-            next.min(Duration::from_secs(IDLE_REPAINT_MAX_SECS))
-        }
+        next
     }
 }
 
 impl eframe::App for BrickApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(window) = frame.winit_window() {
+            self.window_visible =
+                window.is_visible() != Some(false) && window.is_minimized() != Some(true);
+        }
         tray::remember_main_window(frame);
         self.ensure_tray(ctx);
         self.handle_tray(ctx);
@@ -1413,17 +1431,22 @@ impl eframe::App for BrickApp {
             self.refresh_view_if_stale();
         }
 
+        ctx.request_repaint_after(self.next_repaint_after());
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
                     .fill(app_background())
                     .inner_margin(egui::Margin::symmetric(28, 24)),
             )
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 ui.set_width(ui.available_width());
                 self.draw_content(ui);
             });
-        self.draw_logout_confirmation(ctx);
+        self.draw_logout_confirmation(&ctx);
 
         ctx.request_repaint_after(self.next_repaint_after());
     }
@@ -1486,7 +1509,7 @@ fn time_until(last: Instant, interval_secs: u64) -> Duration {
 
 fn configure_style(ctx: &egui::Context) {
     ctx.set_visuals(egui::Visuals::dark());
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.button_padding = egui::vec2(14.0, 8.0);
     style.visuals.panel_fill = app_background();
@@ -1497,7 +1520,7 @@ fn configure_style(ctx: &egui::Context) {
     style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, primary_text());
     style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     style.visuals.selection.bg_fill = Color32::from_rgb(65, 120, 170);
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 fn draw_icon(ui: &mut egui::Ui, texture: Option<&TextureHandle>, size: f32) {
@@ -1647,6 +1670,17 @@ fn capsule(ui: &mut egui::Ui, text: &str, text_color: Color32, fill: Color32) {
         .show(ui, |ui| {
             ui.label(RichText::new(text).small().strong().color(text_color));
         });
+}
+
+// A network wait does not need an animation or a continuous render loop.
+fn busy_indicator(ui: &mut egui::Ui, size: f32, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        for offset in [-0.3, 0.0, 0.3] {
+            let center = rect.center() + egui::vec2(size * offset, 0.0);
+            ui.painter().circle_filled(center, size * 0.09, color);
+        }
+    }
 }
 
 fn status_dot(ui: &mut egui::Ui, color: Color32) {
@@ -2118,4 +2152,151 @@ fn error_accent() -> Color32 {
 
 fn info_accent() -> Color32 {
     Color32::from_rgb(94, 168, 224)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::App as _;
+
+    // No disk, network, tray, or saved user session is needed to exercise scheduling.
+    fn app() -> BrickApp {
+        let now = Instant::now();
+        BrickApp {
+            view: AppView::default(),
+            status: "Ready".into(),
+            egui_ctx: egui::Context::default(),
+            sync_lock: Arc::new(Mutex::new(())),
+            auth_state: AuthUiState::Authorized(AuthorizedUser {
+                user_id: "test".into(),
+                display_name: "Test".into(),
+                username: "test".into(),
+                guild_name: "Advance".into(),
+                role_label: "Raider".into(),
+                expires_at_unix: u64::MAX,
+                created_at_unix: u64::MAX,
+            }),
+            presence_state: PresenceUiState::Idle,
+            active_tab: MainTab::Updates,
+            sync_rx: None,
+            auth_rx: None,
+            app_update_rx: None,
+            app_update_install_rx: None,
+            roster_rx: None,
+            app_update_state: AppUpdateUiState::UpToDate,
+            brick_texture: None,
+            tray: None,
+            tray_attempted: true,
+            window_visible: true,
+            quit_requested: false,
+            confirm_logout: false,
+            show_request_rx: mpsc::channel().1,
+            last_show_request: None,
+            last_auth_check: now,
+            last_view_refresh: now,
+            last_app_update_check: now,
+            last_roster_refresh: now,
+            roster_notice: None,
+        }
+    }
+
+    fn overdue() -> Instant {
+        Instant::now() - Duration::from_secs(600)
+    }
+
+    #[test]
+    fn offered_update_does_not_keep_an_expired_repaint_deadline() {
+        let mut app = app();
+        app.app_update_state = AppUpdateUiState::Available("9.0.0".into());
+        app.last_app_update_check = overdue();
+        app.start_periodic_app_update_check();
+        assert!(app.app_update_rx.is_none());
+        assert!(app.next_repaint_after() > Duration::from_secs(50));
+    }
+
+    #[test]
+    fn workers_sleep_until_completion_instead_of_polling_every_100ms() {
+        let mut app = app();
+        app.app_update_rx = Some(mpsc::channel().1);
+        app.sync_rx = Some(mpsc::channel().1);
+        app.auth_rx = Some(mpsc::channel().1);
+        app.roster_rx = Some(mpsc::channel().1);
+        app.active_tab = MainTab::Roster;
+        app.last_app_update_check = overdue();
+        app.last_view_refresh = overdue();
+        app.last_auth_check = overdue();
+        app.last_roster_refresh = overdue();
+        assert_eq!(app.next_repaint_after(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn unavailable_roster_does_not_retry_on_every_frame() {
+        let mut app = app();
+        app.active_tab = MainTab::Roster;
+        app.presence_state = PresenceUiState::Unavailable("Not configured".into());
+        app.last_roster_refresh = overdue();
+        app.start_roster_refresh_if_stale();
+        assert!(app.roster_rx.is_none());
+        assert!(app.next_repaint_after() > Duration::from_secs(50));
+    }
+
+    #[test]
+    fn failed_view_read_waits_before_retrying() {
+        let mut app = app();
+        app.last_view_refresh = overdue();
+        app.apply_view_refresh(Err("Unreadable settings".into()));
+        assert_eq!(app.status, "Unreadable settings");
+        assert!(app.next_repaint_after() > Duration::from_secs(50));
+    }
+
+    #[test]
+    fn hidden_window_skips_roster_and_filesystem_refreshes() {
+        let mut app = app();
+        app.window_visible = false;
+        app.active_tab = MainTab::Roster;
+        app.last_roster_refresh = overdue();
+        app.last_view_refresh = overdue();
+        app.start_roster_refresh_if_stale();
+        app.refresh_view_if_stale();
+        assert!(app.roster_rx.is_none());
+        assert_eq!(app.status, "Ready");
+        assert!(app.next_repaint_after() > Duration::from_secs(50));
+    }
+
+    #[test]
+    fn due_checks_still_wake_and_completed_workers_are_consumed() {
+        let mut app = app();
+        app.last_app_update_check = overdue();
+        assert_eq!(app.next_repaint_after(), Duration::ZERO);
+        let (tx, rx) = mpsc::channel();
+        app.app_update_rx = Some(rx);
+        tx.send(Ok(Some(AvailableAppUpdate {
+            version: "9.0.0".into(),
+        })))
+        .unwrap();
+        app.poll_app_update(&app.egui_ctx.clone());
+        assert!(matches!(
+            app.app_update_state,
+            AppUpdateUiState::Available(_)
+        ));
+        assert!(app.next_repaint_after() > Duration::from_secs(50));
+    }
+
+    #[test]
+    fn rendering_a_network_wait_does_not_request_animation_frames() {
+        let mut app = app();
+        app.app_update_rx = Some(mpsc::channel().1);
+        app.app_update_state = AppUpdateUiState::Checking;
+        app.sync_rx = Some(mpsc::channel().1);
+        let ctx = app.egui_ctx.clone();
+        let mut frame = eframe::Frame::_new_kittest();
+        // Allow egui's initial layout and font passes to settle first.
+        for _ in 0..5 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.ui(ui, &mut frame));
+        }
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| app.ui(ui, &mut frame));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT].repaint_delay > Duration::from_secs(1)
+        );
+    }
 }

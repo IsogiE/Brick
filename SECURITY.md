@@ -5,9 +5,9 @@ Brick has one high-risk job: it writes files onto guild members' computers autom
 - The app does not run Git, shell scripts, Lua, or arbitrary downloaded executables. The only downloaded executable allowed is a Brick app installer from signed app-update metadata.
 - Discord login is a client-side guild-role gate for the normal Brick UX. It is not a replacement for server-side access control if release downloads need to become private.
 - The addon feed manifest must be signed with the embedded Ed25519 public key.
-- The addon zip must match the SHA-256 hash from the signed manifest.
+- The addon zip must match the SHA-256 hash from the signed manifest. Signed download sizes are enforced while receiving data, with absolute limits on metadata, packages, and presence responses.
 - Downloads must come from the `IsogiE/Brick-Releases` `addon-feed` GitHub release URL namespace.
-- Zip entries are rejected if they escape the allowed addon folders.
+- Zip entries are rejected if they escape the allowed addon folders. Extraction also limits entry count and total expanded bytes, rejects inconsistent entry sizes, and removes failed staging directories.
 - Only these folders are managed: `AdvanceRaidTools`, `AdvanceRaidTools_Libraries`, and `AdvanceRaidTools_Options`.
 - Existing managed folders are deleted and replaced after verification, matching normal addon-manager behavior.
 - App binary releases are produced from the native Rust binary with Cargo Packager. App self-updates use release metadata signed by the existing Brick Ed25519 feed key, verify the downloaded NSIS installer or AppImage SHA-256, and must not execute downloaded scripts.

@@ -9,11 +9,13 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::discord_auth;
+use crate::{discord_auth, download};
 
 const APP_USER_AGENT: &str = "Brick/0.2 (+https://github.com/IsogiE/Brick-Releases)";
 const REQUEST_TIMEOUT_SECS: u64 = 20;
 const HEARTBEAT_INTERVAL_SECS: u64 = 60;
+const MAX_ROSTER_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_STATUS_RESPONSE_BYTES: u64 = 16 * 1024;
 const PRESENCE_API_URL: &str = match option_env!("BRICK_PRESENCE_API_URL") {
     Some(value) => value,
     None => "",
@@ -113,9 +115,12 @@ pub fn fetch_roster(access_token: &str) -> Result<Roster, String> {
         .map_err(|error| format!("Roster refresh failed: {error}"))?;
 
     let status = response.status();
-    let body = response
-        .bytes()
-        .map_err(|error| format!("Roster refresh failed: {error}"))?;
+    let max_bytes = if status.is_success() {
+        MAX_ROSTER_RESPONSE_BYTES
+    } else {
+        MAX_STATUS_RESPONSE_BYTES
+    };
+    let body = download::read_response(response, max_bytes, "Roster refresh failed")?;
 
     if !status.is_success() {
         return Err(api_error("Roster refresh failed", status.as_u16(), &body));
@@ -127,9 +132,7 @@ pub fn fetch_roster(access_token: &str) -> Result<Roster, String> {
 
 fn expect_success(response: reqwest::blocking::Response, prefix: &str) -> Result<(), String> {
     let status = response.status();
-    let body = response
-        .bytes()
-        .map_err(|error| format!("{prefix}: {error}"))?;
+    let body = download::read_response(response, MAX_STATUS_RESPONSE_BYTES, prefix)?;
 
     if status.is_success() {
         Ok(())

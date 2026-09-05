@@ -5,6 +5,7 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
     sync::LazyLock,
+    time::Duration,
 };
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -13,6 +14,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
+
+use crate::download;
 
 const APP_UPDATE_OWNER: &str = "IsogiE";
 const APP_UPDATE_REPO: &str = "Brick-Releases";
@@ -28,6 +31,7 @@ const APP_UPDATE_USER_AGENT: &str = concat!(
     " (+https://github.com/IsogiE/Brick-Releases)"
 );
 const FEED_UNAVAILABLE_MESSAGE: &str = "No signed Brick app update feed is available yet.";
+const INSTALLER_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 const APP_UPDATE_PUBLIC_KEY_B64: &str = match option_env!("BRICK_ADDON_PUBLIC_KEY_B64") {
     Some(value) => value,
@@ -37,6 +41,8 @@ const APP_UPDATE_PUBLIC_KEY_B64: &str = match option_env!("BRICK_ADDON_PUBLIC_KE
 static HTTP_CLIENT: LazyLock<Result<reqwest::blocking::Client, String>> = LazyLock::new(|| {
     reqwest::blocking::Client::builder()
         .user_agent(APP_UPDATE_USER_AGENT)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(180))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .map_err(|error| format!("Failed to create HTTP client: {error}"))
@@ -241,31 +247,35 @@ fn fetch_verified_manifest() -> Result<AppUpdateManifest, String> {
     let client = http_client()?;
     let manifest_response = client
         .get(cache_busted_url(APP_MANIFEST_URL)?)
+        .timeout(Duration::from_secs(30))
         .send()
         .map_err(|error| format!("Failed to download Brick app manifest: {error}"))?;
     if manifest_response.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(FEED_UNAVAILABLE_MESSAGE.to_string());
     }
-    let manifest_bytes = manifest_response
-        .error_for_status()
-        .map_err(|error| format!("Brick app manifest request failed: {error}"))?
-        .bytes()
-        .map_err(|error| format!("Failed to read Brick app manifest: {error}"))?
-        .to_vec();
+    let manifest_bytes = download::read_response(
+        manifest_response
+            .error_for_status()
+            .map_err(|error| format!("Brick app manifest request failed: {error}"))?,
+        download::MANIFEST_MAX_BYTES,
+        "Brick app manifest",
+    )?;
 
     let sig_response = client
         .get(cache_busted_url(APP_MANIFEST_SIG_URL)?)
+        .timeout(Duration::from_secs(30))
         .send()
         .map_err(|error| format!("Failed to download Brick app manifest signature: {error}"))?;
     if sig_response.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(FEED_UNAVAILABLE_MESSAGE.to_string());
     }
-    let sig_bytes = sig_response
-        .error_for_status()
-        .map_err(|error| format!("Brick app manifest signature request failed: {error}"))?
-        .bytes()
-        .map_err(|error| format!("Failed to read Brick app manifest signature: {error}"))?
-        .to_vec();
+    let sig_bytes = download::read_response(
+        sig_response
+            .error_for_status()
+            .map_err(|error| format!("Brick app manifest signature request failed: {error}"))?,
+        download::SIGNATURE_MAX_BYTES,
+        "Brick app manifest signature",
+    )?;
 
     verify_manifest_signature(&manifest_bytes, &sig_bytes)?;
     serde_json::from_slice(&manifest_bytes)
@@ -274,23 +284,19 @@ fn fetch_verified_manifest() -> Result<AppUpdateManifest, String> {
 
 fn fetch_verified_artifact(artifact: &AppUpdateArtifact) -> Result<Vec<u8>, String> {
     validate_github_release_url(&artifact.url)?;
-    let package = http_client()?
+    download::validate_size(artifact.size, INSTALLER_MAX_BYTES, "Brick installer")?;
+    let response = http_client()?
         .get(cache_busted_url(&artifact.url)?)
         .send()
         .map_err(|error| format!("Failed to download Brick installer: {error}"))?
         .error_for_status()
-        .map_err(|error| format!("Brick installer request failed: {error}"))?
-        .bytes()
-        .map_err(|error| format!("Failed to read Brick installer: {error}"))?
-        .to_vec();
-
-    if package.len() as u64 != artifact.size {
-        return Err(format!(
-            "Brick installer size mismatch: expected {}, got {}.",
-            artifact.size,
-            package.len()
-        ));
-    }
+        .map_err(|error| format!("Brick installer request failed: {error}"))?;
+    let package = download::read_exact_response(
+        response,
+        artifact.size,
+        INSTALLER_MAX_BYTES,
+        "Brick installer",
+    )?;
 
     let actual_hash = sha256_hex(&package);
     if actual_hash != artifact.sha256 {
@@ -361,9 +367,7 @@ fn validate_manifest(manifest: &AppUpdateManifest) -> Result<(), String> {
         {
             return Err("Brick app manifest contains an incomplete installer.".to_string());
         }
-        if artifact.size == 0 {
-            return Err("Brick app manifest contains an empty installer.".to_string());
-        }
+        download::validate_size(artifact.size, INSTALLER_MAX_BYTES, "Brick installer")?;
         if artifact.sha256.len() != 64
             || !artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
