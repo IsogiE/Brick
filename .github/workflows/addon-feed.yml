@@ -32,13 +32,6 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.inputs.addon_ref || 'main' }}
 
-      - name: Checkout pinned BigWigs packager
-        uses: actions/checkout@v4
-        with:
-          repository: BigWigsMods/packager
-          ref: 20a3713ec537df54db5c0d8b4822d88ee63c70e8
-          path: bigwigs-packager
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -53,7 +46,25 @@ jobs:
             esac
           done
 
+      - name: Check whether addon source is already published
+        id: feed_status
+        env:
+          BRICK_ADDON_SOURCE_DIR: ${{ github.workspace }}/addon-source
+          BRICK_ADDON_RELEASE_DIR: ${{ github.workspace }}/.release/addon
+          BRICK_PACKAGER_COMMIT: 20a3713ec537df54db5c0d8b4822d88ee63c70e8
+          BRICK_PACKAGER_SCRIPT_SHA256: 49bcf94d977478a6f18ead7f0285f193853bf1f9a23ba7d84d08b979d802a734
+        run: node scripts/publish-addon-feed.mjs --check-current
+
+      - name: Checkout pinned BigWigs packager
+        if: steps.feed_status.outputs.current != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: BigWigsMods/packager
+          ref: 20a3713ec537df54db5c0d8b4822d88ee63c70e8
+          path: bigwigs-packager
+
       - name: Package addon from GitHub source
+        if: steps.feed_status.outputs.current != 'true'
         env:
           BRICK_PACKAGER_SCRIPT_SHA256: 49bcf94d977478a6f18ead7f0285f193853bf1f9a23ba7d84d08b979d802a734
         run: |
@@ -62,6 +73,7 @@ jobs:
           ./bigwigs-packager/release.sh -d -r "$GITHUB_WORKSPACE/.release/addon" -t "$GITHUB_WORKSPACE/addon-source"
 
       - name: Publish signed addon feed
+        if: steps.feed_status.outputs.current != 'true'
         env:
           BRICK_ADDON_PRIVATE_KEY_B64: ${{ secrets.BRICK_ADDON_PRIVATE_KEY_B64 }}
           GH_TOKEN: ${{ secrets.BRICK_RELEASE_TOKEN }}

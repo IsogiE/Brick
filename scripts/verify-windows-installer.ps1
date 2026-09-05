@@ -28,6 +28,20 @@ if ($content -notmatch 'ALLOWDOWNGRADES "false"') {
     throw 'The installer was rendered with downgrades allowed.'
 }
 
+# CI images have Visual C++ runtimes installed and can mask missing DLLs.
+# Check the built PE imports before relying on the installer smoke test.
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+$visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+$dumpbin = Get-ChildItem (Join-Path $visualStudio 'VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe') |
+    Sort-Object FullName -Descending | Select-Object -First 1
+if (-not $dumpbin) { throw 'Visual Studio dumpbin was not found.' }
+$dependencies = & $dumpbin.FullName /DEPENDENTS (Join-Path $repoRoot 'target/release/brick.exe')
+if ($LASTEXITCODE -ne 0) { throw 'Failed to inspect Brick PE imports.' }
+if ($dependencies -match '(?i)(VCRUNTIME|MSVCP|CONCRT)[0-9_]*D?\.dll') {
+    throw 'Brick still depends on an external Visual C++ runtime. Build with -C target-feature=+crt-static.'
+}
+Write-Output 'Brick has no external Visual C++ runtime DLL dependency.'
+
 if (-not $RunInstallSmoke) {
     return
 }

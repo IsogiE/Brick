@@ -1,0 +1,3 @@
+[target.x86_64-pc-windows-msvc]
+# Fresh Windows installs do not include the Visual C++ redistributable.
+rustflags = ["-C", "target-feature=+crt-static"]

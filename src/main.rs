@@ -56,6 +56,15 @@ fn main() -> Result<(), eframe::Error> {
 
     let options = eframe::NativeOptions {
         viewport,
+        #[cfg(target_os = "linux")]
+        event_loop_builder: Some(Box::new(|builder| {
+            // Winit's Wayland backend cannot hide or restore a window. Use
+            // Xwayland where available so closing to the tray remains reversible.
+            use winit::platform::x11::EventLoopBuilderExtX11 as _;
+            if env::var_os("DISPLAY").is_some_and(|display| !display.is_empty()) {
+                builder.with_x11();
+            }
+        })),
         ..Default::default()
     };
 

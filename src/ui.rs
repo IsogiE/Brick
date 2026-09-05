@@ -44,6 +44,9 @@ pub struct BrickApp {
     tray: Option<tray::TrayState>,
     tray_attempted: bool,
     window_visible: bool,
+    initial_visibility_applied: bool,
+    #[cfg(target_os = "linux")]
+    native_wayland: bool,
     quit_requested: bool,
     confirm_logout: bool,
     show_request_rx: mpsc::Receiver<String>,
@@ -149,6 +152,9 @@ impl BrickApp {
             tray: None,
             tray_attempted: false,
             window_visible,
+            initial_visibility_applied: false,
+            #[cfg(target_os = "linux")]
+            native_wayland: false,
             quit_requested: false,
             confirm_logout: false,
             show_request_rx,
@@ -204,6 +210,32 @@ impl BrickApp {
         }
 
         self.refresh_view();
+    }
+
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        self.window_visible = false;
+        // Native Wayland cannot hide windows, but can minimize them. Keep a
+        // taskbar entry there so the user can restore Brick without the tray.
+        #[cfg(target_os = "linux")]
+        if self.native_wayland {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    fn update_window_visibility(
+        &mut self,
+        visible: Option<bool>,
+        minimized: Option<bool>,
+        focused: bool,
+    ) {
+        if visible == Some(false) || minimized == Some(true) {
+            self.window_visible = false;
+        } else if (visible == Some(true) && minimized == Some(false)) || focused {
+            self.window_visible = true;
+        }
+        // Wayland returns None for both queries. Preserve our requested state
+        // until focus confirms that the user restored the window.
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
@@ -749,9 +781,8 @@ impl BrickApp {
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         let close_requested = ctx.input(|input| input.viewport().close_requested());
         if close_requested && !self.quit_requested && self.tray.is_some() {
-            self.window_visible = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.hide_window(ctx);
         }
     }
 
@@ -1411,12 +1442,34 @@ impl BrickApp {
 
 impl eframe::App for BrickApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        #[cfg(target_os = "linux")]
         if let Some(window) = frame.winit_window() {
-            self.window_visible =
-                window.is_visible() != Some(false) && window.is_minimized() != Some(true);
+            use winit::platform::wayland::WindowExtWayland as _;
+            self.native_wayland = window.xdg_toplevel().is_some();
+        }
+        if self.initial_visibility_applied {
+            if let Some(window) = frame.winit_window() {
+                self.update_window_visibility(
+                    window.is_visible(),
+                    window.is_minimized(),
+                    window.has_focus(),
+                );
+            }
         }
         tray::remember_main_window(frame);
         self.ensure_tray(ctx);
+        if !self.initial_visibility_applied {
+            self.initial_visibility_applied = true;
+            if !self.window_visible {
+                // Eframe makes the window visible after its first paint. Apply
+                // startup visibility afterward, once a working tray is known.
+                if self.tray.is_some() {
+                    self.hide_window(ctx);
+                } else {
+                    self.show_window(ctx);
+                }
+            }
+        }
         self.handle_tray(ctx);
         self.handle_show_request(ctx);
         self.poll_auth();
@@ -2188,6 +2241,9 @@ mod tests {
             tray: None,
             tray_attempted: true,
             window_visible: true,
+            initial_visibility_applied: true,
+            #[cfg(target_os = "linux")]
+            native_wayland: false,
             quit_requested: false,
             confirm_logout: false,
             show_request_rx: mpsc::channel().1,
@@ -2202,6 +2258,43 @@ mod tests {
 
     fn overdue() -> Instant {
         Instant::now() - Duration::from_secs(600)
+    }
+
+    #[test]
+    fn unknown_wayland_visibility_preserves_hidden_state_until_user_focuses() {
+        let mut app = app();
+        app.window_visible = false;
+        app.update_window_visibility(None, None, false);
+        assert!(!app.window_visible);
+        app.update_window_visibility(None, None, true);
+        assert!(app.window_visible);
+        app.update_window_visibility(Some(true), Some(true), false);
+        assert!(!app.window_visible);
+        app.update_window_visibility(Some(true), Some(false), false);
+        assert!(app.window_visible);
+    }
+
+    #[test]
+    fn completed_update_check_keeps_hidden_window_hidden() {
+        let mut app = app();
+        app.window_visible = false;
+        let (tx, rx) = mpsc::channel();
+        app.app_update_rx = Some(rx);
+        tx.send(Ok(Some(AvailableAppUpdate {
+            version: "9.0.0".into(),
+        })))
+        .unwrap();
+        let ctx = app.egui_ctx.clone();
+        let output = ctx.run_ui(egui::RawInput::default(), |_| app.poll_app_update(&ctx));
+        assert!(!app.window_visible);
+        assert!(app.app_update_rx.is_none());
+        assert!(matches!(
+            app.app_update_state,
+            AppUpdateUiState::Available(_)
+        ));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .is_empty());
     }
 
     #[test]

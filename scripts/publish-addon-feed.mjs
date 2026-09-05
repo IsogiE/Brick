@@ -1,7 +1,8 @@
 import { createHash, createPrivateKey, sign } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const feedRepo = process.env.BRICK_FEED_REPO || 'IsogiE/Brick-Releases';
 const feedTag = process.env.BRICK_FEED_TAG || 'addon-feed';
@@ -31,15 +32,17 @@ const supportedFlavors = [
   'classic-beta'
 ];
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}
 
 async function main() {
   const source = readSourceMetadata();
   const packagePath = findAddonPackage();
-  const version = packagePath ? versionFromPackageName(packagePath) : source.describe;
+  const version = packagePath ? versionFromPackageName(packagePath) : (source.exactTag || source.describe);
   const releaseType = inferReleaseType(source.exactTag, version);
 
   if (process.argv.includes('--latest')) {
@@ -48,6 +51,28 @@ async function main() {
     return;
   }
 
+  const sourceInfo = {
+    provider: 'github-packager',
+    repo: sourceRepo,
+    commit: source.commit,
+    shortCommit: source.shortHash,
+    version,
+    releaseType,
+    packageFile: packagePath ? basename(packagePath) : `${packageId}-${version}.zip`,
+    packagerCommit,
+    packagerScriptSha256
+  };
+  const existingManifest = await fetchExistingManifest();
+  const current = isSameSource(existingManifest, sourceInfo);
+  if (process.argv.includes('--check-current')) {
+    if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `current=${current}\n`);
+    console.log(current ? `Addon feed already current at ${version} (${source.shortHash}).` : `Addon feed needs ${version} (${source.shortHash}).`);
+    return;
+  }
+  if (current) {
+    console.log(`Addon feed already current at ${version} (${source.shortHash}).`);
+    return;
+  }
   if (!packagePath) {
     throw new Error(`No ${packageId} package zip found under ${releaseDir}. Run the packager first.`);
   }
@@ -57,17 +82,6 @@ async function main() {
   const zip = readFileSync(packagePath);
   const sha256 = createHash('sha256').update(zip).digest('hex');
   const artifactUrl = `https://github.com/${feedRepo}/releases/download/${feedTag}/${artifactName}?brickSource=${source.commit}`;
-  const sourceInfo = {
-    provider: 'github-packager',
-    repo: sourceRepo,
-    commit: source.commit,
-    shortCommit: source.shortHash,
-    version,
-    releaseType,
-    packageFile: basename(packagePath),
-    packagerCommit,
-    packagerScriptSha256
-  };
   const manifest = {
     schema: 1,
     packageId,
@@ -83,12 +97,6 @@ async function main() {
       flavors: supportedFlavors
     }
   };
-
-  const existingManifest = await fetchExistingManifest();
-  if (isSameSource(existingManifest, sourceInfo, zip.length, sha256)) {
-    console.log(`Addon feed already current at ${version} (${source.shortHash}).`);
-    return;
-  }
 
   mkdirSync(outputDir, { recursive: true });
   const artifactPath = join(outputDir, artifactName);
@@ -191,17 +199,28 @@ async function fetchExistingManifest() {
   return response.json();
 }
 
-function isSameSource(manifest, sourceInfo, size, sha256) {
+export function isSameSource(manifest, sourceInfo) {
+  // A published source revision is immutable. ZIP timestamps and freshly
+  // checked-out externals change archive bytes on otherwise identical builds;
+  // comparing those hashes republishes the same version and reinstalls it on
+  // every client. New addon revisions or packaging changes still publish.
   return Boolean(
     manifest
+      && manifest.schema === 1
+      && manifest.packageId === packageId
+      && manifest.commit === sourceInfo.commit
+      && manifest.version === sourceInfo.version
       && manifest.source
       && manifest.source.provider === sourceInfo.provider
       && manifest.source.repo === sourceInfo.repo
       && manifest.source.commit === sourceInfo.commit
       && manifest.source.packageFile === sourceInfo.packageFile
+      && manifest.source.releaseType === sourceInfo.releaseType
+      && manifest.source.packagerCommit === sourceInfo.packagerCommit
+      && manifest.source.packagerScriptSha256 === sourceInfo.packagerScriptSha256
       && manifest.artifact
-      && manifest.artifact.size === size
-      && manifest.artifact.sha256 === sha256
+      && manifest.artifact.size > 0
+      && /^[a-f0-9]{64}$/.test(manifest.artifact.sha256)
   );
 }
 

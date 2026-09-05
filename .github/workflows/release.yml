@@ -7,6 +7,11 @@ on:
         description: 'SemVer version to publish, for example 0.1.0'
         required: true
         default: '0.1.0'
+      publish:
+        description: 'Publish publicly after smoke testing; leave off to build private candidate artifacts'
+        type: boolean
+        required: false
+        default: false
   push:
     tags:
       - 'v*'
@@ -105,7 +110,7 @@ jobs:
           BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
           BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
           BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
-          RUSTFLAGS: -D warnings
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo build --release
 
       - name: Azure login for Windows signing
@@ -144,7 +149,7 @@ jobs:
           BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
           BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
           NO_STRIP: 1
-          RUSTFLAGS: -D warnings
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo packager --release --formats ${{ matrix.formats }}
 
       - name: Build signed Windows package
@@ -154,7 +159,7 @@ jobs:
           BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
           BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
           NO_STRIP: 1
-          RUSTFLAGS: -D warnings
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo packager --config Packager.signed.toml --formats ${{ matrix.formats }}
 
       - name: Verify Windows NSIS installer policy
@@ -183,6 +188,7 @@ jobs:
 
   publish:
     needs: build
+    if: github.event_name == 'push' || inputs.publish == true
     runs-on: ubuntu-22.04
     permissions:
       contents: read

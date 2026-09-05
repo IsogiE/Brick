@@ -27,6 +27,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", features = ["blocking"] }
+winit = { version = "=0.30.13", default-features = false, features = ["x11", "wayland"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 tray-icon = { version = "0.24", default-features = false }
