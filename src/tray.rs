@@ -51,12 +51,114 @@ mod native_window {
 }
 
 #[cfg(target_os = "windows")]
-pub fn remember_main_window(frame: &eframe::Frame) {
+pub fn remember_main_window(frame: &eframe::Frame, _ctx: &egui::Context) {
     native_window::remember(frame);
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn remember_main_window(_frame: &eframe::Frame) {}
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub fn remember_main_window(_frame: &eframe::Frame, _ctx: &egui::Context) {}
+
+#[cfg(target_os = "linux")]
+fn x11_window_id(frame: &eframe::Frame) -> Option<u32> {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    match frame.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Xlib(handle) => handle.window.try_into().ok(),
+        RawWindowHandle::Xcb(handle) => Some(handle.window.get()),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn remember_main_window(frame: &eframe::Frame, ctx: &egui::Context) {
+    use std::{sync::OnceLock, thread};
+    use x11rb::{
+        connection::Connection as _,
+        protocol::{
+            xproto::{ChangeWindowAttributesAux, ConnectionExt as _, EventMask},
+            Event,
+        },
+    };
+    static STARTED: OnceLock<()> = OnceLock::new();
+    let Some(window) = x11_window_id(frame) else {
+        return;
+    };
+    STARTED.get_or_init(|| {
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let observe = || -> Result<(), Box<dyn std::error::Error>> {
+                let (connection, _) = x11rb::connect(None)?;
+                let state = connection
+                    .intern_atom(false, b"_NET_WM_STATE")?
+                    .reply()?
+                    .atom;
+                connection
+                    .change_window_attributes(
+                        window,
+                        &ChangeWindowAttributesAux::new()
+                            .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
+                    )?
+                    .check()?;
+                connection.flush()?;
+                // KDE updates _NET_WM_STATE after FocusOut. Winit does not
+                // notify eframe of that change, so sleep on the X11 event socket.
+                loop {
+                    match connection.wait_for_event()? {
+                        Event::PropertyNotify(event) if event.atom == state => {
+                            ctx.request_repaint()
+                        }
+                        Event::DestroyNotify(_) => break,
+                        _ => {}
+                    }
+                }
+                Ok(())
+            };
+            if let Err(error) = observe() {
+                let _ = crate::addon::record_log(
+                    crate::addon::LogLevel::Warn,
+                    format!("Window state notifications stopped: {error}"),
+                );
+            }
+        });
+    });
+}
+
+#[cfg(target_os = "linux")]
+pub fn withdraw_minimized_window(frame: &eframe::Frame) {
+    use x11rb::{
+        connection::Connection as _,
+        protocol::xproto::{ConnectionExt as _, EventMask, UnmapNotifyEvent, UNMAP_NOTIFY_EVENT},
+    };
+    let Some(window) = x11_window_id(frame) else {
+        return;
+    };
+    let withdraw = || -> Result<(), Box<dyn std::error::Error>> {
+        let (connection, screen) = x11rb::connect(None)?;
+        let root = connection.setup().roots[screen].root;
+        connection.unmap_window(window)?;
+        // An iconified window is already unmapped. ICCCM withdrawal also sends
+        // the WM a synthetic unmap event so it removes the taskbar entry.
+        connection.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+            UnmapNotifyEvent {
+                response_type: UNMAP_NOTIFY_EVENT,
+                sequence: 0,
+                event: root,
+                window,
+                from_configure: false,
+            },
+        )?;
+        connection.flush()?;
+        Ok(())
+    };
+    if let Err(error) = withdraw() {
+        let _ = crate::addon::record_log(
+            crate::addon::LogLevel::Warn,
+            format!("Could not hide minimized window: {error}"),
+        );
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod platform {

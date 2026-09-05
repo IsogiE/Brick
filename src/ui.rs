@@ -1449,14 +1449,16 @@ impl eframe::App for BrickApp {
         }
         if self.initial_visibility_applied {
             if let Some(window) = frame.winit_window() {
-                self.update_window_visibility(
-                    window.is_visible(),
-                    window.is_minimized(),
-                    window.has_focus(),
-                );
+                let minimized = window.is_minimized();
+                if self.window_visible && minimized == Some(true) && self.tray.is_some() {
+                    self.hide_window(ctx);
+                    #[cfg(target_os = "linux")]
+                    tray::withdraw_minimized_window(frame);
+                }
+                self.update_window_visibility(window.is_visible(), minimized, window.has_focus());
             }
         }
-        tray::remember_main_window(frame);
+        tray::remember_main_window(frame, ctx);
         self.ensure_tray(ctx);
         if !self.initial_visibility_applied {
             self.initial_visibility_applied = true;

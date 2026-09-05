@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory=$true)][string]$Installer,
     [string]$OutputDirectory = "$env:USERPROFILE\Desktop\Brick-smoke",
-    [int]$SampleSeconds = 60
+    [int]$SampleSeconds = 60,
+    [string]$SoftwareOpenGLDirectory
 )
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
@@ -84,12 +85,27 @@ public static class BrickWindow {
     $exe = Join-Path $env:LOCALAPPDATA 'Brick\brick.exe'
     Assert-Check (Test-Path $exe) 'Installed under LOCALAPPDATA\Brick'
     $report.binarySha256 = (Get-FileHash $exe -Algorithm SHA256).Hash
+    $report.softwareOpenGL = [bool]$SoftwareOpenGLDirectory
+    if ($SoftwareOpenGLDirectory) {
+        # VM fixture only; these files are never included in the released app.
+        Copy-Item (Join-Path $SoftwareOpenGLDirectory '*.dll') (Split-Path $exe) -Force
+        $env:GALLIUM_DRIVER = 'llvmpipe'
+        $env:LP_NUM_THREADS = [string][Math]::Min(4, [Environment]::ProcessorCount)
+        $report.openGLDlls = @(Get-ChildItem (Join-Path $SoftwareOpenGLDirectory '*.dll') | Get-FileHash -Algorithm SHA256 | Select-Object Hash,Path)
+    }
     $brick = Start-Process $exe -PassThru
     Start-Sleep -Seconds 10
     $brick.Refresh()
     Assert-Check (!$brick.HasExited) 'Brick remains running after launch'
     $window = [BrickWindow]::Find($brick.Id)
     Assert-Check ($window -ne [IntPtr]::Zero -and [BrickWindow]::IsWindowVisible($window)) 'Main window is visible'
+    [BrickWindow]::PostMessage($window, 0x0112, [IntPtr]0xF020, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Seconds 2
+    Assert-Check (![BrickWindow]::IsWindowVisible($window)) 'Minimize button hides Brick into the tray'
+    $second = Start-Process $exe -PassThru
+    $second.WaitForExit(5000) | Out-Null
+    Start-Sleep -Seconds 2
+    Assert-Check ([BrickWindow]::IsWindowVisible($window) -and ![BrickWindow]::IsIconic($window)) 'Restores after using the minimize button'
     Measure-Brick $brick 'visible' $window
     [BrickWindow]::PostMessage($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
     Start-Sleep -Seconds 2
