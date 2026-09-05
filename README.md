@@ -178,3 +178,5 @@ npm run remove:local-appimage -- --purge
 ```
 
 The app must be built with `BRICK_ADDON_PUBLIC_KEY_B64` set before it can trust the public addon feed. Local builds without that key still open the UI, but sync will refuse to install packages. Local builds without `BRICK_DISCORD_CLIENT_ID` show the Discord login configuration screen.
+
+Windows desktop smoke testing and private candidate builds: [instructions](docs/windows-smoke.md).

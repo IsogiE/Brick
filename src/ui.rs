@@ -1449,13 +1449,21 @@ impl eframe::App for BrickApp {
         }
         if self.initial_visibility_applied {
             if let Some(window) = frame.winit_window() {
+                let visible = window.is_visible();
                 let minimized = window.is_minimized();
+                #[cfg(target_os = "windows")]
+                if !self.window_visible && visible == Some(true) && minimized == Some(false) {
+                    // A second instance restores via ShowWindowAsync. Sync
+                    // winit's cached VISIBLE flag with that already-visible
+                    // native window, otherwise its next hide becomes a no-op.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                }
                 if self.window_visible && minimized == Some(true) && self.tray.is_some() {
                     self.hide_window(ctx);
                     #[cfg(target_os = "linux")]
                     tray::withdraw_minimized_window(frame);
                 }
-                self.update_window_visibility(window.is_visible(), minimized, window.has_focus());
+                self.update_window_visibility(visible, minimized, window.has_focus());
             }
         }
         tray::remember_main_window(frame, ctx);

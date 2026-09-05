@@ -181,7 +181,7 @@ function inferReleaseType(exactTag, version) {
 }
 
 async function fetchExistingManifest() {
-  const url = `https://github.com/${feedRepo}/releases/download/${feedTag}/${manifestName}`;
+  const url = `https://github.com/${feedRepo}/releases/download/${feedTag}/${manifestName}?brickFeedCheck=${Date.now()}`;
   const response = await fetch(url, {
     headers: {
       accept: 'application/json',
