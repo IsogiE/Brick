@@ -175,10 +175,7 @@ impl BrickApp {
         if app.auth_state.is_authorized() {
             app.reconcile_autostart();
         }
-        if app.auth_state.is_authorized()
-            && !app.view.setup_required
-            && app.view.settings.watcher_enabled
-        {
+        if app.auth_state.is_authorized() && !app.view.setup_required {
             app.start_sync();
         }
         if startup_mode {
@@ -245,7 +242,7 @@ impl BrickApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         self.refresh_view();
 
-        if !self.view.setup_required && self.view.settings.watcher_enabled {
+        if !self.view.setup_required {
             self.start_sync();
         }
     }
@@ -266,7 +263,7 @@ impl BrickApp {
         match addon::add_wow_paths(&paths) {
             Ok(view) => {
                 self.view = view;
-                match autostart::set_enabled(true) {
+                match autostart::set_enabled(self.view.settings.startup_enabled) {
                     Ok(()) => {
                         let added = self.view.settings.clients.len().saturating_sub(before);
                         self.status = if added == 0 {
@@ -300,8 +297,8 @@ impl BrickApp {
         }
     }
 
-    fn set_automation(&mut self, enabled: bool) {
-        match addon::set_automation_enabled(enabled) {
+    fn set_startup_enabled(&mut self, enabled: bool) {
+        match addon::set_startup_enabled(enabled) {
             Ok(view) => self.view = view,
             Err(error) => {
                 self.status = error;
@@ -312,13 +309,10 @@ impl BrickApp {
         match autostart::set_enabled(enabled) {
             Ok(()) => {
                 self.status = if enabled {
-                    "Automatic updates are on.".to_string()
+                    "Brick will open at login.".to_string()
                 } else {
-                    "Automatic updates are off.".to_string()
+                    "Brick will stay closed at login.".to_string()
                 };
-                if enabled && !self.view.setup_required {
-                    self.start_sync();
-                }
             }
             Err(error) => {
                 let _ = addon::record_log(LogLevel::Warn, error.clone());
@@ -387,7 +381,7 @@ impl BrickApp {
                 self.status = "Discord access verified.".to_string();
                 self.refresh_view();
                 self.reconcile_autostart();
-                if !self.view.setup_required && self.view.settings.watcher_enabled {
+                if !self.view.setup_required {
                     self.start_sync();
                 }
             }
@@ -1228,10 +1222,9 @@ impl BrickApp {
         ui.add_space(8.0);
 
         panel_frame().show(ui, |ui| {
-            let startup_enabled =
-                self.view.settings.startup_enabled && self.view.settings.watcher_enabled;
+            let startup_enabled = self.view.settings.startup_enabled;
             if settings_toggle_row(ui, "Open at login", startup_enabled) {
-                self.set_automation(!startup_enabled);
+                self.set_startup_enabled(!startup_enabled);
             }
 
             ui.separator();
@@ -1361,16 +1354,6 @@ impl BrickApp {
                 detail: friendly_problem(&self.status),
                 accent: error_accent(),
                 accent_soft: Color32::from_rgb(62, 32, 36),
-                version,
-            };
-        }
-
-        if !(self.view.settings.startup_enabled && self.view.settings.watcher_enabled) {
-            return DisplayStatus {
-                title: "Automatic updates are off".to_string(),
-                detail: String::new(),
-                accent: warning_accent(),
-                accent_soft: Color32::from_rgb(61, 47, 30),
                 version,
             };
         }
@@ -2268,6 +2251,28 @@ mod tests {
 
     fn overdue() -> Instant {
         Instant::now() - Duration::from_secs(600)
+    }
+
+    #[test]
+    fn disabling_open_at_login_does_not_change_addon_update_status() {
+        let mut app = app();
+        app.view.settings.startup_enabled = false;
+        app.view.settings.clients.push(WowClient {
+            id: "retail".into(),
+            flavor: addon::Flavor::Retail,
+            path: "World of Warcraft/_retail_".into(),
+            game_version: None,
+            last_installed_version: Some("1.7.1".into()),
+            last_installed_sha256: Some("abc123".into()),
+            last_sync_at: None,
+        });
+        assert_eq!(app.display_status().title, "Up to date");
+
+        app.status = "Installed 1.7.1 on 1 client(s).".into();
+        assert_eq!(app.display_status().title, "Updated");
+
+        app.sync_rx = Some(mpsc::channel().1);
+        assert_eq!(app.display_status().title, "Checking for updates");
     }
 
     #[test]

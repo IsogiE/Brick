@@ -16,7 +16,9 @@ Brick is a native Rust desktop app. It does not use Electron, Tauri, WebView2, W
 1. Run Brick.
 2. Sign in with Discord. Brick allows members with the Advance Raider or Officer role.
 3. Select the World of Warcraft folder, or a specific client folder such as `_retail_`, `_ptr_`, or `_xptr_`.
-4. Brick enables startup automation and immediately syncs the current package.
+4. Brick immediately syncs the current package and opens at login by default.
+
+Addon updates are always enabled while Brick is running and signed in. Brick checks on launch and every five minutes afterward. The "Open at login" setting only controls whether Brick starts with your computer; turning it off does not pause addon updates. "Start minimized" controls whether that login launch opens the window or stays in the tray.
 
 Supported client folders:
 

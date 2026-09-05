@@ -18,7 +18,7 @@ Read this before changing Brick. This repo is the private source app. The public
 
 Brick is not a normal addon manager. Its purpose is to install the current in-house guild package automatically after the first WoW path setup.
 
-On launch, Brick should check the signed addon feed when automation is enabled. If every configured client already has the signed SHA installed and the managed folders exist, it should skip downloading the zip. The periodic watcher is only the follow-up check after launch and should poll every 5 minutes.
+Addon updates are always enabled while Brick is running and Discord-authorized. On launch, Brick should check the signed addon feed once WoW paths are configured and Discord access is available. If every configured client already has the signed SHA installed and the managed folders exist, it should skip downloading the zip. The periodic watcher is only the follow-up check after launch and should poll every 5 minutes. The legacy `watcherEnabled` setting is ignored on read and written as true for compatibility; do not reintroduce an addon-update pause switch.
 
 Before syncing the addon, Brick requires Discord OAuth login. It uses the public desktop OAuth flow with the HTTPS redirect URL derived from `BRICK_PRESENCE_API_URL` (`https://brick.lusaggo.com/discord/callback` in production), requests `identify guilds.members.read`, reads the current user's member roles in the Advance guild, and unlocks only if the cached or freshly refreshed session has the Raider or Officer role ID. The VPS stores only the one-time authorization code briefly until the matching Brick client polls for it; the desktop app still exchanges the code itself with PKCE and stores the user's Discord session locally. A still-current access token should unlock without a network role recheck while the local session is under 30 days old; when the token expires, refresh the token and recheck the roles. On Windows, store the cached session as DPAPI-protected `discord-auth.dat` and migrate/remove legacy plaintext `discord-auth.json`. Local session expiry, clearing, or failing refresh sends the user back to the login screen.
 
@@ -49,7 +49,7 @@ Before syncing the addon, Brick requires Discord OAuth login. It uses the public
 - Public Brick app releases require repo variable `BRICK_PRESENCE_API_URL` for the roster/online-status service. The current production endpoint is `https://brick.lusaggo.com`.
 - Brick's roster tab talks to the Brick Presence API after Discord login. Clients send short-lived heartbeats with the user's Discord OAuth access token; the VPS verifies the token and stores online state. Full guild roster reads happen server-side with the Discord bot token. Never put a Discord bot token or client secret in the desktop app.
 - Brick auto-updates Advance Raid Tools from the signed addon feed. Brick app self-updates use the signed `app-feed` manifest. Clients check the signed app feed on startup and periodically, then show a compact `Update now` prompt when a newer supported package exists. Only the user click downloads the versioned package, verifies its SHA-256, and starts install/restart. Windows uses the NSIS current-user `.exe` from `IsogiE/Brick-Releases`; this is intended for installs under `%LOCALAPPDATA%` so it does not need UAC. Silent NSIS updates force `%LOCALAPPDATA%\Brick` so future updates stay in the current-user install location. Linux AppImage installs download a versioned AppImage, verify its SHA-256, atomically replace the current AppImage, restart Brick, and exit the old process. Deb/pacman style installs may require elevation and are not the preferred self-update path. The addon feed and app feed currently use the same Ed25519 signing key. Brick clients older than the self-update baseline still need one bridge installer.
-- Brick starts at login with `--startup` when automation is enabled. The user-facing "Start minimized" setting defaults on; when disabled, `--startup` launches the full window instead of hiding it.
+- Brick starts at login with `--startup` when "Open at login" is enabled (the default). This preference is independent of automatic addon updates and is preserved when adding WoW folders. The user-facing "Start minimized" setting defaults on; when disabled, `--startup` launches the full window instead of hiding it.
 - The feed workflow prunes non-`v*` tags from its local ART checkout before packaging. This prevents feed/release-only tags from changing BigWigs package versions.
 - Current BigWigs packager pin: `20a3713ec537df54db5c0d8b4822d88ee63c70e8`; `release.sh` SHA-256: `49bcf94d977478a6f18ead7f0285f193853bf1f9a23ba7d84d08b979d802a734`.
 
@@ -79,7 +79,7 @@ It also writes:
 ~/.local/share/icons/hicolor/256x256/apps/dev.isogi.brick.png
 ```
 
-If startup automation has been enabled, Brick may also create:
+If "Open at login" has been enabled, Brick may also create:
 
 ```text
 ~/.config/autostart/Brick.desktop

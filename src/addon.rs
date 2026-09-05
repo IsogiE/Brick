@@ -73,7 +73,10 @@ pub struct AppView {
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub schema: u32,
-    pub watcher_enabled: bool,
+    // Keep writing this legacy field for older Brick versions, but never allow
+    // saved settings to turn off automatic addon updates.
+    #[serde(default = "default_true", skip_deserializing)]
+    watcher_enabled: bool,
     pub startup_enabled: bool,
     #[serde(default = "default_true")]
     pub startup_minimized: bool,
@@ -310,8 +313,6 @@ pub fn add_wow_paths(paths: &[PathBuf]) -> Result<AppView, String> {
         added += 1;
     }
 
-    settings.watcher_enabled = true;
-    settings.startup_enabled = true;
     refresh_client_metadata_now(&mut settings);
     sort_clients(&mut settings.clients);
     save_settings(&settings)?;
@@ -354,16 +355,15 @@ pub fn remove_client(id: &str) -> Result<AppView, String> {
     view_from_settings(settings)
 }
 
-pub fn set_automation_enabled(enabled: bool) -> Result<AppView, String> {
+pub fn set_startup_enabled(enabled: bool) -> Result<AppView, String> {
     let mut settings = load_settings()?;
-    settings.watcher_enabled = enabled;
     settings.startup_enabled = enabled;
     save_settings(&settings)?;
     record_log(
         LogLevel::Info,
         format!(
-            "Brick automation {}.",
-            if enabled { "enabled" } else { "paused" }
+            "Brick open at login {}.",
+            if enabled { "enabled" } else { "disabled" }
         ),
     )?;
     view_from_settings(settings)
@@ -417,15 +417,15 @@ pub fn spawn_watcher(sync_lock: Arc<Mutex<()>>) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(SYNC_INTERVAL_SECS));
 
-        if let Err(error) = run_sync_if_enabled(&sync_lock) {
+        if let Err(error) = run_sync_if_configured(&sync_lock) {
             let _ = record_log(LogLevel::Error, error);
         }
     });
 }
 
-fn run_sync_if_enabled(sync_lock: &Arc<Mutex<()>>) -> Result<(), String> {
+fn run_sync_if_configured(sync_lock: &Arc<Mutex<()>>) -> Result<(), String> {
     let settings = load_settings()?;
-    if !settings.watcher_enabled || settings.clients.is_empty() {
+    if settings.clients.is_empty() {
         return Ok(());
     }
 
@@ -1445,6 +1445,37 @@ mod tests {
 
     fn allowed_folders() -> Vec<String> {
         vec!["AdvanceRaidTools".to_string()]
+    }
+
+    #[test]
+    fn legacy_paused_settings_resume_updates_without_changing_preferences_or_clients() {
+        for startup_enabled in [false, true] {
+            let legacy = serde_json::json!({
+                "schema": 1,
+                "watcherEnabled": false,
+                "startupEnabled": startup_enabled,
+                "startupMinimized": false,
+                "clients": [{
+                    "id": "retail",
+                    "flavor": "retail",
+                    "path": "World of Warcraft/_retail_",
+                    "gameVersion": "12.0.0",
+                    "lastInstalledVersion": "1.7.1",
+                    "lastInstalledSha256": "abc123",
+                    "lastSyncAt": "2026-09-05T13:00:00Z"
+                }]
+            });
+            let settings: Settings = serde_json::from_value(legacy.clone()).unwrap();
+            assert!(settings.watcher_enabled);
+            assert_eq!(settings.startup_enabled, startup_enabled);
+            assert!(!settings.startup_minimized);
+
+            let saved = serde_json::to_value(settings).unwrap();
+            assert_eq!(saved["watcherEnabled"], true);
+            assert_eq!(saved["clients"], legacy["clients"]);
+            assert_eq!(saved["startupEnabled"], legacy["startupEnabled"]);
+            assert_eq!(saved["startupMinimized"], legacy["startupMinimized"]);
+        }
     }
 
     #[test]
