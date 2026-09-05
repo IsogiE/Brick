@@ -16,9 +16,9 @@ CONTAINER = 'brick-windows-smoke'
 
 
 class Monitor:
-    def __init__(self, guest=False):
+    def __init__(self, guest=False, timeout=15):
         self.socket = socket.socket(socket.AF_UNIX)
-        self.socket.settimeout(15)
+        self.socket.settimeout(timeout)
         self.socket.connect(str(ROOT / 'storage' / ('brick-qga.sock' if guest else 'brick-qmp.sock')))
         self.stream = self.socket.makefile('rwb', buffering=0)
         if not guest:
@@ -79,8 +79,13 @@ def main():
                                      '/storage/brick-qmp.sock', '/storage/brick-qga.sock'],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if result.returncode == 0:
-                print('Desktop: http://127.0.0.1:28006 (Windows may still be booting)')
-                return
+                try:
+                    Monitor(timeout=0.5).call('query-status')
+                except (OSError, RuntimeError):
+                    pass  # A stopped VM can leave stale socket files behind.
+                else:
+                    print('Desktop: http://127.0.0.1:28006 (Windows may still be booting)')
+                    return
             time.sleep(0.5)
         raise RuntimeError('VM monitoring sockets did not become ready')
     if args.command == 'stop':
