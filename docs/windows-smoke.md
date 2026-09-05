@@ -51,8 +51,25 @@ The first fresh-VM test of public 0.3.5 caught a missing `VCRUNTIME140.dll`. Win
 
 ## Evidence from initial setup
 
-The final private 0.3.6 candidate (`24b767e`, build run `33969630732`) passed all 11 automated desktop checks with UAC enabled, plus observed tray-click restoration and X afterward. Over 60-second samples it averaged 0.032% Task Manager CPU while visible and 0.051% while hidden, using four vCPUs and software OpenGL. The installer SHA-256 is `2f44faa7c2933585e476613d3f5a9ed70d94d343ad083cf8357784044a446b7e`. The complete report is in `shared/results/latest-smoke.json`, with CSVs in `shared/results/20260905-134656/` and manual screenshots alongside them.
+The final private 0.3.6 candidate (`24b767e`, build run `33969630732`) passed all 11 automated desktop checks with UAC enabled, plus observed tray-click restoration and X afterward. Over 60-second samples it averaged 0.032% Task Manager CPU while visible and 0.051% while hidden, using four vCPUs and software OpenGL. The installer SHA-256 is `2f44faa7c2933585e476613d3f5a9ed70d94d343ad083cf8357784044a446b7e`. The complete report and CSVs are in `shared/results/20260905-134656/` and manual screenshots alongside them.
 
 The installed CachyOS build passed X, minimize, taskbar removal, tray restore, second-instance restore, and startup-minimized tests. A 60-second hidden sample used 0.017% of one CPU core. The addon-feed workflow run `33969838214` verified that the current source revision skips both packaging and publication.
+
+## Published 0.3.6
+
+Brick [v0.3.6](https://github.com/IsogiE/Brick-Releases/releases/tag/v0.3.6) was published from source commit `33617008e707428a0e1f9679d299b86df50cfc8c` by [Release run 33973247056](https://github.com/IsogiE/Brick/actions/runs/33973247056). Automatic addon updates are always enabled and check once a minute, including while hidden in the tray. "Open at login" controls only startup, and legacy disabled-update settings resume updates while preserving startup preferences.
+
+[CI run 33972495395](https://github.com/IsogiE/Brick/actions/runs/33972495395) passed 34 Linux Rust tests, 35 Windows Rust tests, six addon-feed publication tests, formatting, warning-free checks, and optimized builds. [Private candidate run 33972495091](https://github.com/IsogiE/Brick/actions/runs/33972495091) built the tested packages before the public tag was pushed.
+
+The candidate Windows installer passed all 11 automated desktop checks, plus a real tray-icon click and X after restoration. A configured legacy profile also verified `watcherEnabled` becomes true while `startupEnabled=false` and `startupMinimized=true` are preserved. The CachyOS candidate passed minimize, X, taskbar removal, tray restore, second-instance restore, startup-minimized, and legacy-settings checks. It stayed hidden for 60 seconds with no measurable CPU ticks. The installed app also loaded the existing CachyOS Discord session and roster. Windows desktop smoke coverage used a signed-out test profile.
+
+All five public release assets were downloaded and verified. The signed app feed advertises 0.3.6 and the correct source commit; its Ed25519 signature verifies with the key embedded in public 0.3.4. The public AppImage executable is byte-identical to the CachyOS-tested candidate. The public Windows installer was tested separately after publication and passed all 11 desktop checks again.
+
+Public package SHA-256 values:
+
+- Windows installer: `4155c7fa41393010234c99c02eebf2a4f74a8c12238e3b53c8d3be66df9be14c`
+- Linux AppImage: `d7045c9ffd8e40b6c8f80922f406e2909f69ea7ed6e169a22d95c9058720487f`
+
+Durable local evidence is in `~/.local/share/brick-windows-smoke/shared/results/release-0.3.6/`. Candidate Windows CSVs are in `shared/results/20260905-144559/`; public-installer CSVs are in `shared/results/20260905-150139/`. The local CachyOS launcher contains the verified public AppImage.
 
 Sources: [Microsoft evaluation](https://www.microsoft.com/en-us/evalcenter/download-windows-11-enterprise), [VM wrapper](https://github.com/dockur/windows), [QEMU monitor](https://www.qemu.org/docs/master/interop/qemu-qmp-ref.html), [MSYS2 Mesa](https://packages.msys2.org/packages/mingw-w64-ucrt-x86_64-mesa), [Rust C-runtime linkage](https://doc.rust-lang.org/reference/linkage.html#static-and-dynamic-c-runtimes).

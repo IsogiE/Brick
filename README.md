@@ -141,7 +141,7 @@ It publishes:
 
 ART's normal `Package addon` workflow dispatches this workflow with the exact ART commit SHA after Wago/Curse packaging succeeds, so the public Brick feed can update within seconds without shipping a new Brick client. A plain five-minute schedule remains as a fallback for missed dispatches.
 
-Because the workflow packages the current Git commit, untagged commits become alpha-style builds such as `v1.7.10-17-g2f772b5`, while tagged commits become release builds. The workflow ignores non-`v*` tags in its local checkout so release-only feed tags cannot affect addon package versions. The BigWigs packager is pinned to commit `20a3713ec537df54db5c0d8b4822d88ee63c70e8`, and the workflow verifies the `release.sh` SHA-256 before running it. Installed Brick clients poll the signed feed every 5 minutes.
+Because the workflow packages the current Git commit, untagged commits become alpha-style builds such as `v1.7.10-17-g2f772b5`, while tagged commits become release builds. The workflow ignores non-`v*` tags in its local checkout so release-only feed tags cannot affect addon package versions. The BigWigs packager is pinned to commit `20a3713ec537df54db5c0d8b4822d88ee63c70e8`, and the workflow verifies the `release.sh` SHA-256 before running it. Installed Brick clients poll the signed feed every minute.
 
 Brick clients download from that public release, verify the Ed25519 manifest signature, verify the zip SHA-256 from the signed manifest, delete the managed addon folders, and replace them with the verified package. If the feed has not been published yet, clients show a waiting state and retry automatically.
 
