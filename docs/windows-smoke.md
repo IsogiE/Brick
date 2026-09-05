@@ -51,6 +51,8 @@ The first fresh-VM test of public 0.3.5 caught a missing `VCRUNTIME140.dll`. Win
 
 ## Evidence from initial setup
 
-The first private 0.3.6 candidate (`36ee0d8`, build run `33967745747`) passed the original nine desktop checks with UAC enabled. Over 60-second samples it averaged 0.045% Task Manager CPU while visible and 0% while hidden, using four vCPUs and software OpenGL. The later minimize-button check must also pass on the final candidate.
+The final private 0.3.6 candidate (`24b767e`, build run `33969630732`) passed all 11 automated desktop checks with UAC enabled, plus observed tray-click restoration and X afterward. Over 60-second samples it averaged 0.032% Task Manager CPU while visible and 0.051% while hidden, using four vCPUs and software OpenGL. The installer SHA-256 is `2f44faa7c2933585e476613d3f5a9ed70d94d343ad083cf8357784044a446b7e`. The complete report is in `shared/results/latest-smoke.json`, with CSVs in `shared/results/20260905-134656/` and manual screenshots alongside them.
+
+The installed CachyOS build passed X, minimize, taskbar removal, tray restore, second-instance restore, and startup-minimized tests. A 60-second hidden sample used 0.017% of one CPU core. The addon-feed workflow run `33969838214` verified that the current source revision skips both packaging and publication.
 
 Sources: [Microsoft evaluation](https://www.microsoft.com/en-us/evalcenter/download-windows-11-enterprise), [VM wrapper](https://github.com/dockur/windows), [QEMU monitor](https://www.qemu.org/docs/master/interop/qemu-qmp-ref.html), [MSYS2 Mesa](https://packages.msys2.org/packages/mingw-w64-ucrt-x86_64-mesa), [Rust C-runtime linkage](https://doc.rust-lang.org/reference/linkage.html#static-and-dynamic-c-runtimes).
