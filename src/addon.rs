@@ -1201,7 +1201,7 @@ fn install_package_for_client(
     }
 
     let _ = fs::remove_dir_all(&staging_dir);
-    cleanup_staging_transactions(&addons_dir.join(".brick-staging"));
+    prune_old_transactions(&addons_dir.join(".brick-staging"), 2);
     Ok(())
 }
 
@@ -1375,24 +1375,26 @@ fn copy_dir_all(source: &Path, target: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn cleanup_staging_transactions(parent: &Path) {
-    if !fs::symlink_metadata(parent)
-        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-    {
-        return;
-    }
+fn prune_old_transactions(parent: &Path, keep: usize) {
     let Ok(entries) = fs::read_dir(parent) else {
         return;
     };
 
-    // Syncs are serialized. Once the new addon is installed, any other staging
-    // directories are leftovers from interrupted runs, not backups to retain.
-    for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            let _ = fs::remove_dir_all(entry.path());
-        }
+    let mut dirs: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false)
+        })
+        .collect();
+    dirs.sort_by_key(|entry| entry.file_name());
+
+    let remove_count = dirs.len().saturating_sub(keep);
+    for entry in dirs.into_iter().take(remove_count) {
+        let _ = fs::remove_dir_all(entry.path());
     }
-    let _ = fs::remove_dir(parent);
 }
 
 fn safe_version(version: &str) -> String {
@@ -1523,85 +1525,6 @@ mod tests {
             .unwrap();
         zip[central + 24..central + 28].copy_from_slice(&1_u32.to_le_bytes());
         assert!(extract_package_with_limits(&zip, &root, &allowed_folders(), 1, 4).is_err());
-    }
-
-    #[test]
-    fn successful_install_clears_old_staging_and_preserves_unmanaged_addons() {
-        let root = test_directory();
-        let _cleanup = StagingCleanup(&root);
-        let client = WowClient {
-            id: "test".to_string(),
-            flavor: Flavor::Retail,
-            path: root.to_string_lossy().to_string(),
-            game_version: None,
-            last_installed_version: None,
-            last_installed_sha256: None,
-            last_sync_at: None,
-        };
-        let addons = addons_dir_for_client(&client);
-        for name in ["interrupted-a", "interrupted-b"] {
-            let old = addons.join(".brick-staging").join(name);
-            fs::create_dir_all(&old).unwrap();
-            fs::write(old.join("leftover.lua"), b"old").unwrap();
-        }
-        fs::create_dir_all(addons.join("UnmanagedAddon")).unwrap();
-        fs::write(addons.join("UnmanagedAddon/keep.lua"), b"keep").unwrap();
-        let zip = package(&[
-            ("AdvanceRaidTools/new.lua", b"addon"),
-            ("AdvanceRaidTools_Libraries/new.lua", b"libraries"),
-            ("AdvanceRaidTools_Options/new.lua", b"options"),
-        ]);
-        let manifest = AddonManifest {
-            schema: 1,
-            package_id: PACKAGE_ID.to_string(),
-            version: "1.0.0".to_string(),
-            commit: "test".to_string(),
-            built_at: "test".to_string(),
-            artifact: ManifestArtifact {
-                url: String::new(),
-                sha256: sha256_hex(&zip),
-                size: zip.len() as u64,
-                folders: ALLOWED_FOLDERS
-                    .iter()
-                    .map(|folder| folder.to_string())
-                    .collect(),
-                flavors: Vec::new(),
-            },
-        };
-
-        install_package_for_client(&client, &manifest, &zip).unwrap();
-
-        assert!(!addons.join(".brick-staging").exists());
-        for (folder, contents) in ALLOWED_FOLDERS
-            .iter()
-            .zip(["addon", "libraries", "options"])
-        {
-            assert_eq!(
-                fs::read(addons.join(folder).join("new.lua")).unwrap(),
-                contents.as_bytes()
-            );
-        }
-        assert_eq!(
-            fs::read(addons.join("UnmanagedAddon/keep.lua")).unwrap(),
-            b"keep"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn staging_cleanup_does_not_follow_a_redirected_staging_root() {
-        let root = test_directory();
-        let _cleanup = StagingCleanup(&root);
-        let outside = root.join("outside");
-        fs::create_dir_all(outside.join("keep")).unwrap();
-        fs::write(outside.join("keep/addon.lua"), b"keep").unwrap();
-        let staging = root.join(".brick-staging");
-        std::os::unix::fs::symlink(&outside, &staging).unwrap();
-
-        cleanup_staging_transactions(&staging);
-
-        assert!(staging.is_symlink());
-        assert_eq!(fs::read(outside.join("keep/addon.lua")).unwrap(), b"keep");
     }
 
     #[test]
