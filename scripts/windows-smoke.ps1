@@ -16,6 +16,7 @@ try {
     Add-Type @'
 using System;
 using System.Collections.Generic;
+using System.Text;
 using System.Runtime.InteropServices;
 public static class BrickWindow {
     public delegate bool EnumProc(IntPtr hwnd, IntPtr lParam);
@@ -25,11 +26,17 @@ public static class BrickWindow {
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
-    [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr hwnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int maxCount);
     public static IntPtr Find(int targetPid) {
         IntPtr result = IntPtr.Zero;
         EnumWindows((hwnd, unused) => { uint pid; GetWindowThreadProcessId(hwnd, out pid);
-            if (pid == targetPid && GetWindowTextLength(hwnd) > 0) { result = hwnd; return false; } return true;
+            if (pid == targetPid) {
+                var title = new StringBuilder(256);
+                GetWindowText(hwnd, title, title.Capacity);
+                // Windows also creates titled, hidden IME helper windows for this process.
+                if (title.ToString() == "Brick") { result = hwnd; return false; }
+            }
+            return true;
         }, IntPtr.Zero);
         return result;
     }

@@ -72,4 +72,21 @@ Public package SHA-256 values:
 
 Durable local evidence is in `~/.local/share/brick-windows-smoke/shared/results/release-0.3.6/`. Candidate Windows CSVs are in `shared/results/20260905-144559/`; public-installer CSVs are in `shared/results/20260905-150139/`. The local CachyOS launcher contains the verified public AppImage.
 
+## Published 0.3.7
+
+Brick [v0.3.7](https://github.com/IsogiE/Brick-Releases/releases/tag/v0.3.7) was published from source commit `b9bdc3466399f569a19d846f4706f34a13507fdf` by [Release run 33978677746](https://github.com/IsogiE/Brick/actions/runs/33978677746). It adds cleanup of recognized completed installers in the system temporary `Brick/updates` cache. Running-version and older downloads are removed, including legacy MSI files; newer pending downloads and locked files are preserved, with locked files retried on later checks. The cleanup does not scan WoW's `Interface` directory. Addon installation code is unchanged from 0.3.6.
+
+[CI run 33978237761](https://github.com/IsogiE/Brick/actions/runs/33978237761) passed 38 Linux Rust tests, 39 Windows Rust tests, six addon-feed publication tests, formatting, warning-free checks, and optimized builds. The Windows tests include retaining a file while Windows holds it open and removing it after the handle closes. [Private candidate run 33978237635](https://github.com/IsogiE/Brick/actions/runs/33978237635) built the packages tested before the public tag was pushed.
+
+The candidate and public Windows installers each passed all 11 automated desktop checks with the VM-only software OpenGL fixture. An initial public-installer visibility assertion failed despite a visible Brick window. The harness previously accepted any titled process window, including hidden IME helpers; it now selects the window titled `Brick`. Window tracing showed the actual Brick window visible after 0.345 seconds. Candidate and public Windows binaries differ only in PE/debug timestamps and the PDB debug GUID; all other bytes match. Packaged-app cleanup checks on Windows and CachyOS removed old/current installer fixtures while preserving newer pending downloads, unrelated files, nested files, and a test WoW Interface file. The CachyOS candidate also passed minimize, X, taskbar removal, tray restoration, second-instance restoration, and startup-minimized checks; it stayed hidden for 60 seconds at 0.017% of one CPU core. These tests used isolated/signed-out profiles; authenticated addon installation was not retested for this cache-only change.
+
+All five public assets were downloaded and verified. The signed app feed advertises 0.3.7 and the correct source commit, and its Ed25519 signature verifies with the key embedded in public 0.3.4. The public AppImage executable is byte-identical to the tested candidate.
+
+Public package SHA-256 values:
+
+- Windows installer: `946000e024ff3d5dce3748dbb6a6c5c6d98861a0ab70e851c63d52399add47e4`
+- Linux AppImage: `582ed679d1019896c721984906c74f2d0a41d9d5f71b01b57af32d010f296140`
+
+Durable local evidence is in `~/.local/share/brick-windows-smoke/shared/results/release-0.3.7/`. Original Windows candidate results are in `shared/results/20260905-163823/`; public-installer results are in `shared/results/20260905-165557/`.
+
 Sources: [Microsoft evaluation](https://www.microsoft.com/en-us/evalcenter/download-windows-11-enterprise), [VM wrapper](https://github.com/dockur/windows), [QEMU monitor](https://www.qemu.org/docs/master/interop/qemu-qmp-ref.html), [MSYS2 Mesa](https://packages.msys2.org/packages/mingw-w64-ucrt-x86_64-mesa), [Rust C-runtime linkage](https://doc.rust-lang.org/reference/linkage.html#static-and-dynamic-c-runtimes).
