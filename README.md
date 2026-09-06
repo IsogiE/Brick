@@ -8,6 +8,8 @@
 
 A small desktop updater for [Advance Raid Tools](https://github.com/IsogiE/AdvanceRaidTools), written in Rust with egui.
 
+Brick is developed and maintained by Lucas Thoolen (GitHub: IsogiE).
+
 Brick keeps the guild addon installed across your WoW clients, runs in the system tray, and checks for updates automatically. Downloads are verified against signed manifests before installation. Discord sign-in is required for Advance guild members to use the app.
 
 ## Download
