@@ -5,6 +5,7 @@
 
 mod addon;
 mod app_update;
+mod atomic_file;
 mod autostart;
 mod discord_auth;
 mod download;
@@ -22,7 +23,6 @@ use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
     let startup_mode = env::args().any(|arg| arg == "--startup");
-    let start_hidden = startup_mode && addon::startup_minimized_enabled();
     let _instance_guard = match single_instance::acquire() {
         Ok(guard) => Some(guard),
         Err(single_instance::InstanceLockError::AlreadyRunning) => {
@@ -36,6 +36,8 @@ fn main() -> Result<(), eframe::Error> {
             return Ok(());
         }
     };
+
+    let start_hidden = startup_mode && addon::startup_minimized_enabled();
 
     let sync_lock = Arc::new(Mutex::new(()));
     addon::spawn_watcher(sync_lock.clone());

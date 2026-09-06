@@ -29,6 +29,7 @@ const IDLE_REPAINT_MAX_SECS: u64 = 60;
 pub struct BrickApp {
     view: AppView,
     status: String,
+    view_error: Option<String>,
     egui_ctx: egui::Context,
     sync_lock: Arc<Mutex<()>>,
     auth_state: AuthUiState,
@@ -134,9 +135,11 @@ impl BrickApp {
         let now = Instant::now();
 
         let window_visible = !(startup_mode && view.settings.startup_minimized);
+        let view_error = status_needs_attention(&status).then(|| status.clone());
         let mut app = Self {
             view,
             status,
+            view_error,
             egui_ctx: cc.egui_ctx.clone(),
             sync_lock,
             auth_state,
@@ -178,10 +181,6 @@ impl BrickApp {
         if app.auth_state.is_authorized() && !app.view.setup_required {
             app.start_sync();
         }
-        if startup_mode {
-            app.status = "Ready".to_string();
-        }
-
         app
     }
 
@@ -193,8 +192,17 @@ impl BrickApp {
         // Failed reads must wait for the next interval too.
         self.last_view_refresh = Instant::now();
         match result {
-            Ok(view) => self.view = view,
-            Err(error) => self.status = error,
+            Ok(view) => {
+                if self.view_error.as_deref() == Some(self.status.as_str()) {
+                    self.status = "Ready".to_string();
+                }
+                self.view_error = None;
+                self.view = view;
+            }
+            Err(error) => {
+                self.view_error = Some(error.clone());
+                self.status = error;
+            }
         }
     }
 
@@ -1314,6 +1322,18 @@ impl BrickApp {
     fn display_status(&self) -> DisplayStatus {
         let version = current_version(&self.view.settings.clients);
 
+        if settings_problem(&self.status) && status_needs_attention(&self.status) {
+            return DisplayStatus {
+                title: "Settings need attention".to_string(),
+                detail: friendly_problem(&self.status),
+                accent: error_accent(),
+                accent_soft: Color32::from_rgb(62, 32, 36),
+                // A failed settings save can leave the cached version behind
+                // the actual addon installation. Do not present it as current.
+                version: None,
+            };
+        }
+
         if self
             .status
             .to_ascii_lowercase()
@@ -2147,7 +2167,26 @@ fn status_needs_attention(status: &str) -> bool {
 
 fn friendly_problem(status: &str) -> String {
     let lower = status.to_ascii_lowercase();
-    if lower.contains("download") || lower.contains("request") || lower.contains("not available") {
+    let disk_full = lower.contains("os error 112")
+        || lower.contains("os error 28")
+        || lower.contains("not enough space")
+        || lower.contains("no space left")
+        || lower.contains("disk full")
+        || lower.contains("storage full");
+    if settings_problem(status) {
+        if disk_full {
+            "Brick could not save its settings because the disk is full. Free some space; Brick will retry automatically.".to_string()
+        } else if lower.contains("save") || lower.contains("write") {
+            "Brick could not save its settings. Check disk space and access to Brick's settings folder.".to_string()
+        } else {
+            "Brick could not read its settings. Check access to Brick's settings folder; Brick will retry automatically.".to_string()
+        }
+    } else if disk_full {
+        "Brick ran out of disk space. Free some space; Brick will retry automatically.".to_string()
+    } else if lower.contains("download")
+        || lower.contains("request")
+        || lower.contains("not available")
+    {
         "Brick could not reach the update service. It will try again automatically.".to_string()
     } else if lower.contains("signature") || lower.contains("sha") || lower.contains("mismatch") {
         "Brick rejected an update because it could not verify it.".to_string()
@@ -2158,6 +2197,14 @@ fn friendly_problem(status: &str) -> String {
     } else {
         "Brick could not update Advance Raid Tools. It will try again automatically.".to_string()
     }
+}
+
+fn settings_problem(status: &str) -> bool {
+    let lower = status.to_ascii_lowercase();
+    lower.contains("brick settings")
+        || lower.contains("settings.json")
+        || lower.contains("appdata/localappdata")
+        || lower.contains("home/xdg_config_home")
 }
 
 fn app_background() -> Color32 {
@@ -2211,6 +2258,7 @@ mod tests {
         BrickApp {
             view: AppView::default(),
             status: "Ready".into(),
+            view_error: None,
             egui_ctx: egui::Context::default(),
             sync_lock: Arc::new(Mutex::new(())),
             auth_state: AuthUiState::Authorized(AuthorizedUser {
@@ -2251,6 +2299,46 @@ mod tests {
 
     fn overdue() -> Instant {
         Instant::now() - Duration::from_secs(600)
+    }
+
+    #[test]
+    fn settings_failures_are_distinct_from_addon_failures_even_without_clients() {
+        let mut app = app();
+        for error in [
+            "Failed to parse settings.json: EOF while parsing a value at line 1 column 0",
+            "Failed to save Brick settings at C:\\Users\\User\\settings.json: There is not enough space on the disk. (os error 112)",
+            "Failed to read Brick settings at settings.json: Access is denied. (os error 5)",
+        ] {
+            app.status = error.into();
+            let status = app.display_status();
+            assert_eq!(status.title, "Settings need attention");
+            assert!(status.detail.contains("settings"));
+            assert!(!status.detail.contains("Advance Raid Tools"));
+            assert!(!status.detail.contains("WoW folders"));
+            assert!(status.version.is_none());
+        }
+        assert!(
+            friendly_problem("Failed to write settings.json: os error 112")
+                .contains("disk is full")
+        );
+        assert!(friendly_problem(
+            "Failed to save Brick settings: No space left on device (os error 28)"
+        )
+        .contains("disk is full"));
+    }
+
+    #[test]
+    fn successful_view_retry_clears_its_error_but_preserves_unrelated_failures() {
+        let mut app = app();
+        app.apply_view_refresh(Err("Failed to read Brick settings".into()));
+        app.apply_view_refresh(Ok(AppView::default()));
+        assert_eq!(app.status, "Ready");
+        assert!(app.view_error.is_none());
+
+        app.apply_view_refresh(Err("Failed to read Brick settings".into()));
+        app.status = "Failed to verify addon signature".into();
+        app.apply_view_refresh(Ok(AppView::default()));
+        assert_eq!(app.status, "Failed to verify addon signature");
     }
 
     #[test]

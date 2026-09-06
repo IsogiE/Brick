@@ -5,7 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Cursor, Read, Write},
     path::{Component, Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex, MutexGuard},
     thread,
     time::Duration,
 };
@@ -18,7 +18,7 @@ use url::Url;
 use uuid::Uuid;
 use zip::ZipArchive;
 
-use crate::{discord_auth, download};
+use crate::{atomic_file, discord_auth, download};
 
 const APP_ID: &str = "dev.isogi.brick";
 const FEED_OWNER: &str = "IsogiE";
@@ -45,6 +45,18 @@ const ALLOWED_FOLDERS: &[&str] = &[
     "AdvanceRaidTools_Libraries",
     "AdvanceRaidTools_Options",
 ];
+
+// Serialize settings read/modify/write transactions, including recovery. Never
+// hold this across downloads or addon installation: those merge their results
+// into the latest settings after the slow work finishes.
+static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
+static LOG_LOCK: Mutex<()> = Mutex::new(());
+
+fn settings_lock() -> Result<MutexGuard<'static, ()>, String> {
+    SETTINGS_LOCK
+        .lock()
+        .map_err(|_| "Failed to access Brick settings: lock was poisoned.".to_string())
+}
 
 static HTTP_CLIENT: LazyLock<Result<reqwest::blocking::Client, String>> = LazyLock::new(|| {
     reqwest::blocking::Client::builder()
@@ -261,6 +273,7 @@ struct ManifestArtifact {
 }
 
 pub fn load_view() -> Result<AppView, String> {
+    let _guard = settings_lock()?;
     let mut settings = load_settings()?;
     maybe_auto_detect_clients(&mut settings)?;
     if refresh_client_metadata_if_due(&mut settings) {
@@ -270,6 +283,9 @@ pub fn load_view() -> Result<AppView, String> {
 }
 
 pub fn startup_minimized_enabled() -> bool {
+    let Ok(_guard) = settings_lock() else {
+        return true;
+    };
     load_settings()
         .map(|settings| settings.startup_minimized)
         .unwrap_or(true)
@@ -297,6 +313,7 @@ pub fn add_wow_paths(paths: &[PathBuf]) -> Result<AppView, String> {
         return Err(errors.join("; "));
     }
 
+    let _guard = settings_lock()?;
     let mut settings = load_settings()?;
     let mut added = 0;
 
@@ -318,72 +335,78 @@ pub fn add_wow_paths(paths: &[PathBuf]) -> Result<AppView, String> {
     save_settings(&settings)?;
 
     if added > 0 {
-        record_log(
+        let _ = record_log(
             LogLevel::Info,
             format!("Added {added} World of Warcraft client path(s)."),
-        )?;
+        );
     } else {
-        record_log(
+        let _ = record_log(
             LogLevel::Warn,
             "Selected WoW path(s) were already configured.".to_string(),
-        )?;
+        );
     }
 
     if !errors.is_empty() {
-        record_log(
+        let _ = record_log(
             LogLevel::Warn,
             format!(
                 "Some selected WoW path(s) were ignored: {}",
                 errors.join("; ")
             ),
-        )?;
+        );
     }
 
     view_from_settings(settings)
 }
 
 pub fn remove_client(id: &str) -> Result<AppView, String> {
+    let _guard = settings_lock()?;
     let mut settings = load_settings()?;
     let before = settings.clients.len();
     settings.clients.retain(|client| client.id != id);
     save_settings(&settings)?;
 
     if settings.clients.len() != before {
-        record_log(LogLevel::Info, "Removed WoW client path.".to_string())?;
+        let _ = record_log(LogLevel::Info, "Removed WoW client path.".to_string());
     }
 
     view_from_settings(settings)
 }
 
 pub fn set_startup_enabled(enabled: bool) -> Result<AppView, String> {
+    let _guard = settings_lock()?;
     let mut settings = load_settings()?;
     settings.startup_enabled = enabled;
     save_settings(&settings)?;
-    record_log(
+    let _ = record_log(
         LogLevel::Info,
         format!(
             "Brick open at login {}.",
             if enabled { "enabled" } else { "disabled" }
         ),
-    )?;
+    );
     view_from_settings(settings)
 }
 
 pub fn set_startup_minimized(enabled: bool) -> Result<AppView, String> {
+    let _guard = settings_lock()?;
     let mut settings = load_settings()?;
     settings.startup_minimized = enabled;
     save_settings(&settings)?;
-    record_log(
+    let _ = record_log(
         LogLevel::Info,
         format!(
             "Brick startup minimized {}.",
             if enabled { "enabled" } else { "disabled" }
         ),
-    )?;
+    );
     view_from_settings(settings)
 }
 
 pub fn record_log(level: LogLevel, message: String) -> Result<(), String> {
+    let _guard = LOG_LOCK
+        .lock()
+        .map_err(|_| "Failed to access Brick logs: lock was poisoned.".to_string())?;
     let path = logs_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -424,7 +447,8 @@ pub fn spawn_watcher(sync_lock: Arc<Mutex<()>>) {
 }
 
 fn run_sync_if_configured(sync_lock: &Arc<Mutex<()>>) -> Result<(), String> {
-    let settings = load_settings()?;
+    // Recovery and detection must also run while the window is hidden.
+    let settings = load_view()?.settings;
     if settings.clients.is_empty() {
         return Ok(());
     }
@@ -438,15 +462,9 @@ fn run_sync_if_configured(sync_lock: &Arc<Mutex<()>>) -> Result<(), String> {
 }
 
 fn run_sync() -> Result<SyncSummary, String> {
-    let mut settings = load_settings()?;
-    maybe_auto_detect_clients(&mut settings)?;
-    let mut settings_changed = refresh_client_metadata_if_due(&mut settings);
-
+    let mut settings = load_view()?.settings;
     let checked_at = now_stamp();
     if settings.clients.is_empty() {
-        if settings_changed {
-            save_settings(&settings)?;
-        }
         let summary = SyncSummary {
             version: None,
             checked_at,
@@ -460,9 +478,6 @@ fn run_sync() -> Result<SyncSummary, String> {
     let manifest = match fetch_verified_manifest() {
         Ok(manifest) => manifest,
         Err(error) if error == FEED_UNAVAILABLE_MESSAGE => {
-            if settings_changed {
-                save_settings(&settings)?;
-            }
             let summary = SyncSummary {
                 version: None,
                 checked_at,
@@ -486,6 +501,7 @@ fn run_sync() -> Result<SyncSummary, String> {
     };
 
     let mut installed = 0;
+    let mut installed_clients = Vec::new();
     let mut skipped = 0;
     let mut errors = Vec::new();
 
@@ -514,7 +530,7 @@ fn run_sync() -> Result<SyncSummary, String> {
                 client.last_installed_version = Some(manifest.version.clone());
                 client.last_installed_sha256 = Some(manifest.artifact.sha256.clone());
                 client.last_sync_at = Some(checked_at.clone());
-                settings_changed = true;
+                installed_clients.push(client.clone());
             }
             Err(error) => {
                 errors.push(format!("{}: {error}", client.path));
@@ -522,8 +538,12 @@ fn run_sync() -> Result<SyncSummary, String> {
         }
     }
 
-    if settings_changed {
-        save_settings(&settings)?;
+    if !installed_clients.is_empty() {
+        let _guard = settings_lock()?;
+        let mut latest = load_settings()?;
+        if merge_installed_clients(&mut latest, &installed_clients) {
+            save_settings(&latest)?;
+        }
     }
 
     let mut message = if installed > 0 {
@@ -538,9 +558,9 @@ fn run_sync() -> Result<SyncSummary, String> {
     if !errors.is_empty() {
         let joined = errors.join("; ");
         message = format!("{message} {joined}");
-        record_log(LogLevel::Error, message.clone())?;
+        let _ = record_log(LogLevel::Error, message.clone());
     } else if installed > 0 {
-        record_log(LogLevel::Info, message.clone())?;
+        let _ = record_log(LogLevel::Info, message.clone());
     }
 
     Ok(SyncSummary {
@@ -552,52 +572,110 @@ fn run_sync() -> Result<SyncSummary, String> {
     })
 }
 
+fn merge_installed_clients(settings: &mut Settings, installed: &[WowClient]) -> bool {
+    let mut changed = false;
+    for result in installed {
+        if let Some(client) = settings
+            .clients
+            .iter_mut()
+            .find(|client| client.id == result.id && same_path(&client.path, &result.path))
+        {
+            client
+                .last_installed_version
+                .clone_from(&result.last_installed_version);
+            client
+                .last_installed_sha256
+                .clone_from(&result.last_installed_sha256);
+            client.last_sync_at.clone_from(&result.last_sync_at);
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn view_from_settings(settings: Settings) -> Result<AppView, String> {
     Ok(AppView {
         setup_required: settings.clients.is_empty(),
         settings,
-        logs: read_logs()?,
+        logs: read_logs().unwrap_or_default(),
     })
 }
 
+// Callers hold SETTINGS_LOCK for the entire read/modify/write transaction.
 fn load_settings() -> Result<Settings, String> {
-    let path = settings_path()?;
-    if !path.exists() {
-        return Ok(Settings::default());
+    let (settings, warning) = load_settings_from(&settings_path()?)?;
+    if let Some(warning) = warning {
+        let _ = record_log(LogLevel::Warn, warning);
     }
-
-    let contents = fs::read_to_string(&path)
-        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-    let mut settings: Settings = serde_json::from_str(&contents)
-        .map_err(|error| format!("Failed to parse {}: {error}", path.display()))?;
-
-    if settings.schema == 0 {
-        settings.schema = 1;
-    }
-
     Ok(settings)
 }
 
-fn save_settings(settings: &Settings) -> Result<(), String> {
-    let path = settings_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
+fn load_settings_from(path: &Path) -> Result<(Settings, Option<String>), String> {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((Settings::default(), None))
+        }
+        Err(error) => {
+            return Err(format!(
+                "Failed to read Brick settings at {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    if contents.iter().all(u8::is_ascii_whitespace) {
+        return Ok((Settings::default(), None));
     }
+    let mut settings: Settings = match serde_json::from_slice(&contents) {
+        Ok(settings) => settings,
+        Err(error) => {
+            // Retain damaged nonempty files for manual recovery, including
+            // truncated JSON and invalid UTF-8 from an interrupted legacy save.
+            let mut name = path.as_os_str().to_os_string();
+            name.push(format!(".corrupt-{}", Uuid::new_v4()));
+            let preserved = PathBuf::from(name);
+            fs::rename(path, &preserved).map_err(|rename_error| format!(
+                "Failed to recover Brick settings at {}: {error}; could not preserve the damaged file: {rename_error}", path.display()))?;
+            return Ok((Settings::default(), Some(format!(
+                "Recovered damaged Brick settings using defaults. Previous contents kept at {}: {error}", preserved.display()))));
+        }
+    };
+    if settings.schema == 0 {
+        settings.schema = 1;
+    }
+    Ok((settings, None))
+}
 
-    let json = serde_json::to_string_pretty(settings)
-        .map_err(|error| format!("Failed to serialize settings: {error}"))?;
-    fs::write(&path, json).map_err(|error| format!("Failed to write {}: {error}", path.display()))
+fn save_settings(settings: &Settings) -> Result<(), String> {
+    save_settings_to(&settings_path()?, settings)
+}
+
+fn save_settings_to(path: &Path, settings: &Settings) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(settings)
+        .map_err(|error| format!("Failed to serialize Brick settings: {error}"))?;
+    atomic_file::write(path, &json).map_err(|error| {
+        format!(
+            "Failed to save Brick settings at {}: {error}",
+            path.display()
+        )
+    })
 }
 
 fn read_logs() -> Result<Vec<LogEntry>, String> {
-    let path = logs_path()?;
+    let _guard = LOG_LOCK
+        .lock()
+        .map_err(|_| "Failed to access Brick logs: lock was poisoned.".to_string())?;
+    read_logs_from(&logs_path()?)
+}
+
+fn read_logs_from(path: &Path) -> Result<Vec<LogEntry>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
 
-    let contents = fs::read_to_string(&path)
-        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let bytes =
+        fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let contents = String::from_utf8_lossy(&bytes);
     let mut logs = Vec::new();
 
     for line in contents.lines().filter(|line| !line.trim().is_empty()) {
@@ -609,28 +687,21 @@ fn read_logs() -> Result<Vec<LogEntry>, String> {
     if logs.len() > MAX_LOG_ENTRIES {
         let overflow = logs.len() - MAX_LOG_ENTRIES;
         logs.drain(0..overflow);
-        rewrite_logs(&logs)?;
+        let _ = rewrite_logs(path, &logs);
     }
 
     Ok(logs)
 }
 
-fn rewrite_logs(logs: &[LogEntry]) -> Result<(), String> {
-    let path = logs_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
-    }
-
-    let mut file = fs::File::create(&path)
-        .map_err(|error| format!("Failed to compact {}: {error}", path.display()))?;
+fn rewrite_logs(path: &Path, logs: &[LogEntry]) -> Result<(), String> {
+    let mut contents = Vec::new();
     for entry in logs {
-        let line = serde_json::to_string(entry)
+        serde_json::to_writer(&mut contents, entry)
             .map_err(|error| format!("Failed to serialize log entry: {error}"))?;
-        writeln!(file, "{line}")
-            .map_err(|error| format!("Failed to write {}: {error}", path.display()))?;
+        contents.push(b'\n');
     }
-    Ok(())
+    atomic_file::write(path, &contents)
+        .map_err(|error| format!("Failed to compact {}: {error}", path.display()))
 }
 
 fn settings_path() -> Result<PathBuf, String> {
@@ -675,13 +746,14 @@ fn maybe_auto_detect_clients(settings: &mut Settings) -> Result<(), String> {
     settings.clients = detected;
     sort_clients(&mut settings.clients);
     save_settings(settings)?;
-    record_log(
+    let _ = record_log(
         LogLevel::Info,
         format!(
             "Detected {} World of Warcraft client path(s).",
             settings.clients.len()
         ),
-    )
+    );
+    Ok(())
 }
 
 fn discover_default_wow_clients() -> Vec<WowClient> {
@@ -1445,6 +1517,178 @@ mod tests {
 
     fn allowed_folders() -> Vec<String> {
         vec!["AdvanceRaidTools".to_string()]
+    }
+
+    #[test]
+    fn missing_empty_and_whitespace_settings_load_defaults() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let path = root.join(SETTINGS_FILE);
+        let defaults = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(
+            serde_json::to_value(load_settings_from(&path).unwrap().0).unwrap(),
+            defaults
+        );
+        for contents in ["", " \r\n\t"] {
+            fs::write(&path, contents).unwrap();
+            let (settings, warning) = load_settings_from(&path).unwrap();
+            assert_eq!(serde_json::to_value(settings).unwrap(), defaults);
+            assert!(warning.is_none());
+            save_settings_to(&path, &Settings::default()).unwrap();
+            assert_eq!(
+                serde_json::to_value(load_settings_from(&path).unwrap().0).unwrap(),
+                defaults
+            );
+        }
+    }
+
+    #[test]
+    fn damaged_settings_are_preserved_before_recovery() {
+        for contents in [
+            b"{\"schema\":1,".as_slice(),
+            b"\xff\x00broken",
+            b"null",
+            b"{\"clients\":false}",
+        ] {
+            let root = test_directory();
+            let _cleanup = StagingCleanup(&root);
+            let path = root.join(SETTINGS_FILE);
+            fs::write(&path, contents).unwrap();
+            let (settings, warning) = load_settings_from(&path).unwrap();
+            assert!(settings.clients.is_empty());
+            assert!(warning
+                .unwrap()
+                .contains("Recovered damaged Brick settings"));
+            assert!(!path.exists());
+            let preserved = fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
+            assert!(preserved
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("settings.json.corrupt-"));
+            assert_eq!(fs::read(&preserved).unwrap(), contents);
+            save_settings_to(&path, &settings).unwrap();
+            assert!(load_settings_from(&path).unwrap().1.is_none());
+            assert_eq!(fs::read(preserved).unwrap(), contents);
+        }
+    }
+
+    #[test]
+    fn settings_io_errors_are_not_treated_as_missing_or_corrupt() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let path = root.join(SETTINGS_FILE);
+        fs::create_dir(&path).unwrap();
+        assert!(load_settings_from(&path)
+            .unwrap_err()
+            .contains("Failed to read Brick settings"));
+        assert!(path.is_dir());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn installed_results_preserve_concurrent_preferences_and_client_changes() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let retail = client_from_flavor_dir(&FLAVOR_INFOS[0], &root.join("_retail_"));
+        let ptr = client_from_flavor_dir(&FLAVOR_INFOS[1], &root.join("_ptr_"));
+        let added = client_from_flavor_dir(&FLAVOR_INFOS[3], &root.join("_beta_"));
+        let mut result = retail.clone();
+        result.last_installed_version = Some("new version".into());
+        result.last_installed_sha256 = Some("new sha".into());
+        result.last_sync_at = Some("now".into());
+
+        let mut latest = Settings {
+            startup_enabled: false,
+            startup_minimized: false,
+            clients: vec![retail, added.clone()],
+            ..Settings::default()
+        };
+        latest.clients[0].game_version = Some("new game version".into());
+        assert!(merge_installed_clients(&mut latest, &[result, ptr]));
+        assert!(!latest.startup_enabled);
+        assert!(!latest.startup_minimized);
+        assert_eq!(latest.clients.len(), 2);
+        assert_eq!(
+            latest.clients[0].last_installed_sha256.as_deref(),
+            Some("new sha")
+        );
+        assert_eq!(
+            latest.clients[0].game_version.as_deref(),
+            Some("new game version")
+        );
+        assert_eq!(
+            serde_json::to_value(&latest.clients[1]).unwrap(),
+            serde_json::to_value(added).unwrap()
+        );
+    }
+
+    #[test]
+    fn recovery_and_unwritable_logs_do_not_block_detection_or_preferences() {
+        // A child process isolates the real config/detection environment from
+        // both the user's profile and concurrently running unit tests.
+        const PROFILE_ENV: &str = "BRICK_RECOVERY_TEST_PROFILE";
+        if let Some(root) = env::var_os(PROFILE_ENV) {
+            let root = PathBuf::from(root);
+            assert!(config_dir().unwrap().starts_with(&root));
+            let expected = root.join("program-files/World of Warcraft/_retail_");
+            let view = load_view().unwrap();
+            assert!(!view.setup_required);
+            assert!(view
+                .settings
+                .clients
+                .iter()
+                .any(|client| same_path(&client.path, &expected.to_string_lossy())));
+            // A directory at the log filename makes logging unreadable and
+            // unwritable on Windows and Unix, without privilege-dependent tests.
+            assert!(logs_path().unwrap().is_dir());
+            let view = set_startup_minimized(false).unwrap();
+            assert!(!view.settings.startup_minimized);
+            assert!(!startup_minimized_enabled());
+            assert!(!load_view().unwrap().setup_required);
+            return;
+        }
+        for contents in ["", "  \r\n", "{broken"] {
+            let root = test_directory();
+            let _cleanup = StagingCleanup(&root);
+            let config = root.join(APP_ID);
+            fs::create_dir_all(config.join(LOG_FILE)).unwrap();
+            fs::write(config.join(SETTINGS_FILE), contents).unwrap();
+            fs::create_dir_all(root.join("program-files/World of Warcraft/_retail_")).unwrap();
+            let output = std::process::Command::new(env::current_exe().unwrap())
+                .args(["--exact", "addon::tests::recovery_and_unwritable_logs_do_not_block_detection_or_preferences", "--nocapture"])
+                .env(PROFILE_ENV, &root)
+                .env("APPDATA", &root)
+                .env("LOCALAPPDATA", &root)
+                .env("XDG_CONFIG_HOME", &root)
+                .env("ProgramFiles", root.join("program-files"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_log_lines_do_not_hide_valid_entries() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let path = root.join(LOG_FILE);
+        let entry = LogEntry {
+            at: "now".into(),
+            level: LogLevel::Info,
+            message: "valid".into(),
+        };
+        let mut bytes = b"invalid\xff\n".to_vec();
+        serde_json::to_writer(&mut bytes, &entry).unwrap();
+        bytes.extend_from_slice(b"\n{truncated");
+        fs::write(&path, bytes).unwrap();
+        let logs = read_logs_from(&path).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].message, "valid");
     }
 
     #[test]

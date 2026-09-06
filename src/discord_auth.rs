@@ -752,28 +752,8 @@ fn remove_session_file(path: &Path) -> Result<(), String> {
 }
 
 fn write_private_bytes(path: &Path, contents: &[u8]) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::{fs::OpenOptions, io::Write};
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
-        file.write_all(contents)
-            .map_err(|error| format!("Failed to write {}: {error}", path.display()))?;
-        return Ok(());
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::write(path, contents)
-            .map_err(|error| format!("Failed to write {}: {error}", path.display()))
-    }
+    crate::atomic_file::write(path, contents)
+        .map_err(|error| format!("Failed to write {}: {error}", path.display()))
 }
 
 #[cfg(target_os = "windows")]
