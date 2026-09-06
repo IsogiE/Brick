@@ -12,6 +12,8 @@ Brick is developed and maintained by Lucas Thoolen (GitHub: IsogiE).
 
 Brick keeps the guild addon installed across your WoW clients, runs in the system tray, and checks for updates automatically. Downloads are verified against signed manifests before installation. Discord sign-in is required for Advance guild members to use the app.
 
+On startup and every minute while running and signed in, Brick checks the installed addon versions against the current signed release. If a managed addon's folder or TOC file is missing, or its TOC version differs, Brick reinstalls the current package automatically.
+
 ## Download
 
 Get the latest build from [Releases](https://github.com/IsogiE/Brick-Releases/releases/latest).

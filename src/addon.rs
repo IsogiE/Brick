@@ -1205,13 +1205,32 @@ fn validate_github_release_url(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn installed_folders_present(client: &WowClient, manifest: &AddonManifest) -> bool {
+fn addon_toc_matches_version(addons_dir: &Path, folder: &str, expected_version: &str) -> bool {
+    let toc_path = addons_dir.join(folder).join(format!("{folder}.toc"));
+    let Ok(contents) = fs::read_to_string(toc_path) else {
+        return false;
+    };
+
+    contents
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .find_map(|line| {
+            let metadata = line.trim().strip_prefix("##")?;
+            let (key, value) = metadata.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case("Version")
+                .then_some(value.trim())
+        })
+        .is_some_and(|version| !version.is_empty() && version == expected_version.trim())
+}
+
+fn installed_addons_match_version(client: &WowClient, manifest: &AddonManifest) -> bool {
     let addons_dir = addons_dir_for_client(client);
     manifest
         .artifact
         .folders
         .iter()
-        .all(|folder| addons_dir.join(folder).is_dir())
+        .all(|folder| addon_toc_matches_version(&addons_dir, folder, &manifest.version))
 }
 
 fn client_supported_by_manifest(client: &WowClient, manifest: &AddonManifest) -> bool {
@@ -1221,7 +1240,7 @@ fn client_supported_by_manifest(client: &WowClient, manifest: &AddonManifest) ->
 fn client_needs_install(client: &WowClient, manifest: &AddonManifest) -> bool {
     client_supported_by_manifest(client, manifest)
         && (client.last_installed_sha256.as_deref() != Some(manifest.artifact.sha256.as_str())
-            || !installed_folders_present(client, manifest))
+            || !installed_addons_match_version(client, manifest))
 }
 
 fn install_package_for_client(
@@ -1249,6 +1268,12 @@ fn install_package_for_client(
         if !staging_dir.join(folder).is_dir() {
             let _ = fs::remove_dir_all(&staging_dir);
             return Err(format!("Addon package did not contain folder {folder}."));
+        }
+        if !addon_toc_matches_version(&staging_dir, folder, &manifest.version) {
+            return Err(format!(
+                "Addon package TOC version mismatch for {folder}; expected {}.",
+                manifest.version.trim()
+            ));
         }
     }
 
@@ -1517,6 +1542,188 @@ mod tests {
 
     fn allowed_folders() -> Vec<String> {
         vec!["AdvanceRaidTools".to_string()]
+    }
+
+    fn installed_addon_fixture(root: &Path) -> (WowClient, AddonManifest, Vec<u8>) {
+        let version = "v1.7.11-12-g4b579c2";
+        let tocs: Vec<_> = ALLOWED_FOLDERS
+            .iter()
+            .map(|folder| {
+                (
+                    format!("{folder}/{folder}.toc"),
+                    format!("## Interface: 120100\n## Version: {version}\n"),
+                )
+            })
+            .collect();
+        let entries: Vec<_> = tocs
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_bytes()))
+            .collect();
+        let zip = package(&entries);
+        let manifest = AddonManifest {
+            schema: 1,
+            package_id: PACKAGE_ID.to_string(),
+            version: version.to_string(),
+            commit: "test".to_string(),
+            built_at: "test".to_string(),
+            artifact: ManifestArtifact {
+                url: String::new(),
+                sha256: sha256_hex(&zip),
+                size: zip.len() as u64,
+                folders: ALLOWED_FOLDERS
+                    .iter()
+                    .map(|folder| folder.to_string())
+                    .collect(),
+                flavors: vec![Flavor::Retail, Flavor::Ptr],
+            },
+        };
+        let mut client = client_from_flavor_dir(&FLAVOR_INFOS[0], root);
+        install_package_for_client(&client, &manifest, &zip).unwrap();
+        client.last_installed_version = Some(manifest.version.clone());
+        client.last_installed_sha256 = Some(manifest.artifact.sha256.clone());
+        (client, manifest, zip)
+    }
+
+    #[test]
+    fn toc_check_repairs_overwritten_builds_despite_matching_saved_hash() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let (client, manifest, zip) = installed_addon_fixture(&root.join("_retail_"));
+        let (healthy_client, _, _) = installed_addon_fixture(&root.join("_ptr_"));
+        let addons_dir = addons_dir_for_client(&client);
+        let unrelated = addons_dir.join("OtherAddon");
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(unrelated.join("keep.lua"), "keep").unwrap();
+        assert!(!client_needs_install(&client, &manifest));
+
+        for folder in &manifest.artifact.folders {
+            for version in [
+                "v1.7.11-11-g2615914-dirty-local-20260906-164519",
+                "v1.7.11-12-gabcdef0",
+                "v99.0.0-local",
+            ] {
+                let installed = addons_dir.join(folder);
+                fs::write(
+                    installed.join(format!("{folder}.toc")),
+                    format!("## Version: {version}\n"),
+                )
+                .unwrap();
+                fs::write(installed.join("local-only.lua"), "test build").unwrap();
+                assert!(
+                    client_needs_install(&client, &manifest),
+                    "{folder}: {version}"
+                );
+                assert!(!client_needs_install(&healthy_client, &manifest));
+
+                install_package_for_client(&client, &manifest, &zip).unwrap();
+                assert!(!client_needs_install(&client, &manifest));
+                assert!(!installed.join("local-only.lua").exists());
+                assert_eq!(fs::read(unrelated.join("keep.lua")).unwrap(), b"keep");
+            }
+        }
+    }
+
+    #[test]
+    fn toc_check_detects_missing_unreadable_and_invalid_tocs_in_every_folder() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let (client, manifest, zip) = installed_addon_fixture(&root);
+        let addons_dir = addons_dir_for_client(&client);
+        for folder in &manifest.artifact.folders {
+            let installed = addons_dir.join(folder);
+            let toc = installed.join(format!("{folder}.toc"));
+            for contents in [
+                b"".as_slice(),
+                b"## Title: Advance Raid Tools\n",
+                b"## Version:  \r\n",
+                b"## Version: @project-version@\n",
+                b"# Version: v1.7.11-12-g4b579c2\n",
+                b"## Version: \xff\n",
+            ] {
+                fs::write(&toc, contents).unwrap();
+                assert!(
+                    client_needs_install(&client, &manifest),
+                    "{folder}: {contents:?}"
+                );
+            }
+            fs::remove_file(&toc).unwrap();
+            assert!(client_needs_install(&client, &manifest));
+            // A directory in place of a TOC fails reads on Windows and Unix,
+            // independent of the permissions of the user running the test.
+            fs::create_dir(&toc).unwrap();
+            assert!(client_needs_install(&client, &manifest));
+            fs::remove_dir_all(&installed).unwrap();
+            assert!(client_needs_install(&client, &manifest));
+
+            install_package_for_client(&client, &manifest, &zip).unwrap();
+            assert!(!client_needs_install(&client, &manifest));
+        }
+    }
+
+    #[test]
+    fn matching_tocs_skip_install_but_still_require_saved_hash_and_supported_flavor() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let (mut client, manifest, _) = installed_addon_fixture(&root);
+        for folder in &manifest.artifact.folders {
+            fs::write(
+                addons_dir_for_client(&client)
+                    .join(folder)
+                    .join(format!("{folder}.toc")),
+                format!(
+                    "\u{feff}## Interface: 120100\r\n  ## version : \t{} \r\nmain.lua\r\n",
+                    manifest.version
+                ),
+            )
+            .unwrap();
+        }
+        assert!(!client_needs_install(&client, &manifest));
+        client.last_installed_sha256 = Some("different package hash".into());
+        assert!(client_needs_install(&client, &manifest));
+        client.last_installed_sha256 = None;
+        assert!(client_needs_install(&client, &manifest));
+        client.flavor = Flavor::Classic;
+        assert!(!client_needs_install(&client, &manifest));
+    }
+
+    #[test]
+    fn package_toc_mismatch_preserves_all_installed_folders_and_cleans_staging() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let (client, manifest, _) = installed_addon_fixture(&root);
+        let addons_dir = addons_dir_for_client(&client);
+        for contents in ["## Version: wrong\n", "## Title: Missing version\n"] {
+            let zip = package(&[
+                (
+                    "AdvanceRaidTools/AdvanceRaidTools.toc",
+                    b"## Version: v1.7.11-12-g4b579c2\n",
+                ),
+                (
+                    "AdvanceRaidTools_Libraries/AdvanceRaidTools_Libraries.toc",
+                    b"## Version: v1.7.11-12-g4b579c2\n",
+                ),
+                (
+                    "AdvanceRaidTools_Options/AdvanceRaidTools_Options.toc",
+                    contents.as_bytes(),
+                ),
+            ]);
+            let error = install_package_for_client(&client, &manifest, &zip).unwrap_err();
+            assert!(error.contains("TOC version mismatch for AdvanceRaidTools_Options"));
+            for folder in &manifest.artifact.folders {
+                assert_eq!(
+                    fs::read_to_string(addons_dir.join(folder).join(format!("{folder}.toc")))
+                        .unwrap(),
+                    format!("## Interface: 120100\n## Version: {}\n", manifest.version)
+                );
+            }
+            assert!(!client_needs_install(&client, &manifest));
+            assert_eq!(
+                fs::read_dir(addons_dir.join(".brick-staging"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
     }
 
     #[test]
