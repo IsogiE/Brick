@@ -3,8 +3,8 @@ name = "brick"
 version = "0.3.8"
 description = "Advance"
 authors = ["Advance Raid Tools"]
-license = "All rights reserved"
-repository = "https://github.com/IsogiE/AdvanceRaidTools"
+license = "MIT"
+repository = "https://github.com/IsogiE/Brick"
 edition = "2021"
 
 [dependencies]

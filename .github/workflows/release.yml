@@ -8,7 +8,7 @@ on:
         required: true
         default: '0.1.0'
       publish:
-        description: 'Publish publicly after smoke testing; leave off to build private candidate artifacts'
+        description: 'Publish publicly after smoke testing; leave off to build unpublished candidate artifacts'
         type: boolean
         required: false
         default: false

@@ -1,6 +1,6 @@
 # Brick
 
-Small in-house updater for Advance Raid Tools.
+Small in-house updater for Advance Raid Tools. Source is available under the [MIT license](LICENSE). Download installers from [Brick Releases](https://github.com/IsogiE/Brick-Releases/releases/latest).
 
 Brick is intentionally not a general addon manager. After first setup it runs at login, checks the single signed guild feed on GitHub, and installs the latest published package into every configured WoW client folder automatically.
 
@@ -33,15 +33,15 @@ Supported client folders:
 
 ## Release Setup
 
-The Brick source repo can stay private, but updater binaries and the addon feed need to be reachable without GitHub auth. The addon feed and app release artifacts are published to the public release-only repo `IsogiE/Brick-Releases`.
+Brick source is public at `IsogiE/Brick` under the MIT license. The addon feed and app release artifacts are published to the separate public release-only repo `IsogiE/Brick-Releases`, so installed clients can download updates without GitHub authentication.
 
-Push this Brick folder to its private GitHub repo, then add these GitHub secrets to that private Brick repo:
+Maintainers configure these GitHub Actions secrets in the Brick repo:
 
 - `BRICK_RELEASE_TOKEN`: fine-grained GitHub token with Contents read/write for `IsogiE/Brick-Releases`.
 - `BRICK_ADDON_PUBLIC_KEY_B64`: raw 32-byte Ed25519 public key embedded into Brick for addon and app update feeds.
 - `BRICK_ADDON_PRIVATE_KEY_B64`: PKCS#8 Ed25519 private key used by Brick workflows to sign `addon-manifest.json` and `app-manifest.json`.
 
-Add this GitHub repo variable to the private Brick repo:
+Maintainers configure these GitHub repository variables:
 
 - `BRICK_DISCORD_CLIENT_ID`: Discord application/client ID for the Brick login app.
 - `BRICK_PRESENCE_API_URL`: HTTPS URL for the Brick Presence API, currently `https://brick.lusaggo.com`.
@@ -69,7 +69,7 @@ When enabled, the release workflow signs `brick.exe` before Windows packaging an
 
 The public AdvanceRaidTools addon repo does not need Brick feed scripts or Brick signing secrets. For near-immediate feed publishing, it does need one dispatch-only secret:
 
-- `BRICK_WORKFLOW_TOKEN`: fine-grained GitHub token scoped to `IsogiE/Brick` with Actions write access. ART uses it after the normal BigWigs packager step succeeds to dispatch Brick's private `Addon feed` workflow for that exact ART commit.
+- `BRICK_WORKFLOW_TOKEN`: fine-grained GitHub token scoped to `IsogiE/Brick` with Actions write access. ART uses it after the normal BigWigs packager step succeeds to dispatch Brick's `Addon feed` workflow for that exact ART commit.
 
 Generate the addon feed key with:
 
@@ -84,7 +84,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-You can also run the `Release` workflow manually and provide a SemVer version. In both cases, the private Brick repo builds the app and publishes only the installer/package assets to the public `IsogiE/Brick-Releases` repo.
+You can also run the `Release` workflow manually and provide a SemVer version. In both cases, the Brick repo builds the app and publishes only the installer/package assets to the public `IsogiE/Brick-Releases` repo.
 
 The release workflow publishes to `IsogiE/Brick-Releases` and builds:
 
@@ -120,7 +120,7 @@ For `lusaggo.com`, DNS should point the Brick API subdomain at the VPS:
 ```text
 Type: A
 Name: brick
-Content: 2.28.118.132
+Content: <VPS_PUBLIC_IP>
 Proxy: DNS only
 TTL: Auto
 ```
@@ -183,4 +183,4 @@ npm run remove:local-appimage -- --purge
 
 The app must be built with `BRICK_ADDON_PUBLIC_KEY_B64` set before it can trust the public addon feed. Local builds without that key still open the UI, but sync will refuse to install packages. Local builds without `BRICK_DISCORD_CLIENT_ID` show the Discord login configuration screen.
 
-Windows desktop smoke testing and private candidate builds: [instructions](docs/windows-smoke.md).
+Windows desktop smoke testing and unpublished candidate builds: [instructions](docs/windows-smoke.md).

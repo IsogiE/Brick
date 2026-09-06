@@ -8,7 +8,7 @@ The pinned image is `dockurr/windows@sha256:0cff9eb0e7aee9953e55bc682852ca4fdca2
 
 ## Run a candidate
 
-Build private packages from the branch or commit to test. Manual Release runs default to `publish=false`; public tags still trigger the normal release path.
+Build candidate packages from the branch or commit to test. Actions artifacts are public now that the source repo is public. Manual Release runs default to `publish=false`; public tags still trigger the normal release path.
 
 ```sh
 gh workflow run release.yml --repo IsogiE/Brick --ref YOUR_BRANCH -f version=0.3.6 -f publish=false

@@ -6,7 +6,7 @@ authors = ["Advance Raid Tools"]
 publisher = "Advance"
 description = "Advance Raid Tools"
 long-description = "Small in-house updater for the Advance Raid Tools guild addon package."
-homepage = "https://github.com/IsogiE/AdvanceRaidTools"
+homepage = "https://github.com/IsogiE/Brick"
 category = "Utility"
 out-dir = "dist/packages"
 binaries-dir = "target/release"
@@ -14,6 +14,7 @@ before-packaging-command = "cargo build --release"
 binaries = [{ path = "brick", main = true }]
 icons = ["src/assets/brick.ico", "src/assets/brick.png"]
 formats = ["appimage"]
+resources = ["LICENSE"]
 
 [linux]
 generate-desktop-entry = true

@@ -1,6 +1,6 @@
 # Brick Agent Notes
 
-Read this before changing Brick. This repo is the private source app. The public addon repo is `/home/lucas/Documents/GitHub/AdvanceRaidTools`.
+Read this before changing Brick. This repo is the public Brick source app, licensed under MIT. The public addon repo is `/home/lucas/Documents/GitHub/AdvanceRaidTools`.
 
 ## Current Shape
 
@@ -36,14 +36,14 @@ Before syncing the addon, Brick requires Discord OAuth login. It uses the public
 
 ## Repo Split
 
-- Brick private source: `/home/lucas/Documents/GitHub/Brick`
+- Brick public MIT source: `/home/lucas/Documents/GitHub/Brick`
 - ART public addon source: `/home/lucas/Documents/GitHub/AdvanceRaidTools`
 - ART publishes packaged addon builds through the normal BigWigs packager flow to addon platforms.
-- Brick's private `Addon feed` workflow packages ART with a pinned BigWigs packager commit in no-upload mode and signs `addon-manifest.json`.
-- Fast addon feed updates come from ART's normal `Package addon` workflow after the BigWigs packager step succeeds. ART dispatches Brick's private `Addon feed` workflow with the exact ART commit SHA in `addon_ref`.
+- Brick's `Addon feed` workflow packages ART with a pinned BigWigs packager commit in no-upload mode and signs `addon-manifest.json`.
+- Fast addon feed updates come from ART's normal `Package addon` workflow after the BigWigs packager step succeeds. ART dispatches Brick's `Addon feed` workflow with the exact ART commit SHA in `addon_ref`.
 - The addon feed workflow keeps a plain five-minute cron only as a fallback. Do not rely on cron for fast guild updates; GitHub scheduled workflows can be delayed or dropped.
 - The signed addon feed and Brick app releases publish assets to the public `IsogiE/Brick-Releases` repo. Do not change ART workflow/repo plumbing for Brick unless Lucas explicitly asks.
-- The `Release` workflow builds public-test app packages from private Brick source and publishes them to `IsogiE/Brick-Releases`; Windows packaging is the NSIS/current-user `.exe`.
+- The `Release` workflow builds public-test app packages from public Brick source and publishes them to `IsogiE/Brick-Releases`; Windows packaging is the NSIS/current-user `.exe`.
 - The `Release` workflow uses GitHub Actions cache entries for Rust dependencies, the cargo target directory, and the `cargo-packager` binary to reduce future cold-start packaging time.
 - Public Brick app releases should have an empty release body; keep installer guidance out of the GitHub release text.
 - Windows release signing is opt-in with repo variable `BRICK_WINDOWS_SIGNING=artifact-signing` and Azure Artifact Signing secrets. When enabled, the Release workflow signs `target/release/brick.exe` before Windows packaging and signs the final Windows installers before upload.
@@ -103,7 +103,7 @@ Use `NO_STRIP=1` for AppImage builds on Arch/CachyOS. `npm run build:local-appim
 
 ## Release Secrets
 
-Private Brick repo:
+Brick repo (GitHub Actions secrets):
 
 - `BRICK_RELEASE_TOKEN`
 - `BRICK_ADDON_PUBLIC_KEY_B64`
@@ -112,7 +112,7 @@ Private Brick repo:
 
 Public ART repo:
 
-- `BRICK_WORKFLOW_TOKEN`: fine-grained GitHub token that can dispatch the private Brick `Addon feed` workflow.
+- `BRICK_WORKFLOW_TOKEN`: fine-grained GitHub token that can dispatch the Brick `Addon feed` workflow.
 
 Do not use a broad personal token for `BRICK_WORKFLOW_TOKEN` unless Lucas explicitly approves the wider blast radius. Prefer a fine-grained token scoped only to `IsogiE/Brick` with Actions write access.
 
