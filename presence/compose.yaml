@@ -1,22 +1,63 @@
+x-restrictions: &restrictions
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  pids_limit: 128
+  mem_limit: 256m
+  cpus: 1.0
+  tmpfs:
+    - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   api:
+    <<: *restrictions
     build: .
     restart: unless-stopped
-    env_file:
-      - .env
     environment:
       DATA_DIR: /data
       PORT: 8080
+      TRUST_PROXY: "true"
+      DISCORD_BOT_TOKEN_FILE: /run/secrets/discord_bot_token
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:?}
+      DISCORD_OFFICER_ROLE_ID: ${DISCORD_OFFICER_ROLE_ID:?}
+      DISCORD_RAIDER_ROLE_ID: ${DISCORD_RAIDER_ROLE_ID:?}
+      ONLINE_WINDOW_SECONDS: ${ONLINE_WINDOW_SECONDS:-180}
+      ROSTER_CACHE_SECONDS: ${ROSTER_CACHE_SECONDS:-60}
+      HEARTBEAT_RETENTION_SECONDS: ${HEARTBEAT_RETENTION_SECONDS:-1209600}
+      REQUESTER_CACHE_SECONDS: ${REQUESTER_CACHE_SECONDS:-300}
+      REQUESTER_STALE_SECONDS: ${REQUESTER_STALE_SECONDS:-3600}
+      OAUTH_HANDOFF_TTL_SECONDS: ${OAUTH_HANDOFF_TTL_SECONDS:-180}
+      OAUTH_HANDOFF_MAX_ENTRIES: ${OAUTH_HANDOFF_MAX_ENTRIES:-512}
+      DISCORD_GATEWAY_ENABLED: ${DISCORD_GATEWAY_ENABLED:-true}
+    secrets:
+      - discord_bot_token
     volumes:
       - brick-presence-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   caddy:
+    <<: *restrictions
     image: caddy:2-alpine
     restart: unless-stopped
-    env_file:
-      - .env
+    cap_add:
+      - NET_BIND_SERVICE
+    environment:
+      BRICK_DOMAIN: ${BRICK_DOMAIN:?}
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     ports:
       - "80:80"
       - "443:443"
@@ -24,6 +65,10 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+
+secrets:
+  discord_bot_token:
+    file: ./secrets/discord_bot_token
 
 volumes:
   brick-presence-data:

@@ -2,6 +2,7 @@ use std::{
     cmp::Ordering,
     convert::TryInto,
     env, fs,
+    io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::LazyLock,
@@ -54,6 +55,8 @@ pub struct PreparedAppUpdate {
     pub installer_path: PathBuf,
     replacement_path: Option<PathBuf>,
     kind: UpdateKind,
+    sha256: String,
+    size: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +136,8 @@ pub fn prepare_available_update() -> Result<Option<PreparedAppUpdate>, String> {
 
     Ok(Some(PreparedAppUpdate {
         version: manifest.version,
+        sha256: artifact.sha256.clone(),
+        size: artifact.size,
         installer_path: prepared_package.installer_path,
         replacement_path: prepared_package.replacement_path,
         kind: target_update_kind()
@@ -180,10 +185,43 @@ fn select_artifact_index(manifest: &AppUpdateManifest, update_kind: &UpdateKind)
 }
 
 pub fn launch_installer(update: &PreparedAppUpdate) -> Result<(), String> {
+    verify_prepared_installer(update)?;
     match update.kind {
         UpdateKind::WindowsNsis => launch_windows_nsis_installer(update),
         UpdateKind::LinuxAppImage => launch_linux_appimage(update),
     }
+}
+
+fn verify_prepared_installer(update: &PreparedAppUpdate) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(&update.installer_path)
+        .map_err(|error| format!("Failed to inspect Brick installer: {error}"))?;
+    if !metadata.is_file() || metadata.len() != update.size {
+        return Err(
+            "Brick installer changed after download. Please try updating again.".to_string(),
+        );
+    }
+    let mut file = fs::File::open(&update.installer_path)
+        .map_err(|error| format!("Failed to read Brick installer: {error}"))?
+        .take(update.size.saturating_add(1));
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut size = 0_u64;
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("Failed to verify Brick installer: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        size += count as u64;
+        hash.update(&buffer[..count]);
+    }
+    if size != update.size || hex::encode(hash.finalize()) != update.sha256 {
+        return Err(
+            "Brick installer changed after download. Please try updating again.".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn launch_windows_nsis_installer(update: &PreparedAppUpdate) -> Result<(), String> {
@@ -526,7 +564,7 @@ fn write_installer(
         safe_path_part(version),
         safe_path_part(&artifact.file_name)
     ));
-    fs::write(&installer_path, package).map_err(|error| {
+    crate::atomic_file::write(&installer_path, package).map_err(|error| {
         format!(
             "Failed to write Brick installer {}: {error}",
             installer_path.display()
@@ -935,5 +973,28 @@ mod tests {
             sha256: "a".repeat(64),
             size: 1,
         }
+    }
+
+    #[test]
+    fn rechecks_installer_integrity_before_launch() {
+        let root = TestDirectory::new();
+        let path = root.0.join("fixture-installer");
+        let package = b"verified fixture";
+        fs::write(&path, package).unwrap();
+        let update = super::PreparedAppUpdate {
+            version: "1.0.0".to_string(),
+            installer_path: path.clone(),
+            replacement_path: None,
+            kind: super::UpdateKind::WindowsNsis,
+            sha256: super::sha256_hex(package),
+            size: package.len() as u64,
+        };
+        assert!(super::verify_prepared_installer(&update).is_ok());
+        fs::write(&path, b"tampered fixture").unwrap();
+        assert!(super::verify_prepared_installer(&update).is_err());
+        fs::write(&path, b"truncated").unwrap();
+        assert!(super::verify_prepared_installer(&update).is_err());
+        fs::remove_file(&path).unwrap();
+        assert!(super::verify_prepared_installer(&update).is_err());
     }
 }
