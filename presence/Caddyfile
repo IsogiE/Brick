@@ -1,9 +1,30 @@
 {
 	email admin@lusaggo.com
+	servers {
+		max_header_size 16KB
+		timeouts {
+			read_header 10s
+			read_body 15s
+			write 30s
+			idle 1m
+		}
+	}
+	log {
+		format filter {
+			wrap json
+			fields {
+				request>uri delete
+				request>headers delete
+			}
+		}
+	}
 }
 
 {$BRICK_DOMAIN} {
 	encode zstd gzip
+	request_body {
+		max_size 32768
+	}
 
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
