@@ -22,19 +22,20 @@ jobs:
 
     steps:
       - name: Checkout Brick source
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Checkout addon source
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: IsogiE/AdvanceRaidTools
           path: addon-source
           fetch-depth: 0
           ref: ${{ github.event.inputs.addon_ref || 'main' }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
+          package-manager-cache: false
 
       - name: Ignore non-version addon tags
         run: |
@@ -57,7 +58,7 @@ jobs:
 
       - name: Checkout pinned BigWigs packager
         if: steps.feed_status.outputs.current != 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: BigWigsMods/packager
           ref: 20a3713ec537df54db5c0d8b4822d88ee63c70e8
