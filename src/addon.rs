@@ -1631,7 +1631,17 @@ mod tests {
         if let Some(root) = env::var_os(PROFILE_ENV) {
             let root = PathBuf::from(root);
             assert!(config_dir().unwrap().starts_with(&root));
-            let expected = root.join("program-files/World of Warcraft/_retail_");
+            // Windows replaces ProgramFiles while creating a process. Set the
+            // fixture path inside this isolated, single-test child instead.
+            // Environment mutation is thread-safe on Windows.
+            #[cfg(windows)]
+            env::set_var("ProgramFiles", root.join("program-files"));
+            let expected = normalize_path(
+                &root
+                    .join("program-files")
+                    .join("World of Warcraft")
+                    .join("_retail_"),
+            );
             let view = load_view().unwrap();
             assert!(!view.setup_required);
             assert!(view
