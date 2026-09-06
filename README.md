@@ -21,6 +21,8 @@ Get the latest build from [Releases](https://github.com/IsogiE/Brick-Releases/re
 
 Run Brick, sign in with Discord, and select your World of Warcraft folder. You can add more than one installation. Retail, Classic, PTR, and beta clients are supported.
 
+Discord credentials are protected with Windows DPAPI or the Linux desktop keyring (Secret Service, such as GNOME Keyring or KWallet). Linux needs an unlocked keyring to save or restore a login.
+
 Closing or minimizing the window keeps Brick in the tray. **Open at login** controls startup; **Start minimized** keeps that login launch in the tray. Brick's own updates appear in the app when a new release is available.
 
 ## Build from source
@@ -66,7 +68,7 @@ Run the checks before opening a pull request:
 cargo fmt --check
 cargo check --locked
 cargo test --locked
-node --test scripts/publish-addon-feed.test.mjs
+node --test scripts/publish-addon-feed.test.mjs presence/*.test.mjs
 ```
 
 Node.js 22 is used for the service and release scripts. The desktop app itself only needs Rust and its native dependencies. CI checks Windows and Linux.

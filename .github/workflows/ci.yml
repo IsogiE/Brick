@@ -28,7 +28,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev gnome-keyring
 
       - name: Check formatting
         if: runner.os == 'Linux'
@@ -39,6 +39,15 @@ jobs:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo check
 
+      - uses: actions/setup-node@v4
+        if: runner.os == 'Linux'
+        with:
+          node-version: 22
+
+      - name: Test presence API
+        if: runner.os == 'Linux'
+        run: node --test presence/*.test.mjs
+
       - name: Test addon feed publication decisions
         if: runner.os == 'Linux'
         run: node --test scripts/publish-addon-feed.test.mjs
@@ -47,6 +56,20 @@ jobs:
         env:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo test
+
+      - name: Test Linux keyring storage
+        if: runner.os == 'Linux'
+        run: |
+          test_dir="$(mktemp -d)"
+          export XDG_DATA_HOME="$test_dir/data"
+          export XDG_RUNTIME_DIR="$test_dir/runtime"
+          mkdir -p "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          dbus-run-session -- sh -ec '
+            printf "%s" "brick-test-password" | gnome-keyring-daemon --unlock --components=secrets
+            cargo test --locked linux_keyring_roundtrip -- --ignored
+          '
+          DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/brick-no-such-bus cargo test --locked linux_keyring_failure -- --ignored
 
       - name: Build release binary
         env:

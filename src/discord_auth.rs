@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
     sync::{LazyLock, Mutex},
@@ -15,7 +16,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 
-use crate::addon;
+use crate::{addon, download};
 
 const API_BASE: &str = "https://discord.com/api/v10";
 const AUTHORIZE_URL: &str = "https://discord.com/oauth2/authorize";
@@ -25,6 +26,9 @@ const AUTH_CALLBACK_POLL_PATH: &str = "/v1/auth/callback";
 const SESSION_FILE: &str = "discord-auth.dat";
 const LEGACY_SESSION_FILE: &str = "discord-auth.json";
 const SESSION_SCHEMA: u32 = 2;
+const MAX_AUTH_RESPONSE_BYTES: u64 = 64 * 1024;
+const MAX_CALLBACK_BYTES: u64 = 16 * 1024;
+const MAX_SESSION_BYTES: u64 = 128 * 1024;
 const LOGIN_TIMEOUT_SECS: u64 = 180;
 const LOGIN_POLL_INTERVAL_MS: u64 = 750;
 const EXPIRY_SAFETY_SECS: u64 = 60;
@@ -66,11 +70,13 @@ const DISCORD_REDIRECT_URI: &str = match option_env!("BRICK_DISCORD_REDIRECT_URI
     None => "",
 };
 
+static SESSION_STORAGE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SESSION_REFRESH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static HTTP_CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
     Client::builder()
+        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(25))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(APP_USER_AGENT)
         .build()
         .map_err(|error| format!("Failed to create Discord HTTP client: {error}"))
@@ -95,7 +101,7 @@ pub struct AuthorizedUser {
     pub created_at_unix: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthSession {
     schema: u32,
@@ -115,7 +121,7 @@ pub struct AuthSession {
     authorized_at_unix: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct DiscordTokenResponse {
     access_token: String,
     token_type: String,
@@ -143,7 +149,7 @@ struct DiscordErrorResponse {
     message: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct AuthCallbackResponse {
     code: Option<String>,
     error: Option<String>,
@@ -252,7 +258,14 @@ pub fn refresh_saved_session() -> Result<AuthorizedUser, String> {
 }
 
 pub fn clear_session() -> Result<(), String> {
+    let _guard = SESSION_STORAGE_LOCK
+        .lock()
+        .map_err(|_| "Discord session storage is unavailable.".to_string())?;
     let path = session_path()?;
+    #[cfg(target_os = "linux")]
+    if path.exists() {
+        delete_keyring_session(&path)?;
+    }
     remove_session_file(&path)?;
     let legacy_path = legacy_session_path()?;
     remove_session_file(&legacy_path)?;
@@ -419,15 +432,16 @@ fn wait_for_remote_callback(expected_state: &str) -> Result<String, String> {
         let response = match client.get(url).send() {
             Ok(response) => response,
             Err(error) => {
-                last_error = Some(format!("Discord login callback check failed: {error}"));
+                last_error = Some(format!(
+                    "Discord login callback check failed: {}",
+                    error.without_url()
+                ));
                 thread::sleep(Duration::from_millis(LOGIN_POLL_INTERVAL_MS));
                 continue;
             }
         };
         let status = response.status();
-        let body = response
-            .bytes()
-            .map_err(|error| format!("Discord login callback check failed: {error}"))?;
+        let body = download::read_response(response, MAX_CALLBACK_BYTES, "Discord login callback")?;
 
         if status.as_u16() == 202 {
             thread::sleep(Duration::from_millis(LOGIN_POLL_INTERVAL_MS));
@@ -435,27 +449,33 @@ fn wait_for_remote_callback(expected_state: &str) -> Result<String, String> {
         }
 
         if status.is_success() {
-            let callback: AuthCallbackResponse = serde_json::from_slice(&body)
-                .map_err(|error| format!("Discord login callback was invalid: {error}"))?;
-            if let Some(error) = callback.error.filter(|value| !value.trim().is_empty()) {
-                return Err(error);
-            }
-            return callback
-                .code
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| {
-                    "Discord login callback did not include an authorization code.".to_string()
-                });
+            return parse_auth_callback(&body);
         }
 
         let message = discord_error_message(status.as_u16(), &body);
-        if status.is_server_error() {
+        if status.is_server_error() || status.as_u16() == 429 {
             last_error = Some(format!("Discord login callback check failed: {message}"));
             thread::sleep(Duration::from_millis(LOGIN_POLL_INTERVAL_MS));
             continue;
         }
         return Err(format!("Discord login callback check failed: {message}"));
     }
+}
+
+fn parse_auth_callback(body: &[u8]) -> Result<String, String> {
+    let callback: AuthCallbackResponse = serde_json::from_slice(body)
+        .map_err(|_| "Discord login callback was invalid.".to_string())?;
+    if callback.error.is_some() {
+        return Err("Discord login was rejected. Please try again.".to_string());
+    }
+    callback
+        .code
+        .filter(|code| {
+            !code.is_empty() && code.len() <= 2048 && code.bytes().all(|b| b.is_ascii_graphic())
+        })
+        .ok_or_else(|| {
+            "Discord login callback did not include a valid authorization code.".to_string()
+        })
 }
 
 fn exchange_code(
@@ -492,11 +512,9 @@ fn post_token_request(
         .post(format!("{API_BASE}/oauth2/token"))
         .form(params)
         .send()
-        .map_err(|error| format!("{error_prefix}: {error}"))?;
+        .map_err(|error| format!("{error_prefix}: {}", error.without_url()))?;
     let status = response.status();
-    let body = response
-        .bytes()
-        .map_err(|error| format!("{error_prefix}: {error}"))?;
+    let body = download::read_response(response, MAX_AUTH_RESPONSE_BYTES, error_prefix)?;
 
     if !status.is_success() {
         return Err(format!(
@@ -592,11 +610,9 @@ fn get_discord_json<T: for<'de> Deserialize<'de>>(
         .get(url)
         .bearer_auth(access_token)
         .send()
-        .map_err(|error| format!("{error_prefix}: {error}"))?;
+        .map_err(|error| format!("{error_prefix}: {}", error.without_url()))?;
     let status = response.status();
-    let body = response
-        .bytes()
-        .map_err(|error| format!("{error_prefix}: {error}"))?;
+    let body = download::read_response(response, MAX_AUTH_RESPONSE_BYTES, error_prefix)?;
 
     if !status.is_success() {
         return Err(format!(
@@ -677,21 +693,30 @@ fn now_unix_secs() -> u64 {
 }
 
 fn load_session() -> Result<Option<AuthSession>, String> {
-    let path = session_path()?;
+    let _guard = SESSION_STORAGE_LOCK
+        .lock()
+        .map_err(|_| "Discord session storage is unavailable.".to_string())?;
+    load_session_unlocked()
+}
+
+fn load_session_unlocked() -> Result<Option<AuthSession>, String> {
+    load_session_at(&session_path()?, &legacy_session_path()?)
+}
+
+fn load_session_at(path: &Path, legacy_path: &Path) -> Result<Option<AuthSession>, String> {
     if path.exists() {
         let loaded = load_session_file(&path)?;
         if loaded.needs_resave || loaded.session.schema != SESSION_SCHEMA {
-            save_session(&loaded.session)?;
+            save_session_at(path, legacy_path, &loaded.session)?;
         } else {
-            remove_legacy_session_file()?;
+            remove_session_file(legacy_path)?;
         }
         return Ok(Some(loaded.session));
     }
 
-    let legacy_path = legacy_session_path()?;
     if legacy_path.exists() {
         let loaded = load_session_file(&legacy_path)?;
-        save_session(&loaded.session)?;
+        save_session_at(path, legacy_path, &loaded.session)?;
         remove_session_file(&legacy_path)?;
         return Ok(Some(loaded.session));
     }
@@ -700,7 +725,17 @@ fn load_session() -> Result<Option<AuthSession>, String> {
 }
 
 fn save_session(session: &AuthSession) -> Result<(), String> {
-    let path = session_path()?;
+    let _guard = SESSION_STORAGE_LOCK
+        .lock()
+        .map_err(|_| "Discord session storage is unavailable.".to_string())?;
+    save_session_unlocked(session)
+}
+
+fn save_session_unlocked(session: &AuthSession) -> Result<(), String> {
+    save_session_at(&session_path()?, &legacy_session_path()?, session)
+}
+
+fn save_session_at(path: &Path, legacy_path: &Path, session: &AuthSession) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
@@ -715,9 +750,9 @@ fn save_session(session: &AuthSession) -> Result<(), String> {
     let mut json = serde_json::to_vec_pretty(&session)
         .map_err(|error| format!("Failed to serialize Discord session: {error}"))?;
     json.push(b'\n');
-    let payload = session_payload_for_write(&json)?;
+    let payload = session_payload_for_write(&path, &json)?;
     write_private_bytes(&path, &payload)?;
-    remove_legacy_session_file()
+    remove_session_file(legacy_path)
 }
 
 struct LoadedSession {
@@ -726,21 +761,21 @@ struct LoadedSession {
 }
 
 fn load_session_file(path: &Path) -> Result<LoadedSession, String> {
-    let contents =
-        fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let mut contents = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(MAX_SESSION_BYTES + 1).read_to_end(&mut contents))
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    if contents.len() as u64 > MAX_SESSION_BYTES {
+        return Err("Saved Discord session is too large.".to_string());
+    }
     let needs_resave = session_file_needs_resave(&contents);
-    let plaintext = session_plaintext_bytes(&contents)?;
+    let plaintext = session_plaintext_bytes(path, &contents)?;
     let session = serde_json::from_slice(&plaintext)
         .map_err(|error| format!("Failed to parse {}: {error}", path.display()))?;
     Ok(LoadedSession {
         session,
         needs_resave,
     })
-}
-
-fn remove_legacy_session_file() -> Result<(), String> {
-    let legacy_path = legacy_session_path()?;
-    remove_session_file(&legacy_path)
 }
 
 fn remove_session_file(path: &Path) -> Result<(), String> {
@@ -757,7 +792,7 @@ fn write_private_bytes(path: &Path, contents: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn session_payload_for_write(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+fn session_payload_for_write(_path: &Path, plaintext: &[u8]) -> Result<Vec<u8>, String> {
     use std::{ptr, slice};
     use windows_sys::Win32::{
         Foundation::LocalFree,
@@ -807,13 +842,44 @@ fn session_payload_for_write(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     Ok(payload)
 }
 
-#[cfg(not(target_os = "windows"))]
-fn session_payload_for_write(plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    Ok(plaintext.to_vec())
+#[cfg(target_os = "linux")]
+const KEYRING_SESSION_PREFIX: &[u8] = b"BRICK-DISCORD-AUTH-KEYRING-v1\n";
+
+#[cfg(target_os = "linux")]
+fn keyring_error(_error: keyring::Error) -> String {
+    "Brick could not access your desktop keyring. Unlock your keyring and try again. Discord credentials will not be saved in plaintext.".to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn session_keyring_entry(path: &Path) -> Result<keyring::Entry, String> {
+    // Separate isolated profiles without putting account IDs or tokens in attributes.
+    let id = hex::encode(Sha256::digest(path.as_os_str().as_encoded_bytes()));
+    keyring::Entry::new("dev.isogi.brick.discord", &id).map_err(keyring_error)
+}
+
+#[cfg(target_os = "linux")]
+fn delete_keyring_session(path: &Path) -> Result<(), String> {
+    match session_keyring_entry(path)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(keyring_error(error)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn session_payload_for_write(path: &Path, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    session_keyring_entry(path)?
+        .set_secret(plaintext)
+        .map_err(keyring_error)?;
+    Ok(KEYRING_SESSION_PREFIX.to_vec())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn session_payload_for_write(_path: &Path, _plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    Err("Secure Discord credential storage is unavailable on this platform.".to_string())
 }
 
 #[cfg(target_os = "windows")]
-fn session_plaintext_bytes(contents: &[u8]) -> Result<Vec<u8>, String> {
+fn session_plaintext_bytes(_path: &Path, contents: &[u8]) -> Result<Vec<u8>, String> {
     if contents.starts_with(PROTECTED_SESSION_PREFIX) {
         return unprotect_session_payload(&contents[PROTECTED_SESSION_PREFIX.len()..]);
     }
@@ -822,7 +888,14 @@ fn session_plaintext_bytes(contents: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn session_plaintext_bytes(contents: &[u8]) -> Result<Vec<u8>, String> {
+fn session_plaintext_bytes(_path: &Path, contents: &[u8]) -> Result<Vec<u8>, String> {
+    #[cfg(target_os = "linux")]
+    if contents == KEYRING_SESSION_PREFIX {
+        return session_keyring_entry(_path)?
+            .get_secret()
+            .map_err(keyring_error);
+    }
+    // Read legacy sessions solely to migrate them to protected storage.
     Ok(contents.to_vec())
 }
 
@@ -831,9 +904,14 @@ fn session_file_needs_resave(contents: &[u8]) -> bool {
     !contents.starts_with(PROTECTED_SESSION_PREFIX)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+fn session_file_needs_resave(contents: &[u8]) -> bool {
+    contents != KEYRING_SESSION_PREFIX
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn session_file_needs_resave(_contents: &[u8]) -> bool {
-    false
+    true
 }
 
 #[cfg(target_os = "windows")]
@@ -1115,5 +1193,132 @@ mod tests {
             ),
             "Officer"
         );
+    }
+
+    #[test]
+    fn rejects_hostile_callback_fields() {
+        assert_eq!(
+            super::parse_auth_callback(br#"{"code":"valid-code"}"#).unwrap(),
+            "valid-code"
+        );
+        for body in [
+            br#"{"code":""}"#.as_slice(),
+            br#"{"code":"line\nfeed"}"#,
+            br#"{"code":null}"#,
+            br#"{"error":"untrusted instructions"}"#,
+        ] {
+            assert!(super::parse_auth_callback(body).is_err());
+        }
+        let oversized = serde_json::json!({"code": "a".repeat(2049)});
+        assert!(super::parse_auth_callback(&serde_json::to_vec(&oversized).unwrap()).is_err());
+    }
+
+    #[test]
+    fn auth_client_rejects_redirects_and_oversized_callback_bodies() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        for response in [
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/should-not-follow\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", super::MAX_CALLBACK_BYTES + 1),
+            format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}", "x".repeat(super::MAX_CALLBACK_BYTES as usize + 1)),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let redirect = response.contains("302 Found");
+            let serving = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut input = [0; 2048];
+                let _ = socket.read(&mut input);
+                let _ = socket.write_all(response.as_bytes());
+            });
+            let response = super::http_client().unwrap().get(format!("http://{address}/")).send().unwrap();
+            if redirect {
+                assert_eq!(response.status().as_u16(), 302);
+            } else {
+                assert!(crate::download::read_response(response, super::MAX_CALLBACK_BYTES, "callback").is_err());
+            }
+            serving.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn refuses_oversized_saved_credentials() {
+        let path = std::env::temp_dir().join(format!("brick-session-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, vec![b'x'; super::MAX_SESSION_BYTES as usize + 1]).unwrap();
+        assert!(super::load_session_file(&path).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_credentials_are_encrypted_and_tampering_is_rejected() {
+        let path = std::path::Path::new("test-profile");
+        let plaintext = br#"{"accessToken":"fixture-access","refreshToken":"fixture-refresh"}"#;
+        let encrypted = super::session_payload_for_write(path, plaintext).unwrap();
+        assert!(!encrypted.windows(14).any(|part| part == b"fixture-access"));
+        assert!(!super::session_file_needs_resave(&encrypted));
+        assert_eq!(
+            super::session_plaintext_bytes(path, &encrypted).unwrap(),
+            plaintext
+        );
+        assert!(super::session_file_needs_resave(plaintext));
+        let mut damaged = encrypted;
+        *damaged.last_mut().unwrap() ^= 1;
+        assert!(super::session_plaintext_bytes(path, &damaged).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an isolated, unlocked Secret Service test session"]
+    fn linux_keyring_roundtrip_keeps_credentials_out_of_profile() {
+        let path =
+            std::env::temp_dir().join(format!("brick-keyring-test-{}", uuid::Uuid::new_v4()));
+        let legacy = path.with_extension("json");
+        let plaintext = serde_json::json!({
+            "schema": 1, "clientId": "fixture", "guildId": "fixture",
+            "accessToken": "fixture-access", "refreshToken": "fixture-refresh",
+            "expiresAtUnix": 2000, "userId": "12345", "username": "fixture",
+            "globalName": null, "guildNick": null, "roleIds": [],
+            "authorizedRoleIds": [], "authorizedAtUnix": 1000
+        });
+        std::fs::write(&legacy, serde_json::to_vec(&plaintext).unwrap()).unwrap();
+        let session = super::load_session_at(&path, &legacy).unwrap().unwrap();
+        assert_eq!(session.access_token, "fixture-access");
+        assert!(!legacy.exists());
+        let payload = std::fs::read(&path).unwrap();
+        assert_eq!(payload, super::KEYRING_SESSION_PREFIX);
+        let loaded = super::load_session_at(&path, &legacy).unwrap().unwrap();
+        assert_eq!(loaded.schema, super::SESSION_SCHEMA);
+        assert_eq!(loaded.created_at_unix, 1000);
+        assert_eq!(loaded.refresh_token, "fixture-refresh");
+        super::delete_keyring_session(&path).unwrap();
+        assert!(super::session_plaintext_bytes(&path, &payload).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an isolated process with no Secret Service available"]
+    fn linux_keyring_failure_never_returns_plaintext_for_saving() {
+        let path =
+            std::env::temp_dir().join(format!("brick-keyring-test-{}", uuid::Uuid::new_v4()));
+        assert!(super::session_payload_for_write(&path, b"secret fixture").is_err());
+        assert!(!path.exists());
+        let legacy = path.with_extension("json");
+        let plaintext = serde_json::json!({
+            "schema": 1, "clientId": "fixture", "guildId": "fixture",
+            "accessToken": "fixture-access", "refreshToken": "fixture-refresh",
+            "expiresAtUnix": 2000, "userId": "12345", "username": "fixture",
+            "globalName": null, "guildNick": null, "roleIds": [],
+            "authorizedRoleIds": [], "authorizedAtUnix": 1000
+        });
+        let bytes = serde_json::to_vec(&plaintext).unwrap();
+        std::fs::write(&legacy, &bytes).unwrap();
+        let error = super::load_session_at(&path, &legacy).err().unwrap();
+        assert!(error.contains("keyring"));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
+        std::fs::remove_file(legacy).unwrap();
     }
 }

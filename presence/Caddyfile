@@ -12,5 +12,11 @@
 		-Server
 	}
 
-	reverse_proxy api:8080
+	reverse_proxy api:8080 {
+		header_up X-Brick-Client-IP {remote_host}
+		transport http {
+			dial_timeout 3s
+			response_header_timeout 20s
+		}
+	}
 }
