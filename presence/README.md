@@ -1,54 +1,19 @@
-# Brick Presence
+# Presence service
 
-Small HTTPS API for Brick's roster tab.
+Node.js 22 service for Brick's guild roster, online status, and Discord OAuth callback handoff. It has no npm dependencies.
 
-It does a few jobs:
+| Route | Purpose |
+| --- | --- |
+| `GET /health` | Health check |
+| `GET /discord/callback` | Browser redirect after Discord authorization |
+| `GET /v1/auth/callback` | Retrieve the pending authorization code |
+| `POST /v1/heartbeat` | Update the signed-in user's presence |
+| `GET /v1/roster` | Read the guild roster and online status |
 
-- receives the Discord browser callback and hands the one-time code to Brick
-- verifies Brick users with their Discord OAuth access token
-- keeps short-lived client heartbeats so the roster can show online/offline state
-- keeps the Discord bot connected to the Gateway so the bot appears online
-
-Verified Discord access tokens are cached briefly server-side so roster refreshes
-and heartbeats do not hammer Discord.
-
-The Discord bot token lives only on the VPS. Do not put it in the desktop app.
-
-## DNS
-
-Create this record before starting the Caddy container:
-
-```text
-Type: A
-Name: brick
-Content: 2.28.118.132
-Proxy: DNS only
-TTL: Auto
-```
-
-That points `brick.lusaggo.com` to the VPS.
-
-## Required Discord Setting
-
-In the Discord Developer Portal for the bot application, enable the privileged
-`Server Members Intent`. The roster endpoint needs it to list guild members.
-
-On the OAuth2 page, add this redirect:
-
-```text
-https://brick.lusaggo.com/discord/callback
-```
-
-## Deploy
-
-Copy `.env.example` to `.env`, set `DISCORD_BOT_TOKEN`, then run:
+For a local instance, copy `.env.example` to `.env` and fill in your own Discord application and guild configuration. Roster access needs the bot's Server Members Intent enabled. Keep the bot token on the server.
 
 ```sh
-docker compose up -d --build
+node --env-file=.env server.mjs
 ```
 
-Health check:
-
-```sh
-curl https://brick.lusaggo.com/health
-```
+The service listens on port 8080 by default. `compose.yaml` provides an alternative deployment with Caddy for HTTPS.
