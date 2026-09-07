@@ -58,6 +58,11 @@ jobs:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo test
 
+      - name: Test Windows signature verification
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/sign-windows.test.ps1
+
       - name: Test Linux keyring storage
         if: runner.os == 'Linux'
         run: |

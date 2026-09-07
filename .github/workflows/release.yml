@@ -16,6 +16,9 @@ on:
     tags:
       - 'v*'
 
+env:
+  BRICK_WINDOWS_SIGNING: ${{ vars.BRICK_WINDOWS_SIGNING || 'certum' }}
+
 jobs:
   build:
     strategy:
@@ -29,6 +32,7 @@ jobs:
             formats: appimage,deb,pacman
             cache-formats: appimage-deb-pacman
     runs-on: ${{ matrix.os }}
+    environment: release
     permissions:
       contents: read
       id-token: write
@@ -104,8 +108,28 @@ jobs:
           BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
         run: node -e "const url = process.env.BRICK_PRESENCE_API_URL || ''; const parsed = new URL(url); if (parsed.protocol !== 'https:') throw new Error('BRICK_PRESENCE_API_URL repository variable must be an https URL.');"
 
+      - name: Verify Windows signing configuration
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          BRICK_CERTUM_USERNAME: ${{ secrets.BRICK_CERTUM_USERNAME }}
+          BRICK_CERTUM_OTP_URI: ${{ secrets.BRICK_CERTUM_OTP_URI }}
+          BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
+        run: |
+          if ($env:BRICK_WINDOWS_SIGNING -notin @('certum', 'artifact-signing')) {
+            throw 'BRICK_WINDOWS_SIGNING must be certum or artifact-signing. Windows releases require signing.'
+          }
+          if ($env:BRICK_WINDOWS_SIGNING -eq 'certum') {
+            if (-not $env:BRICK_CERTUM_USERNAME -or -not $env:BRICK_CERTUM_OTP_URI) {
+              throw 'Certum signing requires BRICK_CERTUM_USERNAME and BRICK_CERTUM_OTP_URI secrets.'
+            }
+            if ($env:BRICK_CERTUM_THUMBPRINT -notmatch '^[0-9A-Fa-f]{40}$') {
+              throw 'BRICK_CERTUM_THUMBPRINT must be the 40-character certificate thumbprint.'
+            }
+          }
+
       - name: Build Windows binary for signing
-        if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
+        if: runner.os == 'Windows'
         env:
           BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
           BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
@@ -114,8 +138,39 @@ jobs:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo build --release
 
+      - name: Download and verify SimplySign Desktop
+        if: runner.os == 'Windows' && env.BRICK_WINDOWS_SIGNING == 'certum'
+        shell: pwsh
+        run: |
+          $url = 'https://files.certum.eu/software/SimplySignDesktop/Windows/9.4.4.92/SimplySignDesktop-9.4.4.92-64-bit-en.msi'
+          Invoke-WebRequest -Uri $url -OutFile SimplySignDesktop.msi
+          if ((Get-FileHash SimplySignDesktop.msi -Algorithm SHA256).Hash -ne '8ec420fc27798b86078b7bd02fe7152097e1b3005bab51820eaca8e57df84da3') {
+            throw 'SimplySign Desktop installer checksum mismatch.'
+          }
+          if ((Get-AuthenticodeSignature SimplySignDesktop.msi).Status -ne 'Valid') {
+            throw 'SimplySign Desktop installer signature is invalid.'
+          }
+
+      - name: Connect Certum SimplySign
+        if: runner.os == 'Windows' && env.BRICK_WINDOWS_SIGNING == 'certum'
+        timeout-minutes: 12
+        uses: dismine/windows-app-signing-setup-action@89ae3b032d4bc7a5b98d1a42a34e61ecb6faad64
+        with:
+          certum-username: ${{ secrets.BRICK_CERTUM_USERNAME }}
+          certum-otp-uri: ${{ secrets.BRICK_CERTUM_OTP_URI }}
+          certum-key-id: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
+          capture-diagnostics: 'false'
+
+      - name: Sign Windows binary with Certum
+        if: runner.os == 'Windows' && env.BRICK_WINDOWS_SIGNING == 'certum'
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
+        run: ./scripts/sign-windows.ps1 -Path target/release/brick.exe
+
       - name: Azure login for Windows signing
-        if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
+        if: runner.os == 'Windows' && env.BRICK_WINDOWS_SIGNING == 'artifact-signing'
         uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -123,7 +178,7 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Sign Windows binary
-        if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
+        if: runner.os == 'Windows' && env.BRICK_WINDOWS_SIGNING == 'artifact-signing'
         uses: azure/artifact-signing-action@v2
         with:
           endpoint: ${{ secrets.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
@@ -135,7 +190,7 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Prepare signed Windows package config
-        if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           Get-Content Packager.toml |
@@ -143,7 +198,7 @@ jobs:
             Set-Content Packager.signed.toml
 
       - name: Build package
-        if: runner.os != 'Windows' || vars.BRICK_WINDOWS_SIGNING != 'artifact-signing'
+        if: runner.os != 'Windows'
         env:
           BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
           BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
@@ -154,7 +209,7 @@ jobs:
         run: cargo packager --release --formats ${{ matrix.formats }}
 
       - name: Build signed Windows package
-        if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
+        if: runner.os == 'Windows'
         env:
           BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
           BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
@@ -163,13 +218,8 @@ jobs:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo packager --config Packager.signed.toml --formats ${{ matrix.formats }}
 
-      - name: Verify Windows NSIS installer policy
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/verify-windows-installer.ps1 -RunInstallSmoke
-
       - name: Sign Windows NSIS installer
-        if: runner.os == 'Windows' && vars.BRICK_WINDOWS_SIGNING == 'artifact-signing'
+        if: runner.os == 'Windows' && env.BRICK_WINDOWS_SIGNING == 'artifact-signing'
         uses: azure/artifact-signing-action@v2
         with:
           endpoint: ${{ secrets.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
@@ -181,6 +231,25 @@ jobs:
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
+
+      - name: Sign Windows NSIS installer with Certum
+        if: runner.os == 'Windows' && env.BRICK_WINDOWS_SIGNING == 'certum'
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
+        run: ./scripts/sign-windows.ps1 -Path 'dist/packages/*-setup.exe'
+
+      - name: Verify signed Windows artifacts and installer policy
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        shell: pwsh
+        env:
+          BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
+        run: |
+          $thumbprint = if ($env:BRICK_WINDOWS_SIGNING -eq 'certum') { $env:BRICK_CERTUM_THUMBPRINT } else { '' }
+          ./scripts/sign-windows.ps1 -Path 'target/release/brick.exe', 'dist/packages/*-setup.exe' -Thumbprint $thumbprint -VerifyOnly
+          ./scripts/verify-windows-installer.ps1 -RunInstallSmoke -RequireSignature -ExpectedSigner $thumbprint
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

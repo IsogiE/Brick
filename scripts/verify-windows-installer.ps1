@@ -1,5 +1,7 @@
 param(
-    [switch]$RunInstallSmoke
+    [switch]$RunInstallSmoke,
+    [switch]$RequireSignature,
+    [string]$ExpectedSigner
 )
 
 $ErrorActionPreference = 'Stop'
@@ -76,6 +78,13 @@ if ($first.ExitCode -ne 0) {
 }
 if (-not (Test-Path (Join-Path $good 'brick.exe'))) {
     throw 'Brick was not installed under LOCALAPPDATA.'
+}
+if ($RequireSignature) {
+    & (Join-Path $PSScriptRoot 'sign-windows.ps1') -Path (Join-Path $good 'brick.exe') -Thumbprint $ExpectedSigner -VerifyOnly
+    $builtHash = (Get-FileHash (Join-Path $repoRoot 'target/release/brick.exe') -Algorithm SHA256).Hash
+    if ((Get-FileHash (Join-Path $good 'brick.exe') -Algorithm SHA256).Hash -ne $builtHash) {
+        throw 'The installer did not preserve the signed Brick executable.'
+    }
 }
 if (Test-Path (Join-Path $bad 'brick.exe')) {
     throw 'Brick incorrectly installed into the first alternate /D path.'
