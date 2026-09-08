@@ -423,7 +423,7 @@ fn initialize_gtk() -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn remove_unused_linux_ipc(view: &webkit2gtk::WebView) {
+fn remove_unused_linux_ipc(view: &webkit2gtk::WebView) -> Result<(), String> {
     use gtk::prelude::*;
     use webkit2gtk::{UserContentManagerExt, WebViewExt};
 
@@ -435,23 +435,45 @@ fn remove_unused_linux_ipc(view: &webkit2gtk::WebView) {
         if let Some(signal) =
             gtk::glib::subclass::SignalId::lookup("script-message-received", manager.type_())
         {
-            use gtk::glib::{gobject_ffi, translate::IntoGlib};
-            // SAFETY: manager owns a live GObject on the GTK thread. The match is
-            // solely its signal id; null function/data pointers are ignored by
-            // G_SIGNAL_MATCH_ID. This private manager has no application handlers.
-            unsafe {
-                gobject_ffi::g_signal_handlers_disconnect_matched(
-                    manager.as_ptr().cast(),
-                    gobject_ffi::G_SIGNAL_MATCH_ID,
-                    signal.into_glib(),
-                    0,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-            }
+            disconnect_linux_signal_handlers(manager.upcast_ref(), signal)?;
         }
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn disconnect_linux_signal_handlers(
+    object: &gtk::glib::Object,
+    signal: gtk::glib::subclass::SignalId,
+) -> Result<(), String> {
+    use gtk::glib::{gobject_ffi, object::ObjectType, translate::IntoGlib};
+
+    // Older GLib silently ignores an ID-only disconnect_matched request. Find
+    // each registration instead; handler_find supports this mask on Ubuntu's
+    // GLib too. This private manager has only Wry's callback at this point.
+    for attempt in 0..=8 {
+        // SAFETY: object remains alive on its GTK thread. MATCH_ID ignores the
+        // null closure/function/data arguments; only returned live IDs are used.
+        let handler = unsafe {
+            gobject_ffi::g_signal_handler_find(
+                object.as_ptr(),
+                gobject_ffi::G_SIGNAL_MATCH_ID,
+                signal.into_glib(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if handler == 0 {
+            return Ok(());
+        }
+        if attempt == 8 {
+            break;
+        }
+        unsafe { gobject_ffi::g_signal_handler_disconnect(object.as_ptr(), handler) };
+    }
+    Err("The stream player could not release its browser callbacks.".to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -506,7 +528,7 @@ fn protect_linux_navigation(webview: &WebView, player_url: &str) -> Result<(), S
             "The stream player cannot start because its browser sandbox is disabled.".to_string(),
         );
     }
-    remove_unused_linux_ipc(&view);
+    remove_unused_linux_ipc(&view)?;
     if let Some(settings) = WebViewExt::settings(&view) {
         // The user already selected this stream in the native sidebar. Permit
         // the official iframe's muted autoplay without a second browser click.
@@ -705,6 +727,30 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn signal_cleanup_releases_captured_references_on_older_glib() {
+        use gtk::glib::{prelude::*, Object};
+
+        // Plain GObject needs no display. This runs on Ubuntu's older GLib in
+        // ordinary CI and detects the otherwise silent ID-only cleanup failure.
+        let object = Object::new::<Object>();
+        let keepalive = Arc::new(());
+        let weak = Arc::downgrade(&keepalive);
+        for _ in 0..2 {
+            let captured = keepalive.clone();
+            object.connect_notify_local(None, move |_, _| {
+                std::hint::black_box(&captured);
+            });
+        }
+        drop(keepalive);
+        assert!(weak.upgrade().is_some());
+        let signal = gtk::glib::subclass::SignalId::lookup("notify", object.type_()).unwrap();
+        disconnect_linux_signal_handlers(&object, signal).unwrap();
+        assert!(weak.upgrade().is_none());
+        disconnect_linux_signal_handlers(&object, signal).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     #[ignore = "requires its own X11 display and /tmp/brick-consent-native profile"]
     fn native_preference_relay_survives_reopen_and_releases_webkit() {
         use gtk::prelude::*;
@@ -839,7 +885,7 @@ mod tests {
             }
             drop(seed);
             drop(context);
-            remove_unused_linux_ipc(&webview.webview());
+            remove_unused_linux_ipc(&webview.webview()).unwrap();
             let handler = attach_linux_preferences(&webview, bridge.clone()).unwrap();
             let view = webview.webview();
             let weak = view.downgrade();

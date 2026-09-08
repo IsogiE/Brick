@@ -22,6 +22,7 @@ try {
   }
   const required = [
     'usr/bin/brick', 'usr/bin/bwrap', 'usr/bin/brick-bwrap', 'usr/bin/xdg-dbus-proxy',
+    'usr/lib/libxkbcommon.so.0', 'usr/lib/libxkbcommon-x11.so.0', 'usr/lib/libxcb-xkb.so.1',
     'usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner',
     ...['coreelements', 'playback', 'soup', 'isomp4', 'hls', 'libav', 'audioconvert'].map((name) => `usr/lib/gstreamer-1.0/libgst${name}.so`),
   ];
@@ -36,9 +37,9 @@ try {
     assert((await stat(file)).isFile(), `Missing runtime file ${relative}`);
     const dependencies = execFileSync('ldd', [file], { env, encoding: 'utf8', timeout: 10_000 });
     assert(!dependencies.includes('not found'), `Unresolved runtime dependency in ${relative}:\n${dependencies}`);
-    if (relative.endsWith('/brick') || relative.includes('/WebKit')) {
+    if (relative.endsWith('/brick') || relative.includes('/WebKit') || relative.includes('/libxkbcommon')) {
       for (const line of dependencies.split('\n')) {
-        if (/lib(webkit2gtk|javascriptcoregtk|soup-3|gtk-3|gstreamer)/.test(line)) {
+        if (/lib(webkit2gtk|javascriptcoregtk|soup-3|gtk-3|gstreamer|xkbcommon|xcb-xkb)/.test(line)) {
           assert(line.includes(appdir), `Runtime escaped the AppImage in ${relative}: ${line}`);
         }
       }

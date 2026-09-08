@@ -78,6 +78,15 @@ for (const source of required) {
   await chmod(target, 0o755);
 }
 
+// Winit dlopens the X11 companion, so ldd cannot discover it. Its private
+// keymap objects must match the bundled base library, including at shutdown.
+const xkbLibdir = execFileSync('pkg-config', ['--variable=libdir', 'xkbcommon-x11'], { encoding: 'utf8' }).trim();
+for (const name of ['libxkbcommon.so.0', 'libxkbcommon-x11.so.0', 'libxcb-xkb.so.1']) {
+  const target = path.join(output, 'usr/lib', name);
+  await mkdir(path.dirname(target), { recursive: true });
+  await cp(path.join(xkbLibdir, name), target, { dereference: true });
+}
+
 execFileSync('cc', ['-O2', '-Wall', '-Wextra', '-Werror', '-o', path.join(output, 'usr/bin/bwrap'), 'packaging/linux/bwrap-wrapper.c']);
 await chmod(path.join(output, 'usr/bin/bwrap'), 0o755);
 
