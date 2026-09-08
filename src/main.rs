@@ -11,6 +11,10 @@ mod discord_auth;
 mod download;
 mod presence;
 mod single_instance;
+mod stream_player;
+mod stream_preferences;
+mod streams;
+mod streams_ui;
 mod tray;
 mod ui;
 

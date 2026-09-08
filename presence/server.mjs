@@ -4,8 +4,9 @@ import { promises as fs } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { HttpError, RateLimit, readBounded, clientAddress } from "./security.mjs";
+import { createStreamService, streamPlayerPage } from "./streams.mjs";
 
-export async function createPresenceServer({ env = process.env, fetch = globalThis.fetch } = {}) {
+export async function createPresenceServer({ env = process.env, fetch = globalThis.fetch, now = Date.now, firstStreamCheckWaitMs = 5_000 } = {}) {
   const DISCORD_API = "https://discord.com/api/v10";
   const MAX_BODY_BYTES = 32 * 1024;
   const GATEWAY_INTENTS = 1;
@@ -33,6 +34,8 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   const oauthHandoffTtlSeconds = parsePositiveInt(env.OAUTH_HANDOFF_TTL_SECONDS, 3 * 60);
   const oauthHandoffMaxEntries = parsePositiveInt(env.OAUTH_HANDOFF_MAX_ENTRIES, 512);
   const gatewayEnabled = env.DISCORD_GATEWAY_ENABLED?.trim().toLowerCase() !== "false";
+  const streams = await createStreamService({ dataDir, env, fetch, now, firstCheckWaitMs: firstStreamCheckWaitMs });
+  const requestDeadlines = new WeakMap();
 
   let rosterCache = null;
   let rosterInFlight = null;
@@ -41,6 +44,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   const requests = new RateLimit(600, 10, 300, 5);
   const verifications = new RateLimit(60, 1, 12, 0.2);
   const callbacks = new RateLimit(60, 0.5, 10, 0.1);
+  const streamChanges = new RateLimit(120, 1, 6, 1 / 10);
   const failures = new Map();
   const address = (request) => clientAddress(request, env.TRUST_PROXY === "true");
   const oauthHandoffs = new Map();
@@ -73,11 +77,11 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     response.end(JSON.stringify(payload));
   }
 
-  function sendHtml(response, status, body) {
+  function sendHtml(response, status, body, player = false) {
     response.writeHead(status, {
       "x-content-type-options": "nosniff",
-      "referrer-policy": "no-referrer",
-      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+      "referrer-policy": player ? "strict-origin-when-cross-origin" : "no-referrer",
+      "content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; ${player ? "frame-src https://player.twitch.tv https://www.youtube.com; " : ""}frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
       ...(status === 429 || status === 503 ? { "retry-after": "5" } : {}),
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
@@ -179,40 +183,43 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     ) || "Unknown";
   }
 
-  async function verifyRequester(request) {
+  async function verifyRequester(request, { allowStale = true } = {}) {
     const token = bearerToken(request);
     if (!token) {
       throw new HttpError(401, "Missing Discord authorization token.");
     }
 
     const cacheKey = tokenCacheKey(token);
+    // A roster request may use a bounded stale session during Discord rate limits.
+    // Stream access fails closed and must never share that in-flight fallback.
+    const inFlightKey = `${cacheKey}:${allowStale ? "roster" : "streams"}`;
     const cached = requesterCache.get(cacheKey);
     const now = Date.now();
     if (cached && cached.expiresAt > now) {
       return cached.user;
     }
 
-    if (requesterInFlight.has(cacheKey)) {
-      return requesterInFlight.get(cacheKey);
+    if (requesterInFlight.has(inFlightKey)) {
+      return requesterInFlight.get(inFlightKey);
     }
 
     for (const [key, expires] of failures) if (expires <= now) failures.delete(key);
     if (failures.has(cacheKey)) throw new HttpError(401, "Discord authorization failed.");
     verifications.take(address(request));
     if (requesterInFlight.size >= 8) throw new HttpError(503, "Login checks are busy. Try again shortly.");
-    const verification = verifyRequesterFromDiscord(token, cacheKey, cached, now).catch((error) => {
+    const verification = verifyRequesterFromDiscord(token, cacheKey, cached, now, allowStale).catch((error) => {
       if (error instanceof HttpError && [401, 403].includes(error.status) && failures.size < 1024) {
         failures.set(cacheKey, Date.now() + 30_000);
       }
       throw error;
     }).finally(() => {
-      requesterInFlight.delete(cacheKey);
+      requesterInFlight.delete(inFlightKey);
     });
-    requesterInFlight.set(cacheKey, verification);
+    requesterInFlight.set(inFlightKey, verification);
     return verification;
   }
 
-  async function verifyRequesterFromDiscord(token, cacheKey, cached, now) {
+  async function verifyRequesterFromDiscord(token, cacheKey, cached, now, allowStale) {
     const authorization = `Bearer ${token}`;
     let user;
     let member;
@@ -222,7 +229,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
         discordJson(`/users/@me/guilds/${guildId}/member`, authorization),
       ]);
     } catch (error) {
-      if (error instanceof HttpError && error.status === 429 && cached?.staleUntil > now) {
+      if (allowStale && error instanceof HttpError && error.status === 429 && cached?.staleUntil > now) {
         console.error(`Discord requester verification rate limited; using stale user ${cached.user.id}`);
         return cached.user;
       }
@@ -444,14 +451,16 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     });
   }
 
-  async function fetchRosterMembers() {
-    if (rosterCache && rosterCache.expiresAt > Date.now()) {
+  async function fetchRosterMembers({ strict = false } = {}) {
+    const fresh = () => rosterCache?.verifiedAt + rosterCacheSeconds * 1000 > Date.now();
+    if (rosterCache && rosterCache.expiresAt > Date.now() && (!strict || fresh())) {
       return rosterCache.members;
     }
 
-    if (rosterInFlight) return rosterInFlight;
-    rosterInFlight = refreshRosterMembers().finally(() => { rosterInFlight = null; });
-    return rosterInFlight;
+    if (!rosterInFlight) rosterInFlight = refreshRosterMembers().finally(() => { rosterInFlight = null; });
+    const members = await rosterInFlight;
+    if (strict && !fresh()) throw new HttpError(503, "Guild access could not be checked. Try again shortly.");
+    return members;
   }
 
   async function refreshRosterMembers() {
@@ -459,6 +468,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
       const members = await fetchRosterMembersFromDiscord();
       rosterCache = {
         expiresAt: Date.now() + rosterCacheSeconds * 1000,
+        verifiedAt: Date.now(),
         members,
       };
       return members;
@@ -559,6 +569,48 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     });
   }
 
+  async function handleStreams(request, response, url) {
+    // Authorization always precedes registry access, parsing bodies, and provider requests.
+    const requester = await verifyRequester(request, { allowStale: false });
+    const members = await streamMembers();
+    // Apply current guild eligibility to reads and writes alike, even while the
+    // OAuth identity token remains in its short verification cache.
+    if (!members.some(member => member.userId === requester.id)) throw new HttpError(403, "Discord user does not have the required guild role.");
+    if (url.pathname === "/v1/streams/me" && ["PUT", "DELETE"].includes(request.method)) {
+      streamChanges.take(requester.id);
+      const body = await readJsonBody(request);
+      sendJson(response, 200, request.method === "PUT"
+        ? await streams.save(requester, body.url, { checkTimeoutMs: Math.max(0, requestDeadlines.get(request) - performance.now() - 500) })
+        : await streams.remove(requester, body.provider));
+      return;
+    }
+    const player = url.pathname.match(/^\/v1\/streams\/player\/([0-9]{1,20})(?:\/(twitch|youtube))?$/);
+    const recording = url.pathname.match(/^\/v1\/streams\/vods(?:\/([0-9]{1,20}))?$/);
+    if (request.method !== "GET" || (url.pathname !== "/v1/streams" && !player && !recording)) {
+      throw new HttpError(404, "Not found.");
+    }
+    if (recording) {
+      const eligible = new Map(members.map(member => [member.userId, member.name]));
+      if (recording[1] && !eligible.has(recording[1])) throw new HttpError(404, "This member is unavailable.");
+      const vods = (await streams.recordings()).filter(vod => eligible.has(vod.userId) && (!recording[1] || recording[1] === vod.userId))
+        .map(vod => ({ ...vod, name: eligible.get(vod.userId) }));
+      sendJson(response, 200, { vods });
+      return;
+    }
+    const snapshot = await streams.snapshot(requester, members);
+    if (player) {
+      const stream = snapshot.streams.find(entry => entry.userId === player[1] && (!player[2] || entry.provider === player[2]));
+      if (!stream) throw new HttpError(404, "This stream is no longer live.");
+      sendHtml(response, 200, streamPlayerPage(stream, streams.playerOrigin), true);
+    } else sendJson(response, 200, snapshot);
+  }
+
+  async function streamMembers() {
+    return (await fetchRosterMembers({ strict: true }))
+      .filter(member => roleFromIds(member.roles) && !member.user?.bot && /^[0-9]{1,20}$/.test(member.user?.id))
+      .map(member => ({ userId: member.user.id, name: displayName(member, member.user) }));
+  }
+
   async function handleRequest(request, response) {
     requests.take(address(request));
     const url = requestUrl(request);
@@ -589,6 +641,11 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
       return;
     }
 
+    if (url.pathname === "/v1/streams" || url.pathname.startsWith("/v1/streams/")) {
+      await handleStreams(request, response, url);
+      return;
+    }
+
     sendJson(response, 404, { error: "Not found." });
   }
 
@@ -596,14 +653,24 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   const server = http.createServer({ maxHeaderSize: 8192, headersTimeout: 10_000, requestTimeout: 15_000 }, (request, response) => {
     if (activeRequests >= 100) {
       response.setHeader("connection", "close");
+      if (request.url?.startsWith("/v1/streams/player/")) {
+        sendHtml(response, 503, callbackPage("Stream unavailable", "Return to Brick to sign in or choose a live stream."));
+        return;
+      }
       sendJson(response, 503, { error: "Service is busy. Try again shortly." });
       return;
     }
     activeRequests++;
+    requestDeadlines.set(request, performance.now() + 15_000);
     const deadline = setTimeout(() => request.destroy(), 15_000);
     handleRequest(request, response).catch((error) => {
       if (response.destroyed || response.headersSent) return;
       response.setHeader("connection", "close");
+      if (request.url?.startsWith("/v1/streams/player/")) {
+        const status = error instanceof HttpError ? error.status : 500;
+        sendHtml(response, status, callbackPage("Stream unavailable", "Return to Brick to sign in or choose a live stream."));
+        return;
+      }
       if (error instanceof HttpError) {
         sendJson(response, error.status, { error: error.message });
         return;
@@ -612,6 +679,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
       sendJson(response, 500, { error: "Internal server error." });
     }).finally(() => {
       clearTimeout(deadline);
+      requestDeadlines.delete(request);
       activeRequests--;
     });
   });
@@ -619,8 +687,36 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   server.maxRequestsPerSocket = 100;
   server.keepAliveTimeout = 5_000;
   server.setTimeout(15_000, (socket) => socket.destroy());
+  let streamTimer;
+  let streamPollingClosed = false;
+  const pollStreams = async () => {
+    let delayMs = 30_000;
+    try {
+      if (await streams.needsPolling()) {
+        await streams.poll(await streamMembers());
+        delayMs = streams.nextPollDelayMs();
+      }
+    } catch {
+      // Never log stream records, submitted URLs, or upstream request credentials.
+      console.error("Background stream status refresh failed");
+    } finally {
+      if (!streamPollingClosed) {
+        streamTimer = setTimeout(pollStreams, delayMs);
+        streamTimer.unref();
+      }
+    }
+  };
+  server.on("close", () => {
+    streamPollingClosed = true;
+    clearTimeout(streamTimer);
+    streams.close();
+  });
   server.on("listening", () => {
     if (gatewayEnabled) startBotGatewayPresence();
+    if (env.STREAM_BACKGROUND_ENABLED !== "false") {
+      streamTimer = setTimeout(pollStreams, 0);
+      streamTimer.unref();
+    }
   });
   return server;
 

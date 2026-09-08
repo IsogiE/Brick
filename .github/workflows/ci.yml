@@ -28,7 +28,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev gnome-keyring
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav gnome-keyring
 
       - name: Check formatting
         if: runner.os == 'Linux'
@@ -45,9 +45,13 @@ jobs:
           node-version: 22
           package-manager-cache: false
 
-      - name: Test presence API
+      - name: Test presence API and stream preferences
         if: runner.os == 'Linux'
-        run: node --test presence/*.test.mjs
+        run: node --test presence/*.test.mjs tests/stream-preferences.test.mjs
+
+      - name: Test AppImage sandbox relocation
+        if: runner.os == 'Linux'
+        run: node --test packaging/linux/bwrap-wrapper.test.mjs
 
       - name: Test addon feed publication decisions
         if: runner.os == 'Linux'

@@ -5,7 +5,7 @@ WORKDIR /app
 
 RUN mkdir -p /data && chown node:node /data
 
-COPY server.mjs security.mjs ./
+COPY server.mjs security.mjs streams.mjs stream_vods.mjs ./
 
 USER node
 EXPOSE 8080
