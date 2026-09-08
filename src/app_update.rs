@@ -992,9 +992,12 @@ mod tests {
         assert!(super::verify_prepared_installer(&update).is_ok());
         fs::write(&path, b"tampered fixture").unwrap();
         assert!(super::verify_prepared_installer(&update).is_err());
+        assert!(super::launch_installer(&update).is_err());
         fs::write(&path, b"truncated").unwrap();
         assert!(super::verify_prepared_installer(&update).is_err());
+        assert!(super::launch_installer(&update).is_err());
         fs::remove_file(&path).unwrap();
         assert!(super::verify_prepared_installer(&update).is_err());
+        assert!(super::launch_installer(&update).is_err());
     }
 }

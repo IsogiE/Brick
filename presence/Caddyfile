@@ -29,7 +29,8 @@
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		X-Content-Type-Options "nosniff"
-		Referrer-Policy "no-referrer"
+		# The API sets no-referrer, except the authenticated player wrapper which
+		# needs strict-origin-when-cross-origin for official YouTube embeds.
 		-Server
 	}
 

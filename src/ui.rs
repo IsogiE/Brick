@@ -10,11 +10,13 @@ use eframe::egui::{self, Color32, RichText, Stroke, TextureHandle};
 
 use crate::{
     addon::{self, AppView, LogLevel, SyncSummary, WowClient},
-    app_update::{self, AvailableAppUpdate, PreparedAppUpdate},
+    app_update::{self, AvailableAppUpdate},
     autostart,
     discord_auth::{self, AuthorizedUser, SessionStatus},
     presence::{self, Roster, RosterMember},
-    single_instance, tray,
+    single_instance,
+    streams_ui::StreamsUi,
+    tray,
 };
 
 const ICON_BYTES: &[u8] = include_bytes!("assets/brick.png");
@@ -34,11 +36,12 @@ pub struct BrickApp {
     sync_lock: Arc<Mutex<()>>,
     auth_state: AuthUiState,
     presence_state: PresenceUiState,
+    streams: StreamsUi,
     active_tab: MainTab,
     sync_rx: Option<mpsc::Receiver<Result<SyncSummary, String>>>,
     auth_rx: Option<mpsc::Receiver<Result<AuthorizedUser, String>>>,
     app_update_rx: Option<mpsc::Receiver<Result<Option<AvailableAppUpdate>, String>>>,
-    app_update_install_rx: Option<mpsc::Receiver<Result<Option<PreparedAppUpdate>, String>>>,
+    app_update_install_rx: Option<mpsc::Receiver<Result<Option<String>, String>>>,
     roster_rx: Option<mpsc::Receiver<Result<Roster, String>>>,
     app_update_state: AppUpdateUiState,
     brick_texture: Option<TextureHandle>,
@@ -78,6 +81,7 @@ impl AuthUiState {
 enum MainTab {
     Updates,
     Roster,
+    Streams,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +148,7 @@ impl BrickApp {
             sync_lock,
             auth_state,
             presence_state: initial_presence_state(),
+            streams: StreamsUi::default(),
             active_tab: MainTab::Updates,
             sync_rx: None,
             auth_rx: None,
@@ -585,7 +590,17 @@ impl BrickApp {
         let (tx, rx) = mpsc::channel();
         let ctx = self.egui_ctx.clone();
         thread::spawn(move || {
-            let result = app_update::prepare_available_update();
+            // Rechecking the installer hash and replacing an AppImage can read
+            // hundreds of MiB. Keep that work off the native UI thread too.
+            // launch_installer still verifies the saved package before launch.
+            let result = app_update::prepare_available_update().and_then(|update| {
+                update
+                    .map(|update| {
+                        app_update::launch_installer(&update)?;
+                        Ok(update.version)
+                    })
+                    .transpose()
+            });
             let _ = tx.send(result);
             ctx.request_repaint();
         });
@@ -682,26 +697,14 @@ impl BrickApp {
         };
 
         match rx.try_recv() {
-            Ok(Ok(Some(update))) => {
-                let version = update.version.clone();
+            Ok(Ok(Some(version))) => {
                 let message = format!("Installing Brick {version}.");
-                match app_update::launch_installer(&update) {
-                    Ok(()) => {
-                        let _ = addon::record_log(LogLevel::Info, message.clone());
-                        self.status = message;
-                        self.app_update_state = AppUpdateUiState::Installing;
-                        self.app_update_install_rx = None;
-                        self.quit_requested = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    Err(error) => {
-                        let _ = addon::record_log(LogLevel::Error, error.clone());
-                        self.status = error;
-                        self.app_update_state =
-                            AppUpdateUiState::Error("Update failed".to_string());
-                        self.app_update_install_rx = None;
-                    }
-                }
+                let _ = addon::record_log(LogLevel::Info, message.clone());
+                self.status = message;
+                self.app_update_state = AppUpdateUiState::Installing;
+                self.app_update_install_rx = None;
+                self.quit_requested = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             Ok(Ok(None)) => {
                 self.status = "Brick is up to date.".to_string();
@@ -795,12 +798,15 @@ impl BrickApp {
         }
 
         self.draw_header(ui);
-        ui.add_space(14.0);
+        let compact_streams =
+            self.active_tab == MainTab::Streams && ui.ctx().content_rect().height() < 640.0;
+        ui.add_space(if compact_streams { 4.0 } else { 14.0 });
         self.draw_tab_bar(ui);
-        ui.add_space(18.0);
+        ui.add_space(if compact_streams { 4.0 } else { 18.0 });
         match self.active_tab {
             MainTab::Updates => self.draw_scrollable_updates_tab(ui),
             MainTab::Roster => self.draw_roster_tab(ui),
+            MainTab::Streams => self.streams.draw(ui),
         }
     }
 
@@ -833,6 +839,9 @@ impl BrickApp {
             if tab_button(ui, "Roster", self.active_tab == MainTab::Roster).clicked() {
                 self.active_tab = MainTab::Roster;
                 self.start_roster_refresh_if_stale();
+            }
+            if tab_button(ui, "Streams", self.active_tab == MainTab::Streams).clicked() {
+                self.active_tab = MainTab::Streams;
             }
         });
     }
@@ -1439,7 +1448,11 @@ impl BrickApp {
             }
         }
 
-        next
+        next.min(self.streams.repaint_after(
+            self.auth_state.is_authorized()
+                && self.window_visible
+                && self.active_tab == MainTab::Streams,
+        ))
     }
 }
 
@@ -1490,6 +1503,13 @@ impl eframe::App for BrickApp {
         self.poll_app_update(ctx);
         self.start_periodic_app_update_check();
         self.handle_close_request(ctx);
+        if self.streams.tick(
+            ctx,
+            self.auth_state.is_authorized(),
+            self.window_visible && self.active_tab == MainTab::Streams,
+        ) {
+            self.auth_state = AuthUiState::Denied("Sign in again to access guild streams.".into());
+        }
         if self.auth_state.is_authorized() {
             self.poll_sync();
             self.poll_roster();
@@ -1500,19 +1520,37 @@ impl eframe::App for BrickApp {
         ctx.request_repaint_after(self.next_repaint_after());
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let vertical_margin = if self.auth_state.is_authorized()
+            && self.active_tab == MainTab::Streams
+            && ctx.content_rect().height() < 640.0
+        {
+            8
+        } else {
+            24
+        };
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
                     .fill(app_background())
-                    .inner_margin(egui::Margin::symmetric(28, 24)),
+                    .inner_margin(egui::Margin::symmetric(28, vertical_margin)),
             )
             .show_inside(ui, |ui| {
                 ui.set_width(ui.available_width());
                 self.draw_content(ui);
             });
         self.draw_logout_confirmation(&ctx);
+        if self.streams.update_player(
+            frame,
+            &ctx,
+            self.auth_state.is_authorized()
+                && self.window_visible
+                && self.active_tab == MainTab::Streams
+                && !self.confirm_logout,
+        ) {
+            self.auth_state = AuthUiState::Denied("Sign in again to access guild streams.".into());
+        }
 
         ctx.request_repaint_after(self.next_repaint_after());
     }
@@ -1574,6 +1612,7 @@ fn time_until(last: Instant, interval_secs: u64) -> Duration {
 }
 
 fn configure_style(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
     ctx.set_visuals(egui::Visuals::dark());
     let mut style = (*ctx.global_style()).clone();
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
@@ -2271,6 +2310,7 @@ mod tests {
                 created_at_unix: u64::MAX,
             }),
             presence_state: PresenceUiState::Idle,
+            streams: StreamsUi::default(),
             active_tab: MainTab::Updates,
             sync_rx: None,
             auth_rx: None,
@@ -2423,6 +2463,25 @@ mod tests {
         app.last_auth_check = overdue();
         app.last_roster_refresh = overdue();
         assert_eq!(app.next_repaint_after(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn pending_installer_work_does_not_close_or_repaint_the_window() {
+        let mut app = app();
+        let (_tx, rx) = mpsc::channel();
+        app.app_update_install_rx = Some(rx);
+        app.app_update_state = AppUpdateUiState::Installing;
+        app.last_app_update_check = overdue();
+        let ctx = app.egui_ctx.clone();
+        let output = ctx.run_ui(egui::RawInput::default(), |_| {
+            app.poll_app_update_install(&ctx);
+        });
+        assert!(!app.quit_requested);
+        assert!(app.app_update_install_rx.is_some());
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .is_empty());
+        assert!(app.next_repaint_after() > Duration::from_secs(50));
     }
 
     #[test]

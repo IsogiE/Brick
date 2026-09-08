@@ -151,7 +151,7 @@ fn api_error(prefix: &str, status: u16, body: &[u8]) -> String {
     format!("{prefix}: HTTP {status}")
 }
 
-fn endpoint_url(path: &str) -> Result<Url, String> {
+pub(crate) fn endpoint_url(path: &str) -> Result<Url, String> {
     let base = PRESENCE_API_URL.trim();
     if base.is_empty() {
         return Err(configuration_error());
@@ -168,7 +168,7 @@ fn endpoint_url(path: &str) -> Result<Url, String> {
         .map_err(|error| format!("Invalid Brick presence API endpoint: {error}"))
 }
 
-fn http_client() -> Result<Client, String> {
+pub(crate) fn http_client() -> Result<Client, String> {
     match &*HTTP_CLIENT {
         Ok(client) => Ok(client.clone()),
         Err(error) => Err(error.clone()),

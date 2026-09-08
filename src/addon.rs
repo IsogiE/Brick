@@ -3,7 +3,7 @@ use std::{
     convert::TryInto,
     env,
     fs::{self, OpenOptions},
-    io::{self, Cursor, Read, Write},
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock, Mutex, MutexGuard},
     thread,
@@ -35,6 +35,8 @@ const FEED_UNAVAILABLE_MESSAGE: &str =
 const SETTINGS_FILE: &str = "settings.json";
 const LOG_FILE: &str = "logs.jsonl";
 const MAX_LOG_ENTRIES: usize = 80;
+const MAX_LOG_BYTES: u64 = 1024 * 1024;
+const MAX_LOG_MESSAGE_BYTES: usize = 4096;
 const SYNC_INTERVAL_SECS: u64 = 60;
 const CLIENT_METADATA_REFRESH_INTERVAL_SECS: i64 = 300;
 const PACKAGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -407,12 +409,23 @@ pub fn record_log(level: LogLevel, message: String) -> Result<(), String> {
     let _guard = LOG_LOCK
         .lock()
         .map_err(|_| "Failed to access Brick logs: lock was poisoned.".to_string())?;
-    let path = logs_path()?;
+    record_log_to(&logs_path()?, level, message)
+}
+
+fn record_log_to(path: &Path, level: LogLevel, mut message: String) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
     }
 
+    if message.len() > MAX_LOG_MESSAGE_BYTES {
+        let mut end = MAX_LOG_MESSAGE_BYTES - '…'.len_utf8();
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message.push('…');
+    }
     let entry = LogEntry {
         at: now_stamp(),
         level,
@@ -423,10 +436,31 @@ pub fn record_log(level: LogLevel, message: String) -> Result<(), String> {
 
     let mut file = OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
-        .open(&path)
+        .open(path)
         .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
-    writeln!(file, "{line}").map_err(|error| format!("Failed to write {}: {error}", path.display()))
+    let length = file.metadata().map_err(|error| error.to_string())?.len();
+    if length.saturating_add(line.len() as u64 + 2) > MAX_LOG_BYTES {
+        // Close before atomic replacement so compaction also works on Windows.
+        drop(file);
+        let mut logs = read_logs_from(path)?;
+        logs.push(entry);
+        return rewrite_logs(path, &logs);
+    }
+    let mut write = || -> io::Result<()> {
+        // A crash may have left the previous JSON record unfinished.
+        if length > 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")?;
+            }
+        }
+        writeln!(file, "{line}")
+    };
+    write().map_err(|error| format!("Failed to write {}: {error}", path.display()))
 }
 
 pub fn run_sync_with_lock(sync_lock: &Arc<Mutex<()>>) -> Result<SyncSummary, String> {
@@ -669,36 +703,77 @@ fn read_logs() -> Result<Vec<LogEntry>, String> {
 }
 
 fn read_logs_from(path: &Path) -> Result<Vec<LogEntry>, String> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let bytes =
-        fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("Failed to read {}: {error}", path.display())),
+    };
+    let (bytes, truncated) = read_log_tail(&mut file)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    drop(file);
     let contents = String::from_utf8_lossy(&bytes);
     let mut logs = Vec::new();
+    let mut compact = truncated;
 
-    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+    for line in contents
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+    {
+        if logs.len() == MAX_LOG_ENTRIES {
+            compact = true;
+            break;
+        }
         if let Ok(entry) = serde_json::from_str::<LogEntry>(line) {
             logs.push(entry);
         }
     }
-
-    if logs.len() > MAX_LOG_ENTRIES {
-        let overflow = logs.len() - MAX_LOG_ENTRIES;
-        logs.drain(0..overflow);
+    logs.reverse();
+    if compact {
         let _ = rewrite_logs(path, &logs);
     }
 
     Ok(logs)
 }
 
+fn read_log_tail(file: &mut (impl Read + Seek)) -> io::Result<(Vec<u8>, bool)> {
+    let length = file.seek(SeekFrom::End(0))?;
+    let offset = length.saturating_sub(MAX_LOG_BYTES);
+    file.seek(SeekFrom::Start(offset.saturating_sub(1)))?;
+    let mut bytes = Vec::new();
+    if offset > 0 {
+        let mut preceding = [0];
+        file.read_exact(&mut preceding)?;
+        file.take(MAX_LOG_BYTES).read_to_end(&mut bytes)?;
+        if preceding[0] != b'\n' {
+            let start = bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |index| index + 1);
+            bytes.drain(..start);
+        }
+    } else {
+        file.take(MAX_LOG_BYTES).read_to_end(&mut bytes)?;
+    }
+    Ok((bytes, offset > 0))
+}
+
 fn rewrite_logs(path: &Path, logs: &[LogEntry]) -> Result<(), String> {
-    let mut contents = Vec::new();
-    for entry in logs {
-        serde_json::to_writer(&mut contents, entry)
+    let mut lines = Vec::new();
+    let mut length = 0;
+    for entry in logs.iter().rev().take(MAX_LOG_ENTRIES) {
+        let mut line = serde_json::to_vec(entry)
             .map_err(|error| format!("Failed to serialize log entry: {error}"))?;
-        contents.push(b'\n');
+        line.push(b'\n');
+        if length + line.len() > MAX_LOG_BYTES as usize {
+            break;
+        }
+        length += line.len();
+        lines.push(line);
+    }
+    let mut contents = Vec::with_capacity(length);
+    for line in lines.into_iter().rev() {
+        contents.extend_from_slice(&line);
     }
     atomic_file::write(path, &contents)
         .map_err(|error| format!("Failed to compact {}: {error}", path.display()))
@@ -1906,6 +1981,101 @@ mod tests {
         let logs = read_logs_from(&path).unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].message, "valid");
+        record_log_to(&path, LogLevel::Info, "after interrupted write".into()).unwrap();
+        let logs = read_logs_from(&path).unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[1].message, "after interrupted write");
+    }
+
+    #[test]
+    fn oversized_legacy_logs_read_only_a_bounded_tail_and_keep_the_latest_entries() {
+        struct MeasuredReader {
+            file: fs::File,
+            bytes_read: usize,
+        }
+        impl Read for MeasuredReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let count = self.file.read(buffer)?;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+        impl Seek for MeasuredReader {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.file.seek(position)
+            }
+        }
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let path = root.join(LOG_FILE);
+        let mut file = fs::File::create(&path).unwrap();
+        file.set_len(64 * MAX_LOG_BYTES).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(b"\n").unwrap();
+        for index in 0..100 {
+            let entry = LogEntry {
+                at: "now".into(),
+                level: LogLevel::Info,
+                message: index.to_string(),
+            };
+            serde_json::to_writer(&mut file, &entry).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        file.write_all(b"{interrupted").unwrap();
+        drop(file);
+        let mut reader = MeasuredReader {
+            file: fs::File::open(&path).unwrap(),
+            bytes_read: 0,
+        };
+        let (_, truncated) = read_log_tail(&mut reader).unwrap();
+        assert!(truncated);
+        assert!(reader.bytes_read <= MAX_LOG_BYTES as usize + 1);
+        drop(reader);
+        let logs = read_logs_from(&path).unwrap();
+        assert_eq!(logs.len(), MAX_LOG_ENTRIES);
+        assert_eq!(logs.first().unwrap().message, "20");
+        assert_eq!(logs.last().unwrap().message, "99");
+        assert!(fs::metadata(&path).unwrap().len() < MAX_LOG_BYTES);
+        assert_eq!(read_logs_from(&path).unwrap().len(), MAX_LOG_ENTRIES);
+    }
+
+    #[test]
+    fn bounded_log_tail_distinguishes_complete_lines_from_partial_first_records() {
+        let line = b"{\"at\":\"now\",\"level\":\"info\",\"message\":\"boundary\"}\n";
+        for preceding in [b'\n', b'x'] {
+            let mut bytes = vec![preceding];
+            bytes.extend_from_slice(line);
+            bytes.resize(MAX_LOG_BYTES as usize + 1, b'\n');
+            let (tail, truncated) = read_log_tail(&mut Cursor::new(bytes)).unwrap();
+            assert!(truncated);
+            assert_eq!(tail.starts_with(line), preceding == b'\n');
+        }
+    }
+
+    #[test]
+    fn recording_without_loading_a_view_bounds_legacy_files_and_utf8_messages() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let path = root.join(LOG_FILE);
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_LOG_BYTES * 2)
+            .unwrap();
+        record_log_to(&path, LogLevel::Warn, "😀".repeat(MAX_LOG_MESSAGE_BYTES)).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() <= MAX_LOG_BYTES);
+        let logs = read_logs_from(&path).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].message.len() <= MAX_LOG_MESSAGE_BYTES);
+        assert!(logs[0].message.ends_with('…'));
+        // Repeated verbose appends remain bounded even without any view reads.
+        for _ in 0..45 {
+            record_log_to(&path, LogLevel::Info, "\0".repeat(MAX_LOG_MESSAGE_BYTES)).unwrap();
+            assert!(fs::metadata(&path).unwrap().len() <= MAX_LOG_BYTES);
+        }
+        record_log_to(&path, LogLevel::Info, "latest entry".into()).unwrap();
+        let logs = read_logs_from(&path).unwrap();
+        assert!(logs.len() <= MAX_LOG_ENTRIES);
+        assert_eq!(logs.last().unwrap().message, "latest entry");
     }
 
     #[test]

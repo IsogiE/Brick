@@ -14,7 +14,7 @@ async function fixture(t, upstream, extra = {}) {
   const server = await createPresenceServer({ env: {
     DATA_DIR: data, DISCORD_BOT_TOKEN: "test-only", DISCORD_GUILD_ID: "123",
     DISCORD_OFFICER_ROLE_ID: "456", DISCORD_RAIDER_ROLE_ID: "789",
-    DISCORD_GATEWAY_ENABLED: "false", ...extra,
+    DISCORD_GATEWAY_ENABLED: "false", STREAM_BACKGROUND_ENABLED: "false", ...extra,
   }, fetch: upstream });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
