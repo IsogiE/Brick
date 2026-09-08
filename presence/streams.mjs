@@ -8,6 +8,9 @@ const REFRESH_MS = 30_000;
 const YOUTUBE_DAILY_BUDGET = 8_000;
 const YOUTUBE_FRESH_MS = 90_000;
 const PROVIDER_BACKOFF_MS = 15 * 60_000;
+const FIRST_CHECK_WAIT_MS = 5_000;
+const FIRST_CHECK_QUEUE_LIMIT = 128;
+const FIRST_CHECK_YOUTUBE_DAILY_BUDGET = 256;
 const MAX_STREAMS = 1000;
 const MAX_FILE_BYTES = 1024 * 1024;
 const TWITCH_RESERVED = new Set(["directory", "downloads", "jobs", "p", "search", "settings", "subscriptions", "turbo", "videos", "wallet"]);
@@ -68,7 +71,7 @@ export function streamPlayerPage(stream, origin) {
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Brick stream</title><style>html,body,iframe{margin:0;width:100%;height:100%;border:0;background:#14161a;overflow:hidden}iframe{display:block}</style></head><body><iframe title="Guild stream" src="${escaped}" referrerpolicy="strict-origin-when-cross-origin" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen></iframe></body></html>`;
 }
 
-export async function createStreamService({ dataDir, env, fetch, now = Date.now }) {
+export async function createStreamService({ dataDir, env, fetch, now = Date.now, firstCheckWaitMs = FIRST_CHECK_WAIT_MS }) {
   const filePath = path.join(dataDir, "streams.json");
   const credential = async (name) => env[`${name}_FILE`]
     ? (await fs.readFile(env[`${name}_FILE`], "utf8")).trim() : env[name]?.trim() || "";
@@ -82,6 +85,9 @@ export async function createStreamService({ dataDir, env, fetch, now = Date.now 
   let writes = Promise.resolve();
   let refresh = null;
   let refreshAt = 0;
+  let firstCheckTimer = null;
+  const firstChecks = new Map();
+  const manualYoutubeChecks = [];
   let statuses = new Map();
   let youtubeNextCheckAt = 0;
   let youtubeBackoffUntil = 0;
@@ -207,11 +213,20 @@ export async function createStreamService({ dataDir, env, fetch, now = Date.now 
   const viewers = value => Number.isSafeInteger(Number(value)) && Number(value) >= 0 && value !== null && value !== ""
     ? { viewerCount: Number(value) } : {};
 
-  async function refreshStatuses(entries) {
+  function manualYoutubeAvailable() {
+    while (manualYoutubeChecks.length && manualYoutubeChecks[0] <= now() - 86_400_000) manualYoutubeChecks.shift();
+    return manualYoutubeChecks.length < FIRST_CHECK_YOUTUBE_DAILY_BUDGET;
+  }
+
+  async function refreshStatuses(entries, targeted = false) {
+    // Schedule from the start so a slow provider or recording write cannot
+    // add another whole interval after an earlier result expires.
+    const startedAt = now();
     // A single deadline and worker pool bound all provider activity, including token acquisition.
-    const signal = AbortSignal.any([AbortSignal.timeout(10_000), shutdown.signal]);
+    const signal = AbortSignal.any([AbortSignal.timeout(targeted ? FIRST_CHECK_WAIT_MS : 10_000), shutdown.signal]);
+    const submissions = targeted ? new Map(entries.map(entry => [keyFor(entry), entry])) : null;
     const targets = new Map();
-    for (const entry of [...entries, ...await vods.targets()]) {
+    for (const entry of [...entries, ...(targeted ? [] : await vods.targets())]) {
       const key = keyFor(entry);
       const target = targets.get(key) || { provider: entry.provider, channelId: entry.channelId, owners: [] };
       target.owners = [...new Set([...target.owners, ...(entry.owners || [])])];
@@ -231,9 +246,8 @@ export async function createStreamService({ dataDir, env, fetch, now = Date.now 
     const twitch = [...new Set(entries.filter(entry => entry.provider === "twitch").map(entry => entry.channelId))];
     const youtube = [...new Set(entries.filter(entry => entry.provider === "youtube").map(entry => entry.channelId))];
     const youtubeTargets = new Set(youtube);
-    for (const id of youtubeCache.keys()) if (!youtubeTargets.has(id)) youtubeCache.delete(id);
     if (providers.twitch && twitch.length) {
-      for (const id of twitch) result.set(`twitch:${id}`, { status: "unknown", title: "" });
+      for (const id of twitch) result.set(`twitch:${id}`, { status: "unknown", title: "", checkedAt: now() });
       try { token = await getTwitchToken(signal); } catch { /* Unavailable stays unknown until the next shared refresh. */ }
     }
     if (token) for (let start = 0; start < twitch.length; start += 100) {
@@ -260,27 +274,34 @@ export async function createStreamService({ dataDir, env, fetch, now = Date.now 
         for (const id of ids) {
           const item = live.get(id);
           result.set(`twitch:${id}`, item
-            ? { status: "live", title: title(item.title), ...viewers(item.viewer_count),
+            ? { status: "live", title: title(item.title), ...viewers(item.viewer_count), checkedAt: now(),
               startedAt: item.started_at, twitchUserId: item.user_id, streamId: item.id }
-            : { status: "offline", title: "" });
+            : { status: "offline", title: "", checkedAt: now() });
           observed.add(`twitch:${id}`);
         }
       });
     }
-    const checkYoutube = providers.youtube && youtube.length
-      && now() >= Math.max(youtubeNextCheckAt, youtubeBackoffUntil);
+    const checkYoutube = providers.youtube && youtube.length && now() >= youtubeBackoffUntil
+      && (targeted ? manualYoutubeAvailable() : now() >= youtubeNextCheckAt);
     if (checkYoutube) {
-      for (const id of youtube) result.set(`youtube:${id}`, { status: "unknown", title: "" });
+      if (!targeted) for (const id of youtube) result.set(`youtube:${id}`, { status: "unknown", title: "", checkedAt: now() });
       // videos.list costs one unit per batch. Keep room in the daily project
       // quota as registrations and pending recording targets grow.
-      youtubeNextCheckAt = now() + Math.max(REFRESH_MS,
+      if (!targeted) youtubeNextCheckAt = now() + Math.max(REFRESH_MS,
         Math.ceil(Math.ceil(youtube.length / 50) * 86_400_000 / YOUTUBE_DAILY_BUDGET));
-      youtubeCache.clear();
+      for (const id of youtube) youtubeCache.delete(id);
     }
     if (checkYoutube) for (let start = 0; start < youtube.length; start += 50) {
       const ids = youtube.slice(start, start + 50);
       jobs.push(async () => {
         if (now() < youtubeBackoffUntil) return;
+        // Manual checks use a small, bounded part of the quota headroom left
+        // above the normal 8,000-unit schedule; they never bypass backoff.
+        if (targeted) {
+          if (!manualYoutubeAvailable()) return;
+          manualYoutubeChecks.push(now());
+          for (const id of ids) result.set(`youtube:${id}`, { status: "unknown", title: "", checkedAt: now() });
+        }
         const query = new URLSearchParams({ part: "snippet,status,liveStreamingDetails", id: ids.join(","), key: youtubeKey });
         let body;
         try {
@@ -314,37 +335,122 @@ export async function createStreamService({ dataDir, env, fetch, now = Date.now 
       }
     }));
     for (const [id, cached] of youtubeCache) {
+      if (targeted && !youtubeTargets.has(id)) continue;
       if (now() < cached.checkedAt + YOUTUBE_FRESH_MS) result.set(`youtube:${id}`, { ...cached.state, checkedAt: cached.checkedAt });
     }
     // Failed batches immediately withdraw previously live entries. An outage never reports them offline.
-    statuses = result;
-    refreshAt = now() + REFRESH_MS;
+    if (targeted) {
+      for (const [key, state] of result) statuses.set(key, state);
+      if (refreshAt === 0) refreshAt = startedAt + REFRESH_MS;
+    } else {
+      // A save can finish while a normal provider round is in flight. Retain
+      // a fresh first-check result for any newly registered target it omitted.
+      const registered = new Set([...(registrations?.values() || [])].flatMap(platforms => [...platforms.values()].map(keyFor)));
+      const retained = new Set([...targets.keys(), ...registered]);
+      for (const [key, state] of statuses) if (!result.has(key) && registered.has(key)) result.set(key, state);
+      for (const key of result.keys()) if (!retained.has(key)) result.delete(key);
+      for (const id of youtubeCache.keys()) if (!retained.has(`youtube:${id}`)) youtubeCache.delete(id);
+      statuses = result;
+      refreshAt = startedAt + REFRESH_MS;
+    }
     try {
       await vods.observe(entries.map(entry => ({ ...entry,
-        ...(observed.has(keyFor(entry)) ? result.get(keyFor(entry)) : { status: "unknown", title: "" }) })), signal);
+        ...(observed.has(keyFor(entry)) ? result.get(keyFor(entry)) : { status: "unknown", title: "" }),
+        ...(targeted ? { owners: submissions.get(keyFor(entry)).owners } : {}) })), signal, { discoverArchives: !targeted });
     } catch {
       // A recording-store/provider failure must not turn a verified live status into offline.
       console.error("Stream recording refresh failed");
     }
   }
 
+  function freshCache(entry) {
+    const cached = statuses.get(keyFor(entry));
+    const lifetime = entry.provider === "youtube" ? YOUTUBE_FRESH_MS : REFRESH_MS;
+    return cached?.checkedAt !== undefined && now() < cached.checkedAt + lifetime ? cached : null;
+  }
+
   function row(userId, name, entry) {
     const cached = statuses.get(keyFor(entry));
-    const fresh = now() < refreshAt ? cached : null;
-    const state = entry.provider === "youtube" && !(now() < (fresh?.checkedAt || 0) + YOUTUBE_FRESH_MS) ? null : fresh;
+    const state = freshCache(entry);
     return { userId, name, ...entry, status: state?.status || (!cached || cached.status === "checking"
       ? uncheckedStatus(entry) : "unknown"), title: state?.title || "",
       ...(state?.viewerCount !== undefined ? { viewerCount: state.viewerCount } : {}),
       ...(state?.broadcastState ? { broadcastState: state.broadcastState } : {}) };
   }
 
+  function finishRefresh() {
+    refresh = null;
+    scheduleFirstChecks();
+  }
+
+  function scheduleFirstChecks() {
+    if (shutdown.signal.aborted || refresh || firstCheckTimer || !firstChecks.size) return;
+    firstCheckTimer = setTimeout(() => {
+      firstCheckTimer = null;
+      if (refresh || shutdown.signal.aborted) return;
+      const batch = [];
+      for (const job of firstChecks.values()) {
+        if (job.running) continue;
+        const cached = freshCache(job.entry);
+        const registered = job.entry.owners.some(id => registrations.get(id)?.get(job.entry.provider)?.channelId === job.entry.channelId);
+        if (!registered || (cached && cached.status !== "checking")) {
+          firstChecks.delete(keyFor(job.entry));
+          job.resolve();
+        } else batch.push(job);
+      }
+      if (!batch.length) return;
+      for (const job of batch) job.running = true;
+      // The same work lock protects normal and manual rounds. Their existing
+      // three-worker pool is the total concurrency limit, not one pool per save.
+      refresh = refreshStatuses(batch.map(job => job.entry), true).catch(() => {}).finally(() => {
+        for (const job of batch) {
+          firstChecks.delete(keyFor(job.entry));
+          job.resolve();
+        }
+        finishRefresh();
+      });
+    }, 50);
+  }
+
+  async function firstCheck(entry, userId, waitMs) {
+    if (waitMs <= 0 || shutdown.signal.aborted || !providers[entry.provider]
+      || (entry.provider === "youtube" && (now() < youtubeBackoffUntil || !manualYoutubeAvailable()))) return;
+    const key = keyFor(entry);
+    const cached = freshCache(entry);
+    if (cached && cached.status !== "checking") return;
+    let job = firstChecks.get(key);
+    if (!job) {
+      if (firstChecks.size >= FIRST_CHECK_QUEUE_LIMIT) return;
+      let resolve;
+      const promise = new Promise(done => { resolve = done; });
+      job = { entry: { ...entry, owners: [userId] }, promise, resolve, waiters: 0, running: false };
+      firstChecks.set(key, job);
+    } else job.entry.owners = [...new Set([...job.entry.owners, userId])];
+    job.waiters++;
+    scheduleFirstChecks();
+    try {
+      await new Promise(resolve => {
+        const timer = setTimeout(resolve, waitMs);
+        job.promise.then(() => { clearTimeout(timer); resolve(); });
+      });
+    } finally {
+      job.waiters--;
+      if (!job.waiters && !job.running) {
+        firstChecks.delete(key);
+        job.resolve();
+      }
+    }
+  }
+
   async function poll(members) {
+    // Give a due normal round priority after an in-flight first check.
+    if (refresh) await refresh;
     await writes;
     const users = await load();
     const eligible = new Map(members.map(member => [member.userId, member.name]));
     const entries = [...users].filter(([id]) => eligible.has(id)).flatMap(([userId, platforms]) =>
       [...platforms.values()].map(entry => ({ ...entry, owners: [userId] })));
-    if (now() >= refreshAt && !refresh) refresh = refreshStatuses(entries).finally(() => { refresh = null; });
+    if (now() >= refreshAt && !refresh) refresh = refreshStatuses(entries).finally(finishRefresh);
     if (refresh) await refresh;
   }
 
@@ -367,14 +473,27 @@ export async function createStreamService({ dataDir, env, fetch, now = Date.now 
 
   return {
     snapshot, playerOrigin, poll,
+    nextPollDelayMs: () => refreshAt ? Math.max(1_000, Math.min(REFRESH_MS, refreshAt - now())) : REFRESH_MS,
     async recordings() { return vods.list(); },
-    close() { shutdown.abort(); },
+    close() {
+      shutdown.abort();
+      clearTimeout(firstCheckTimer);
+      firstCheckTimer = null;
+      for (const job of firstChecks.values()) job.resolve();
+      firstChecks.clear();
+    },
     async needsPolling() { return (await load()).size > 0 || (await vods.targets()).length > 0; },
-    async save(requester, value) {
+    async save(requester, value, { checkTimeoutMs = firstCheckWaitMs } = {}) {
+      const deadline = performance.now() + Math.max(0, Math.min(FIRST_CHECK_WAIT_MS, firstCheckWaitMs, checkTimeoutMs));
       const entry = parseStreamUrl(value);
       await update(requester.id, entry);
-      return { ownStream: row(requester.id, requester.name, entry),
-        ownStreams: [...registrations.get(requester.id).values()].map(stream => row(requester.id, requester.name, stream)) };
+      // Persistence succeeds independently of provider availability. A failed
+      // or delayed first check must never turn a saved link into a failed save.
+      await firstCheck(entry, requester.id, deadline - performance.now());
+      const current = registrations.get(requester.id);
+      const saved = current?.get(entry.provider);
+      return { ownStream: saved ? row(requester.id, requester.name, saved) : null,
+        ownStreams: [...(current?.values() || [])].map(stream => row(requester.id, requester.name, stream)) };
     },
     async remove(requester, provider) {
       if (provider !== undefined && !["twitch", "youtube"].includes(provider)) throw new HttpError(400, "Choose Twitch or YouTube to remove.");

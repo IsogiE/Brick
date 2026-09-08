@@ -208,6 +208,10 @@ jobs:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo packager --release --formats ${{ matrix.formats }}
 
+      - name: Verify bundled Linux runtime and updater size limit
+        if: runner.os == 'Linux'
+        run: node packaging/linux/verify-appimage.mjs
+
       - name: Build signed Windows package
         if: runner.os == 'Windows'
         env:

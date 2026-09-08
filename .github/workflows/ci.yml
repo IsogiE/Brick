@@ -45,9 +45,13 @@ jobs:
           node-version: 22
           package-manager-cache: false
 
-      - name: Test presence API
+      - name: Test presence API and stream preferences
         if: runner.os == 'Linux'
-        run: node --test presence/*.test.mjs
+        run: node --test presence/*.test.mjs tests/stream-preferences.test.mjs
+
+      - name: Test AppImage sandbox relocation
+        if: runner.os == 'Linux'
+        run: node --test packaging/linux/bwrap-wrapper.test.mjs
 
       - name: Test addon feed publication decisions
         if: runner.os == 'Linux'

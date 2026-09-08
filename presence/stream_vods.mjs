@@ -153,7 +153,7 @@ export function createVodService({ dataDir, now = Date.now, twitchRequest }) {
     next.active = next.active.filter(session => !completed.has(sessionKey(session)));
   }
 
-  async function observe(observations, signal = AbortSignal.timeout(10_000)) {
+  async function observe(observations, signal = AbortSignal.timeout(10_000), { discoverArchives = true } = {}) {
     if (!Array.isArray(observations) || observations.length > MAX_OBSERVATIONS) throw new Error("Invalid stream observations");
     const operation = queue.catch(() => {}).then(async () => {
       const next = structuredClone(await load());
@@ -214,7 +214,7 @@ export function createVodService({ dataDir, now = Date.now, twitchRequest }) {
       next.active = next.active.filter(session => session.endedAt
         ? currentTime - Date.parse(session.endedAt) <= ARCHIVE_WAIT_MS
         : currentTime - session.lastSeenAt <= ABANDONED_MS);
-      await findTwitchArchives(next, signal);
+      if (discoverArchives) await findTwitchArchives(next, signal);
       if (JSON.stringify(next) !== before) await persist(next);
     });
     queue = operation.catch(() => {});

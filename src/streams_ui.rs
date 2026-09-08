@@ -11,6 +11,7 @@ use eframe::egui::{self, Color32, RichText};
 use crate::{
     discord_auth, presence,
     stream_player::StreamPlayer,
+    stream_preferences::Preferences,
     streams::{self, Provider, Snapshot, Status, Stream, Vod},
 };
 
@@ -33,7 +34,7 @@ enum ResultData {
     Recordings(Vec<Vod>),
 }
 type WorkResult = Result<ResultData, streams::Error>;
-type PlayerResult = Result<(String, String), streams::Error>;
+type PlayerResult = Result<(String, String, Option<Preferences>), streams::Error>;
 
 pub struct StreamsUi {
     snapshot: Option<Rc<Snapshot>>,
@@ -45,6 +46,7 @@ pub struct StreamsUi {
     recordings_open: bool,
     recordings: Option<Rc<Vec<Vod>>>,
     player: Option<StreamPlayer>,
+    preferences: Option<Preferences>,
     player_work: Option<mpsc::Receiver<PlayerResult>>,
     player_attempted: bool,
     player_rect: Option<egui::Rect>,
@@ -69,6 +71,7 @@ impl Default for StreamsUi {
             recordings_open: false,
             recordings: None,
             player: None,
+            preferences: None,
             player_work: None,
             player_attempted: false,
             player_rect: None,
@@ -790,8 +793,16 @@ impl StreamsUi {
             if let Some(result) = result {
                 self.player_work = None;
                 match result {
-                    Ok((url, token)) => {
-                        match StreamPlayer::new(frame, &url, &token, rect, ctx.pixels_per_point()) {
+                    Ok((url, token, preferences)) => {
+                        self.preferences = preferences;
+                        match StreamPlayer::new(
+                            frame,
+                            &url,
+                            &token,
+                            rect,
+                            ctx.pixels_per_point(),
+                            self.preferences.clone(),
+                        ) {
                             Ok(player) => self.player = Some(player),
                             Err(error) => self.player_error = Some(error),
                         }
@@ -811,11 +822,19 @@ impl StreamsUi {
             };
             let user_id = stream.user_id.clone();
             let provider = stream.provider.clone();
+            let preferences = self.preferences.clone();
             let (tx, rx) = mpsc::channel();
             let ctx = ctx.clone();
             thread::spawn(move || {
                 let result = access_token().and_then(|token| {
-                    streams::player_url(&user_id, &provider).map(|url| (url, token))
+                    streams::player_url(&user_id, &provider).map(|url| {
+                        let preferences = if provider == Provider::Twitch {
+                            Some(preferences.unwrap_or_else(Preferences::load))
+                        } else {
+                            preferences
+                        };
+                        (url, token, preferences)
+                    })
                 });
                 let _ = tx.send(result);
                 ctx.request_repaint();

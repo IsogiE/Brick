@@ -16,7 +16,7 @@ const members = [
   { user: { id: "33", username: "Removed" }, roles: [] },
 ];
 
-async function fixture(t, upstream = () => { throw new Error("Unexpected provider request"); }, extra = {}) {
+async function fixture(t, upstream = () => { throw new Error("Unexpected provider request"); }, extra = {}, timing = {}) {
   const data = await mkdtemp(path.join(os.tmpdir(), "brick-stream-test-"));
   let clock = 1_700_000_000_000;
   let calls = 0;
@@ -50,7 +50,9 @@ async function fixture(t, upstream = () => { throw new Error("Unexpected provide
     await new Promise(resolve => server.close(resolve));
   };
   const start = async () => {
-    server = await createPresenceServer({ env, fetch: fetchUpstream, now: () => clock });
+    // Most existing cases exercise the scheduled refresh in isolation. Initial
+    // submission checks have separate integration coverage with the real default.
+    server = await createPresenceServer({ env, fetch: fetchUpstream, now: () => clock, firstStreamCheckWaitMs: 0, ...timing });
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     base = `http://127.0.0.1:${server.address().port}`;
@@ -94,7 +96,7 @@ async function quotaFixture(t, count, upstream) {
   await writeFile(path.join(dataDir, "streams.json"), JSON.stringify({ version: 2, users }));
   let clock = 1_700_000_000_000;
   let requests = 0;
-  const service = await createStreamService({ dataDir, env: providerEnv, now: () => clock,
+  const service = await createStreamService({ dataDir, env: providerEnv, now: () => clock, firstCheckWaitMs: 0,
     fetch: async (url, options) => {
       requests++;
       return upstream(new URL(url), options);
@@ -105,6 +107,18 @@ async function quotaFixture(t, count, upstream) {
     snapshot: () => service.snapshot({ id: "1", name: "Member 1" }, eligible),
     save: url => service.save({ id: "1", name: "Member 1" }, url),
   };
+}
+
+async function manualFixture(t, upstream, users = {}) {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "brick-stream-manual-"));
+  await writeFile(path.join(dataDir, "streams.json"), JSON.stringify({ version: 2, users }));
+  let clock = 1_700_000_000_000;
+  const service = await createStreamService({ dataDir, env: providerEnv, now: () => clock, fetch: upstream });
+  t.after(async () => { service.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const eligible = Array.from({ length: 1000 }, (_, index) => ({ userId: String(index + 1), name: `Member ${index + 1}` }));
+  return { dataDir, service, advance: milliseconds => { clock += milliseconds; },
+    save: (url, id = "1", options) => service.save({ id, name: `Member ${id}` }, url, options),
+    snapshot: () => service.snapshot({ id: "1", name: "Member 1" }, eligible) };
 }
 
 const liveYoutubeBatch = url => json({ items: url.searchParams.get("id").split(",").map(id => ({
@@ -504,6 +518,247 @@ test("new saves remain checking until the shared refresh and do not warn or inva
   assert.equal(snapshot.ownStreams.find(stream => stream.provider === "youtube").status, "live");
   assert.equal(snapshot.unverifiedCount, 1, "an actual failed attempt still surfaces a warning");
   assert.equal(providerCalls, 4);
+});
+
+test("manual saves check only their target immediately and leave the normal 30-second round unchanged", async t => {
+  const queries = [];
+  const f = await fixture(t, (url, options) => {
+    if (url.includes("oauth2/token")) return twitchLive(url, options);
+    const parsed = new URL(url);
+    queries.push({ provider: url.includes("googleapis") ? "youtube" : "twitch",
+      ids: parsed.searchParams.get("id")?.split(",") || parsed.searchParams.getAll("user_login") });
+    return url.includes("googleapis") ? liveYoutubeBatch(parsed) : twitchLive(url, options);
+  }, providerEnv, { firstStreamCheckWaitMs: 5_000 });
+  await f.list();
+  f.advance(10_000);
+  assert.equal((await (await f.save("https://twitch.tv/alice")).json()).ownStream.status, "live");
+  f.advance(10_000);
+  const saved = await (await f.save(`https://youtu.be/${videoId}`)).json();
+  assert(saved.ownStreams.every(stream => stream.status === "live"));
+  assert.deepEqual(queries, [{ provider: "twitch", ids: ["alice"] }, { provider: "youtube", ids: [videoId] }]);
+  assert.equal((await f.list()).streams.length, 2);
+  assert.equal(queries.length, 2);
+  f.advance(10_000);
+  assert.equal((await f.list()).streams.length, 2);
+  assert.equal(queries.length, 4, "manual saves do not postpone the original normal deadline");
+});
+
+test("slow mixed-provider rounds keep the next normal refresh aligned with fast Twitch freshness", async t => {
+  let releaseYoutube;
+  let twitchCalls = 0;
+  const f = await manualFixture(t, (url, options) => {
+    if (url.includes("id.twitch.tv")) return twitchLive(url, options);
+    if (url.includes("api.twitch.tv")) {
+      twitchCalls++;
+      return twitchLive(url, options);
+    }
+    if (releaseYoutube) return liveYoutubeBatch(new URL(url));
+    return new Promise(resolve => { releaseYoutube = () => resolve(liveYoutubeBatch(new URL(url))); });
+  }, { "1": { twitch: { url: "https://twitch.tv/alice" }, youtube: { url: `https://youtu.be/${videoId}` } } });
+  const first = f.snapshot();
+  for (let i = 0; i < 100 && !releaseYoutube; i++) await new Promise(resolve => setTimeout(resolve, 1));
+  assert(releaseYoutube);
+  await new Promise(resolve => setImmediate(resolve));
+  f.advance(10_000);
+  releaseYoutube();
+  assert.equal((await first).streams.length, 2);
+  assert.equal(f.service.nextPollDelayMs(), 20_000, "provider latency cannot postpone the regular deadline");
+  f.advance(19_999);
+  assert.equal((await f.snapshot()).streams.length, 2);
+  assert.equal(twitchCalls, 1);
+  assert.equal(f.service.nextPollDelayMs(), 1_000, "worker scheduling stays bounded near the deadline");
+  f.advance(1);
+  const next = await f.snapshot();
+  assert.equal(twitchCalls, 2, "the next round begins before a verified Twitch status gets a skipped tick");
+  assert.equal(next.streams.length, 2);
+  assert.equal(next.unverifiedCount, 0);
+  assert.equal(f.service.nextPollDelayMs(), 30_000);
+});
+
+test("manual YouTube replacements preserve other members' fresh cached broadcasts", async t => {
+  const queries = [];
+  const f = await fixture(t, url => {
+    const parsed = new URL(url);
+    queries.push(parsed.searchParams.get("id"));
+    return liveYoutubeBatch(parsed);
+  }, providerEnv, { firstStreamCheckWaitMs: 5_000 });
+  await f.save(`https://youtu.be/${videoId}`);
+  await f.save("https://youtu.be/abcDEF_12-4", "bob-token");
+  await f.save("https://youtu.be/abcDEF_12-5");
+  const snapshot = await f.list();
+  assert.deepEqual(snapshot.streams.map(stream => stream.channelId).sort(), ["abcDEF_12-4", "abcDEF_12-5"]);
+  assert.deepEqual(queries, [videoId, "abcDEF_12-4", "abcDEF_12-5"]);
+});
+
+test("concurrent first checks deduplicate canonical targets and keep every submitting recording owner", async t => {
+  let release;
+  let calls = 0;
+  const f = await fixture(t, url => {
+    calls++;
+    return new Promise(resolve => { release = () => resolve(liveYoutubeBatch(new URL(url))); });
+  }, providerEnv, { firstStreamCheckWaitMs: 5_000 });
+  const alice = f.save(`https://youtu.be/${videoId}`);
+  for (let i = 0; i < 200 && !release; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert(release);
+  const bob = f.save(`https://www.youtube.com/watch?v=${videoId}&feature=share`, "bob-token");
+  for (let i = 0; i < 200; i++) {
+    const registry = JSON.parse(await readFile(path.join(f.data, "streams.json"), "utf8"));
+    if (registry.users["22"]) break;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  await new Promise(resolve => setTimeout(resolve, 10));
+  release();
+  for (const response of await Promise.all([alice, bob])) {
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).ownStream.status, "live");
+  }
+  assert.equal(calls, 1);
+  const recordings = JSON.parse(await readFile(path.join(f.data, "stream-vods.json"), "utf8"));
+  assert.deepEqual(recordings.active[0].owners.sort(), ["11", "22"]);
+  assert.equal((await (await f.save(`https://youtube.com/live/${videoId}`)).json()).ownStream.status, "live");
+  assert.equal(calls, 1, "a fresh canonical target reuses its verified cache");
+});
+
+test("a persisted save succeeds after its check deadline and after concurrent removal", async t => {
+  let release;
+  const f = await fixture(t, (url, options) => url.includes("oauth2/token") ? twitchLive(url, options)
+    : new Promise(resolve => { release = () => resolve(twitchLive(url, options)); }), providerEnv, { firstStreamCheckWaitMs: 120 });
+  const saved = await f.save("https://twitch.tv/alice");
+  assert.equal(saved.status, 200);
+  assert.equal((await saved.json()).ownStream.status, "checking");
+  assert.equal(JSON.parse(await readFile(path.join(f.data, "streams.json"), "utf8")).users["11"].twitch.channelId, "alice");
+  assert(release);
+  const waiting = f.save("https://twitch.tv/alice_next");
+  for (let i = 0; i < 200; i++) {
+    const registry = JSON.parse(await readFile(path.join(f.data, "streams.json"), "utf8"));
+    if (registry.users["11"].twitch.channelId === "alice_next") break;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  assert.equal((await f.authorized("/v1/streams/me", { method: "DELETE" })).status, 200);
+  release();
+  const response = await waiting;
+  assert.equal(response.status, 200);
+  const removed = await response.json();
+  assert.equal(removed.ownStream, null);
+  assert.deepEqual(removed.ownStreams, []);
+});
+
+test("a save finishing after a replacement reports the current registration instead of the old URL", async t => {
+  let release;
+  let calls = 0;
+  const f = await fixture(t, (url, options) => {
+    if (url.includes("oauth2/token")) return twitchLive(url, options);
+    if (calls++ === 0) return new Promise(resolve => { release = () => resolve(twitchLive(url, options)); });
+    return twitchLive(url, options);
+  }, providerEnv, { firstStreamCheckWaitMs: 5_000 });
+  const previous = f.save("https://twitch.tv/alice");
+  for (let i = 0; i < 200 && !release; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert(release);
+  const replacement = f.save("https://twitch.tv/alice_next");
+  for (let i = 0; i < 200; i++) {
+    const registry = JSON.parse(await readFile(path.join(f.data, "streams.json"), "utf8"));
+    if (registry.users["11"].twitch.channelId === "alice_next") break;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  release();
+  for (const response of await Promise.all([previous, replacement])) {
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.ownStream.channelId, "alice_next");
+    assert.deepEqual(body.ownStreams.map(stream => stream.channelId), ["alice_next"]);
+  }
+  assert.equal((await f.list()).ownStream.status, "live");
+});
+
+test("manual YouTube checks respect the same provider backoff without failing a persisted submission", async t => {
+  let calls = 0;
+  const f = await fixture(t, () => { calls++; return json({}, 403); }, providerEnv, { firstStreamCheckWaitMs: 5_000 });
+  assert.equal((await (await f.save(`https://youtu.be/${videoId}`)).json()).ownStream.status, "unknown");
+  const response = await f.save("https://youtu.be/abcDEF_12-4");
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).ownStream.status, "unknown");
+  assert.equal(calls, 1, "a new URL cannot bypass an API backoff");
+});
+
+test("manual queues stay bounded and share the three-worker limit without losing the normal round's cache", async t => {
+  const users = Object.fromEntries(Array.from({ length: 201 }, (_, index) => [String(index + 1), {
+    twitch: { url: `https://twitch.tv/member_${index + 1}` },
+  }]));
+  let active = 0;
+  let peak = 0;
+  let normalFinished = 0;
+  let manualCalls = 0;
+  const releases = [];
+  const f = await manualFixture(t, async (url, options) => {
+    if (url.includes("oauth2/token")) return twitchLive(url, options);
+    const manual = new URL(url).searchParams.getAll("user_login").every(id => id.startsWith("manual_"));
+    active++;
+    peak = Math.max(peak, active);
+    if (manual) {
+      manualCalls++;
+      assert.equal(normalFinished, 3, "manual work starts after the existing normal round");
+    } else {
+      await new Promise(resolve => { releases.push(resolve); });
+      normalFinished++;
+    }
+    const result = twitchLive(url, options);
+    active--;
+    return result;
+  }, users);
+  const normal = f.snapshot();
+  for (let i = 0; i < 200 && releases.length < 3; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(releases.length, 3);
+  let completed = 0;
+  const saves = Array.from({ length: 150 }, (_, index) => f.save(`https://twitch.tv/manual_${index}`, String(202 + index)).then(result => { completed++; return result; }));
+  for (let i = 0; i < 600 && completed < 22; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(completed, 22, "only the overflow beyond 128 queued targets falls back immediately");
+  assert.equal(manualCalls, 0);
+  for (const release of releases) release();
+  await normal;
+  const saved = await Promise.all(saves);
+  assert.equal(saved.filter(result => result.ownStream.status === "live").length, 128);
+  assert.equal(saved.filter(result => result.ownStream.status === "checking").length, 22);
+  assert.equal(manualCalls, 2, "the bounded queue is coalesced into 100-channel provider batches");
+  assert.equal(peak, 3);
+  assert.equal((await f.snapshot()).streams.length, 329, "targeted cache merges retain every existing live member");
+});
+
+test("manual YouTube quota is bounded separately and cannot consume the normal refresh allowance", async t => {
+  let calls = 0;
+  const f = await manualFixture(t, async url => {
+    assert.equal(new URL(url).hostname, "www.googleapis.com");
+    calls++;
+    return json({ items: [] });
+  });
+  const url = index => `https://youtu.be/${String(index).padStart(11, "0")}`;
+  for (let index = 0; index < 256; index++) {
+    assert.equal((await f.save(url(index))).ownStream.status, "offline");
+  }
+  assert.equal(calls, 256);
+  assert.equal((await f.save(url(256))).ownStream.status, "checking");
+  assert.equal(calls, 256);
+  f.advance(30_000);
+  assert.equal((await f.snapshot()).ownStream.status, "offline");
+  assert.equal(calls, 257, "normal quota remains available after the manual allowance is exhausted");
+  assert.equal((await f.save(url(257))).ownStream.status, "checking");
+  f.advance(86_400_000);
+  assert.equal((await f.save(url(258))).ownStream.status, "offline");
+  assert.equal(calls, 258, "manual allowance returns after its rolling 24-hour window");
+});
+
+test("a manual first check does not query unrelated pending Twitch recording targets", async t => {
+  const requests = [];
+  const f = await manualFixture(t, async url => {
+    requests.push(new URL(url).hostname);
+    return liveYoutubeBatch(new URL(url));
+  });
+  await writeFile(path.join(f.dataDir, "stream-vods.json"), JSON.stringify({ version: 1, history: [], active: [{
+    provider: "twitch", channelId: "other_channel", owners: ["2"], title: "", live: false,
+    lastSeenAt: 1_700_000_000_000, nextAttemptAt: 0, endedAt: "2023-11-14T22:13:20.000Z",
+    streamId: "123", twitchUserId: "456",
+  }] }));
+  assert.equal((await f.save(`https://youtu.be/${videoId}`)).ownStream.status, "live");
+  assert.deepEqual(requests, ["www.googleapis.com"]);
 });
 
 test("YouTube actual end wins over live snippet; upcoming, missing, and nonembeddable videos are never listed", async t => {

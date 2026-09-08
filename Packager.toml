@@ -10,7 +10,7 @@ homepage = "https://github.com/IsogiE/Brick"
 category = "Utility"
 out-dir = "dist/packages"
 binaries-dir = "target/release"
-before-packaging-command = "cargo build --release"
+before-packaging-command = "cargo build --release && node packaging/linux/prepare-appimage.mjs"
 binaries = [{ path = "brick", main = true }]
 icons = ["src/assets/brick.ico", "src/assets/brick.png"]
 formats = ["appimage"]
@@ -26,14 +26,12 @@ depends = ["libgtk-3-0 | libgtk-3-0t64", "libwebkit2gtk-4.1-0", "gstreamer1.0-pl
 depends = ["gtk3", "webkit2gtk-4.1", "gst-plugins-good", "gst-plugins-bad", "gst-libav"]
 
 [appimage]
-# WebKit's helper processes and GStreamer modules must match their system
-# libraries. Keep this complete runtime outside the AppImage.
-excluded-libraries = [
-  "libwebkit2gtk-4.1*", "libjavascriptcoregtk-4.1*", "libsoup-3.0*",
-  "libgtk-3*", "libgdk-3*", "libgdk_pixbuf-2.0*", "libatk-1.0*",
-  "libglib-2.0*", "libgio-2.0*", "libgobject-2.0*", "libgmodule-2.0*", "libgthread-2.0*",
-  "libgst*", "libpango*", "libcairo*",
-]
+files = { "target/appimage-runtime" = "/" }
+
+[appimage.linuxdeploy-plugins]
+# The preparation hook verifies SHA-256 before cargo-packager runs these plugins.
+gtk = "https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/b5eb8d05b4c0ed40107fe2158c5d8527f94568ef/linuxdeploy-plugin-gtk.sh"
+gstreamer = "https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gstreamer/2a2e67491c32995a3f279ad0ecbe77abd512b42a/linuxdeploy-plugin-gstreamer.sh"
 
 [nsis]
 installer-mode = "currentUser"

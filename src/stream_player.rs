@@ -16,6 +16,8 @@ use wry::{
     NewWindowResponse, PageLoadEvent, WebView, WebViewBuilder,
 };
 
+use crate::stream_preferences::{PreferenceBridge, Preferences};
+
 const WRAPPER_LOAD_TIMEOUT: Duration = Duration::from_secs(25);
 
 pub struct StreamPlayer {
@@ -24,6 +26,9 @@ pub struct StreamPlayer {
     loaded: Arc<AtomicBool>,
     created: Instant,
     failure: Arc<Mutex<Option<String>>>,
+    preferences: Option<PreferenceBridge>,
+    #[cfg(target_os = "linux")]
+    preference_handler: Option<(webkit2gtk::UserContentManager, gtk::glib::SignalHandlerId)>,
 }
 
 impl StreamPlayer {
@@ -33,6 +38,7 @@ impl StreamPlayer {
         token: &str,
         rect: egui::Rect,
         pixels_per_point: f32,
+        preferences: Option<Preferences>,
     ) -> Result<Self, String> {
         let created = Instant::now();
         let player_url = validated_player_url(url)?;
@@ -78,6 +84,9 @@ impl StreamPlayer {
         let failure = Arc::new(Mutex::new(None));
         let wrapper_loaded = Arc::clone(&loaded);
         let wrapper_url = player_url.to_string();
+        let preferences = preferences
+            .filter(|_| player_url.path().ends_with("/twitch"))
+            .map(|preferences| PreferenceBridge::new(player_url.as_str(), preferences));
         let builder = WebViewBuilder::new()
             .with_bounds(wry_bounds(bounds))
             .with_incognito(true)
@@ -105,9 +114,26 @@ impl StreamPlayer {
                 }
             });
 
+        let builder = if let Some(preferences) = &preferences {
+            let (relay, capture) = preferences.scripts(&player_url.origin().ascii_serialization());
+            builder
+                .with_initialization_script_for_main_only(relay, true)
+                .with_initialization_script_for_main_only(capture, false)
+        } else {
+            builder
+        };
+
         #[cfg(target_os = "windows")]
         let builder = {
             use wry::WebViewBuilderExtWindows;
+            let builder = if let Some(preferences) = &preferences {
+                let preferences = preferences.clone();
+                builder.with_ipc_handler(move |request| {
+                    preferences.receive(&request.uri().to_string(), request.body());
+                })
+            } else {
+                builder
+            };
             // Override Wry's default flags so WebView2 keeps SmartScreen enabled.
             builder.with_additional_browser_args("--autoplay-policy=no-user-gesture-required")
         };
@@ -146,7 +172,12 @@ impl StreamPlayer {
             loaded,
             created,
             failure,
+            preferences,
+            #[cfg(target_os = "linux")]
+            preference_handler: None,
         };
+        #[cfg(target_os = "linux")]
+        let mut player = player;
         let webview = player
             .webview
             .as_ref()
@@ -155,6 +186,9 @@ impl StreamPlayer {
         {
             protect_linux_navigation(webview, player_url.as_str())?;
             watch_linux_failures(webview, player_url.as_str(), Arc::clone(&player.failure));
+            if let Some(preferences) = &player.preferences {
+                player.preference_handler = attach_linux_preferences(webview, preferences.clone());
+            }
         }
         #[cfg(target_os = "windows")]
         protect_windows_permissions(webview)?;
@@ -274,6 +308,16 @@ impl StreamPlayer {
 
 impl Drop for StreamPlayer {
     fn drop(&mut self) {
+        if let Some(preferences) = &self.preferences {
+            preferences.close();
+        }
+        #[cfg(target_os = "linux")]
+        if let Some((manager, handler)) = self.preference_handler.take() {
+            use gtk::prelude::*;
+            use webkit2gtk::UserContentManagerExt;
+            manager.unregister_script_message_handler("brickConsent");
+            manager.disconnect(handler);
+        }
         let Some(webview) = self.webview.take() else {
             return;
         };
@@ -379,30 +423,14 @@ fn initialize_gtk() -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn protect_linux_navigation(webview: &WebView, player_url: &str) -> Result<(), String> {
+fn remove_unused_linux_ipc(view: &webkit2gtk::WebView) {
     use gtk::prelude::*;
-    use webkit2gtk::{
-        HardwareAccelerationPolicy, NavigationPolicyDecision, NavigationPolicyDecisionExt,
-        PermissionRequestExt, PolicyDecisionExt, PolicyDecisionType, SettingsExt, URIRequestExt,
-        UserContentManagerExt, WebContextExt, WebViewExt,
-    };
-    use wry::WebViewExtUnix;
+    use webkit2gtk::{UserContentManagerExt, WebViewExt};
 
-    let view = webview.webview();
-    let sandboxed = view
-        .context()
-        .is_some_and(|context| context.is_sandbox_enabled() && context.is_ephemeral());
-    #[cfg(test)]
-    eprintln!("Stream WebKit sandbox enabled={sandboxed}");
-    if !sandboxed {
-        return Err(
-            "The stream player cannot start because its browser sandbox is disabled.".to_string(),
-        );
-    }
     if let Some(manager) = view.user_content_manager() {
-        // This media child has no native JavaScript API. Wry registers an unused
-        // IPC callback that strongly captures WebView, while WebView owns this
-        // manager. Remove that reference cycle before loading provider content.
+        // Wry registers an unused general-purpose IPC callback that strongly
+        // captures WebView, while WebView owns this manager. Remove that cycle
+        // before adding the narrow, weak preference callback below.
         manager.unregister_script_message_handler("ipc");
         if let Some(signal) =
             gtk::glib::subclass::SignalId::lookup("script-message-received", manager.type_())
@@ -424,6 +452,61 @@ fn protect_linux_navigation(webview: &WebView, player_url: &str) -> Result<(), S
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn attach_linux_preferences(
+    webview: &WebView,
+    preferences: PreferenceBridge,
+) -> Option<(webkit2gtk::UserContentManager, gtk::glib::SignalHandlerId)> {
+    use gtk::prelude::*;
+    use webkit2gtk::{UserContentManagerExt, WebViewExt};
+    use wry::WebViewExtUnix;
+
+    let view = webview.webview();
+    let manager = view.user_content_manager()?;
+    let weak = view.downgrade();
+    let handler =
+        manager.connect_script_message_received(Some("brickConsent"), move |_, result| {
+            // WebKit reports only the top-level URL for this signal. The protected
+            // wrapper separately checks the browser's iframe origin and source and
+            // adds its private nonce. Never trust an origin claimed in JSON.
+            if let (Some(view), Some(value)) = (weak.upgrade(), result.js_value()) {
+                if let Some(uri) = view.uri() {
+                    preferences.receive(uri.as_str(), &value.to_string());
+                }
+            }
+        });
+    if manager.register_script_message_handler("brickConsent") {
+        Some((manager, handler))
+    } else {
+        manager.disconnect(handler);
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn protect_linux_navigation(webview: &WebView, player_url: &str) -> Result<(), String> {
+    use gtk::prelude::*;
+    use webkit2gtk::{
+        HardwareAccelerationPolicy, NavigationPolicyDecision, NavigationPolicyDecisionExt,
+        PermissionRequestExt, PolicyDecisionExt, PolicyDecisionType, SettingsExt, URIRequestExt,
+        WebContextExt, WebViewExt,
+    };
+    use wry::WebViewExtUnix;
+
+    let view = webview.webview();
+    let sandboxed = view
+        .context()
+        .is_some_and(|context| context.is_sandbox_enabled() && context.is_ephemeral());
+    #[cfg(test)]
+    eprintln!("Stream WebKit sandbox enabled={sandboxed}");
+    if !sandboxed {
+        return Err(
+            "The stream player cannot start because its browser sandbox is disabled.".to_string(),
+        );
+    }
+    remove_unused_linux_ipc(&view);
     if let Some(settings) = WebViewExt::settings(&view) {
         // The user already selected this stream in the native sidebar. Permit
         // the official iframe's muted autoplay without a second browser click.
@@ -620,10 +703,220 @@ pub fn pump_events() {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires its own X11 display and /tmp/brick-consent-native profile"]
+    fn native_preference_relay_survives_reopen_and_releases_webkit() {
+        use gtk::prelude::*;
+        use std::{
+            fs,
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        use webkit2gtk::{WebContextExt, WebViewExt};
+        use wry::{WebViewBuilderExtUnix, WebViewExtUnix};
+
+        fn owned_webkit_processes() -> Vec<u32> {
+            let processes: Vec<_> = fs::read_dir("/proc")
+                .unwrap()
+                .flatten()
+                .filter_map(|entry| {
+                    let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+                    let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+                    let end = stat.rfind(')')?;
+                    let parent = stat[end + 2..]
+                        .split_whitespace()
+                        .nth(1)?
+                        .parse::<u32>()
+                        .ok()?;
+                    let webkit = stat.contains("(WebKit");
+                    Some((pid, parent, webkit))
+                })
+                .collect();
+            let mut selected = std::collections::HashSet::from([std::process::id()]);
+            loop {
+                let before = selected.len();
+                for (pid, parent, _) in &processes {
+                    if selected.contains(parent) {
+                        selected.insert(*pid);
+                    }
+                }
+                if selected.len() == before {
+                    break;
+                }
+            }
+            processes
+                .into_iter()
+                .filter_map(|(pid, _, webkit)| (webkit && selected.contains(&pid)).then_some(pid))
+                .collect()
+        }
+
+        fn process_is_running(pid: u32) -> bool {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat.rfind(')').map(|end| stat[end + 2..].starts_with('Z')))
+                .is_some_and(|zombie| !zombie)
+        }
+
+        let profile = crate::addon::config_dir().unwrap();
+        assert!(profile.starts_with(std::env::temp_dir().join("brick-consent-native")));
+        fs::create_dir_all(&profile).unwrap();
+        let saved = profile.join("stream-preferences.json");
+        let _ = fs::remove_file(&saved);
+        gtk::init().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let wrapper = format!("http://127.0.0.1:{port}/wrapper");
+        let provider_origin = format!("http://localhost:{port}");
+        let first = Arc::new(AtomicBool::new(true));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let expiry = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            + 60_000;
+        let fixture_value =
+            format!("{{\"loggedIn\":{{}},\"loggedOut\":{{\"Gambling\":{expiry}}}}}");
+        let server_first = first.clone();
+        let server_stopped = stopped.clone();
+        let provider_url = format!("{provider_origin}/provider");
+        let expected = fixture_value.clone();
+        let server = thread::spawn(move || {
+            while !server_stopped.load(Ordering::Relaxed) {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut request = [0u8; 4096];
+                let count = socket.read(&mut request).unwrap_or(0);
+                let provider =
+                    String::from_utf8_lossy(&request[..count]).starts_with("GET /provider ");
+                let body = if provider {
+                    let acknowledgement = if server_first.load(Ordering::Relaxed) {
+                        format!("localStorage.setItem('content-classification-labels-acknowledged',{});", serde_json::to_string(&expected).unwrap())
+                    } else {
+                        String::new()
+                    };
+                    format!("<!doctype html><script>{acknowledgement}parent.postMessage({{kind:'fixture-report',value:localStorage.getItem('content-classification-labels-acknowledged')}},'*');</script>")
+                } else {
+                    format!("<!doctype html><script>addEventListener('message',e=>{{if(e.data.kind==='fixture-report')document.title=e.data.value||'missing'}})</script><iframe src='{provider_url}'></iframe>")
+                };
+                let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+            }
+        });
+        let window = gtk::Window::new(gtk::WindowType::Toplevel);
+        window.set_default_size(640, 480);
+
+        for cycle in 0..3 {
+            let context = webkit2gtk::WebContext::new_ephemeral();
+            context.set_sandbox_enabled(true);
+            let seed = webkit2gtk::WebView::with_context(&context);
+            let bridge = PreferenceBridge::new(&wrapper, Preferences::load());
+            let (relay, capture) = bridge.scripts(&format!("http://127.0.0.1:{port}"));
+            // Only this ignored test substitutes a localhost provider. No real
+            // Twitch page is loaded and no consent is fabricated for a service.
+            let webview = WebViewBuilder::new()
+                .with_incognito(true)
+                .with_related_view(seed.clone())
+                .with_initialization_script_for_main_only(
+                    relay.replace("https://player.twitch.tv", &provider_origin),
+                    true,
+                )
+                .with_initialization_script_for_main_only(
+                    capture.replace("https://player.twitch.tv", &provider_origin),
+                    false,
+                )
+                .build_gtk(&window)
+                .unwrap();
+            unsafe {
+                seed.destroy();
+            }
+            drop(seed);
+            drop(context);
+            remove_unused_linux_ipc(&webview.webview());
+            let handler = attach_linux_preferences(&webview, bridge.clone()).unwrap();
+            let view = webview.webview();
+            let weak = view.downgrade();
+            let weak_context = view.context().unwrap().downgrade();
+            assert!(view.context().unwrap().is_sandbox_enabled());
+            let player = StreamPlayer {
+                webview: Some(webview),
+                bounds: [0; 4],
+                loaded: Arc::new(AtomicBool::new(true)),
+                created: Instant::now(),
+                failure: Arc::new(Mutex::new(None)),
+                preferences: Some(bridge),
+                preference_handler: Some(handler),
+            };
+            player.webview.as_ref().unwrap().load_url(&wrapper).unwrap();
+            window.show_all();
+            let deadline = Instant::now() + Duration::from_secs(12);
+            while Instant::now() < deadline {
+                pump_events();
+                if view.title().as_deref() == Some(fixture_value.as_str()) && saved.is_file() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                view.title().as_deref(),
+                Some(fixture_value.as_str()),
+                "cycle {cycle} did not capture/restore through the real iframe"
+            );
+            assert_eq!(
+                fs::read_to_string(&saved).unwrap(),
+                format!("{{\"Gambling\":{expiry}}}")
+            );
+            first.store(false, Ordering::Relaxed);
+            let children = owned_webkit_processes();
+            assert!(
+                !children.is_empty(),
+                "the native fixture created no WebKit processes"
+            );
+            drop(view);
+            drop(player);
+            for _ in 0..400 {
+                pump_events();
+                if weak.upgrade().is_none()
+                    && weak_context.upgrade().is_none()
+                    && !children.iter().any(|pid| process_is_running(*pid))
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                weak.upgrade().is_none(),
+                "cycle {cycle} retained its widget"
+            );
+            assert!(
+                weak_context.upgrade().is_none(),
+                "cycle {cycle} retained its private context"
+            );
+            assert!(
+                !children.iter().any(|pid| process_is_running(*pid)),
+                "cycle {cycle} retained its owned WebKit processes: {children:?}"
+            );
+            eprintln!("Native preference cycle {cycle}: original expiry restored; widget/context and all {} owned WebKit processes released", children.len());
+        }
+        window.close();
+        stopped.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
     #[test]
     fn load_timeout_does_not_interrupt_a_loaded_player() {
         let player = StreamPlayer {
             webview: None,
+            preferences: None,
+            #[cfg(target_os = "linux")]
+            preference_handler: None,
             bounds: [0; 4],
             loaded: Arc::new(AtomicBool::new(false)),
             created: Instant::now() - WRAPPER_LOAD_TIMEOUT,

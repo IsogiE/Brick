@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { HttpError, RateLimit, readBounded, clientAddress } from "./security.mjs";
 import { createStreamService, streamPlayerPage } from "./streams.mjs";
 
-export async function createPresenceServer({ env = process.env, fetch = globalThis.fetch, now = Date.now } = {}) {
+export async function createPresenceServer({ env = process.env, fetch = globalThis.fetch, now = Date.now, firstStreamCheckWaitMs = 5_000 } = {}) {
   const DISCORD_API = "https://discord.com/api/v10";
   const MAX_BODY_BYTES = 32 * 1024;
   const GATEWAY_INTENTS = 1;
@@ -34,7 +34,8 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   const oauthHandoffTtlSeconds = parsePositiveInt(env.OAUTH_HANDOFF_TTL_SECONDS, 3 * 60);
   const oauthHandoffMaxEntries = parsePositiveInt(env.OAUTH_HANDOFF_MAX_ENTRIES, 512);
   const gatewayEnabled = env.DISCORD_GATEWAY_ENABLED?.trim().toLowerCase() !== "false";
-  const streams = await createStreamService({ dataDir, env, fetch, now });
+  const streams = await createStreamService({ dataDir, env, fetch, now, firstCheckWaitMs: firstStreamCheckWaitMs });
+  const requestDeadlines = new WeakMap();
 
   let rosterCache = null;
   let rosterInFlight = null;
@@ -579,7 +580,8 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
       streamChanges.take(requester.id);
       const body = await readJsonBody(request);
       sendJson(response, 200, request.method === "PUT"
-        ? await streams.save(requester, body.url) : await streams.remove(requester, body.provider));
+        ? await streams.save(requester, body.url, { checkTimeoutMs: Math.max(0, requestDeadlines.get(request) - performance.now() - 500) })
+        : await streams.remove(requester, body.provider));
       return;
     }
     const player = url.pathname.match(/^\/v1\/streams\/player\/([0-9]{1,20})(?:\/(twitch|youtube))?$/);
@@ -659,6 +661,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
       return;
     }
     activeRequests++;
+    requestDeadlines.set(request, performance.now() + 15_000);
     const deadline = setTimeout(() => request.destroy(), 15_000);
     handleRequest(request, response).catch((error) => {
       if (response.destroyed || response.headersSent) return;
@@ -676,6 +679,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
       sendJson(response, 500, { error: "Internal server error." });
     }).finally(() => {
       clearTimeout(deadline);
+      requestDeadlines.delete(request);
       activeRequests--;
     });
   });
@@ -686,14 +690,18 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   let streamTimer;
   let streamPollingClosed = false;
   const pollStreams = async () => {
+    let delayMs = 30_000;
     try {
-      if (await streams.needsPolling()) await streams.poll(await streamMembers());
+      if (await streams.needsPolling()) {
+        await streams.poll(await streamMembers());
+        delayMs = streams.nextPollDelayMs();
+      }
     } catch {
       // Never log stream records, submitted URLs, or upstream request credentials.
       console.error("Background stream status refresh failed");
     } finally {
       if (!streamPollingClosed) {
-        streamTimer = setTimeout(pollStreams, 30_000);
+        streamTimer = setTimeout(pollStreams, delayMs);
         streamTimer.unref();
       }
     }
