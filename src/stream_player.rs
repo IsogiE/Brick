@@ -34,6 +34,7 @@ pub struct StreamPlayer {
 impl StreamPlayer {
     pub fn new(
         frame: &eframe::Frame,
+        ctx: &egui::Context,
         url: &str,
         token: &str,
         rect: egui::Rect,
@@ -84,6 +85,7 @@ impl StreamPlayer {
         let failure = Arc::new(Mutex::new(None));
         let wrapper_loaded = Arc::clone(&loaded);
         let wrapper_url = player_url.to_string();
+        let browser_ctx = ctx.clone();
         let preferences = preferences
             .filter(|_| player_url.path().ends_with("/twitch"))
             .map(|preferences| PreferenceBridge::new(player_url.as_str(), preferences));
@@ -96,7 +98,9 @@ impl StreamPlayer {
             .with_hotkeys_zoom(false)
             .with_focused(false)
             .with_background_color((18, 20, 25, 255))
-            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+            .with_new_window_req_handler(move |destination, _| {
+                open_provider_window(&browser_ctx, &destination)
+            })
             .with_download_started_handler(|_, _| false)
             .with_on_page_load_handler(move |event, destination| {
                 #[cfg(test)]
@@ -139,11 +143,20 @@ impl StreamPlayer {
         };
 
         // WebView2 invokes this for top-level navigations; provider iframe requests
-        // are separate. Block redirects and links away from the protected wrapper.
+        // are separate. Public provider links leave through the system browser;
+        // the child itself must stay on the protected wrapper.
         #[cfg(not(target_os = "linux"))]
         let builder = {
             let allowed = player_url.to_string();
-            builder.with_navigation_handler(move |destination| destination == allowed)
+            let ctx = ctx.clone();
+            builder.with_navigation_handler(move |destination| {
+                if destination == allowed {
+                    true
+                } else {
+                    open_provider_link(&ctx, &destination);
+                    false
+                }
+            })
         };
 
         #[cfg(target_os = "linux")]
@@ -184,7 +197,7 @@ impl StreamPlayer {
             .expect("The player has just been created");
         #[cfg(target_os = "linux")]
         {
-            protect_linux_navigation(webview, player_url.as_str())?;
+            protect_linux_navigation(webview, player_url.as_str(), ctx)?;
             watch_linux_failures(webview, player_url.as_str(), Arc::clone(&player.failure));
             if let Some(preferences) = &player.preferences {
                 player.preference_handler = attach_linux_preferences(webview, preferences.clone());
@@ -351,6 +364,42 @@ fn validated_player_url(value: &str) -> Result<Url, String> {
     validate_player_address(value, option_env!("BRICK_PRESENCE_API_URL").unwrap_or(""))
 }
 
+fn open_provider_window(ctx: &egui::Context, destination: &str) -> NewWindowResponse {
+    open_provider_link(ctx, destination);
+    // Never create another embedded browser, even for a valid provider link.
+    NewWindowResponse::Deny
+}
+
+fn open_provider_link(ctx: &egui::Context, destination: &str) {
+    let Ok(url) = Url::parse(destination) else {
+        return;
+    };
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || !matches!(
+            url.host_str(),
+            Some(
+                "twitch.tv"
+                    | "www.twitch.tv"
+                    | "m.twitch.tv"
+                    | "clips.twitch.tv"
+                    | "youtube.com"
+                    | "www.youtube.com"
+                    | "m.youtube.com"
+                    | "youtu.be"
+            )
+        )
+    {
+        return;
+    }
+    // Eframe opens these using the system's default browser, just like native
+    // hyperlinks. Only the public URL crosses over, never the wrapper's headers.
+    ctx.open_url(egui::OpenUrl::new_tab(url.as_str()));
+    ctx.request_repaint();
+}
+
 fn validate_player_address(value: &str, configured: &str) -> Result<Url, String> {
     let invalid = || "The stream player address is invalid.".to_string();
     let url = Url::parse(value).map_err(|_| invalid())?;
@@ -508,7 +557,11 @@ fn attach_linux_preferences(
 }
 
 #[cfg(target_os = "linux")]
-fn protect_linux_navigation(webview: &WebView, player_url: &str) -> Result<(), String> {
+fn protect_linux_navigation(
+    webview: &WebView,
+    player_url: &str,
+    ctx: &egui::Context,
+) -> Result<(), String> {
     use gtk::prelude::*;
     use webkit2gtk::{
         HardwareAccelerationPolicy, NavigationPolicyDecision, NavigationPolicyDecisionExt,
@@ -538,6 +591,7 @@ fn protect_linux_navigation(webview: &WebView, player_url: &str) -> Result<(), S
         settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
     }
     let allowed = player_url.to_string();
+    let ctx = ctx.clone();
     // WebKit calls this for subframes too. Permit only official media frames,
     // and explicitly reject any attempted forwarding of the Brick bearer header.
     view.connect_decide_policy(move |_, decision, kind| {
@@ -558,6 +612,9 @@ fn protect_linux_navigation(webview: &WebView, player_url: &str) -> Result<(), S
                         || (!has_authorization
                             && !action.is_user_gesture()
                             && allowed_provider_frame(&destination));
+                    if !permitted && !has_authorization && action.is_user_gesture() {
+                        open_provider_link(&ctx, &destination);
+                    }
                     #[cfg(test)]
                     eprintln!(
                         "Stream policy permitted={permitted}: {}",
@@ -724,6 +781,62 @@ pub fn pump_events() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_popups_open_in_the_system_browser_without_creating_a_webview() {
+        for destination in [
+            "https://www.twitch.tv/guildmate?tt_content=channel_name&tt_medium=embed",
+            "https://twitch.tv/guildmate",
+            "https://m.twitch.tv/guildmate",
+            "https://clips.twitch.tv/ExampleClip",
+            "https://www.youtube.com/watch?v=abcdefghijk&feature=emb_logo&t=30",
+            "https://youtube.com/live/abcdefghijk",
+            "https://m.youtube.com/watch?v=abcdefghijk",
+            "https://youtu.be/abcdefghijk?t=30",
+        ] {
+            let ctx = egui::Context::default();
+            assert!(matches!(
+                open_provider_window(&ctx, destination),
+                NewWindowResponse::Deny
+            ));
+            ctx.output(|output| {
+                assert_eq!(output.commands.len(), 1, "{destination}");
+                let egui::OutputCommand::OpenUrl(open) = &output.commands[0] else {
+                    panic!("Expected a system browser request for {destination}");
+                };
+                assert_eq!(open.url, destination);
+                assert!(open.new_tab);
+            });
+        }
+    }
+
+    #[test]
+    fn provider_popups_reject_private_and_non_provider_destinations() {
+        for destination in [
+            "https://brick.example/v1/streams/player/12345/twitch",
+            "https://www.twitch.tv.evil.example/guildmate",
+            "https://www.youtube.com@evil.example/watch?v=abcdefghijk",
+            "https://token@www.twitch.tv/guildmate",
+            "https://www.twitch.tv:8443/guildmate",
+            "https://evil.example/",
+            "http://www.twitch.tv/guildmate",
+            "javascript:alert(1)",
+            "file:///tmp/stream.html",
+            "twitch://stream/guildmate",
+            "about:blank",
+            "not a URL",
+        ] {
+            let ctx = egui::Context::default();
+            assert!(matches!(
+                open_provider_window(&ctx, destination),
+                NewWindowResponse::Deny
+            ));
+            assert!(
+                ctx.output(|output| output.commands.is_empty()),
+                "{destination}"
+            );
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
