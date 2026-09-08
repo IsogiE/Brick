@@ -797,6 +797,7 @@ impl StreamsUi {
                         self.preferences = preferences;
                         match StreamPlayer::new(
                             frame,
+                            ctx,
                             &url,
                             &token,
                             rect,
