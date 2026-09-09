@@ -319,12 +319,12 @@ impl StreamsUi {
                             self.selected = None;
                             self.recordings_open = true;
                             self.stop_player();
-                            self.notice = Some("This recording is no longer in Brick.".into());
+                            self.notice = Some("This VOD is no longer in Brick.".into());
                         }
                     }
                     Ok(ResultData::RecordingRemoved(provider, id)) => {
                         self.apply_recording_removal(&provider, &id);
-                        self.notice = Some("Recording removed from Brick.".into());
+                        self.notice = Some("VOD removed from Brick.".into());
                     }
                     Err(error) => {
                         self.saved_provider = None;
@@ -652,7 +652,7 @@ impl StreamsUi {
         ui.horizontal(|ui| {
             if self.recordings_open {
                 ui.label(
-                    RichText::new("Recordings")
+                    RichText::new("VODs")
                         .size(18.0)
                         .strong()
                         .color(Color32::from_rgb(239, 242, 247)),
@@ -719,7 +719,7 @@ impl StreamsUi {
                         action_button(if self.recordings_open {
                             "Live streams"
                         } else {
-                            "Recordings"
+                            "VODs"
                         }),
                     )
                     .clicked()
@@ -1020,7 +1020,7 @@ impl StreamsUi {
         let mut remove = false;
         let modal = egui::Modal::new(egui::Id::new("remove-recording")).show(ctx, |ui| {
             ui.set_width(400.0_f32.min((ctx.content_rect().width() - 64.0).max(240.0)));
-            ui.heading("Remove recording from Brick?");
+            ui.heading("Remove VOD from Brick?");
             ui.add_space(8.0);
             ui.label(RichText::new(recording_title(&vod)).strong());
             ui.label(format!(
@@ -1447,7 +1447,7 @@ fn recording_time(vod: &Vod) -> &str {
 
 fn recording_title(vod: &Vod) -> &str {
     if vod.title.trim().is_empty() {
-        "Untitled recording"
+        "VOD"
     } else {
         &vod.title
     }
@@ -1591,7 +1591,7 @@ fn recording_labels(vods: &[Vod], povs: &[Stream]) -> crate::review_ui::Recordin
                     at.minute()
                 )
             })
-            .unwrap_or_else(|| "Recording date unavailable".into());
+            .unwrap_or_else(|| "VOD date unavailable".into());
             Some((
                 key,
                 crate::review_ui::RecordingLabel {

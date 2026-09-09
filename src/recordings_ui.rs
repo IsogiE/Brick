@@ -230,7 +230,7 @@ impl Library {
                             egui::TextEdit::singleline(&mut self.query)
                                 .desired_width(search_width)
                                 .margin(egui::vec2(8.0, 8.0))
-                                .hint_text("Search recordings")
+                                .hint_text("Search VODs")
                                 .char_limit(128),
                         )
                         .changed();
@@ -259,7 +259,7 @@ impl Library {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(format!(
-                        "{} recording{}",
+                        "{} VOD{}",
                         self.filtered.len(),
                         if self.filtered.len() == 1 { "" } else { "s" }
                     ))
@@ -272,12 +272,12 @@ impl Library {
                     ui.label(
                         RichText::new(if source.is_empty() {
                             if loading {
-                                "Loading recordings…"
+                                "Loading VODs…"
                             } else {
-                                "No recordings yet."
+                                "No VODs yet."
                             }
                         } else {
-                            "No recordings match these filters."
+                            "No VODs match these filters."
                         })
                         .color(MUTED),
                     );
@@ -511,7 +511,7 @@ fn paint_line(ui: &egui::Ui, text: &str, pos: egui::Pos2, width: f32, size: f32,
 
 fn title(vod: &Vod) -> &str {
     if vod.title.trim().is_empty() {
-        "Untitled recording"
+        "VOD"
     } else {
         &vod.title
     }
@@ -757,14 +757,14 @@ mod tests {
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(100));
                 egui::CentralPanel::default().show_inside(ui, |ui| {
-                    ui.heading("Recordings");
+                    ui.heading("VODs");
                     ui.add_space(12.0);
                     self.library.draw(ui, &self.source, false, true, false);
                 });
             }
         }
         eframe::run_native(
-            "Brick · Recordings library check",
+            "Brick · VOD library check",
             eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default()
                     .with_inner_size([980.0, 600.0])

@@ -190,13 +190,9 @@ impl Comparison {
             .map_or(self.desired.1, Controller::wants_playing);
         // The barrier's temporary pauses must not look like a user Pause.
         state.playback_intent = Some(intent);
-        if self
-            .controller
-            .as_ref()
-            .is_none_or(|c| matches!(c.status(), Status::Preparing | Status::Buffering))
-        {
-            state.buffering = true;
-        }
+        // Preserve the primary's actual SDK position and buffering state.
+        // Marking it buffering because only its peer is catching up made the
+        // timeline discard that position and fall back to the initial target.
         state
     }
 
@@ -420,7 +416,7 @@ impl Comparison {
             let clocks = recording_clock(primary_review, pull).and_then(|first| {
                 recording_clock(secondary_review, secondary_pull).map(|second| [first, second])
             });
-            let range = [pull.start_ms.saturating_sub(5_000), pull.end_ms];
+            let range = [pull.start_ms, pull.end_ms];
             match clocks.and_then(|clocks| {
                 Controller::new(
                     clocks,
@@ -1026,9 +1022,21 @@ mod tests {
     #[test]
     fn temporary_barrier_pause_does_not_change_user_intent() {
         let comparison = Comparison::new(&ReviewUi::default(), stream(), 1000, true);
-        let state = comparison.state_for_controls(PlaybackState::default());
+        let mut primary = PlaybackState::default();
+        primary.ready = true;
+        primary.seconds = 127.25;
+        primary.mark_polled_now();
+        let state = comparison.state_for_controls(primary.clone());
         assert_eq!(state.playback_intent, Some(true));
-        assert!(state.buffering);
+        assert!(!state.buffering);
+        assert_eq!(state.seconds, primary.seconds);
+        assert!(state.is_fresh());
+        primary.buffering = true;
+        let buffering = comparison.state_for_controls(primary);
+        assert!(
+            buffering.buffering,
+            "Real primary buffering must remain visible"
+        );
     }
 }
 
@@ -1056,6 +1064,7 @@ mod native_test {
         phase_at: Instant,
         hold: Duration,
         phase: u8,
+        steady_reseeks: u8,
         anchor: i64,
         activated: bool,
         captures: [bool; 2],
@@ -1071,6 +1080,7 @@ mod native_test {
         }
         fn next(&mut self, phase: u8) {
             self.phase = phase;
+            self.steady_reseeks = 0;
             self.phase_at = Instant::now();
             self.anchor = self.controller.position_ms();
             eprintln!(
@@ -1142,6 +1152,48 @@ mod native_test {
                 [&first.playback_state(), &second.playback_state()],
                 Instant::now(),
             );
+            if matches!(self.phase, 1 | 8)
+                && matches!(commands.primary, Some(PlaybackCommand::SeekPaused(_)))
+                && matches!(commands.secondary, Some(PlaybackCommand::SeekPaused(_)))
+            {
+                self.steady_reseeks += 1;
+                if self.steady_reseeks > 1 {
+                    return Err(
+                        "Comparison repeatedly restarted both videos during uninterrupted playback"
+                            .into(),
+                    );
+                }
+            }
+            if std::env::var_os("BRICK_COMPARE_TRACE").is_some()
+                && (commands.primary.is_some() || commands.secondary.is_some())
+            {
+                let command = |value: Option<PlaybackCommand>| match value {
+                    Some(PlaybackCommand::Play) => "play".into(),
+                    Some(PlaybackCommand::Pause) => "pause".into(),
+                    Some(PlaybackCommand::Seek(at)) => format!("seek-play:{at:.3}"),
+                    Some(PlaybackCommand::SeekPaused(at)) => format!("seek-pause:{at:.3}"),
+                    None => "none".into(),
+                };
+                let states = [first.playback_state(), second.playback_state()].map(|state| {
+                    let ages = state.observation_window().map(|[requested, received]| {
+                        [
+                            requested.elapsed().as_secs_f64(),
+                            received.elapsed().as_secs_f64(),
+                        ]
+                    });
+                    format!(
+                        "at={:.3},playing={},buffering={},pending={:?},sample_ages={ages:?}",
+                        state.seconds, state.playing, state.buffering, state.playback_intent
+                    )
+                });
+                eprintln!(
+                    "Comparison trace phase={} status={:?} commands=[{},{}] states={states:?}",
+                    self.phase,
+                    self.controller.status(),
+                    command(commands.primary),
+                    command(commands.secondary)
+                );
+            }
             apply_commands(commands, first, second)?;
             if let Status::Failed(error) = self.controller.status() {
                 return Err(error.to_string());
@@ -1427,7 +1479,6 @@ mod native_test {
         };
         let first = load("BRICK_REPLAY_FIXTURE");
         let second = load("BRICK_REPLAY_ALT_FIXTURE");
-        assert_eq!(first.provider, streams::Provider::Youtube);
         let primary_offset = std::env::var("BRICK_REPLAY_TEST_OFFSET")
             .ok()
             .map(|value| {
@@ -1449,13 +1500,23 @@ mod native_test {
                     && offsets[side] >= 0.0
                     && offsets[side] + 90.0 < replays[side].available_seconds.min(604800) as f64
             );
-            let member = if side == 0 {
+            let default_member = if side == 0 {
                 "101"
             } else if replays[side].provider == streams::Provider::Youtube {
                 "102"
             } else {
                 "103"
             };
+            let member = std::env::var(if side == 0 {
+                "BRICK_REPLAY_TEST_MEMBER"
+            } else {
+                "BRICK_REPLAY_ALT_MEMBER"
+            })
+            .unwrap_or_else(|_| default_member.into());
+            assert!(
+                matches!(member.as_str(), "101" | "102" | "103"),
+                "Local fixture member required"
+            );
             let mut url = url::Url::parse("http://127.0.0.1:18083").unwrap();
             url.set_path(&format!(
                 "/v1/streams/player/{member}/{}",
@@ -1529,6 +1590,7 @@ mod native_test {
                     phase_at: now,
                     hold,
                     phase: 0,
+                    steady_reseeks: 0,
                     anchor: START,
                     activated: false,
                     captures: [false, false],

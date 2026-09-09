@@ -41,6 +41,8 @@ pub struct PlaybackState {
     pub playback_intent: Option<bool>,
     #[serde(skip)]
     polled_at: Option<Instant>,
+    #[serde(skip)]
+    poll_finished_at: Option<Instant>,
 }
 impl PlaybackState {
     pub fn is_fresh(&self) -> bool {
@@ -59,14 +61,29 @@ impl PlaybackState {
         self.is_fresh() && self.polled_at.is_some_and(|at| at > since)
     }
 
+    /// The SDK read happened between the native request and its callback.
+    /// This brackets an observation; it is not a decoded frame timestamp.
+    pub(crate) fn observation_window(&self) -> Option<[Instant; 2]> {
+        let start = self.polled_at?;
+        let end = self.poll_finished_at?;
+        (start <= end).then_some([start, end])
+    }
+
     #[cfg(test)]
     pub(crate) fn mark_polled_now(&mut self) {
-        self.polled_at = Some(Instant::now());
+        self.mark_polled_at(Instant::now());
     }
 
     #[cfg(test)]
     pub(crate) fn mark_polled_at(&mut self, at: Instant) {
         self.polled_at = Some(at);
+        self.poll_finished_at = Some(at);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_polled_between(&mut self, start: Instant, end: Instant) {
+        self.polled_at = Some(start);
+        self.poll_finished_at = Some(end);
     }
 }
 #[derive(Clone, Copy)]
@@ -555,6 +572,7 @@ impl StreamPlayer {
             .evaluate_script_with_callback(
                 "JSON.stringify(window.brickMedia ? window.brickMedia.state() : null)",
                 move |value| {
+                    let poll_finished_at = Instant::now();
                     pending.store(false, Ordering::Relaxed);
                     if value.len() > 4096 {
                         return;
@@ -562,6 +580,7 @@ impl StreamPlayer {
                     let decoded = serde_json::from_str::<String>(&value).unwrap_or(value);
                     if let Ok(mut next) = serde_json::from_str::<PlaybackState>(&decoded) {
                         next.polled_at = Some(polled_at);
+                        next.poll_finished_at = Some(poll_finished_at);
                         if next.seconds.is_finite() && (0.0..=604800.0).contains(&next.seconds) {
                             if let Ok(mut state) = state.lock() {
                                 // A callback retried after a timeout must not

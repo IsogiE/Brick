@@ -416,7 +416,7 @@ impl ReviewUi {
         let replay = &self.review.as_ref()?.replay;
         let target = (at_ms - replay.start_ms().ok()?) as f64 / 1000.0 + seconds as f64;
         if !(0.0..replay.available_seconds as f64).contains(&target) {
-            self.notice = Some("That timing would move this moment outside the recording.".into());
+            self.notice = Some("That timing would move this moment outside the VOD.".into());
             return None;
         }
         self.playback.as_ref()?;
@@ -988,7 +988,7 @@ impl ReviewUi {
                         .map(|_| Data::Authentication),
                     Action::Disconnect => client.disconnect(&token).map(|_| Data::Authentication),
                     Action::Refresh => client
-                        .review(&token, stream.as_ref().ok_or("Choose a recording first.")?)
+                        .review(&token, stream.as_ref().ok_or("Choose a VOD first.")?)
                         .map(Data::Review),
                     Action::Align(replay, pull, seconds) => client
                         .align_video(&replay, &pull, seconds)
@@ -1020,7 +1020,7 @@ impl ReviewUi {
         let Some(review) = &self.review else {
             return;
         };
-        let seconds = (pull_video_start(review, &pull) - 5.0).max(0.0);
+        let seconds = pull_video_start(review, &pull).max(0.0);
         let playback = Playback {
             seconds,
             autoplay: true,
@@ -1153,7 +1153,7 @@ impl ReviewUi {
         ui.visuals_mut().widgets.inactive.bg_fill = Color32::from_rgb(30, 34, 42);
 
         if !self.connected {
-            ui.label("Connect Warcraft Logs to find this recording's raid pulls.");
+            ui.label("Connect Warcraft Logs to find this VOD's raid pulls.");
             self.draw(ui, stream);
             ui.add_space(8.0);
         }
@@ -1247,7 +1247,7 @@ impl ReviewUi {
                     self.popup_open |= menu.inner.is_some();
                     if ui
                         .button(if stream.recording_id.is_some() {
-                            "Back to recordings"
+                            "Back to VODs"
                         } else {
                             "Back to streams"
                         })
@@ -1548,7 +1548,7 @@ impl ReviewUi {
             self.playback = None;
             self.notice = Some("This POV does not contain the selected moment.".into());
         } else {
-            self.notice = Some("This POV has no recording of the selected pull.".into());
+            self.notice = Some("This POV does not contain the selected pull.".into());
         }
         // A missing recording does not clear the user's pull/time. Another
         // available POV must restore it even after several immediate switches.
@@ -2347,7 +2347,7 @@ fn draw_pov_selector(
             ui.separator();
             if rows.is_empty() {
                 ui.label(if menu.search.trim().is_empty() && menu.covered.is_some() {
-                    "No other recordings cover this moment."
+                    "No other VODs cover this moment."
                 } else {
                     "No matching players."
                 });
@@ -2425,7 +2425,7 @@ fn draw_pov_selector(
                             let status = if watching {
                                 "Watching"
                             } else if pov.recording_id.is_some() {
-                                "Recording"
+                                "VOD"
                             } else {
                                 match pov.status {
                                     Status::Live => "Live",
@@ -3358,6 +3358,32 @@ mod tests {
     }
 
     #[test]
+    fn selecting_a_pull_starts_at_timeline_zero_with_its_own_video_timing() {
+        for correction in [None, Some(-3), Some(0), Some(6), Some(9)] {
+            let (mut review, pull, _) = fixture();
+            review.timing.clear();
+            if let Some(seconds) = correction {
+                review.timing.insert(pull.report.clone(), seconds);
+            }
+            let expected = (pull.start_ms - review.replay.start_ms().unwrap()) as f64 / 1000.0
+                + correction.unwrap_or(DEFAULT_SECONDS) as f64;
+            let mut ui = ReviewUi::default();
+            ui.review = Some(review.clone());
+            ui.active = true;
+            ui.select(pull.clone());
+            let playback = ui.playback().unwrap();
+            assert!((playback.seconds - expected).abs() < 0.000_001);
+            assert_eq!(
+                encounter_moment(&review, &pull, playback.seconds),
+                pull.start_ms
+            );
+            assert!(playback.autoplay);
+            ui.capture_pov_position(&PlaybackState::default());
+            assert_eq!(ui.pending_focus.as_ref().unwrap().1, pull.start_ms);
+        }
+    }
+
+    #[test]
     fn immediate_pov_switch_keeps_initial_pull_before_first_current_sample() {
         let (review, pull, _) = fixture();
         let mut old_live_state = PlaybackState::default();
@@ -3372,7 +3398,7 @@ mod tests {
             ui.capture_pov_position(&state);
             let (wanted, at_ms, autoplay) = ui.pending_focus.as_ref().unwrap();
             assert_eq!(pull_key(wanted), pull_key(&pull));
-            assert_eq!(*at_ms, pull.start_ms - 5_000);
+            assert_eq!(*at_ms, pull.start_ms);
             assert!(*autoplay);
         }
     }
