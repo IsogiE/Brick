@@ -7,9 +7,19 @@ mod addon;
 mod app_update;
 mod atomic_file;
 mod autostart;
+mod browser;
+mod credential_store;
+mod defensives;
 mod discord_auth;
 mod download;
 mod presence;
+mod replay_health;
+mod replay_observer;
+mod replay_ocr;
+#[cfg(test)]
+mod replay_smoke;
+mod replay_timing;
+mod review_ui;
 mod single_instance;
 mod stream_player;
 mod stream_preferences;
@@ -17,6 +27,7 @@ mod streams;
 mod streams_ui;
 mod tray;
 mod ui;
+mod warcraftlogs;
 
 use std::{
     env,
@@ -26,6 +37,7 @@ use std::{
 use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
+    replay_observer::configure_at_startup();
     let startup_mode = env::args().any(|arg| arg == "--startup");
     let _instance_guard = match single_instance::acquire() {
         Ok(guard) => Some(guard),
@@ -49,8 +61,9 @@ fn main() -> Result<(), eframe::Error> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Brick")
-        .with_inner_size([980.0, 760.0])
-        .with_min_inner_size([760.0, 640.0])
+        .with_inner_size([1440.0, 900.0])
+        .with_min_inner_size([980.0, 720.0])
+        .with_clamp_size_to_monitor_size(true)
         .with_app_id("dev.isogi.brick");
 
     if let Some(icon) = ui::load_window_icon() {

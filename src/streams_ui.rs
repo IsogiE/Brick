@@ -46,6 +46,7 @@ pub struct StreamsUi {
     recordings_open: bool,
     recordings: Option<Rc<Vec<Vod>>>,
     player: Option<StreamPlayer>,
+    player_switch_pending: bool,
     preferences: Option<Preferences>,
     player_work: Option<mpsc::Receiver<PlayerResult>>,
     player_attempted: bool,
@@ -57,6 +58,8 @@ pub struct StreamsUi {
     edit_open: bool,
     drafts: [String; 2],
     confirm_remove: Option<Provider>,
+    review: crate::review_ui::ReviewUi,
+    observer: crate::replay_observer::Observer,
 }
 
 impl Default for StreamsUi {
@@ -71,6 +74,7 @@ impl Default for StreamsUi {
             recordings_open: false,
             recordings: None,
             player: None,
+            player_switch_pending: false,
             preferences: None,
             player_work: None,
             player_attempted: false,
@@ -82,17 +86,28 @@ impl Default for StreamsUi {
             edit_open: false,
             drafts: [String::new(), String::new()],
             confirm_remove: None,
+            review: crate::review_ui::ReviewUi::default(),
+            observer: crate::replay_observer::Observer::default(),
         }
     }
 }
 
 impl StreamsUi {
+    pub fn reviewing(&self) -> bool {
+        self.review.active() && !self.recordings_open
+    }
+
     pub fn clear(&mut self) {
+        let mut observer = std::mem::take(&mut self.observer);
+        observer.reset();
         *self = Self::default();
+        self.observer = observer;
     }
 
     pub fn stop_player(&mut self) {
+        self.observer.reset();
         self.player = None;
+        self.player_switch_pending = false;
         self.player_work = None;
         self.player_attempted = false;
         self.player_rect = None;
@@ -135,7 +150,7 @@ impl StreamsUi {
                                     stream.user_id == selected.user_id
                                         && stream.channel_id == selected.channel_id
                                         && stream.provider == selected.provider
-                                        && stream.status == Status::Live
+                                        && (self.review.active() || stream.status == Status::Live)
                                 })
                                 .cloned();
                             if current.is_none() {
@@ -174,21 +189,61 @@ impl StreamsUi {
         {
             self.start(ctx, Action::Refresh);
         }
-        if self.player.is_some() {
+        if self.review.tick(
+            ctx,
+            self.selected
+                .as_ref()
+                .filter(|_| active && !self.recordings_open),
+        ) && (!self.player_switch_pending || !self.review.active())
+        {
+            self.stop_player();
+        }
+        if let Some(player) = &mut self.player {
+            if self.review.active() {
+                player.poll_playback(ctx);
+            }
             crate::stream_player::pump_events();
         }
         if let Some(error) = self.player.as_ref().and_then(StreamPlayer::failure) {
             self.player = None;
-            self.player_error = Some(error);
-            self.player_attempted = true;
+            let switching = self.player_switch_pending;
+            self.player_switch_pending = false;
+            self.player_error = (!switching).then_some(error);
+            self.player_attempted = !switching;
+        }
+        if self.observer.enabled() {
+            if active && !self.recordings_open && !self.player_switch_pending {
+                self.review.prepare_health_observation();
+            }
+            let identity = (active && !self.recordings_open && !self.player_switch_pending)
+                .then(|| self.review.observation_context())
+                .flatten()
+                .map(|(replay, pull)| crate::replay_observer::Identity::new(replay, pull));
+            self.observer.tick_with_health(
+                ctx,
+                self.player.as_ref(),
+                identity,
+                self.review.observation_boss_names(),
+                self.review.observation_health_window(),
+            );
+            if let Some(observation) = self.observer.observation() {
+                self.review.observe_health(observation);
+            }
         }
         false
+    }
+
+    pub(crate) fn replay_observation(&self) -> Option<&crate::replay_observer::Observation> {
+        self.observer.observation()
     }
 
     pub fn repaint_after(&self, active: bool) -> Duration {
         #[cfg(target_os = "linux")]
         if self.player.is_some() {
             return Duration::from_millis(33);
+        }
+        if self.player.is_some() && self.review.active() {
+            return Duration::from_millis(500);
         }
         if active && presence::configured() && self.work.is_none() {
             return self
@@ -255,6 +310,72 @@ impl StreamsUi {
 
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         self.player_rect = None;
+        if self.review.active() && !self.recordings_open {
+            if let Some(stream) = self.selected.clone() {
+                let povs = self
+                    .snapshot
+                    .as_ref()
+                    .map(|s| s.streams.clone())
+                    .unwrap_or_default();
+                let state = if self.player_switch_pending {
+                    // A retained hidden child still belongs to the previous
+                    // POV until its new authenticated navigation starts.
+                    let mut state = crate::stream_player::PlaybackState::default();
+                    state.playback_intent =
+                        self.review.playback().map(|playback| playback.autoplay);
+                    state
+                } else {
+                    self.player
+                        .as_ref()
+                        .map(StreamPlayer::playback_state)
+                        .unwrap_or_default()
+                };
+                let action = self.review.draw_workspace(
+                    ui,
+                    &stream,
+                    &povs,
+                    &state,
+                    self.player_error.as_deref(),
+                );
+                self.player_rect = action.rect;
+                if action.reload {
+                    self.stop_player();
+                    self.player_rect = action.rect;
+                    self.player_error = None;
+                }
+                if let Some(command) = action.command {
+                    if let Some(player) = &mut self.player {
+                        if let Err(error) = player.command(command) {
+                            self.player_error = Some(error);
+                        }
+                    }
+                }
+                if let Some(stream) = action.stream {
+                    // Keep one paused, hidden media child while the selected
+                    // POV's authenticated replay metadata is checked.
+                    let retain = self
+                        .player
+                        .as_ref()
+                        .is_some_and(StreamPlayer::can_reuse_for_replay);
+                    if retain {
+                        if let Some(player) = &mut self.player {
+                            let _ = player.command(crate::stream_player::PlaybackCommand::Pause);
+                            player.set_visible(false);
+                        }
+                        self.player_switch_pending = true;
+                        self.player_work = None;
+                        self.player_attempted = false;
+                    } else {
+                        self.stop_player();
+                    }
+                    self.player_error = None;
+                    self.focused = Some((stream.user_id.clone(), stream.name.clone()));
+                    self.selected = Some(stream);
+                }
+                return;
+            }
+        }
+
         ui.horizontal(|ui| {
             if self.recordings_open {
                 ui.label(
@@ -508,8 +629,7 @@ impl StreamsUi {
                     let size = egui::vec2(
                         ui.available_width(),
                         (ui.available_width() * 9.0 / 16.0)
-                            .max(300.0)
-                            .min((height - 120.0).max(300.0)),
+                            .min((ui.available_height() - 112.0).max(160.0)),
                     );
                     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
                     ui.painter()
@@ -533,7 +653,11 @@ impl StreamsUi {
                     });
                     let mut caption = egui::text::LayoutJob::default();
                     caption.append(
-                        "LIVE  ·  ",
+                        if self.review.playback().is_some() {
+                            "REPLAY  ·  "
+                        } else {
+                            "LIVE  ·  "
+                        },
                         0.0,
                         egui::TextFormat {
                             font_id: egui::FontId::proportional(11.0),
@@ -565,6 +689,14 @@ impl StreamsUi {
                             .halign(egui::Align::Center)
                             .truncate(),
                     );
+                    if self.review.draw(ui, &stream) {
+                        self.stop_player();
+                        self.player_rect = Some(rect);
+                        self.player_error = None;
+                    }
+                    if let Some(playback) = self.review.playback() {
+                        ui.hyperlink_to("Open replay in browser", &playback.public_url);
+                    }
                     if let Some(error) = &self.player_error {
                         ui.label(RichText::new(error).small().color(MUTED));
                         if ui.button("Retry player").clicked() {
@@ -769,6 +901,22 @@ impl StreamsUi {
             self.stop_player();
             return false;
         }
+        if self.review.active() && self.review.playback().is_none() {
+            if self.player_switch_pending {
+                if let Some(player) = &self.player {
+                    player.set_visible(false);
+                }
+            } else {
+                self.stop_player();
+            }
+            return false;
+        }
+        if let Some(player) = &self.player {
+            player.set_visible(!self.review.obscures_player() && !self.player_switch_pending);
+        }
+        if self.review.obscures_player() {
+            return false;
+        }
         let Some(rect) = self.player_rect else {
             self.stop_player();
             return false;
@@ -777,8 +925,11 @@ impl StreamsUi {
             if let Err(error) = player.set_bounds(rect, ctx.pixels_per_point()) {
                 self.player_error = Some(error);
                 self.player = None;
+                self.player_switch_pending = false;
             }
-            return false;
+            if !self.player_switch_pending {
+                return false;
+            }
         }
         if let Some(rx) = &self.player_work {
             let result = match rx.try_recv() {
@@ -794,7 +945,26 @@ impl StreamsUi {
                 self.player_work = None;
                 match result {
                     Ok((url, token, preferences)) => {
+                        // Preparation may finish after another pull was selected.
+                        // Only its credentials/preferences are reusable; read the
+                        // latest playback intent before constructing the player.
+                        let url = player_url_for_playback(&url, self.review.playback());
                         self.preferences = preferences;
+                        if let Some(player) = &mut self.player {
+                            if self.player_switch_pending {
+                                match player.load_replay(ctx, &url, &token) {
+                                    Ok(()) => {
+                                        player.set_visible(true);
+                                    }
+                                    Err(error) => {
+                                        self.player_error = Some(error);
+                                        self.player = None;
+                                    }
+                                }
+                                self.player_switch_pending = false;
+                                return false;
+                            }
+                        }
                         match StreamPlayer::new(
                             frame,
                             ctx,
@@ -804,7 +974,10 @@ impl StreamsUi {
                             ctx.pixels_per_point(),
                             self.preferences.clone(),
                         ) {
-                            Ok(player) => self.player = Some(player),
+                            Ok(player) => {
+                                self.player = Some(player);
+                                self.player_switch_pending = false;
+                            }
                             Err(error) => self.player_error = Some(error),
                         }
                     }
@@ -824,16 +997,14 @@ impl StreamsUi {
             let user_id = stream.user_id.clone();
             let provider = stream.provider.clone();
             let preferences = self.preferences.clone();
+            let playback = self.review.playback().cloned();
             let (tx, rx) = mpsc::channel();
             let ctx = ctx.clone();
             thread::spawn(move || {
                 let result = access_token().and_then(|token| {
+                    let preferences = Some(preferences.unwrap_or_else(Preferences::load));
                     streams::player_url(&user_id, &provider).map(|url| {
-                        let preferences = if provider == Provider::Twitch {
-                            Some(preferences.unwrap_or_else(Preferences::load))
-                        } else {
-                            preferences
-                        };
+                        let url = player_url_for_playback(&url, playback.as_ref());
                         (url, token, preferences)
                     })
                 });
@@ -1046,12 +1217,55 @@ fn access_token() -> Result<String, streams::Error> {
     })
 }
 
+fn player_url_for_playback(url: &str, playback: Option<&crate::review_ui::Playback>) -> String {
+    let mut url = url::Url::parse(url).expect("Validated player URL");
+    url.set_query(None);
+    if let Some(playback) = playback {
+        url.query_pairs_mut()
+            .append_pair("at", &format!("{:.3}", playback.seconds))
+            .append_pair("broadcast", &playback.broadcast_id);
+        if !playback.autoplay {
+            url.query_pairs_mut().append_pair("paused", "1");
+        }
+    }
+    url.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn snapshot() -> Snapshot {
         serde_json::from_value(serde_json::json!({"streams":[{"userId":"1","name":"Guildmate","provider":"twitch","channelId":"guildmate","url":"https://www.twitch.tv/guildmate","status":"live"}],"ownStream":null,"providers":{"twitch":true,"youtube":true}})).unwrap()
+    }
+
+    #[test]
+    fn player_preparation_uses_the_latest_pull_position_and_pause_intent() {
+        let earlier =
+            "https://brick.example/v1/streams/player/101/youtube?at=30&broadcast=abcDEF_12-3";
+        let latest = crate::review_ui::Playback {
+            seconds: 151.375,
+            autoplay: false,
+            broadcast_id: "abcDEF_12-3".into(),
+            public_url: String::new(),
+        };
+        let url = url::Url::parse(&player_url_for_playback(earlier, Some(&latest))).unwrap();
+        assert_eq!(
+            url.query_pairs().find(|(key, _)| key == "at").unwrap().1,
+            "151.375"
+        );
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "paused")
+                .unwrap()
+                .1,
+            "1"
+        );
+        assert_eq!(url.query_pairs().count(), 3);
+        assert!(url::Url::parse(&player_url_for_playback(earlier, None))
+            .unwrap()
+            .query()
+            .is_none());
     }
 
     #[test]

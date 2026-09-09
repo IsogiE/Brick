@@ -126,6 +126,45 @@ const liveYoutubeBatch = url => json({ items: url.searchParams.get("id").split("
   liveStreamingDetails: {},
 })) });
 
+test("private-log setup and replay reads require current Discord eligibility; PKCE codes stay isolated", async t => {
+  const f = await fixture(t, twitchLive, { WARCRAFTLOGS_CLIENT_ID: "public-pkce-id", ROSTER_CACHE_SECONDS: "1" });
+  assert.equal((await f.request("/v1/streams/review/config")).status, 401);
+  assert.deepEqual(await (await f.authorized("/v1/streams/review/config")).json(), { clientId: "public-pkce-id", guildId: 580482, userId: "11" });
+  const state = "a".repeat(64);
+  assert.equal((await f.request(`/warcraftlogs/callback?state=${state}&code=private-code`)).status, 200);
+  assert.equal((await f.request(`/v1/streams/review/callback?state=${state}`)).status, 401);
+  assert.equal((await f.request(`/v1/auth/callback?state=${state}`)).status, 202, "Discord cannot consume a WCL callback");
+  assert.deepEqual(await (await f.authorized(`/v1/streams/review/callback?state=${state}`)).json(), { code: "private-code" });
+  assert.equal((await f.authorized(`/v1/streams/review/callback?state=${state}`)).status, 202);
+  f.setMembers(members.filter(m => m.user.id !== "11"));
+  await new Promise(resolve => setTimeout(resolve, 1050));
+  assert.equal((await f.authorized("/v1/streams/review/config")).status, 403);
+});
+
+test("replay endpoints and embedded seeking cannot cross broadcast identities or seek beyond availability", async t => {
+  const startedAt = new Date(1_700_000_000_000 - 6 * 3600_000).toISOString();
+  const f = await fixture(t, (url, options) => {
+    if (url === "https://id.twitch.tv/oauth2/token") return json({ access_token: "app-token", expires_in: 3600 });
+    if (url.includes("/helix/streams?")) return json({ data: [{ user_login: "alice", type: "live", id: "123", user_id: "42", started_at: startedAt }] });
+    if (url.includes("/helix/videos?")) return json({ data: [{ id: "456", stream_id: "123", user_id: "42", type: "archive", duration: "5h59m" }] });
+    throw new Error("Unexpected provider request");
+  }, providerEnv);
+  await f.save("https://twitch.tv/alice");
+  const replay = await (await f.authorized("/v1/streams/review/11/twitch")).json();
+  assert.equal(replay.broadcastId, "123"); assert.equal(replay.videoId, "456"); assert.equal(Date.parse(replay.startedAt), Date.parse(startedAt));
+  assert.equal((await f.request("/v1/streams/review/11/twitch")).status, 401);
+  assert.equal((await f.authorized("/v1/streams/review/33/twitch")).status, 404);
+  const valid = await f.authorized("/v1/streams/player/11/twitch?at=19800&broadcast=123");
+  assert.equal(valid.status, 200); assert.match(await valid.text(), /video=v456.*time=19800s/);
+  const paused = await f.authorized("/v1/streams/player/11/twitch?at=19800.875&broadcast=123&paused=1");
+  assert.equal(paused.status, 200);
+  const html = await paused.text();
+  assert.match(html, /autoplay=false/); assert.match(html, /time=19800.875s/);
+  for (const query of ["at=19800&broadcast=122", "at=21600&broadcast=123", "at=-1&broadcast=123", "at=2&at=3&broadcast=123", "at=2&broadcast=123&broadcast=123", "at=2&broadcast=123&extra=x", "broadcast=123", "paused=1", "at=1&paused=1", "at=1&broadcast=123&paused=0", "at=1&broadcast=123&paused=true", "at=1&broadcast=123&paused=1&paused=1", "at=1.0001&broadcast=123", "at=1.&broadcast=123", "at=.5&broadcast=123", "at=1e2&broadcast=123", "at=NaN&broadcast=123", "at=604800.001&broadcast=123"]) {
+    assert.ok((await f.authorized(`/v1/streams/player/11/twitch?${query}`)).status >= 400, query);
+  }
+});
+
 test("large YouTube directories reduce quota use while verified entries never outlive the freshness limit", async t => {
   const small = await quotaFixture(t, 200, liveYoutubeBatch);
   assert.equal((await small.snapshot()).streams.length, 200);
@@ -817,7 +856,7 @@ test("authenticated players use only official iframes, trusted parent and safe r
     const html = await response.text();
     assert(html.includes(provider));
     assert(html.includes("brick.example.com"));
-    for (const secret of ["alice-token", "test-bot", "test-secret", "test-app-token", "test-key", "evil.example", "<script>"]) assert(!html.includes(secret));
+    for (const secret of ["alice-token", "test-bot", "test-secret", "test-app-token", "test-key", "evil.example", '<script>alert("x")</script>']) assert(!html.includes(secret));
   }
   const anonymous = await f.request("/v1/streams/player/11?token=alice-token");
   assert.equal(anonymous.status, 401);

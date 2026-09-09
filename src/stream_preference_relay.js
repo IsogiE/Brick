@@ -1,5 +1,8 @@
 (() => {
-  if (window !== window.top || location.href !== __BRICK_WRAPPER_URL__) return;
+  // Native navigation permits only the currently selected exact wrapper URL.
+  // The bridge rechecks that URL for each message; this origin remains constant
+  // when one secured WebView moves between guild members' provider wrappers.
+  if (window !== window.top || location.origin !== new URL(__BRICK_WRAPPER_URL__).origin) return;
   // This nonce remains in the protected top-level document's closure. The
   // provider script receives neither it nor a general native API capability.
   const nonce = __BRICK_NONCE__;

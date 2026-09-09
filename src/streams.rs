@@ -170,7 +170,7 @@ pub fn player_url(user_id: &str, provider: &Provider) -> Result<String, Error> {
     Ok(presence::endpoint_url(&format!("/v1/streams/player/{user_id}/{}", provider.key()))?.into())
 }
 
-fn request(
+pub(crate) fn request(
     method: Method,
     path: &str,
     token: &str,
@@ -178,6 +178,7 @@ fn request(
 ) -> Result<Vec<u8>, Error> {
     let mut request = presence::http_client()?
         .request(method, presence::endpoint_url(path)?)
+        .timeout(std::time::Duration::from_secs(20))
         .bearer_auth(token);
     if let Some(body) = body {
         request = request.json(&body);

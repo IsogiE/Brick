@@ -5,3 +5,12 @@ target/
 *.log
 presence/.env
 presence/secrets/
+
+# Keep documentation and investigation notes local.
+*.[mM][dD]
+*.[mM][dD][xX]
+*.[mM][aA][rR][kK][dD][oO][wW][nN]
+*.[mM][dD][oO][wW][nN]
+*.[mM][kK][dD]
+*.[mM][kK][dD][nN]
+[Rr][Ee][Aa][Dd][Mm][Ee]*

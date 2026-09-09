@@ -43,6 +43,10 @@ struct State {
 }
 
 impl Preferences {
+    /// An ephemeral player may retain harmless preferences without disk access.
+    pub fn in_memory() -> Self {
+        Self::load_from(None)
+    }
     /// Called by the existing player preparation worker, never the GUI thread.
     pub fn load() -> Self {
         Self::load_from(
@@ -136,7 +140,7 @@ impl Preferences {
 pub struct PreferenceBridge(Arc<BridgeState>);
 
 struct BridgeState {
-    wrapper: String,
+    wrapper: Mutex<String>,
     nonce: String,
     active: AtomicBool,
     changes: AtomicU8,
@@ -153,7 +157,7 @@ struct Message {
 impl PreferenceBridge {
     pub fn new(wrapper: &str, preferences: Preferences) -> Self {
         Self(Arc::new(BridgeState {
-            wrapper: wrapper.to_owned(),
+            wrapper: Mutex::new(wrapper.to_owned()),
             nonce: uuid::Uuid::new_v4().to_string(),
             active: AtomicBool::new(true),
             changes: AtomicU8::new(0),
@@ -162,8 +166,14 @@ impl PreferenceBridge {
     }
 
     pub fn scripts(&self, wrapper_origin: &str) -> (String, String) {
+        let address = self
+            .0
+            .wrapper
+            .lock()
+            .map(|url| url.clone())
+            .unwrap_or_default();
         let wrapper = include_str!("stream_preference_relay.js")
-            .replace("__BRICK_WRAPPER_URL__", &json(&self.0.wrapper))
+            .replace("__BRICK_WRAPPER_URL__", &json(&address))
             .replace("__BRICK_NONCE__", &json(&self.0.nonce));
         let provider = include_str!("stream_preference_capture.js")
             .replace("__BRICK_WRAPPER_ORIGIN__", &json(wrapper_origin))
@@ -177,7 +187,11 @@ impl PreferenceBridge {
 
     pub fn receive(&self, wrapper: &str, body: &str) {
         if !self.0.active.load(Ordering::Relaxed)
-            || wrapper != self.0.wrapper
+            || !self
+                .0
+                .wrapper
+                .lock()
+                .is_ok_and(|current| wrapper == *current)
             || body.len() > MAX_BYTES
             || self.0.changes.load(Ordering::Relaxed) >= MAX_CHANGES_PER_PLAYER
         {
@@ -194,6 +208,24 @@ impl PreferenceBridge {
             self.0.changes.fetch_add(1, Ordering::Relaxed);
             self.0.preferences.record(message.acknowledgements);
         }
+    }
+
+    /// The native caller has validated the full protected player URL. Keep the
+    /// existing bridge bound to that exact wrapper within the original origin.
+    pub fn retarget(&self, wrapper: &str) -> bool {
+        let Ok(next) = url::Url::parse(wrapper) else {
+            return false;
+        };
+        let Ok(mut current) = self.0.wrapper.lock() else {
+            return false;
+        };
+        if !self.0.active.load(Ordering::Relaxed)
+            || !url::Url::parse(&current).is_ok_and(|previous| previous.origin() == next.origin())
+        {
+            return false;
+        }
+        *current = wrapper.to_owned();
+        true
     }
 
     pub fn close(&self) {
@@ -254,6 +286,22 @@ mod tests {
         bridge.close();
         bridge.receive(WRAPPER, &message(&bridge, serde_json::json!({})));
         assert_eq!(preferences.snapshot()[&Label::Gambling], expiry);
+    }
+
+    #[test]
+    fn reused_bridge_accepts_only_its_current_same_origin_wrapper() {
+        let preferences = Preferences::in_memory();
+        let bridge = PreferenceBridge::new(WRAPPER, preferences.clone());
+        let next = "https://brick.example/v1/streams/player/2/youtube?at=1&broadcast=example";
+        assert!(!bridge.retarget("https://other.example/v1/streams/player/2/twitch"));
+        assert!(bridge.retarget(next));
+        let valid = message(&bridge, serde_json::json!({"Gambling": now_ms() + 60000}));
+        bridge.receive(WRAPPER, &valid);
+        assert!(preferences.snapshot().is_empty());
+        bridge.receive(next, &valid);
+        assert_eq!(preferences.snapshot().len(), 1);
+        bridge.close();
+        assert!(!bridge.retarget(WRAPPER));
     }
 
     #[test]
