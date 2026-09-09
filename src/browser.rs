@@ -140,6 +140,8 @@ mod desktop {
         for key in [
             "PATH",
             "LD_LIBRARY_PATH",
+            "PYTHONPATH",
+            "PERLLIB",
             "XDG_DATA_DIRS",
             "GTK_PATH",
             "GIO_EXTRA_MODULES",
@@ -170,6 +172,7 @@ mod desktop {
             }
         }
         for key in [
+            "PYTHONHOME",
             "GTK_DATA_PREFIX",
             "GTK_EXE_PREFIX",
             "GTK_IM_MODULE_FILE",
@@ -233,6 +236,15 @@ mod desktop {
                 ("APPIMAGE", "/apps/Brick.AppImage"),
                 ("PATH", "/tmp/Brick.AppDir/usr/bin:/custom/bin:/usr/bin"),
                 ("LD_LIBRARY_PATH", "/tmp/Brick.AppDir/usr/lib:/host/lib"),
+                ("PYTHONHOME", "/tmp/Brick.AppDir/usr/"),
+                (
+                    "PYTHONPATH",
+                    "/tmp/Brick.AppDir/usr/share/pyshared/:/host/python",
+                ),
+                (
+                    "PERLLIB",
+                    "/tmp/Brick.AppDir/usr/share/perl5/:/tmp/Brick.AppDir/usr/lib/perl5/:/host/perl",
+                ),
                 (
                     "XDG_DATA_DIRS",
                     "/tmp/Brick.AppDir/usr/share:/usr/share:/custom/share",
@@ -274,12 +286,21 @@ mod desktop {
                 "/host/lib"
             );
             assert_eq!(
+                clean.get(std::ffi::OsStr::new("PYTHONPATH")).unwrap(),
+                "/host/python"
+            );
+            assert_eq!(
+                clean.get(std::ffi::OsStr::new("PERLLIB")).unwrap(),
+                "/host/perl"
+            );
+            assert_eq!(
                 clean.get(std::ffi::OsStr::new("XDG_DATA_DIRS")).unwrap(),
                 "/usr/share:/custom/share"
             );
             for key in [
                 "APPDIR",
                 "APPIMAGE",
+                "PYTHONHOME",
                 "GIO_EXTRA_MODULES",
                 "GSETTINGS_SCHEMA_DIR",
             ] {
@@ -288,9 +309,15 @@ mod desktop {
             let ordinary = environment(&[
                 ("PATH", "/custom/bin"),
                 ("LD_LIBRARY_PATH", "/host/lib"),
+                ("PYTHONHOME", "/host/python-home"),
+                ("PYTHONPATH", "/host/python"),
+                ("PERLLIB", "/host/perl"),
                 ("GTK_THEME", "Custom"),
             ]);
             assert_eq!(host_environment(ordinary.clone()), ordinary);
+            let mut bundled = ordinary.clone();
+            bundled.insert("APPDIR".into(), "/tmp/Brick.AppDir".into());
+            assert_eq!(host_environment(bundled), ordinary);
         }
 
         struct Scripts(std::path::PathBuf);
