@@ -1544,11 +1544,8 @@ impl eframe::App for BrickApp {
                     // native window, otherwise its next hide becomes a no-op.
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 }
-                if self.window_visible && minimized == Some(true) && self.tray.is_some() {
-                    self.hide_window(ctx);
-                    #[cfg(target_os = "linux")]
-                    tray::withdraw_minimized_window(frame);
-                }
+                // Minimize belongs to the window manager: retain the taskbar
+                // entry. Only a close request (or startup) hides to the tray.
                 self.update_window_visibility(visible, minimized, window.has_focus());
             }
         }

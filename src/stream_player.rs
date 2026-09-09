@@ -21,6 +21,7 @@ use crate::stream_preferences::{PreferenceBridge, Preferences};
 
 mod capture;
 mod fullscreen;
+mod resize;
 pub use capture::FrameCapture;
 
 const WRAPPER_LOAD_TIMEOUT: Duration = Duration::from_secs(25);
@@ -525,7 +526,7 @@ impl StreamPlayer {
             return;
         }
         if let Some(webview) = &self.webview {
-            if webview.set_visible(visible).is_ok() {
+            if resize::set_visible(webview, visible, self.bounds).is_ok() {
                 self.visible.set(visible);
             }
         }

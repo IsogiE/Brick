@@ -108,7 +108,7 @@ public static class BrickWindow {
     Assert-Check ($window -ne [IntPtr]::Zero -and [BrickWindow]::IsWindowVisible($window)) 'Main window is visible'
     [BrickWindow]::PostMessage($window, 0x0112, [IntPtr]0xF020, [IntPtr]::Zero) | Out-Null
     Start-Sleep -Seconds 2
-    Assert-Check (![BrickWindow]::IsWindowVisible($window)) 'Minimize button hides Brick into the tray'
+    Assert-Check ([BrickWindow]::IsWindowVisible($window) -and [BrickWindow]::IsIconic($window)) 'Minimize keeps Brick in the taskbar'
     $second = Start-Process $exe -PassThru
     $second.WaitForExit(5000) | Out-Null
     Start-Sleep -Seconds 2
