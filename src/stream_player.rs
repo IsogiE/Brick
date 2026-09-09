@@ -20,9 +20,12 @@ use wry::{
 use crate::stream_preferences::{PreferenceBridge, Preferences};
 
 mod capture;
+mod fullscreen;
 pub use capture::FrameCapture;
 
 const WRAPPER_LOAD_TIMEOUT: Duration = Duration::from_secs(25);
+const COMMAND_RETRY_AFTER: Duration = Duration::from_secs(4);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Default, serde::Deserialize)]
 #[serde(default)]
@@ -50,9 +53,20 @@ impl PlaybackState {
         self.is_fresh() && self.polled_at.is_some_and(|at| at >= since)
     }
 
+    /// A new provider gesture needs a poll strictly later than the command
+    /// barrier. Equal clock ticks cannot establish which action happened first.
+    pub fn is_fresh_after(&self, since: Instant) -> bool {
+        self.is_fresh() && self.polled_at.is_some_and(|at| at > since)
+    }
+
     #[cfg(test)]
     pub(crate) fn mark_polled_now(&mut self) {
         self.polled_at = Some(Instant::now());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_polled_at(&mut self, at: Instant) {
+        self.polled_at = Some(at);
     }
 }
 #[derive(Clone, Copy)]
@@ -79,7 +93,9 @@ pub struct StreamPlayer {
     ready_since: Option<Instant>,
     pending_seek: Option<(f64, bool, Instant)>,
     pending_playback: Option<(bool, Instant)>,
+    command_retried: bool,
     capture: capture::Controller,
+    fullscreen: fullscreen::Controller,
     #[cfg(target_os = "linux")]
     preference_handler: Option<(webkit2gtk::UserContentManager, gtk::glib::SignalHandlerId)>,
 }
@@ -265,7 +281,9 @@ impl StreamPlayer {
             ready_since: None,
             pending_seek: initial_seek.map(|target| (target, !paused, created)),
             pending_playback: initial_seek.map(|_| (!paused, created)),
+            command_retried: false,
             capture: capture::Controller::default(),
+            fullscreen: fullscreen::Controller::new(ctx),
             #[cfg(target_os = "linux")]
             preference_handler: None,
         };
@@ -289,6 +307,7 @@ impl StreamPlayer {
         }
         #[cfg(target_os = "windows")]
         protect_windows_permissions(webview)?;
+        player.fullscreen.attach(webview)?;
 
         #[cfg(target_os = "linux")]
         if ctx.input(|input| input.viewport().focused.unwrap_or(false)) {
@@ -338,10 +357,16 @@ impl StreamPlayer {
         let resume = !url
             .query_pairs()
             .any(|(key, value)| key == "paused" && value == "1");
-        let broadcast = |url: &Url| {
-            url.query_pairs()
+        let identity = |url: &Url| {
+            let recording = url
+                .query_pairs()
+                .find(|(key, _)| key == "recording")
+                .map(|(_, value)| value.into_owned());
+            let broadcast = url
+                .query_pairs()
                 .find(|(key, _)| key == "broadcast")
-                .map(|(_, value)| value.into_owned())
+                .map(|(_, value)| value.into_owned());
+            (recording, broadcast)
         };
         let same_video = self
             .allowed_url
@@ -350,8 +375,8 @@ impl StreamPlayer {
             .and_then(|url| Url::parse(&url).ok())
             .is_some_and(|previous| {
                 previous.path().rsplit('/').next() == url.path().rsplit('/').next()
-                    && broadcast(&previous).is_some()
-                    && broadcast(&previous) == broadcast(&url)
+                    && identity(&previous).1.is_some()
+                    && identity(&previous) == identity(&url)
             });
         if same_video {
             return self.command(if resume {
@@ -360,6 +385,7 @@ impl StreamPlayer {
                 PlaybackCommand::SeekPaused(target)
             });
         }
+        self.exit_fullscreen();
         if token.is_empty() || token.len() > 2048 {
             return Err("Sign in to Discord again to watch this stream.".into());
         }
@@ -390,6 +416,7 @@ impl StreamPlayer {
         self.ready_since = None;
         self.pending_seek = Some((target, resume, self.created));
         self.pending_playback = Some((resume, self.created));
+        self.command_retried = false;
         self.queued_command = Some(if resume {
             PlaybackCommand::Play
         } else {
@@ -415,7 +442,9 @@ impl StreamPlayer {
     pub fn set_visible(&self, visible: bool) {
         if !visible {
             self.capture.cancel();
+            self.exit_fullscreen();
         }
+        self.fullscreen.set_enabled(visible);
         if self.visible.get() == visible {
             return;
         }
@@ -423,6 +452,23 @@ impl StreamPlayer {
             if webview.set_visible(visible).is_ok() {
                 self.visible.set(visible);
             }
+        }
+    }
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen.active()
+    }
+
+    pub fn enter_fullscreen(&self) {
+        if self.visible.get() {
+            self.capture.cancel();
+            self.fullscreen.enter();
+        }
+    }
+
+    pub fn exit_fullscreen(&self) {
+        if self.fullscreen.active() {
+            self.capture.cancel();
+            self.fullscreen.exit(self.webview.as_ref());
         }
     }
     pub fn playback_state(&self) -> PlaybackState {
@@ -470,6 +516,12 @@ impl StreamPlayer {
             let state = self.playback_state();
             if self.pending_seek.is_none() && playback_acknowledged(playing, requested, &state) {
                 self.pending_playback = None;
+            }
+        }
+        if let Some(command) = self.recover_pending_command() {
+            if let (Some(webview), Ok(call)) = (&self.webview, playback_call(command)) {
+                let _ = webview
+                    .evaluate_script(&format!("if(window.brickMedia) window.brickMedia.{call}"));
             }
         }
         // Wry queues scripts during navigation without retaining their callbacks.
@@ -532,6 +584,7 @@ impl StreamPlayer {
         let call = playback_call(command)?;
         let webview = self.webview.as_ref().ok_or("The player has closed.")?;
         self.capture.cancel();
+        self.command_retried = false;
         // A new native action always supersedes startup or a seek queued while
         // loading, even if the provider became ready between this frame's ticks.
         self.queued_command = None;
@@ -584,8 +637,8 @@ impl StreamPlayer {
         Ok(())
     }
 
-    /// Provider-specific errors stay in the iframe; native loading or command
-    /// timeouts surface a retry instead of leaving the replay waiting forever.
+    /// A command timeout is recoverable and must not destroy a loaded player.
+    /// Only failures of the native wrapper itself replace the media view.
     pub fn failure(&self) -> Option<String> {
         if let Some(message) = self.failure.lock().ok().and_then(|failure| failure.clone()) {
             return Some(message);
@@ -601,13 +654,41 @@ impl StreamPlayer {
                 "The recording player took too long to become ready. Please try again.".into(),
             );
         }
-        if self
-            .pending_playback
-            .is_some_and(|(_, requested)| requested.elapsed() >= Duration::from_secs(30))
-        {
-            return Some("The player couldn't finish changing playback. Please try again.".into());
-        }
         None
+    }
+
+    fn recover_pending_command(&mut self) -> Option<PlaybackCommand> {
+        let (playing, requested) = self.pending_playback?;
+        let elapsed = requested.elapsed();
+        if elapsed >= COMMAND_TIMEOUT {
+            // Keep the decoded video and its real SDK position. An unfulfilled
+            // request is never acknowledged by pretending it reached its target.
+            self.pending_seek = None;
+            self.pending_playback = None;
+            self.queued_command = None;
+            self.capture.cancel();
+            return None;
+        }
+        let state = self.playback_state();
+        if self.command_retried
+            || elapsed < COMMAND_RETRY_AFTER
+            || !self.visible.get()
+            || !self.loaded.load(Ordering::Relaxed)
+            || !state.ready
+            || !state.is_fresh_since(requested)
+            || state.buffering
+        {
+            return None;
+        }
+        // A provider can ignore a seek during its own startup or state change.
+        // Retry once in the same iframe; never reload or spawn another decoder.
+        self.command_retried = true;
+        Some(match self.pending_seek {
+            Some((target, true, _)) => PlaybackCommand::Seek(target),
+            Some((target, false, _)) => PlaybackCommand::SeekPaused(target),
+            None if playing => PlaybackCommand::Play,
+            None => PlaybackCommand::Pause,
+        })
     }
 
     /// Opt-in capture of this media child, with a fresh SDK timing bracket.
@@ -648,6 +729,16 @@ impl StreamPlayer {
         if let Some(webview) = &self.webview {
             webview.webview().load_html("<!doctype html><html><body style='margin:0;background:#ff00ff;color:white;font:36px sans-serif'><div style='height:100px;background:#008080'>Brick native rendering diagnostic</div><p>Local HTML draws without provider requests.</p></body></html>", None);
         }
+    }
+
+    #[cfg(test)]
+    pub fn diagnostic_provider_command(&self, command: PlaybackCommand) -> Result<(), String> {
+        let call = playback_call(command)?;
+        self.webview
+            .as_ref()
+            .ok_or("The diagnostic player closed")?
+            .evaluate_script(&format!("if(window.brickMedia)window.brickMedia.{call};"))
+            .map_err(|_| "The diagnostic provider command failed".to_string())
     }
 
     #[cfg(test)]
@@ -717,7 +808,15 @@ impl StreamPlayer {
         use wry::WebViewExtUnix;
         if let Some(webview) = &self.webview {
             let view = webview.webview();
-            eprintln!("Stream GTK allocation {:?}, mapped={}, drawable={}, loading={}, progress={}, parent={:?}", view.allocation(), view.is_mapped(), view.is_drawable(), view.is_loading(), view.estimated_load_progress(), view.parent().map(|parent| parent.allocation()));
+            eprintln!(
+                "Stream GTK allocation {:?}, mapped={}, drawable={}, loading={}, progress={}, parent={:?}",
+                view.allocation(),
+                view.is_mapped(),
+                view.is_drawable(),
+                view.is_loading(),
+                view.estimated_load_progress(),
+                view.parent().map(|parent| parent.allocation())
+            );
             let _ = webview.evaluate_script_with_callback(
                 "JSON.stringify({visibility:document.visibilityState,focus:document.hasFocus()})",
                 |result| eprintln!("Stream document visibility: {result}"),
@@ -770,6 +869,7 @@ fn playback_acknowledged(playing: bool, requested: Instant, state: &PlaybackStat
 impl Drop for StreamPlayer {
     fn drop(&mut self) {
         self.capture.cancel();
+        self.fullscreen.set_enabled(false);
         if let Some(preferences) = &self.preferences {
             preferences.close();
         }
@@ -882,7 +982,30 @@ fn valid_playback_query(url: &Url) -> bool {
         return true;
     }
     let pairs: Vec<_> = url.query_pairs().collect();
-    (pairs.len() == 2 || pairs.len() == 3)
+    let recording_count = pairs.iter().filter(|(key, _)| key == "recording").count();
+    let valid_recording = recording_count <= 1
+        && pairs
+            .iter()
+            .filter(|(key, _)| key == "recording")
+            .all(|(_, value)| match url.path().rsplit('/').next() {
+                Some("twitch") => {
+                    (1..=30).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
+                }
+                Some("youtube") => {
+                    value.len() == 11
+                        && value
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                }
+                _ => false,
+            });
+    if !valid_recording {
+        return false;
+    }
+    if recording_count == 1 && pairs.len() == 1 {
+        return true;
+    }
+    (pairs.len() == 2 + recording_count || pairs.len() == 3 + recording_count)
         && pairs.iter().filter(|(k, _)| k == "at").count() == 1
         && pairs.iter().filter(|(k, _)| k == "broadcast").count() == 1
         && pairs.iter().filter(|(k, _)| k == "paused").count() <= 1
@@ -903,6 +1026,7 @@ fn valid_playback_query(url: &Url) -> bool {
                         .is_ok_and(|s| s.is_finite() && (0.0..=604800.0).contains(&s))
             }
             "paused" => value == "1",
+            "recording" => true, // Provider-specific value and uniqueness checked above.
             "broadcast" => {
                 !value.is_empty()
                     && value.len() <= 30
@@ -1547,15 +1671,26 @@ mod tests {
                     String::from_utf8_lossy(&request[..count]).starts_with("GET /provider ");
                 let body = if provider {
                     let acknowledgement = if server_first.load(Ordering::Relaxed) {
-                        format!("localStorage.setItem('content-classification-labels-acknowledged',{});", serde_json::to_string(&expected).unwrap())
+                        format!(
+                            "localStorage.setItem('content-classification-labels-acknowledged',{});",
+                            serde_json::to_string(&expected).unwrap()
+                        )
                     } else {
                         String::new()
                     };
-                    format!("<!doctype html><script>{acknowledgement}parent.postMessage({{kind:'fixture-report',value:localStorage.getItem('content-classification-labels-acknowledged')}},'*');</script>")
+                    format!(
+                        "<!doctype html><script>{acknowledgement}parent.postMessage({{kind:'fixture-report',value:localStorage.getItem('content-classification-labels-acknowledged')}},'*');</script>"
+                    )
                 } else {
-                    format!("<!doctype html><script>addEventListener('message',e=>{{if(e.data.kind==='fixture-report')document.title=e.data.value||'missing'}})</script><iframe src='{provider_url}'></iframe>")
+                    format!(
+                        "<!doctype html><script>addEventListener('message',e=>{{if(e.data.kind==='fixture-report')document.title=e.data.value||'missing'}})</script><iframe src='{provider_url}'></iframe>"
+                    )
                 };
-                let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
             }
         });
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
@@ -1608,7 +1743,9 @@ mod tests {
                 ready_since: None,
                 pending_seek: None,
                 pending_playback: None,
+                command_retried: false,
                 capture: capture::Controller::default(),
+                fullscreen: fullscreen::Controller::new(&egui::Context::default()),
                 preferences: Some(bridge),
                 preference_handler: Some(handler),
             };
@@ -1661,7 +1798,10 @@ mod tests {
                 !children.iter().any(|pid| process_is_running(*pid)),
                 "cycle {cycle} retained its owned WebKit processes: {children:?}"
             );
-            eprintln!("Native preference cycle {cycle}: original expiry restored; widget/context and all {} owned WebKit processes released", children.len());
+            eprintln!(
+                "Native preference cycle {cycle}: original expiry restored; widget/context and all {} owned WebKit processes released",
+                children.len()
+            );
         }
         window.close();
         stopped.store(true, Ordering::Relaxed);
@@ -1670,7 +1810,7 @@ mod tests {
 
     #[test]
     fn load_timeout_does_not_interrupt_a_loaded_player() {
-        let player = StreamPlayer {
+        let mut player = StreamPlayer {
             webview: None,
             allowed_url: Arc::new(Mutex::new(String::new())),
             preferences: None,
@@ -1681,7 +1821,9 @@ mod tests {
             ready_since: None,
             pending_seek: None,
             pending_playback: None,
+            command_retried: false,
             capture: capture::Controller::default(),
+            fullscreen: fullscreen::Controller::new(&egui::Context::default()),
             #[cfg(target_os = "linux")]
             preference_handler: None,
             bounds: [0; 4],
@@ -1693,6 +1835,44 @@ mod tests {
         assert!(player.failure().unwrap().contains("too long"));
         player.loaded.store(true, Ordering::Relaxed);
         assert!(player.failure().is_none());
+        {
+            let mut state = player.playback_state.lock().unwrap();
+            state.ready = true;
+            state.seconds = 123.5;
+            state.mark_polled_now();
+        }
+        let requested = Instant::now() - COMMAND_RETRY_AFTER;
+        player.pending_seek = Some((300.0, false, requested));
+        player.pending_playback = Some((false, requested));
+        player.visible.set(false);
+        assert!(player.recover_pending_command().is_none());
+        player.visible.set(true);
+        player.playback_state.lock().unwrap().buffering = true;
+        assert!(player.recover_pending_command().is_none());
+        player.playback_state.lock().unwrap().buffering = false;
+        assert!(matches!(
+            player.recover_pending_command(),
+            Some(PlaybackCommand::SeekPaused(300.0))
+        ));
+        assert!(
+            player.recover_pending_command().is_none(),
+            "Only one automatic retry"
+        );
+        let expired = Instant::now() - COMMAND_TIMEOUT;
+        player.pending_seek = Some((300.0, false, expired));
+        player.pending_playback = Some((false, expired));
+        assert!(
+            player.failure().is_none(),
+            "A loaded player must not be discarded"
+        );
+        assert!(player.recover_pending_command().is_none());
+        assert!(player.pending_seek.is_none());
+        assert!(player.pending_playback.is_none());
+        assert_eq!(
+            player.playback_state().seconds,
+            123.5,
+            "Never fabricate a successful seek"
+        );
         *player.failure.lock().unwrap() =
             Some("The stream player stopped unexpectedly.".to_string());
         assert!(player.failure().unwrap().contains("stopped unexpectedly"));
@@ -1777,6 +1957,45 @@ mod tests {
                 "{query}"
             );
         }
+    }
+
+    #[test]
+    fn saved_recording_navigation_rejects_duplicate_foreign_and_incomplete_queries() {
+        let base = "https://brick.example";
+        for (provider, recording) in [("twitch", "123456789"), ("youtube", "abcDEF_12-3")] {
+            let path = format!("{base}/v1/streams/player/12345/{provider}");
+            for query in [
+                format!("recording={recording}"),
+                format!("recording={recording}&at=32.875&broadcast=example&paused=1"),
+            ] {
+                assert!(validate_player_address(&format!("{path}?{query}"), base).is_ok());
+            }
+            for query in [
+                format!("recording={recording}&recording={recording}"),
+                format!("recording={recording}&at=0"),
+                format!("recording={recording}&broadcast=example"),
+                format!("recording={recording}&paused=1"),
+                format!("recording={recording}&at=0&broadcast=example&token=secret"),
+                "recording=https%3A%2F%2Fyoutube.com".into(),
+                "recording=..%2Fsecret".into(),
+                "recording=".into(),
+            ] {
+                assert!(
+                    validate_player_address(&format!("{path}?{query}"), base).is_err(),
+                    "{query}"
+                );
+            }
+        }
+        assert!(validate_player_address(
+            &format!("{base}/v1/streams/player/12345/twitch?recording=abcDEF_12-3"),
+            base
+        )
+        .is_err());
+        assert!(validate_player_address(
+            &format!("{base}/v1/streams/player/12345/youtube?recording=123"),
+            base
+        )
+        .is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createReplayService, createLogsHandoff, videoDuration } from "./stream_review.mjs";
+import { createReplayService, createRecordingReplayService, createLogsHandoff, videoDuration, youtubeDuration } from "./stream_review.mjs";
 import { streamPlayerPage } from "./streams.mjs";
 
 test("late discovery uses the original broadcast and only its exact archive", async () => {
@@ -81,4 +81,64 @@ test("replay embeds address the VOD and selected timestamp instead of the live c
   assert.match(pausedYoutube, /data-start="19800.875"/);
   const pausedTwitch = streamPlayerPage({ provider: "twitch", channelId: "alice" }, origin, { videoId: "12345", seconds: 19800.875, paused: true });
   assert.match(pausedTwitch, /autoplay=false/); assert.match(pausedTwitch, /time=19800.875s/);
+});
+
+test("saved YouTube uses the exact video's media duration after the channel goes offline", async () => {
+  let calls = 0;
+  const record = { provider: "youtube", id: "abcDEF_12-3", startedAt: "2026-09-08T12:00:00Z" };
+  const replay = createRecordingReplayService({ now: () => Date.parse("2026-09-09T12:00:00Z"),
+    twitchRequest: () => assert.fail(), youtubeRequest: async id => {
+      calls++; assert.equal(id, record.id);
+      return { items: [{ id, status: { embeddable: true, privacyStatus: "public" }, contentDetails: { duration: "PT3H9M37.483S" },
+        liveStreamingDetails: { actualStartTime: record.startedAt, actualEndTime: "2026-09-08T16:00:00Z" } }] };
+    } });
+  const results = await Promise.all(Array.from({ length: 12 }, () => replay(record)));
+  assert.equal(calls, 1);
+  assert.equal(results[0].availableSeconds, 11377);
+  assert.equal(results[0].videoId, record.id);
+  assert.equal(Date.parse(results[0].startedAt), Date.parse(record.startedAt));
+  for (const invalid of [null, "PT", "P", "PT0S", "PT999999H", "PT1Ssecret", "PT-1S"]) assert.equal(youtubeDuration(invalid), null);
+  assert.equal(youtubeDuration("P1DT1H"), 90000);
+});
+
+test("saved Twitch validates broadcast ownership and never treats archive creation as broadcast start", async () => {
+  const record = { provider: "twitch", id: "900", broadcastId: "123", twitchUserId: "42", startedAt: "2026-09-08T08:00:00Z" };
+  const replay = createRecordingReplayService({ now: () => Date.parse("2026-09-09T12:00:00Z"),
+    youtubeRequest: () => assert.fail(), twitchRequest: async route => {
+      assert.equal(route, "/videos?id=900");
+      return { data: [{ id: "900", stream_id: "123", user_id: "42", type: "archive", duration: "12h40m43s", created_at: "2026-09-08T08:00:05Z" }] };
+    } });
+  assert.equal((await replay(record)).startedAt, "2026-09-08T08:00:00.000Z");
+  assert.equal((await replay(record)).availableSeconds, 45643);
+  await assert.rejects(replay({ ...record, broadcastId: "124" }), { status: 410 });
+  await assert.rejects(replay({ ...record, twitchUserId: "43" }), { status: 410 });
+  await assert.rejects(replay({ ...record, startedAt: undefined }), { status: 409 });
+});
+
+test("saved replay rejects missing, private and disabled videos without exposing provider errors", async () => {
+  for (const items of [[], [{ id: "abcDEF_12-3" }], [{ id: "abcDEF_12-3", status: { privacyStatus: "private" } }], [{ id: "abcDEF_12-3", status: { embeddable: false } }]]) {
+    const replay = createRecordingReplayService({ youtubeRequest: async () => ({ items }) });
+    await assert.rejects(replay({ provider: "youtube", id: "abcDEF_12-3" }), { status: 410 });
+  }
+  const replay = createRecordingReplayService({ youtubeRequest: async () => { throw new Error("private key in upstream URL"); } });
+  await assert.rejects(replay({ provider: "youtube", id: "abcDEF_12-3" }), error => error.status === 502 && !error.message.includes("private"));
+});
+
+test("saved recording metadata limits concurrent provider work and coalesces duplicate requests", async () => {
+  const releases = [];
+  let calls = 0;
+  const replay = createRecordingReplayService({ youtubeRequest: () => {
+    calls++;
+    return new Promise(resolve => releases.push(() => resolve({ items: [] })));
+  } });
+  const records = Array.from({ length: 4 }, (_, index) => ({ provider: "youtube", id: String(index).padStart(11, "0") }));
+  const requests = records.slice(0, 3).map(record => assert.rejects(replay(record), { status: 410 }));
+  requests.push(assert.rejects(replay(records[0]), { status: 410 }));
+  await assert.rejects(replay(records[3]), { status: 503 });
+  assert.equal(calls, 3);
+  releases.forEach(release => release());
+  await Promise.all(requests);
+  const next = assert.rejects(replay(records[3]), { status: 410 });
+  releases[3]();
+  await next;
 });

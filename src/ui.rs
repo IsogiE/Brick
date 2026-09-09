@@ -1592,6 +1592,11 @@ impl eframe::App for BrickApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let fullscreen = self.auth_state.is_authorized()
+            && self.window_visible
+            && self.active_tab == MainTab::Streams
+            && !self.confirm_logout
+            && self.streams.fullscreen();
         let reviewing = self.review_workspace_open();
         let vertical_margin = if reviewing {
             12
@@ -1607,14 +1612,19 @@ impl eframe::App for BrickApp {
             .frame(
                 egui::Frame::NONE
                     .fill(app_background())
-                    .inner_margin(egui::Margin::symmetric(
-                        if reviewing { 20 } else { 28 },
-                        vertical_margin,
-                    )),
+                    .inner_margin(if fullscreen {
+                        egui::Margin::ZERO
+                    } else {
+                        egui::Margin::symmetric(if reviewing { 20 } else { 28 }, vertical_margin)
+                    }),
             )
             .show_inside(ui, |ui| {
                 ui.set_width(ui.available_width());
-                self.draw_content(ui);
+                if fullscreen {
+                    self.streams.draw_fullscreen(ui);
+                } else {
+                    self.draw_content(ui);
+                }
             });
         self.draw_logout_confirmation(&ctx);
         if self.streams.update_player(

@@ -1,6 +1,7 @@
 use crate::{
     defensives::DefensiveGroup,
     discord_auth,
+    replay_timing::DEFAULT_SECONDS,
     stream_player::{PlaybackCommand, PlaybackState},
     streams::{Status, Stream},
     warcraftlogs::{while_current, Client, EventKind, Pull, RaidEvent, Replay, Review},
@@ -18,6 +19,99 @@ use std::{
 const ACCENT: Color32 = Color32::from_rgb(244, 100, 56);
 const MUTED: Color32 = Color32::from_rgb(145, 155, 173);
 const DEATH: Color32 = Color32::from_rgb(237, 82, 93);
+
+static PEER_METADATA_RUNNING: AtomicBool = AtomicBool::new(false);
+struct PeerMetadataPermit;
+impl PeerMetadataPermit {
+    fn acquire() -> Option<Self> {
+        PEER_METADATA_RUNNING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self)
+    }
+}
+impl Drop for PeerMetadataPermit {
+    fn drop(&mut self) {
+        PEER_METADATA_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+// Shared by the primary view and its comparison peer. At most one local save
+// runs at once; repeated edits coalesce without retaining obsolete workers.
+#[derive(Clone)]
+struct TimingWrite {
+    replay: Replay,
+    pull: Pull,
+    seconds: i64,
+}
+impl TimingWrite {
+    fn same_context(&self, other: &Self) -> bool {
+        self.replay.provider == other.replay.provider
+            && self.replay.video_id == other.replay.video_id
+            && self.pull.report == other.pull.report
+    }
+}
+#[derive(Default)]
+struct TimingWrites {
+    pending: Vec<TimingWrite>,
+    running: Option<TimingWrite>,
+    latest: Vec<TimingWrite>,
+}
+impl TimingWrites {
+    fn enqueue(&mut self, write: TimingWrite) -> bool {
+        if let Some(old) = self.pending.iter_mut().find(|old| old.same_context(&write)) {
+            *old = write.clone();
+        } else if self.pending.len() < 64 {
+            self.pending.push(write.clone());
+        } else {
+            return false;
+        }
+        // A refresh captured before an edit must not restore its old mapping.
+        self.remember(write);
+        true
+    }
+    fn remember(&mut self, write: TimingWrite) {
+        if let Some(old) = self.latest.iter_mut().find(|old| old.same_context(&write)) {
+            *old = write;
+        } else {
+            if self.latest.len() == 64 {
+                self.latest.remove(0);
+            }
+            self.latest.push(write);
+        }
+    }
+    fn next(&self) -> Option<TimingWrite> {
+        self.running
+            .is_none()
+            .then(|| self.pending.first().cloned())
+            .flatten()
+    }
+    fn begin(&mut self, write: &TimingWrite) -> bool {
+        if self.running.is_some() {
+            return false;
+        }
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|queued| queued.same_context(write) && queued.seconds == write.seconds)
+        else {
+            return false;
+        };
+        self.running = Some(self.pending.remove(index));
+        true
+    }
+    fn apply_to(&self, review: &mut Review) {
+        for write in &self.latest {
+            if write.replay.provider == review.replay.provider
+                && write.replay.video_id == review.replay.video_id
+            {
+                review
+                    .timing
+                    .insert(write.pull.report.clone(), write.seconds);
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Playback {
@@ -40,7 +134,7 @@ enum Action {
 enum Data {
     Review(Review),
     Authentication,
-    Aligned(String, String, i64),
+    Aligned,
     Events(String, EventKind, Vec<RaidEvent>),
     Health(
         String,
@@ -53,6 +147,8 @@ type Outcome = (u64, String, Result<Data, String>, bool);
 
 #[derive(Default)]
 pub struct WorkspaceAction {
+    pub compare: bool,
+    pub close_comparison: bool,
     pub rect: Option<egui::Rect>,
     pub reload: bool,
     pub command: Option<PlaybackCommand>,
@@ -61,6 +157,8 @@ pub struct WorkspaceAction {
 
 pub struct ReviewUi {
     client: Arc<Mutex<Option<Client>>>,
+    timing_writes: Arc<Mutex<TimingWrites>>,
+    metadata_only: bool,
     work: Option<mpsc::Receiver<Outcome>>,
     work_action: Option<Action>,
     cancel: Arc<AtomicBool>,
@@ -68,9 +166,12 @@ pub struct ReviewUi {
     key: String,
     last_attempt: Option<Instant>,
     review: Option<Review>,
+    replay_coverage: Option<(i64, i64)>,
     notice: Option<String>,
     connected: bool,
     active: bool,
+    comparing: bool,
+    open_first_pull: bool,
     popup_open: bool,
     signing_in: bool,
     playback: Option<Playback>,
@@ -83,7 +184,6 @@ pub struct ReviewUi {
     selected_event: Option<(i64, String)>,
     scroll_to_event: bool,
     aligning: bool,
-    alignment_save: Option<i64>,
     event_notice: Option<String>,
     search: String,
     scrub: Option<f64>,
@@ -108,6 +208,8 @@ impl Default for ReviewUi {
     fn default() -> Self {
         Self {
             client: Arc::new(Mutex::new(None)),
+            timing_writes: Arc::new(Mutex::new(TimingWrites::default())),
+            metadata_only: false,
             work: None,
             work_action: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -115,9 +217,12 @@ impl Default for ReviewUi {
             key: String::new(),
             last_attempt: None,
             review: None,
+            replay_coverage: None,
             notice: None,
             connected: false,
             active: false,
+            comparing: false,
+            open_first_pull: false,
             popup_open: false,
             signing_in: false,
             playback: None,
@@ -130,7 +235,6 @@ impl Default for ReviewUi {
             selected_event: None,
             scroll_to_event: false,
             aligning: false,
-            alignment_save: None,
             event_notice: None,
             search: String::new(),
             scrub: None,
@@ -154,7 +258,9 @@ impl Default for ReviewUi {
 }
 impl Drop for ReviewUi {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        if !matches!(self.work_action, Some(Action::Align(..))) {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 impl ReviewUi {
@@ -166,6 +272,203 @@ impl ReviewUi {
     }
     pub fn playback(&self) -> Option<&Playback> {
         self.playback.as_ref()
+    }
+
+    pub(crate) fn metadata_peer(&self) -> Self {
+        let mut peer = Self::default();
+        peer.client = self.client.clone();
+        peer.timing_writes = self.timing_writes.clone();
+        peer.metadata_only = true;
+        peer
+    }
+
+    pub(crate) fn comparison_notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    pub(crate) fn comparison_metadata(&self) -> Option<&Review> {
+        self.review.as_ref()
+    }
+
+    pub(crate) fn comparison_context(&self) -> Option<(&Review, &Pull)> {
+        if !self.active || self.pending_focus.is_some() {
+            return None;
+        }
+        let review = self.review.as_ref()?;
+        let playback = self.playback.as_ref()?;
+        (playback.broadcast_id == review.replay.broadcast_id)
+            .then_some((review, self.pull.as_ref()?))
+    }
+
+    pub(crate) fn comparison_position(&self, state: &PlaybackState) -> Option<(i64, bool)> {
+        let (review, pull) = self.comparison_context()?;
+        let seconds = self
+            .confirmed_video_position(state)
+            .or_else(|| {
+                state
+                    .is_fresh_since(self.range_epoch)
+                    .then_some(state.seeking)
+                    .flatten()
+            })
+            .or_else(|| self.playback.as_ref().map(|p| p.seconds))?;
+        Some((
+            encounter_moment(review, pull, seconds),
+            playback_intent(state, self.playback.as_ref()),
+        ))
+    }
+
+    pub(crate) fn pov_covers_moment(&self, candidate: &Stream, pull: &Pull, at_ms: i64) -> bool {
+        let video_id = candidate.recording_id.as_deref().or_else(|| {
+            (candidate.provider == crate::streams::Provider::Youtube)
+                .then_some(candidate.channel_id.as_str())
+        });
+        let known = self.review.as_ref().filter(|review| {
+            review.replay.provider == candidate.provider
+                && (pov_key(candidate) == self.key
+                    || video_id == Some(review.replay.video_id.as_str()))
+        });
+        // RFC3339 decoding happens once when metadata arrives, never while
+        // painting or filtering the candidate list.
+        let range = known
+            .and(self.replay_coverage)
+            .or_else(|| candidate.replay_range());
+        let Some(range) = range else {
+            return false;
+        };
+        let mut correction = known
+            .and_then(|review| review.timing.get(&pull.report))
+            .copied()
+            .unwrap_or(DEFAULT_SECONDS);
+        if let (Some(video_id), Ok(writes)) = (video_id, self.timing_writes.lock()) {
+            if let Some(write) = writes.latest.iter().find(|write| {
+                write.replay.provider == candidate.provider
+                    && write.replay.video_id == video_id
+                    && write.pull.report == pull.report
+            }) {
+                correction = write.seconds;
+            }
+        }
+        recording_covers_moment(range, pull.start_ms, at_ms, correction)
+    }
+
+    pub(crate) fn pov_selection_context(&self, state: &PlaybackState) -> Option<(&Pull, i64)> {
+        if let Some((pull, at_ms, _)) = &self.pending_focus {
+            return Some((pull, *at_ms));
+        }
+        Some((self.pull.as_ref()?, self.comparison_position(state)?.0))
+    }
+
+    pub(crate) fn video_timing(&self, report: &str) -> i64 {
+        self.review
+            .as_ref()
+            .and_then(|review| review.timing.get(report))
+            .copied()
+            .unwrap_or(DEFAULT_SECONDS)
+    }
+
+    fn set_video_timing(&mut self, pull: &Pull, seconds: i64) -> bool {
+        if !(-600..=600).contains(&seconds) || self.video_timing(&pull.report) == seconds {
+            return false;
+        }
+        let Some(review) = self.review.as_mut() else {
+            return false;
+        };
+        if !review
+            .pulls
+            .iter()
+            .any(|item| item.report == pull.report && item.id == pull.id)
+        {
+            return false;
+        }
+        let write = TimingWrite {
+            replay: review.replay.clone(),
+            pull: pull.clone(),
+            seconds,
+        };
+        if !self
+            .timing_writes
+            .lock()
+            .is_ok_and(|mut writes| writes.enqueue(write))
+        {
+            self.notice = Some("Video timing is busy. Try again in a moment.".into());
+            return false;
+        }
+        review.timing.insert(pull.report.clone(), seconds);
+        self.notice = None;
+        true
+    }
+
+    /// A metadata peer supplies its matching pull explicitly; it need not open
+    /// another workspace or issue player commands to save its own correction.
+    pub(crate) fn draw_video_timing(&mut self, ui: &mut egui::Ui, pull: &Pull) -> bool {
+        let seconds = self.video_timing(&pull.report);
+        video_timing_control(ui, seconds, self.review.is_some())
+            .is_some_and(|seconds| self.set_video_timing(pull, seconds))
+    }
+
+    fn adjust_video_timing(
+        &mut self,
+        pull: &Pull,
+        seconds: i64,
+        at_ms: i64,
+        autoplay: bool,
+    ) -> Option<PlaybackCommand> {
+        let replay = &self.review.as_ref()?.replay;
+        let target = (at_ms - replay.start_ms().ok()?) as f64 / 1000.0 + seconds as f64;
+        if !(0.0..replay.available_seconds as f64).contains(&target) {
+            self.notice = Some("That timing would move this moment outside the recording.".into());
+            return None;
+        }
+        self.playback.as_ref()?;
+        if !self.set_video_timing(pull, seconds) {
+            return None;
+        }
+        self.seek_absolute_with_playback(at_ms, autoplay)
+    }
+
+    pub(crate) fn set_recording_labels(&mut self, labels: RecordingLabels) {
+        self.pov_menu.labels = labels;
+    }
+
+    pub(crate) fn set_comparing(&mut self, comparing: bool) {
+        self.comparing = comparing;
+    }
+
+    pub(crate) fn open_recording(&mut self) {
+        self.cancel_read();
+        self.clear_health();
+        self.review = None;
+        self.replay_coverage = None;
+        self.pull = None;
+        self.playback = None;
+        self.pending_focus = None;
+        self.events.clear();
+        self.requested_events.clear();
+        self.loaded_events.clear();
+        self.selected_event = None;
+        self.notice = None;
+        self.last_attempt = None;
+        self.popup_open = false;
+        self.aligning = false;
+        self.active = true;
+        self.open_first_pull = true;
+    }
+
+    pub(crate) fn report_span(&self) -> Option<(i64, i64)> {
+        let Some(review) = self.review.as_ref() else {
+            return self
+                .pending_focus
+                .as_ref()
+                .map(|(pull, _, _)| (pull.start_ms, pull.end_ms));
+        };
+        let report = &self.pull.as_ref().or(review.pulls.first())?.report;
+        let mut pulls = review.pulls.iter().filter(|pull| &pull.report == report);
+        let first = pulls.next()?;
+        Some(
+            pulls.fold((first.start_ms, first.end_ms), |(start, end), pull| {
+                (start.min(pull.start_ms), end.max(pull.end_ms))
+            }),
+        )
     }
 
     pub(crate) fn observation_context(&self) -> Option<(&Replay, &Pull)> {
@@ -289,15 +592,14 @@ impl ReviewUi {
     }
 
     pub fn tick(&mut self, ctx: &egui::Context, stream: Option<&Stream>) -> bool {
-        let key = stream
-            .map(|s| format!("{}:{}:{}", s.user_id, s.provider.key(), s.channel_id))
-            .unwrap_or_default();
+        let key = stream.map(pov_key).unwrap_or_default();
         let mut changed = false;
         if self.key != key {
             self.cancel_read();
             self.clear_health();
             self.key = key;
             self.review = None;
+            self.replay_coverage = None;
             self.notice = None;
             self.last_attempt = None;
             self.playback = None;
@@ -309,6 +611,7 @@ impl ReviewUi {
             self.popup_open = false;
             if stream.is_none() {
                 self.active = false;
+                self.open_first_pull = false;
                 self.pending_focus = None;
             }
             changed = true;
@@ -331,27 +634,23 @@ impl ReviewUi {
                         && key == self.key
                         && !self.cancel.load(Ordering::Relaxed)
                     {
-                        self.connected = connected;
+                        let local_save = matches!(action, Some(Action::Align(..)));
+                        if !local_save {
+                            self.connected = connected;
+                        }
                         match result {
                             Ok(Data::Review(review)) => {
                                 changed |= self.accept_review(review);
                                 changed |= self.restore_pov_position();
                             }
-                            Ok(Data::Aligned(broadcast, report, seconds)) => {
-                                if let Some(review) = self
-                                    .review
-                                    .as_mut()
-                                    .filter(|r| r.replay.broadcast_id == broadcast)
-                                {
-                                    review.timing.insert(report, seconds);
-                                }
-                                self.reset_playback_range();
-                                self.aligning = false;
-                                self.notice = None;
+                            Ok(Data::Aligned) => {
+                                // The visible mapping changes with the user's edit.
+                                // An older save completion must never roll it back.
                             }
                             Ok(Data::Authentication) => {
                                 self.clear_health();
                                 self.review = None;
+                                self.replay_coverage = None;
                                 self.pull = None;
                                 self.events.clear();
                                 self.requested_events.clear();
@@ -415,14 +714,17 @@ impl ReviewUi {
                                     {
                                         self.event_notice = Some(error);
                                     }
+                                } else if matches!(action, Some(Action::Align(..))) {
+                                    self.notice = Some("Video timing changed for this session, but could not be saved.".into());
                                 } else {
                                     self.notice = Some(error);
                                 }
                             }
                         }
-                        if !connected {
+                        if !connected && !local_save {
                             self.clear_health();
                             self.review = None;
+                            self.replay_coverage = None;
                             self.pull = None;
                             self.events.clear();
                             self.requested_events.clear();
@@ -445,8 +747,8 @@ impl ReviewUi {
                 Err(mpsc::TryRecvError::Empty) => (),
             }
         }
-        if let Some(stream) = stream {
-            if let Some(action) = self.next_action() {
+        if let Some(action) = self.next_action() {
+            if stream.is_some() || matches!(action, Action::Align(..)) {
                 self.start(ctx, stream, action);
             }
         }
@@ -489,6 +791,14 @@ impl ReviewUi {
         if self.work.is_some() {
             return None;
         }
+        if let Some(write) = self
+            .timing_writes
+            .lock()
+            .ok()
+            .and_then(|writes| writes.next())
+        {
+            return Some(Action::Align(write.replay, write.pull, write.seconds));
+        }
         let missing = [EventKind::Deaths, EventKind::Defensives]
             .into_iter()
             .find(|kind| !self.requested_events.contains(kind));
@@ -520,7 +830,19 @@ impl ReviewUi {
         }
     }
 
-    fn accept_review(&mut self, review: Review) -> bool {
+    fn accept_review(&mut self, mut review: Review) -> bool {
+        self.replay_coverage = review.replay.start_ms().ok().and_then(|start| {
+            start
+                .checked_add(
+                    i64::try_from(review.replay.available_seconds)
+                        .ok()?
+                        .checked_mul(1000)?,
+                )
+                .map(|end| (start, end))
+        });
+        if let Ok(writes) = self.timing_writes.lock() {
+            writes.apply_to(&mut review);
+        }
         let broadcast_changed = self
             .playback
             .as_ref()
@@ -563,15 +885,50 @@ impl ReviewUi {
         }
         self.review = Some(review);
         self.notice = unavailable.then(|| "This pull is no longer available.".into());
-        broadcast_changed || unavailable
+        let first = self
+            .open_first_pull
+            .then(|| self.review.as_ref()?.pulls.first().cloned())
+            .flatten();
+        let opened = first.is_some();
+        if let Some(pull) = first {
+            self.select(pull);
+            self.open_first_pull = false;
+        }
+        broadcast_changed || unavailable || opened
     }
 
-    fn start(&mut self, ctx: &egui::Context, stream: &Stream, action: Action) {
+    fn start(&mut self, ctx: &egui::Context, stream: Option<&Stream>, action: Action) {
         if self.work.is_some() {
             return;
         }
+        let peer_permit = if self.metadata_only {
+            let Some(permit) = PeerMetadataPermit::acquire() else {
+                return;
+            };
+            Some(permit)
+        } else {
+            None
+        };
+        let local_write = if let Action::Align(replay, pull, seconds) = &action {
+            let write = TimingWrite {
+                replay: replay.clone(),
+                pull: pull.clone(),
+                seconds: *seconds,
+            };
+            if !self
+                .timing_writes
+                .lock()
+                .is_ok_and(|mut writes| writes.begin(&write))
+            {
+                return;
+            }
+            Some(write)
+        } else {
+            None
+        };
+        let timing_writes = self.timing_writes.clone();
         let client = self.client.clone();
-        let stream = stream.clone();
+        let stream = stream.cloned();
         let ctx = ctx.clone();
         let key = self.key.clone();
         self.generation = self.generation.wrapping_add(1);
@@ -596,12 +953,30 @@ impl ReviewUi {
         }
         self.signing_in = matches!(action, Action::Connect);
         thread::spawn(move || {
+            let _peer_permit = peer_permit;
             let mut connected = false;
             let result = (|| {
+                if let Some(write) = &local_write {
+                    // This preference is local. Saving it does not require a
+                    // network refresh and must survive closing a comparison.
+                    let mut lock = client.lock().map_err(|_| "Video timing is unavailable.")?;
+                    if lock.is_none() {
+                        *lock = Some(Client::new()?);
+                    }
+                    lock.as_mut().unwrap().align_video(
+                        &write.replay,
+                        &write.pull,
+                        write.seconds,
+                    )?;
+                    return Ok(Data::Aligned);
+                }
                 let token =
                     while_current(&cancel, discord_auth::current_or_refreshed_access_token)??
                         .ok_or("Sign in to Discord again.")?;
                 let mut lock = client.lock().map_err(|_| "Warcraft Logs is unavailable.")?;
+                // A metadata peer may have closed while waiting for the primary
+                // request. No cancelled peer may initialize or use the client.
+                while_current(&cancel, || ())?;
                 if lock.is_none() {
                     *lock = Some(Client::new()?);
                 }
@@ -612,10 +987,12 @@ impl ReviewUi {
                         .login(&token, &ctx, &cancel)
                         .map(|_| Data::Authentication),
                     Action::Disconnect => client.disconnect(&token).map(|_| Data::Authentication),
-                    Action::Refresh => client.review(&token, &stream).map(Data::Review),
+                    Action::Refresh => client
+                        .review(&token, stream.as_ref().ok_or("Choose a recording first.")?)
+                        .map(Data::Review),
                     Action::Align(replay, pull, seconds) => client
                         .align_video(&replay, &pull, seconds)
-                        .map(|_| Data::Aligned(replay.broadcast_id, pull.report, seconds)),
+                        .map(|_| Data::Aligned),
                     Action::Events(pull, kind) => client
                         .events(&token, &pull, kind)
                         .map(|events| Data::Events(pull_key(&pull), kind, events)),
@@ -629,6 +1006,11 @@ impl ReviewUi {
                 connected = client.connected();
                 result
             })();
+            if local_write.is_some() {
+                if let Ok(mut writes) = timing_writes.lock() {
+                    writes.running = None;
+                }
+            }
             let _ = tx.send((generation, key, result, connected));
             ctx.request_repaint();
         });
@@ -682,7 +1064,7 @@ impl ReviewUi {
             .as_ref()
             .and_then(|pull| review.timing.get(&pull.report))
             .copied()
-            .unwrap_or(0);
+            .unwrap_or(DEFAULT_SECONDS);
         let seconds = (at_ms - start) as f64 / 1000.0 + correction as f64;
         if !seconds.is_finite()
             || seconds < 0.0
@@ -730,7 +1112,7 @@ impl ReviewUi {
                         )
                         .clicked()
                     {
-                        self.start(ui.ctx(), stream, Action::Disconnect);
+                        self.start(ui.ctx(), Some(stream), Action::Disconnect);
                         ui.close();
                     }
                 });
@@ -745,7 +1127,7 @@ impl ReviewUi {
                 .clicked()
             {
                 self.notice = None;
-                self.start(ui.ctx(), stream, Action::Connect);
+                self.start(ui.ctx(), Some(stream), Action::Connect);
             }
         });
         if let Some(notice) = &self.notice {
@@ -762,12 +1144,19 @@ impl ReviewUi {
         povs: &[Stream],
         state: &PlaybackState,
         player_error: Option<&str>,
+        mut comparison: Option<&mut crate::review_compare_ui::Comparison>,
     ) -> WorkspaceAction {
         let mut action = WorkspaceAction::default();
         ui.visuals_mut().selection.bg_fill = Color32::from_rgb(113, 52, 33);
         ui.visuals_mut().selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
         ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::from_rgb(30, 34, 42);
         ui.visuals_mut().widgets.inactive.bg_fill = Color32::from_rgb(30, 34, 42);
+
+        if !self.connected {
+            ui.label("Connect Warcraft Logs to find this recording's raid pulls.");
+            self.draw(ui, stream);
+            ui.add_space(8.0);
+        }
 
         let pulls = self
             .review
@@ -824,18 +1213,13 @@ impl ReviewUi {
                     selected = index.map(|i| i + 1);
                 }
                 if let Some(pull) = &self.pull {
-                    let badge = if pull.kill {
-                        "Kill".into()
-                    } else {
-                        pull.remaining
-                            .map(|n| format!("Wipe · {n:.1}% remaining"))
-                            .unwrap_or_else(|| "Wipe".into())
-                    };
-                    ui.label(RichText::new(badge).color(if pull.kill {
-                        Color32::from_rgb(71, 208, 129)
-                    } else {
-                        DEATH
-                    }));
+                    if !pull.kill {
+                        if let Some(remaining) = pull.remaining {
+                            ui.label(
+                                RichText::new(format!("{remaining:.1}% remaining")).color(DEATH),
+                            );
+                        }
+                    }
                     ui.label(
                         RichText::new(clock((pull.end_ms - pull.start_ms) as f64 / 1000.0))
                             .color(MUTED),
@@ -843,16 +1227,6 @@ impl ReviewUi {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let menu = ui.menu_button("…", |ui| {
-                        if ui
-                            .add_enabled(
-                                state.ready && self.work.is_none(),
-                                egui::Button::new("Align video…"),
-                            )
-                            .clicked()
-                        {
-                            self.aligning = true;
-                            ui.close();
-                        }
                         if let Some(pull) = &self.pull {
                             ui.hyperlink_to("Open this pull in Warcraft Logs", pull.log_url());
                         }
@@ -871,7 +1245,14 @@ impl ReviewUi {
                         }
                     });
                     self.popup_open |= menu.inner.is_some();
-                    if ui.button("Back to streams").clicked() {
+                    if ui
+                        .button(if stream.recording_id.is_some() {
+                            "Back to recordings"
+                        } else {
+                            "Back to streams"
+                        })
+                        .clicked()
+                    {
                         leave = true;
                     }
                 });
@@ -887,7 +1268,32 @@ impl ReviewUi {
                 .as_ref()
                 .map(|p| PlaybackCommand::Seek(p.seconds));
         }
+        let coverage_context = self.pov_selection_context(state).map(|(pull, at_ms)| {
+            let at_ms = if action.command.is_some() {
+                at_ms
+            } else {
+                comparison
+                    .as_deref()
+                    .map_or(at_ms, |peer| peer.position().0)
+            };
+            (pull.clone(), at_ms)
+        });
+        let covered: Vec<bool> = povs
+            .iter()
+            .map(|candidate| {
+                coverage_context
+                    .as_ref()
+                    .is_some_and(|(pull, at_ms)| self.pov_covers_moment(candidate, pull, *at_ms))
+            })
+            .collect();
+        let available: Vec<usize> = covered
+            .iter()
+            .enumerate()
+            .filter_map(|(index, covered)| covered.then_some(index))
+            .collect();
+        self.pov_menu.covered = Some(covered);
         ui.add_space(5.0);
+        let mut comparison_x = None;
         ui.scope(|ui| {
             ui.spacing_mut().interact_size.y = 32.0;
             ui.horizontal(|ui| {
@@ -896,17 +1302,56 @@ impl ReviewUi {
                     self.capture_pov_position(state);
                     action.stream = Some(povs[index].clone());
                 }
-                ui.label(
-                    RichText::new(format!(
-                        "{} stream{}",
-                        povs.len(),
-                        if povs.len() == 1 { "" } else { "s" }
-                    ))
-                    .small()
-                    .color(MUTED),
-                );
+
+                if let Some(comparison) = comparison.as_deref_mut() {
+                    comparison_x = Some(ui.next_widget_position().x);
+                    action.close_comparison =
+                        comparison.draw_inline(ui, povs, stream, &self.pov_menu.labels, &available);
+                }
+                if !self.comparing
+                    && ui
+                        .add_enabled(
+                            self.comparison_context().is_some()
+                                && available.iter().any(|index| {
+                                    let candidate = &povs[*index];
+                                    pov_key(candidate) != pov_key(stream)
+                                        && (candidate.recording_id.is_some()
+                                            || candidate.status == Status::Live)
+                                }),
+                            egui::Button::new("Compare POVs"),
+                        )
+                        .clicked()
+                {
+                    action.compare = true;
+                }
             });
         });
+        if let Some(pull) = self.pull.clone() {
+            let position = comparison
+                .as_deref()
+                .map(|peer| peer.position())
+                .or_else(|| self.comparison_position(state));
+            let seconds = self.video_timing(&pull.report);
+            ui.horizontal(|ui| {
+                ui.push_id("primary-video-timing", |ui| {
+                    if let Some(seconds) = video_timing_control(ui, seconds, position.is_some()) {
+                        if let Some((at_ms, autoplay)) = position {
+                            if let Some(command) =
+                                self.adjust_video_timing(&pull, seconds, at_ms, autoplay)
+                            {
+                                action.command = Some(command);
+                            }
+                        }
+                    }
+                });
+                if let Some(comparison) = comparison.as_deref_mut() {
+                    if let Some(x) = comparison_x {
+                        ui.add_space((x - ui.next_widget_position().x).max(0.0));
+                    }
+                    comparison.draw_video_timing(ui, &pull);
+                }
+            });
+        }
         self.popup_open = egui::Popup::is_any_open(ui.ctx());
         ui.add_space(7.0);
         if let Some(notice) = &self.notice {
@@ -915,12 +1360,14 @@ impl ReviewUi {
         // Allocate the workspace once. A long player/ability name must never push
         // the media child or controls beyond the native window's bounds.
         let (workspace, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
-        let rail_width = if workspace.width() >= 1100.0 {
+        let rail_width = if self.comparing {
+            0.0
+        } else if workspace.width() >= 1100.0 {
             270.0
         } else {
             235.0
         };
-        let gap = 14.0;
+        let gap = if self.comparing { 0.0 } else { 14.0 };
         let left = egui::Rect::from_min_max(
             workspace.min,
             egui::pos2(workspace.right() - rail_width - gap, workspace.bottom()),
@@ -940,9 +1387,6 @@ impl ReviewUi {
                 ui.vertical_centered(|ui| {
                     ui.add_space((video.height() / 2.0 - 55.0).max(0.0));
                     ui.label(error);
-                    if ui.button("Retry player").clicked() {
-                        action.reload = true;
-                    }
                     if let Some(playback) = &self.playback {
                         ui.hyperlink_to("Open video in browser", &playback.public_url);
                     }
@@ -974,6 +1418,8 @@ impl ReviewUi {
                     .is_some_and(|review| review.pulls.is_empty())
                 {
                     "No raid pulls are available for this view"
+                } else if self.work.is_some() {
+                    "Finding raid pulls…"
                 } else {
                     "Choose a pull to watch"
                 },
@@ -994,25 +1440,20 @@ impl ReviewUi {
             egui::pos2(left.right() + gap, workspace.top()),
             workspace.max,
         );
-        ui.scope_builder(egui::UiBuilder::new().max_rect(rail), |ui| {
-            ui.set_clip_rect(rail.intersect(ui.clip_rect()));
-            if let Some(command) = self.draw_events(ui, rail.height()) {
-                action.command = Some(command);
-            }
-        });
-        if let Some(seconds) = self.alignment_save.take() {
-            if let (Some(review), Some(pull)) = (&self.review, &self.pull) {
-                self.start(
-                    ui.ctx(),
-                    stream,
-                    Action::Align(review.replay.clone(), pull.clone(), seconds),
-                );
-            }
+        if !self.comparing {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rail), |ui| {
+                ui.set_clip_rect(rail.intersect(ui.clip_rect()));
+                if let Some(command) = self.draw_events(ui, rail.height()) {
+                    action.command = Some(command);
+                }
+            });
         }
         if action.stream.is_some() {
+            self.open_first_pull = false;
             self.cancel_read();
             self.playback = None;
             self.review = None;
+            self.replay_coverage = None;
             self.pull = None;
             self.events.clear();
             self.requested_events.clear();
@@ -1022,6 +1463,7 @@ impl ReviewUi {
         if leave || disconnect {
             self.cancel_read();
             self.active = false;
+            self.open_first_pull = false;
             self.playback = None;
             self.pull = None;
             self.events.clear();
@@ -1032,7 +1474,7 @@ impl ReviewUi {
             self.popup_open = false;
             action.reload = true;
             if disconnect {
-                self.start(ui.ctx(), stream, Action::Disconnect);
+                self.start(ui.ctx(), Some(stream), Action::Disconnect);
             }
         }
         if let Some(playback) = &mut self.playback {
@@ -1161,6 +1603,8 @@ impl ReviewUi {
         }
         let playing = playback_intent(state, self.playback.as_ref());
         let replay = confirmed_position.is_some() && elapsed >= duration && !self.aligning;
+        let mut seek_range = None;
+        let label_gutter = ui.next_widget_position().x + 132.0;
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
@@ -1205,11 +1649,20 @@ impl ReviewUi {
                 .color(MUTED),
             );
             let mut position = self.scrub.unwrap_or(current);
+            ui.add_space((label_gutter - ui.next_widget_position().x).max(0.0));
             ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(60.0);
             let response = ui.add_enabled(
                 state.ready,
-                egui::Slider::new(&mut position, 0.0..=duration).show_value(false),
+                egui::Slider::new(&mut position, 0.0..=duration)
+                    .show_value(false)
+                    .handle_shape(egui::style::HandleShape::Circle)
+                    .smart_aim(false),
             );
+            // egui places a circular slider handle inside its allocation by
+            // height / 2.5. Use that same travel range for the event timeline,
+            // so its cursor and every clickable time line up with the thumb.
+            seek_range = Some(response.rect.x_range().shrink(response.rect.height() / 2.5));
+            response.widget_info(|| egui::WidgetInfo::slider(state.ready, position, "Pull time"));
             response.clone().on_hover_text("Seek within this pull");
             if response.dragged() {
                 self.scrub = Some(position);
@@ -1222,58 +1675,16 @@ impl ReviewUi {
                 );
             }
         });
-        if self.aligning {
-            ui.horizontal_wrapped(|ui| {
-                ui.small("Pause at the moment this pull begins.");
-                if ui
-                    .add_enabled(
-                        state.ready
-                            && !state.playing
-                            && !playback_intent(state, self.playback.as_ref())
-                            && state.seeking.is_none()
-                            && !state.buffering
-                            && state.is_fresh()
-                            && self.work.is_none(),
-                        egui::Button::new("Set pull start here"),
-                    )
-                    .clicked()
-                {
-                    let raw_start = (pull.start_ms
-                        - self
-                            .review
-                            .as_ref()
-                            .unwrap()
-                            .replay
-                            .start_ms()
-                            .unwrap_or(pull.start_ms)) as f64
-                        / 1000.0;
-                    let seconds = (state.seconds - raw_start).round() as i64;
-                    if (-600..=600).contains(&seconds) {
-                        self.alignment_save = Some(seconds);
-                    } else {
-                        self.notice = Some(
-                            "Move the video within 10 minutes of this pull's estimated start."
-                                .into(),
-                        );
-                    }
-                }
-                if ui
-                    .add_enabled(self.work.is_none(), egui::Button::new("Reset timing"))
-                    .clicked()
-                {
-                    self.alignment_save = Some(0);
-                }
-                if ui.small_button("Cancel").clicked() {
-                    self.aligning = false;
-                }
-            });
-        }
+
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), 135.0),
             egui::Sense::click(),
         );
-        let grid =
-            egui::Rect::from_min_max(egui::pos2(rect.left() + 132.0, rect.top() + 20.0), rect.max);
+        let seek_range = seek_range?;
+        let grid = egui::Rect::from_min_max(
+            egui::pos2(seek_range.min, rect.top() + 20.0),
+            egui::pos2(seek_range.max, rect.bottom()),
+        );
         let painter = ui.painter();
         for i in 0..=4 {
             let x = egui::lerp(grid.x_range(), i as f32 / 4.0);
@@ -1483,7 +1894,7 @@ impl ReviewUi {
             .then_some(state.seconds)
     }
 
-    fn pause_at_pull_end(&mut self, state: &PlaybackState) -> Option<PlaybackCommand> {
+    pub(crate) fn pause_at_pull_end(&mut self, state: &PlaybackState) -> Option<PlaybackCommand> {
         // A prior POV's sample, pending seek or stalled frame must never pause
         // the newly selected replay. Timestamp freshness uses SDK request start.
         if !self.active
@@ -1693,23 +2104,75 @@ Click to watch this moment",
         chosen.and_then(|event| self.watch_event(event))
     }
 }
+#[derive(Clone)]
+pub(crate) struct RecordingLabel {
+    pub when: String,
+    pub title: String,
+}
+pub(crate) type RecordingLabels = std::collections::HashMap<String, RecordingLabel>;
+pub(crate) fn recording_label<'a>(
+    labels: &'a RecordingLabels,
+    stream: &Stream,
+) -> Option<&'a RecordingLabel> {
+    let id = stream.recording_id.as_deref().or_else(|| {
+        (stream.provider == crate::streams::Provider::Youtube).then_some(stream.channel_id.as_str())
+    })?;
+    labels.get(&format!("{}:{id}", stream.provider.key()))
+}
+pub(crate) fn pov_display_label(labels: &RecordingLabels, stream: &Stream) -> String {
+    let base = format!("{} · {}", stream.name, stream.provider.label());
+    recording_label(labels, stream).map_or(base.clone(), |recording| {
+        format!("{base} · {}", recording.when)
+    })
+}
+
 #[derive(Default)]
 struct PovMenuState {
     search: String,
     cursor: Option<String>,
+    labels: RecordingLabels,
+    covered: Option<Vec<bool>>,
 }
 
 fn pov_key(stream: &Stream) -> String {
     format!(
-        "{}:{}:{}",
+        "{}:{}:{}:{}",
         stream.user_id,
         stream.provider.key(),
-        stream.channel_id
+        stream.channel_id,
+        stream.recording_id.as_deref().unwrap_or("")
     )
+}
+
+/// Match the protected replay mapper's pull-start rule, then check the actual
+/// requested video instant after this POV's local correction. Ends are exclusive.
+pub(crate) fn recording_covers_moment(
+    range: (i64, i64),
+    pull_start_ms: i64,
+    at_ms: i64,
+    correction_seconds: i64,
+) -> bool {
+    let (start, end) = range;
+    if start < 0
+        || end <= start
+        || end
+            .checked_sub(start)
+            .is_none_or(|duration| duration > 7 * 86_400_000)
+        || !(-600..=600).contains(&correction_seconds)
+        || !(start..end).contains(&pull_start_ms)
+    {
+        return false;
+    }
+    at_ms
+        .checked_add(correction_seconds * 1000)
+        .is_some_and(|video_instant| (start..end).contains(&video_instant))
 }
 
 fn pov_unavailable(stream: &Stream, current: &Stream) -> Option<&'static str> {
     if pov_key(stream) == pov_key(current) {
+        return None;
+    }
+    if stream.recording_id.is_some() {
         return None;
     }
     match stream.status {
@@ -1761,7 +2224,7 @@ fn draw_pov_selector(
     if povs.is_empty() && was_open {
         egui::Popup::close_id(ui.ctx(), popup_id);
     }
-    let label = format!("{} · {}", current.name, current.provider.label());
+    let label = pov_display_label(&menu.labels, current);
     let button = ui
         .add_enabled_ui(!povs.is_empty(), |ui| {
             ui.add_sized(
@@ -1833,7 +2296,12 @@ fn draw_pov_selector(
             if opening {
                 search.request_focus();
             }
-            let rows = matching_povs(povs, &menu.search);
+            let mut rows = matching_povs(povs, &menu.search);
+            rows.retain(|(index, _)| {
+                menu.covered
+                    .as_ref()
+                    .is_none_or(|covered| covered.get(*index) == Some(&true))
+            });
             let available: Vec<_> = rows
                 .iter()
                 .enumerate()
@@ -1878,11 +2346,22 @@ fn draw_pov_selector(
             );
             ui.separator();
             if rows.is_empty() {
-                ui.label("No matching players.");
+                ui.label(if menu.search.trim().is_empty() && menu.covered.is_some() {
+                    "No other recordings cover this moment."
+                } else {
+                    "No matching players."
+                });
             }
-            const ROW_HEIGHT: f32 = 44.0;
-            let stride = ROW_HEIGHT + ui.spacing().item_spacing.y;
-            let height = ui.available_height().max(ROW_HEIGHT);
+            let row_height = if rows
+                .iter()
+                .any(|(_, pov)| recording_label(&menu.labels, pov).is_some())
+            {
+                62.0
+            } else {
+                44.0
+            };
+            let stride = row_height + ui.spacing().item_spacing.y;
+            let height = ui.available_height().max(row_height);
             let mut scroll = egui::ScrollArea::vertical()
                 .id_salt("pov-list")
                 .max_height(height)
@@ -1900,7 +2379,7 @@ fn draw_pov_selector(
                     (index as f32 * stride - (height - stride) / 2.0).max(0.0),
                 );
             }
-            scroll.show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
+            scroll.show_rows(ui, row_height, rows.len(), |ui, range| {
                 for index in range {
                     let (source_index, pov) = rows[index];
                     let watching = pov_key(pov) == pov_key(current);
@@ -1909,7 +2388,7 @@ fn draw_pov_selector(
                     let row = ui
                         .add_enabled_ui(enabled, |ui| {
                             let (rect, response) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), ROW_HEIGHT),
+                                egui::vec2(ui.available_width(), row_height),
                                 egui::Sense::click(),
                             );
                             let highlighted = menu
@@ -1945,6 +2424,8 @@ fn draw_pov_selector(
                             );
                             let status = if watching {
                                 "Watching"
+                            } else if pov.recording_id.is_some() {
+                                "Recording"
                             } else {
                                 match pov.status {
                                     Status::Live => "Live",
@@ -1960,10 +2441,28 @@ fn draw_pov_selector(
                             painter.text(
                                 rect.min + egui::vec2(8.0, 25.0),
                                 egui::Align2::LEFT_TOP,
-                                format!("{} · {status}", pov.provider.label()),
+                                recording_label(&menu.labels, pov).map_or_else(
+                                    || format!("{} · {status}", pov.provider.label()),
+                                    |recording| {
+                                        format!(
+                                            "{} · {status} · {}",
+                                            pov.provider.label(),
+                                            recording.when
+                                        )
+                                    },
+                                ),
                                 egui::FontId::proportional(11.0),
                                 if watching { ACCENT } else { MUTED },
                             );
+                            if let Some(recording) = recording_label(&menu.labels, pov) {
+                                painter.text(
+                                    rect.min + egui::vec2(8.0, 43.0),
+                                    egui::Align2::LEFT_TOP,
+                                    &recording.title,
+                                    egui::FontId::proportional(11.0),
+                                    MUTED,
+                                );
+                            }
                             response
                         })
                         .inner;
@@ -2003,7 +2502,16 @@ fn draw_pov_selector(
                     if let Some(reason) = unavailable {
                         row.on_disabled_hover_text(reason);
                     } else {
-                        row.on_hover_text(format!("{} · {}", pov.name, pov.provider.label()));
+                        row.on_hover_text(recording_label(&menu.labels, pov).map_or_else(
+                            || pov_display_label(&menu.labels, pov),
+                            |recording| {
+                                format!(
+                                    "{}\n{}",
+                                    pov_display_label(&menu.labels, pov),
+                                    recording.title
+                                )
+                            },
+                        ));
                     }
                 }
             });
@@ -2022,6 +2530,23 @@ fn dropdown_indicator(ui: &egui::Ui, button: &egui::Response) {
         ui.visuals().text_color(),
         egui::Stroke::NONE,
     ));
+}
+
+fn pull_outcome(kill: bool, last_phase: Option<u32>, intermission: bool) -> String {
+    if kill {
+        "Kill".into()
+    } else if let Some(phase) = last_phase {
+        format!(
+            "Wipe · {} {phase}",
+            if intermission {
+                "Intermission"
+            } else {
+                "Phase"
+            }
+        )
+    } else {
+        "Wipe".into()
+    }
 }
 
 /// Give the native menu a stable viewport instead of reusing its last measured
@@ -2075,7 +2600,7 @@ fn draw_pull_selector(
             ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
         }
     }
-    let label = current
+    let primary_label = current
         .map(|index| {
             format!(
                 "{} · Pull {} of {}",
@@ -2085,14 +2610,29 @@ fn draw_pull_selector(
             )
         })
         .unwrap_or_else(|| pending_label.unwrap_or("Choose a pull").into());
+    let outcome = current.map(|index| {
+        let pull = &pulls[index];
+        pull_outcome(pull.kill, pull.last_phase, pull.last_phase_is_intermission)
+    });
+    let label = outcome.as_ref().map_or_else(
+        || primary_label.clone(),
+        |outcome| format!("{primary_label} · {outcome}"),
+    );
     let button = ui
         .add_enabled_ui(!pulls.is_empty(), |ui| {
             ui.add_sized(
-                egui::vec2(252.0, ui.spacing().interact_size.y),
-                egui::Button::new(&label).right_text("   ").truncate(),
+                egui::vec2(352.0, ui.spacing().interact_size.y),
+                egui::Button::new(&primary_label)
+                    .right_text(
+                        outcome
+                            .as_ref()
+                            .map_or_else(|| "   ".into(), |outcome| format!("{outcome}   ")),
+                    )
+                    .truncate(),
             )
         })
-        .inner;
+        .inner
+        .on_hover_text(&label);
     dropdown_indicator(ui, &button);
     button.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, !pulls.is_empty(), &label)
@@ -2111,6 +2651,9 @@ fn draw_pull_selector(
     popup.show(|ui| {
         const ROW_HEIGHT: f32 = 30.0;
         ui.spacing_mut().interact_size.y = ROW_HEIGHT;
+        // Reserve a real gutter: an overlay scrollbar otherwise covers the
+        // phase and duration at the right edge of each pull row.
+        ui.spacing_mut().scroll.floating = false;
         let stride = ROW_HEIGHT + ui.spacing().item_spacing.y;
         let height = menu_height.min(pulls.len() as f32 * stride);
         ui.set_width(menu_width);
@@ -2126,16 +2669,17 @@ fn draw_pull_selector(
         scroll.show_rows(ui, ROW_HEIGHT, pulls.len(), |ui, range| {
             for index in range {
                 let pull = &pulls[index];
-                let label = format!(
-                    "{} · {} · {} · {}",
-                    index + 1,
-                    pull.name,
-                    if pull.kill { "Kill" } else { "Wipe" },
-                    clock((pull.end_ms - pull.start_ms) as f64 / 1000.0),
+                let name = format!("{} · {}", index + 1, pull.name);
+                let details = format!(
+                    "{} · {}",
+                    pull_outcome(pull.kill, pull.last_phase, pull.last_phase_is_intermission),
+                    clock((pull.end_ms - pull.start_ms) as f64 / 1000.0)
                 );
+                let label = format!("{name} · {details}");
                 let row = ui.add_sized(
                     egui::vec2(ui.available_width(), ROW_HEIGHT),
-                    egui::Button::new(&label)
+                    egui::Button::new(&name)
+                        .right_text(&details)
                         .selected(current == Some(index))
                         .truncate(),
                 );
@@ -2201,9 +2745,51 @@ fn event_description(event: &RaidEvent) -> String {
     }
 }
 
+fn video_timing_control(ui: &mut egui::Ui, current: i64, enabled: bool) -> Option<i64> {
+    let mut changed = None;
+    ui.allocate_ui_with_layout(egui::vec2(240.0, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().button_padding = egui::vec2(5.0, 3.0);
+        ui.spacing_mut().interact_size.y = 24.0;
+        ui.label(RichText::new("Video timing").small().color(MUTED));
+        ui.add_enabled_ui(enabled, |ui| {
+            let drag_id = ui.make_persistent_id("timing-drag");
+            let mut seconds = ui.ctx().data(|data| data.get_temp::<i64>(drag_id)).unwrap_or(current);
+            if ui.add_enabled(current > -600, egui::Button::new("−")).on_hover_text("Move video 1 second earlier").clicked() {
+                changed = Some(current - 1);
+            }
+            let value = ui.add(egui::DragValue::new(&mut seconds)
+                .range(-600..=600).speed(1.0).fixed_decimals(0)
+                .update_while_editing(false)
+                .custom_formatter(|value, _| format!("{value:+.0} s"))
+                .custom_parser(|text| text.trim().trim_end_matches('s').trim().parse().ok()));
+            value.clone().on_hover_text("Increase if the video is behind the log; decrease if it is ahead. Click the value to type seconds.");
+            value.widget_info(|| egui::WidgetInfo::slider(enabled, seconds as f64, "Video timing in seconds"));
+            if value.dragged() {
+                ui.ctx().data_mut(|data| data.insert_temp(drag_id, seconds));
+            } else if value.drag_stopped() || value.changed() {
+                ui.ctx().data_mut(|data| data.remove::<i64>(drag_id));
+                changed = Some(seconds);
+            }
+            if ui.add_enabled(current < 600, egui::Button::new("+")).on_hover_text("Move video 1 second later").clicked() {
+                changed = Some(current + 1);
+            }
+            if ui.add_enabled(current != DEFAULT_SECONDS, egui::Button::new("↺"))
+                .on_hover_text(format!("Reset video timing to {DEFAULT_SECONDS:+} seconds")).clicked() {
+                changed = Some(DEFAULT_SECONDS);
+            }
+        });
+    });
+    changed.filter(|seconds| *seconds != current)
+}
+
 fn pull_video_start(review: &Review, pull: &Pull) -> f64 {
     (pull.start_ms - review.replay.start_ms().unwrap_or(pull.start_ms)) as f64 / 1000.0
-        + review.timing.get(&pull.report).copied().unwrap_or(0) as f64
+        + review
+            .timing
+            .get(&pull.report)
+            .copied()
+            .unwrap_or(DEFAULT_SECONDS) as f64
 }
 
 fn encounter_moment(review: &Review, pull: &Pull, video_seconds: f64) -> i64 {
@@ -2242,6 +2828,8 @@ mod tests {
             difficulty: 5,
             report_start_ms: start - 50_000,
             remaining: Some(75.8),
+            last_phase: Some(2),
+            last_phase_is_intermission: false,
             name: "A very long encounter name".into(),
             kill: false,
             start_ms: start,
@@ -2249,6 +2837,12 @@ mod tests {
             seconds: 19_800,
         };
         let stream = Stream {
+            replay_start_ms: replay.start_ms().ok(),
+            replay_end_ms: replay
+                .start_ms()
+                .ok()
+                .map(|start| start + replay.available_seconds as i64 * 1000),
+            recording_id: None,
             user_id: "101".into(),
             name: "A guildmate with a long character name".into(),
             provider: Provider::Youtube,
@@ -2266,6 +2860,288 @@ mod tests {
             pull,
             stream,
         )
+    }
+
+    #[test]
+    fn recording_coverage_excludes_later_povs_from_earlier_pulls_and_checks_current_moment() {
+        let (review, pull, _) = fixture();
+        let start = review.replay.start_ms().unwrap();
+        let end = start + 25_000_000;
+        assert!(recording_covers_moment(
+            (start, end),
+            pull.start_ms,
+            pull.start_ms + 121_867,
+            6
+        ));
+        // Overlapping the same raid report is insufficient when this recording
+        // starts several pulls after the selected fight.
+        let later = pull.end_ms + 5 * 240_000;
+        assert!(!recording_covers_moment(
+            (later, end),
+            pull.start_ms,
+            pull.start_ms + 121_867,
+            6
+        ));
+        assert!(recording_covers_moment(
+            (later, end),
+            later + 60_000,
+            later + 121_867,
+            6
+        ));
+        let short_end = pull.start_ms + 120_000;
+        assert!(recording_covers_moment(
+            (start, short_end),
+            pull.start_ms,
+            pull.start_ms + 100_000,
+            6
+        ));
+        assert!(!recording_covers_moment(
+            (start, short_end),
+            pull.start_ms,
+            pull.start_ms + 121_867,
+            6
+        ));
+    }
+
+    #[test]
+    fn recording_coverage_preserves_milliseconds_and_applies_only_the_candidate_correction() {
+        let start = 1_700_000_000_000;
+        let end = start + 240_000;
+        assert!(recording_covers_moment(
+            (start, end),
+            start,
+            start - 6000,
+            6
+        ));
+        assert!(!recording_covers_moment(
+            (start, end),
+            start,
+            start - 6001,
+            6
+        ));
+        assert!(recording_covers_moment((start, end), start, end - 6001, 6));
+        assert!(!recording_covers_moment((start, end), start, end - 6000, 6));
+        assert!(recording_covers_moment((start, end), start, end - 1, 0));
+        assert!(!recording_covers_moment(
+            (start, end),
+            start,
+            start + 2999,
+            -3
+        ));
+        for range in [(start, start), (end, start), (-1, end), (0, i64::MAX)] {
+            assert!(!recording_covers_moment(range, start, start, 0));
+        }
+        assert!(!recording_covers_moment((start, end), start, i64::MAX, 6));
+        assert!(!recording_covers_moment((start, end), start, start, 601));
+    }
+
+    #[test]
+    fn pov_coverage_uses_loaded_current_metadata_and_never_assumes_unknown_candidates() {
+        let (review, pull, mut current) = fixture();
+        let mut ui = ReviewUi::default();
+        ui.key = pov_key(&current);
+        ui.accept_review(review.clone());
+        current.replay_start_ms = None;
+        current.replay_end_ms = None;
+        assert!(ui.pov_covers_moment(&current, &pull, pull.start_ms + 121_867));
+        let mut other = current.clone();
+        other.channel_id = "otherVID123".into();
+        other.user_id = "102".into();
+        assert!(!ui.pov_covers_moment(&other, &pull, pull.start_ms + 121_867));
+        other.replay_start_ms = Some(pull.end_ms + 5 * 240_000);
+        other.replay_end_ms = Some(pull.end_ms + 20 * 240_000);
+        assert!(!ui.pov_covers_moment(&other, &pull, pull.start_ms + 121_867));
+        other.replay_start_ms = review.replay.start_ms().ok();
+        other.replay_end_ms = Some(pull.end_ms);
+        assert!(ui.pov_covers_moment(&other, &pull, pull.end_ms - 6001));
+        assert!(!ui.pov_covers_moment(&other, &pull, pull.end_ms - 6000));
+        let mut replay = review.replay;
+        replay.video_id = other.channel_id.clone();
+        ui.timing_writes.lock().unwrap().enqueue(TimingWrite {
+            replay,
+            pull: pull.clone(),
+            seconds: 0,
+        });
+        assert!(ui.pov_covers_moment(&other, &pull, pull.end_ms - 1));
+        assert!(!ui.pov_covers_moment(&other, &pull, pull.end_ms));
+    }
+
+    #[test]
+    fn video_timing_label_is_centered_with_its_buttons_and_value() {
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(980.0, 720.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                ui.spacing_mut().interact_size.y = 32.0;
+                ui.horizontal(|ui| {
+                    video_timing_control(ui, 6, true);
+                });
+            },
+        );
+        let center = |label: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.pos.y + text.galley.rect.center().y)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("Missing timing control text: {label}"))
+        };
+        for label in ["−", "+", "+6 s"] {
+            assert!(
+                (center("Video timing") - center(label)).abs() <= 1.0,
+                "Timing label not centered with {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_timing_moves_video_later_without_changing_encounter_milliseconds_or_pause() {
+        let (review, pull, _) = fixture();
+        let mut ui = ReviewUi::default();
+        ui.review = Some(review);
+        ui.active = true;
+        ui.select(pull.clone());
+        let moment = pull.start_ms + 121_867;
+        ui.seek_absolute_with_playback(moment, false).unwrap();
+        let before = ui.playback().unwrap().seconds;
+        assert!(matches!(ui.adjust_video_timing(&pull, 10, moment, false),
+            Some(PlaybackCommand::SeekPaused(at)) if (at - before - 1.0).abs() < 0.0001));
+        let playback = ui.playback().unwrap();
+        assert!(!playback.autoplay);
+        assert_eq!(
+            encounter_moment(ui.review.as_ref().unwrap(), &pull, playback.seconds),
+            moment
+        );
+        assert!(matches!(ui.adjust_video_timing(&pull, -3, moment, true),
+            Some(PlaybackCommand::Seek(at)) if (at - before + 12.0).abs() < 0.0001));
+        assert_eq!(
+            encounter_moment(
+                ui.review.as_ref().unwrap(),
+                &pull,
+                ui.playback().unwrap().seconds
+            ),
+            moment
+        );
+        assert_eq!(ui.timing_writes.lock().unwrap().pending.len(), 1);
+    }
+
+    #[test]
+    fn default_timing_and_explicit_zero_use_the_same_forward_and_inverse_mapping() {
+        let (mut review, pull, _) = fixture();
+        review.timing.clear();
+        let raw = (pull.start_ms - review.replay.start_ms().unwrap()) as f64 / 1000.0;
+        assert_eq!(
+            pull_video_start(&review, &pull),
+            raw + DEFAULT_SECONDS as f64
+        );
+        let mut ui = ReviewUi::default();
+        ui.review = Some(review);
+        ui.active = true;
+        ui.select(pull.clone());
+        assert_eq!(ui.video_timing(&pull.report), DEFAULT_SECONDS);
+        let moment = pull.start_ms + 137_625;
+        assert!(matches!(ui.seek_absolute_with_playback(moment, false),
+            Some(PlaybackCommand::SeekPaused(at)) if (at - raw - 137.625 - DEFAULT_SECONDS as f64).abs() < 0.0001));
+        ui.adjust_video_timing(&pull, 0, moment, false).unwrap();
+        assert_eq!(ui.video_timing(&pull.report), 0);
+        assert_eq!(pull_video_start(ui.review.as_ref().unwrap(), &pull), raw);
+        ui.adjust_video_timing(&pull, DEFAULT_SECONDS, moment, false)
+            .unwrap();
+        assert_eq!(ui.video_timing(&pull.report), DEFAULT_SECONDS);
+    }
+
+    #[test]
+    fn stale_provider_seek_after_timing_edit_does_not_change_the_next_edit_moment() {
+        let (review, pull, _) = fixture();
+        let mut ui = ReviewUi::default();
+        ui.review = Some(review);
+        ui.active = true;
+        ui.select(pull.clone());
+        let moment = pull.start_ms + 121_867;
+        ui.seek_absolute_with_playback(moment, false).unwrap();
+        let mut state = PlaybackState::default();
+        state.ready = true;
+        state.seeking = Some(ui.playback().unwrap().seconds);
+        state.mark_polled_now();
+        ui.adjust_video_timing(&pull, 10, moment, false).unwrap();
+        assert_eq!(ui.comparison_position(&state), Some((moment, false)));
+        ui.adjust_video_timing(&pull, 11, moment, false).unwrap();
+        assert_eq!(ui.comparison_position(&state), Some((moment, false)));
+    }
+
+    #[test]
+    fn timing_writes_survive_peer_close_and_do_not_restore_an_older_completed_value() {
+        let (review, pull, _) = fixture();
+        let mut primary = ReviewUi::default();
+        primary.review = Some(review.clone());
+        let mut peer = primary.metadata_peer();
+        peer.review = Some(review.clone());
+        assert!(peer.set_video_timing(&pull, 10));
+        let first = primary.timing_writes.lock().unwrap().next().unwrap();
+        assert!(primary.timing_writes.lock().unwrap().begin(&first));
+        assert!(peer.set_video_timing(&pull, 12));
+        drop(peer);
+        let mut writes = primary.timing_writes.lock().unwrap();
+        assert!(writes.next().is_none());
+        writes.running = None;
+        assert_eq!(writes.next().unwrap().seconds, 12);
+        let mut stale = review.clone();
+        writes.apply_to(&mut stale);
+        assert_eq!(stale.timing[&pull.report], 12);
+        writes.pending.clear();
+        writes.apply_to(&mut stale);
+        assert_eq!(stale.timing[&pull.report], 12);
+        drop(writes);
+        primary.accept_review(review);
+        assert_eq!(primary.video_timing(&pull.report), 12);
+    }
+
+    #[test]
+    fn timing_changes_reject_out_of_recording_targets_and_bound_pending_contexts() {
+        let (review, pull, _) = fixture();
+        let mut ui = ReviewUi::default();
+        ui.review = Some(review.clone());
+        ui.active = true;
+        ui.select(pull.clone());
+        let before = ui.playback().unwrap().seconds;
+        let too_early = review.replay.start_ms().unwrap();
+        assert!(ui.adjust_video_timing(&pull, -1, too_early, true).is_none());
+        assert!(ui
+            .adjust_video_timing(&pull, 601, pull.start_ms, true)
+            .is_none());
+        assert_eq!(ui.video_timing(&pull.report), 9);
+        assert_eq!(ui.playback().unwrap().seconds, before);
+        let mut writes = TimingWrites::default();
+        for index in 0..64 {
+            let mut replay = review.replay.clone();
+            replay.video_id = format!("video-{index}");
+            assert!(writes.enqueue(TimingWrite {
+                replay,
+                pull: pull.clone(),
+                seconds: 6
+            }));
+        }
+        assert!(!writes.enqueue(TimingWrite {
+            replay: review.replay,
+            pull: pull.clone(),
+            seconds: 6
+        }));
+        let mut same = writes.pending[0].clone();
+        same.seconds = 0;
+        assert!(writes.enqueue(same));
+        assert_eq!(writes.pending.len(), 64);
+        assert_eq!(writes.latest.len(), 64);
+        assert_eq!(writes.pending[0].seconds, 0);
     }
 
     #[test]
@@ -2444,6 +3320,29 @@ mod tests {
             encounter_moment(&source, &pull, ui.playback().unwrap().seconds),
             moment
         );
+    }
+
+    #[test]
+    fn recording_review_opens_first_pull_once_and_uses_a_distinct_request_identity() {
+        let (review, pull, live) = fixture();
+        let mut saved = live.clone();
+        saved.status = Status::Offline;
+        saved.recording_id = Some(saved.channel_id.clone());
+        assert_ne!(pov_key(&live), pov_key(&saved));
+        assert!(pov_unavailable(&saved, &live).is_none());
+        let mut ui = ReviewUi::default();
+        ui.open_recording();
+        assert!(ui.active());
+        assert!(ui.playback().is_none());
+        assert!(ui.accept_review(review.clone()));
+        assert_eq!(ui.pull.as_ref().unwrap().id, pull.id);
+        ui.seek_absolute_with_playback(pull.start_ms + 120_000, false)
+            .unwrap();
+        let seconds = ui.playback().unwrap().seconds;
+        ui.accept_review(review);
+        assert_eq!(ui.playback().unwrap().seconds, seconds);
+        assert!(!ui.playback().unwrap().autoplay);
+        assert_eq!(ui.report_span(), Some((pull.start_ms, pull.end_ms)));
     }
 
     #[test]
@@ -2638,12 +3537,7 @@ mod tests {
     #[test]
     fn returning_to_same_pov_does_not_accept_its_cancelled_generation() {
         let (review, _, stream) = fixture();
-        let key = format!(
-            "{}:{}:{}",
-            stream.user_id,
-            stream.provider.key(),
-            stream.channel_id
-        );
+        let key = pov_key(&stream);
         let mut other = stream.clone();
         other.user_id = "102".into();
         let ctx = egui::Context::default();
@@ -2762,6 +3656,14 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn pull_outcome_names_the_wipe_phase_without_guessing_missing_data() {
+        assert_eq!(pull_outcome(false, Some(2), false), "Wipe · Phase 2");
+        assert_eq!(pull_outcome(false, Some(1), true), "Wipe · Intermission 1");
+        assert_eq!(pull_outcome(false, None, false), "Wipe");
+        assert_eq!(pull_outcome(true, Some(3), false), "Kill");
+    }
+
     struct SelectorHarness {
         ctx: egui::Context,
         pulls: Vec<Pull>,
@@ -2770,6 +3672,7 @@ mod tests {
         button: egui::Rect,
         popup: egui::Id,
         size: egui::Vec2,
+        details_right: Option<f32>,
     }
     impl SelectorHarness {
         fn new() -> Self {
@@ -2793,11 +3696,12 @@ mod tests {
                 button: egui::Rect::NOTHING,
                 popup: egui::Id::NULL,
                 size: egui::vec2(980.0, 720.0),
+                details_right: None,
             }
         }
         fn frame(&mut self, events: Vec<egui::Event>) -> Option<usize> {
             let mut chosen = None;
-            let _ = self.ctx.run_ui(
+            let output = self.ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
                     events,
@@ -2818,6 +3722,16 @@ mod tests {
                     self.button = row.response.rect;
                 },
             );
+            self.details_right = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text().starts_with("Wipe · Phase") => {
+                        Some(text.pos.x + text.galley.rect.right())
+                    }
+                    _ => None,
+                })
+                .reduce(f32::max);
             if chosen.is_some() {
                 self.current = chosen;
             }
@@ -2863,6 +3777,21 @@ mod tests {
             self.frame(vec![]);
             assert!(egui::Popup::is_id_open(&self.ctx, self.popup));
             self.ctx.read_response(self.popup).unwrap().rect
+        }
+    }
+
+    #[test]
+    fn pull_phase_and_duration_leave_space_for_the_scrollbar() {
+        let mut menu = SelectorHarness::new();
+        for size in [egui::vec2(980.0, 720.0), egui::vec2(1440.0, 900.0)] {
+            menu.size = size;
+            let popup = menu.open();
+            let right = menu.details_right.expect("visible phase and duration text");
+            assert!(
+                right <= popup.right() - 10.0,
+                "Pull details overlap scrollbar: {right} in {popup:?}"
+            );
+            menu.key(egui::Key::Escape);
         }
     }
 
@@ -3037,6 +3966,26 @@ mod tests {
     }
 
     #[test]
+    fn pov_menu_removes_uncovered_views_from_mouse_and_keyboard_choices() {
+        let mut menu = PovSelectorHarness::new();
+        let mut covered = vec![false; menu.povs.len()];
+        covered[0] = true;
+        covered[4] = true;
+        menu.menu.covered = Some(covered);
+        menu.open();
+        menu.key(egui::Key::ArrowDown);
+        assert_eq!(menu.key(egui::Key::Enter), Some(4));
+        // An ended current recording keeps its selector label, but cannot
+        // re-enable itself as a menu choice when the canonical moment advances.
+        menu.menu.covered.as_mut().unwrap()[4] = false;
+        menu.open();
+        assert_eq!(menu.key(egui::Key::Enter), Some(0));
+        menu.menu.covered = Some(vec![false; menu.povs.len()]);
+        menu.open();
+        assert_eq!(menu.key(egui::Key::Enter), None);
+    }
+
+    #[test]
     fn thirty_povs_fit_one_control_and_search_selects_the_matching_player() {
         let mut menu = PovSelectorHarness::new();
         let rect = menu.open();
@@ -3148,6 +4097,352 @@ mod tests {
         );
     }
 
+    fn timeline_paint(output: &egui::FullOutput) -> (egui::Pos2, f32, egui::Rect) {
+        fn visit(
+            shape: &egui::Shape,
+            circles: &mut Vec<egui::Pos2>,
+            lines: &mut Vec<[egui::Pos2; 2]>,
+            cursor: &mut Option<f32>,
+        ) {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        visit(shape, circles, lines, cursor);
+                    }
+                }
+                egui::Shape::Circle(circle) => circles.push(circle.center),
+                egui::Shape::LineSegment { points, stroke } if points[0].x == points[1].x => {
+                    if stroke.color == Color32::WHITE && stroke.width == 1.5 {
+                        *cursor = Some(points[0].x);
+                    } else if stroke.color == Color32::from_rgb(39, 43, 51) && stroke.width == 1.0 {
+                        lines.push(*points);
+                    }
+                }
+                _ => (),
+            }
+        }
+        let mut circles = Vec::new();
+        let mut lines = Vec::new();
+        let mut cursor = None;
+        for shape in &output.shapes {
+            visit(&shape.shape, &mut circles, &mut lines, &mut cursor);
+        }
+        let left = lines.iter().map(|line| line[0].x).reduce(f32::min).unwrap();
+        let right = lines.iter().map(|line| line[0].x).reduce(f32::max).unwrap();
+        let grid = egui::Rect::from_min_max(
+            egui::pos2(left, lines[0][0].y),
+            egui::pos2(right, lines[0][1].y),
+        );
+        let thumb = circles
+            .into_iter()
+            .find(|center| center.y < grid.top())
+            .unwrap();
+        (thumb, cursor.unwrap(), grid)
+    }
+
+    #[test]
+    fn seek_thumb_and_event_cursor_share_the_rendered_range_at_every_size() {
+        for (width, scale) in [
+            (640.0, 1.0),
+            (980.0, 1.0),
+            (1440.0, 1.0),
+            (980.0, 1.5),
+            (980.0, 2.0),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            // Apply the queued DPI change before measuring the viewport.
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |_| {},
+            );
+            for fraction in [0.0, 0.25, 0.5, 0.666, 1.0] {
+                let (review, pull, _) = fixture();
+                let start = pull_video_start(&review, &pull);
+                let mut review_ui = ReviewUi::default();
+                review_ui.review = Some(review);
+                review_ui.select(pull);
+                let mut state = PlaybackState::default();
+                state.ready = true;
+                state.seconds = start + 210.0 * fraction;
+                state.mark_polled_now();
+                for _ in 0..2 {
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 300.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            assert!(
+                                review_ui.draw_timeline(ui, &state).is_none(),
+                                "Painting a settled video must not seek it"
+                            );
+                        },
+                    );
+                    let (thumb, cursor, grid) = timeline_paint(&output);
+                    assert!(
+                        (thumb.x - cursor).abs() < 0.1,
+                        "Thumb {thumb:?} and cursor {cursor} differ at {fraction}"
+                    );
+                    assert!((thumb.x - egui::lerp(grid.x_range(), fraction as f32)).abs() < 0.1);
+                    assert!(grid.left() >= 132.0 && grid.right() < width, "Timeline {grid:?} escaped width={width}, scale={scale}, position={fraction}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dragging_seekbar_keeps_event_cursor_under_thumb_and_preserves_pause() {
+        let (review, pull, _) = fixture();
+        let start = pull_video_start(&review, &pull);
+        let mut review_ui = ReviewUi::default();
+        review_ui.review = Some(review);
+        review_ui.select(pull);
+        let ctx = egui::Context::default();
+        let mut state = PlaybackState::default();
+        state.ready = true;
+        state.seconds = start;
+        let mut frame = |events| {
+            state.mark_polled_now();
+            let mut command = None;
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(980.0, 300.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    command = review_ui.draw_timeline(ui, &state);
+                },
+            );
+            (output, command)
+        };
+        frame(vec![]);
+        let (output, _) = frame(vec![]);
+        let (thumb, _, grid) = timeline_paint(&output);
+        frame(vec![
+            egui::Event::PointerMoved(thumb),
+            egui::Event::PointerButton {
+                pos: thumb,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let target = egui::pos2(egui::lerp(grid.x_range(), 0.687), thumb.y);
+        let (output, _) = frame(vec![egui::Event::PointerMoved(target)]);
+        let (thumb, cursor, _) = timeline_paint(&output);
+        assert!((thumb.x - cursor).abs() < 0.1);
+        assert!((thumb.x - target.x).abs() < 0.1);
+        let (_, command) = frame(vec![egui::Event::PointerButton {
+            pos: target,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let Some(PlaybackCommand::SeekPaused(seconds)) = command else {
+            panic!("Paused drag must emit a paused seek");
+        };
+        assert!((seconds - start - 210.0 * 0.687).abs() < 0.002);
+    }
+
+    #[test]
+    #[ignore = "opt-in native workspace drawing CPU benchmark, without provider decoding"]
+    fn review_workspace_drawing_benchmark() {
+        assert_eq!(std::env::var("BRICK_REVIEW_UI_BENCH").as_deref(), Ok("1"));
+        println!(
+            "review_ui_benchmark pid={} events=8000 povs=30 frames_per_case=600 warmup=30",
+            std::process::id()
+        );
+        for (width, height, comparing) in [
+            (960.0, 640.0, false),
+            (1440.0, 800.0, false),
+            (1440.0, 800.0, true),
+        ] {
+            let (review, pull, stream) = fixture();
+            let start = pull_video_start(&review, &pull);
+            let mut review_ui = ReviewUi::default();
+            review_ui.review = Some(review);
+            review_ui.connected = true;
+            review_ui.active = true;
+            review_ui.select(pull.clone());
+            review_ui.comparing = comparing;
+            review_ui.kind = EventKind::Defensives;
+            review_ui.loaded_events = vec![EventKind::Deaths, EventKind::Defensives];
+            review_ui.events = (0..8000)
+                .map(|index| {
+                    let group = match index % 4 {
+                        0 => None,
+                        1 => Some(DefensiveGroup::Personal),
+                        2 => Some(DefensiveGroup::External),
+                        _ => Some(DefensiveGroup::Raid),
+                    };
+                    RaidEvent {
+                        at_ms: pull.start_ms + index * 210_000 / 8000,
+                        actor: format!("Player {}", index % 30),
+                        class: "Priest".into(),
+                        ability: "Major defensive cooldown".into(),
+                        ability_id: 33206,
+                        target: Some(format!("Player {}", (index + 1) % 30)),
+                        kind: if group.is_some() {
+                            EventKind::Defensives
+                        } else {
+                            EventKind::Deaths
+                        },
+                        group,
+                    }
+                })
+                .collect();
+            let povs = pov_fixture();
+            let ctx = egui::Context::default();
+            let mut state = PlaybackState::default();
+            state.ready = true;
+            state.seconds = start;
+            let mut samples = Vec::with_capacity(600);
+            let mut shape_count = 0;
+            let mut painted: Option<(egui::Pos2, f32, egui::Rect)> = None;
+            for frame in 0..630 {
+                state.seconds = start + (frame % 180) as f64;
+                state.mark_polled_now();
+                let mut events = Vec::new();
+                if (230..430).contains(&frame) {
+                    events.push(egui::Event::PointerMoved(egui::pos2(
+                        width - 100.0,
+                        height / 2.0,
+                    )));
+                    events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -32.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                } else if frame >= 430 {
+                    if let Some((thumb, _, grid)) = painted {
+                        let fraction = ((frame - 430) % 90) as f32 / 90.0;
+                        let pos = egui::pos2(egui::lerp(grid.x_range(), fraction), thumb.y);
+                        events.push(egui::Event::PointerMoved(pos));
+                        if frame == 430 || frame == 629 {
+                            events.push(egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed: frame == 430,
+                                modifiers: egui::Modifiers::NONE,
+                            });
+                        }
+                    }
+                }
+                let begin = Instant::now();
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, height),
+                        )),
+                        time: Some(frame as f64 / 60.0),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        std::hint::black_box(
+                            review_ui.draw_workspace(ui, &stream, &povs, &state, None, None),
+                        );
+                    },
+                );
+                let elapsed = begin.elapsed().as_secs_f64() * 1000.0;
+                if frame >= 30 {
+                    samples.push(elapsed);
+                }
+                shape_count = shape_count.max(output.shapes.len());
+                painted = Some(timeline_paint(&output));
+                std::hint::black_box(&output);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "review_ui_benchmark width={width} height={height} comparing={comparing} median_ms={:.3} p95_ms={:.3} worst_ms={:.3} max_shapes={shape_count}",
+                samples[300], samples[569], samples[599]
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_selector_stays_in_the_pov_row_at_small_and_default_sizes() {
+        for size in [egui::vec2(924.0, 548.0), egui::vec2(1384.0, 728.0)] {
+            let (review, pull, stream) = fixture();
+            let mut review_ui = ReviewUi::default();
+            review_ui.review = Some(review);
+            review_ui.active = true;
+            review_ui.connected = true;
+            review_ui.select(pull.clone());
+            review_ui.comparing = true;
+            let mut other = stream.clone();
+            other.user_id = "102".into();
+            other.name = "Another player with a very long name".into();
+            let povs = [stream.clone(), other.clone()];
+            let mut comparison =
+                crate::review_compare_ui::Comparison::new(&review_ui, other, pull.start_ms, false);
+            comparison.metadata_for_test().review = review_ui.review.clone();
+            let ctx = egui::Context::default();
+            ctx.global_style_mut(|style| {
+                style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+                style.spacing.button_padding = egui::vec2(14.0, 8.0);
+            });
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            for _ in 0..3 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let available = ui.available_rect_before_wrap();
+                        let action = review_ui.draw_workspace(
+                            ui,
+                            &stream,
+                            &povs,
+                            &PlaybackState::default(),
+                            None,
+                            Some(&mut comparison),
+                        );
+                        assert!(available.contains_rect(action.rect.unwrap()));
+                        assert!(
+                            ui.min_rect().right() <= available.right() + 1.0,
+                            "Comparison toolbar escaped the window"
+                        );
+                    },
+                );
+                let label = |word: &str| {
+                    output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.text() == word => Some(text.pos),
+                            _ => None,
+                        })
+                        .unwrap()
+                };
+                let first = label("POV");
+                let second = label("Compare");
+                assert!(second.x > first.x);
+                assert!(
+                    (first.y - second.y).abs() <= 1.0,
+                    "Comparison is not beside the POV selector"
+                );
+            }
+        }
+    }
+
     #[test]
     fn review_controls_fit_small_and_default_windows_with_long_event_names() {
         for size in [egui::vec2(924.0, 548.0), egui::vec2(1384.0, 728.0)] {
@@ -3188,8 +4483,14 @@ mod tests {
                         },
                         |ui| {
                             let available = ui.available_rect_before_wrap();
-                            let action =
-                                review_ui.draw_workspace(ui, &stream, &pov_fixture(), &state, None);
+                            let action = review_ui.draw_workspace(
+                                ui,
+                                &stream,
+                                &pov_fixture(),
+                                &state,
+                                None,
+                                None,
+                            );
                             let video = action.rect.unwrap();
                             assert!(
                                 available.contains_rect(video),

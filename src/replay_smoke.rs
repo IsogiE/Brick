@@ -989,6 +989,11 @@ mod native {
         url.query_pairs_mut()
             .append_pair("at", &format!("{offset:.3}"))
             .append_pair("broadcast", &replay.broadcast_id);
+        let saved = std::env::var("BRICK_REPLAY_SAVED_RECORDING").as_deref() == Ok("1");
+        if saved {
+            url.query_pairs_mut()
+                .append_pair("recording", &replay.video_id);
+        }
         let alternate = std::env::var_os("BRICK_REPLAY_ALT_FIXTURE").map(|path| {
             let mut bytes = Vec::new();
             std::fs::File::open(path)
@@ -1028,6 +1033,11 @@ mod native {
                 .append_pair("at", &format!("{offset:.3}"))
                 .append_pair("broadcast", &replay.broadcast_id)
                 .append_pair("paused", "1");
+            if saved {
+                alternate
+                    .query_pairs_mut()
+                    .append_pair("recording", &replay.video_id);
+            }
             (alternate.into(), offset)
         });
         // Explicit resource/stability probe only; the ordinary regression keeps

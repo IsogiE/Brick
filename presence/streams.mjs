@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { HttpError, readBounded } from "./security.mjs";
 import { createVodService } from "./stream_vods.mjs";
 import { youtubeControlTags, twitchControlTags } from "./player_control.mjs";
-import { createReplayService } from "./stream_review.mjs";
+import { createReplayService, createRecordingReplayService } from "./stream_review.mjs";
 
 const REFRESH_MS = 30_000;
 const YOUTUBE_DAILY_BUDGET = 8_000;
@@ -120,6 +120,18 @@ export async function createStreamService({ dataDir, env, fetch, now = Date.now,
   };
   const vods = await createVodService({ dataDir, fetch, now, twitchRequest });
   const replay = createReplayService({ twitchRequest, now });
+  const recordingReplay = createRecordingReplayService({ twitchRequest, now, youtubeRequest: async (id, signal) => {
+    if (!providers.youtube || now() < youtubeBackoffUntil || !manualYoutubeAvailable()) {
+      throw new HttpError(503, "Recording checks are temporarily unavailable. Try again shortly.");
+    }
+    manualYoutubeChecks.push(now());
+    const query = new URLSearchParams({ part: "status,contentDetails,liveStreamingDetails", id, key: youtubeKey });
+    try { return await providerJson(`https://www.googleapis.com/youtube/v3/videos?${query}`, {}, signal); }
+    catch (error) {
+      if ([403, 429].includes(error.status)) youtubeBackoffUntil = now() + PROVIDER_BACKOFF_MS;
+      throw error;
+    }
+  } });
 
   async function load() {
     if (registrations) return registrations;
@@ -389,8 +401,15 @@ export async function createStreamService({ dataDir, env, fetch, now = Date.now,
   function row(userId, name, entry) {
     const cached = statuses.get(keyFor(entry));
     const state = freshCache(entry);
+    const start = typeof state?.startedAt === "string" ? Date.parse(state.startedAt) : NaN;
+    const end = typeof state?.endedAt === "string" ? Date.parse(state.endedAt)
+      : state?.status === "live" ? now() - 30_000 : NaN;
+    const replayRange = Number.isSafeInteger(start) && Number.isSafeInteger(end)
+      && start > 0 && end > start && end - start <= 604_800_000
+      ? { replayStartMs: start, replayEndMs: end } : {};
     return { userId, name, ...entry, status: state?.status || (!cached || cached.status === "checking"
       ? uncheckedStatus(entry) : "unknown"), title: state?.title || "",
+      ...replayRange,
       ...(state?.viewerCount !== undefined ? { viewerCount: state.viewerCount } : {}),
       ...(state?.broadcastState ? { broadcastState: state.broadcastState } : {}) };
   }
@@ -493,6 +512,8 @@ export async function createStreamService({ dataDir, env, fetch, now = Date.now,
     async replay(stream) { return replay(stream, freshCache(stream)); },
     nextPollDelayMs: () => refreshAt ? Math.max(1_000, Math.min(REFRESH_MS, refreshAt - now())) : REFRESH_MS,
     async recordings() { return vods.list(); },
+    async recordingReplay(record) { return recordingReplay(record); },
+    async removeRecording(provider, id) { await vods.remove(provider, id); return { ok: true }; },
     close() {
       shutdown.abort();
       clearTimeout(firstCheckTimer);

@@ -104,6 +104,8 @@ pub struct Pull {
     pub remaining: Option<f64>,
     pub name: String,
     pub kill: bool,
+    pub last_phase: Option<u32>,
+    pub last_phase_is_intermission: bool,
     pub start_ms: i64,
     pub end_ms: i64,
     #[cfg(test)]
@@ -179,7 +181,7 @@ pub struct Client {
     session: Option<Session>,
     http: HttpClient,
     reports: HashMap<String, (Instant, Value)>,
-    directory: Option<(i64, Instant, Vec<Value>)>,
+    directory: Option<ReportDirectory>,
     retry_at: Option<Instant>,
     events: HashMap<(String, u64, EventKind), (Instant, Vec<RaidEvent>)>,
     health: HashMap<(String, u64, i64, i64), (Instant, HealthWindow)>,
@@ -187,6 +189,31 @@ pub struct Client {
     health_bands: HashMap<(String, u64, i64, i64, String), (Instant, HealthWindow)>,
     timing: crate::replay_timing::Store,
     cancel: Arc<AtomicBool>,
+}
+
+struct ReportDirectory {
+    window: (i64, i64),
+    loaded_at: Instant,
+    reports: Vec<Value>,
+}
+
+impl ReportDirectory {
+    fn covers(&self, window: (i64, i64)) -> bool {
+        self.window == window && self.loaded_at.elapsed() < Duration::from_secs(60)
+    }
+}
+
+fn report_window(start: i64, end: i64) -> Option<(i64, i64)> {
+    if start <= 0 || end <= start || end.checked_sub(start)? > 7 * DAY {
+        return None;
+    }
+    // Retain the lookback for reports opened before the video, while excluding
+    // all unrelated raids after this archive. Day boundaries let nearby POVs
+    // share the same directory without depending on today's calendar date.
+    Some((
+        start.saturating_sub(2 * DAY) / DAY * DAY,
+        end.checked_add(DAY - 1)? / DAY * DAY,
+    ))
 }
 
 impl Client {
@@ -547,18 +574,20 @@ impl Client {
     pub fn review(&mut self, discord_token: &str, stream: &Stream) -> Result<Review, String> {
         self.configure(discord_token, true)?;
         self.access_token()?;
-        let path = format!(
-            "/v1/streams/review/{}/{}",
-            stream.user_id,
-            stream.provider.key()
-        );
+        let path = streams::review_path(stream).map_err(|error| error.message)?;
         let bytes = while_current(&self.cancel, || {
             streams::request(Method::GET, &path, discord_token, None)
         })?
         .map_err(|e| e.message)?;
         let replay: Replay =
             serde_json::from_slice(&bytes).map_err(|_| "Couldn't read this broadcast's replay.")?;
-        if replay.provider != stream.provider || !valid_video(&replay) {
+        if replay.provider != stream.provider
+            || !valid_video(&replay)
+            || stream
+                .recording_id
+                .as_ref()
+                .is_some_and(|id| id != &replay.video_id)
+        {
             return Err("The replay does not match this stream.".into());
         }
         self.review_replay(replay)
@@ -632,15 +661,21 @@ impl Client {
         if replay.available_seconds == 0 || replay.available_seconds > 7 * 86400 {
             return Err("The replay isn't available yet.".into());
         }
-        let window_start = (start - 2 * DAY).max(0) / DAY * DAY;
-        if !self.directory.as_ref().is_some_and(|(since, at, _)| {
-            *since == window_start && at.elapsed() < Duration::from_secs(60)
-        }) {
+        let end = start
+            .checked_add(replay.available_seconds as i64 * 1000)
+            .ok_or("The recording's date range is unavailable.")?;
+        let window =
+            report_window(start, end).ok_or("The recording's date range is unavailable.")?;
+        if !self
+            .directory
+            .as_ref()
+            .is_some_and(|directory| directory.covers(window))
+        {
             let mut reports = Vec::new();
             for page in 1..=5 {
                 check_cancelled(&self.cancel)?;
                 let data = self.query("query($guild:Int!,$start:Float!,$end:Float!,$page:Int!){reportData{reports(guildID:$guild,startTime:$start,endTime:$end,page:$page,limit:100){data{code startTime endTime} has_more_pages}}}",
-                    json!({"guild":self.config.as_ref().unwrap().guild_id,"start":window_start,"end":now_secs()*1000,"page":page}))?;
+                    json!({"guild":self.config.as_ref().unwrap().guild_id,"start":window.0,"end":window.1,"page":page}))?;
                 let batch = &data["reportData"]["reports"];
                 let entries = batch["data"]
                     .as_array()
@@ -659,14 +694,17 @@ impl Client {
                 }
             }
             check_cancelled(&self.cancel)?;
-            self.directory = Some((window_start, Instant::now(), reports));
+            self.directory = Some(ReportDirectory {
+                window,
+                loaded_at: Instant::now(),
+                reports,
+            });
         }
-        let end = start + replay.available_seconds as i64 * 1000;
         let reports: Vec<_> = self
             .directory
             .as_ref()
             .unwrap()
-            .2
+            .reports
             .iter()
             .filter(|report| {
                 number_ms(&report["startTime"]).is_some_and(|s| s < end)
@@ -693,7 +731,7 @@ impl Client {
                 .get(code)
                 .is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(60))
             {
-                let data = self.query("query($code:String!){reportData{report(code:$code){code startTime endTime fights{ id encounterID difficulty name kill fightPercentage startTime endTime }}}}", json!({"code":code}))?;
+                let data = self.query("query($code:String!){reportData{report(code:$code){code startTime endTime fights{ id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime }}}}", json!({"code":code}))?;
                 let report = data["reportData"]["report"].clone();
                 if report.is_null() {
                     continue;
@@ -794,6 +832,11 @@ pub fn map_pulls(report: &Value, replay: &Replay) -> Result<Vec<Pull>, String> {
                 .filter(|n| n.is_finite() && (0.0..=100.0).contains(n)),
             name: name.chars().filter(|c| !c.is_control()).collect(),
             kill: fight["kill"].as_bool().unwrap_or(false),
+            last_phase: fight["lastPhase"]
+                .as_u64()
+                .filter(|phase| *phase > 0)
+                .and_then(|phase| u32::try_from(phase).ok()),
+            last_phase_is_intermission: fight["lastPhaseIsIntermission"].as_bool().unwrap_or(false),
             start_ms: pull_start,
             end_ms: pull_end,
             #[cfg(test)]
@@ -997,6 +1040,42 @@ mod tests {
             available_seconds: 8 * 3600,
         }
     }
+
+    #[test]
+    fn historical_recording_only_searches_its_own_dates_and_cache_includes_end() {
+        let at = |text| {
+            time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+                .unwrap()
+                .unix_timestamp()
+                * 1000
+        };
+        let start = at("2022-05-04T08:00:00Z");
+        let end = at("2022-05-04T23:30:00Z");
+        let window = report_window(start, end).unwrap();
+        assert_eq!(
+            window,
+            (at("2022-05-02T00:00:00Z"), at("2022-05-05T00:00:00Z"))
+        );
+        // More recent reports cannot consume the pagination budget for this archive.
+        assert!(at("2022-06-01T18:00:00Z") > window.1);
+        let directory = ReportDirectory {
+            window,
+            loaded_at: Instant::now(),
+            reports: Vec::new(),
+        };
+        assert!(directory.covers(report_window(start + 3_600_000, end - 3_600_000).unwrap()));
+        let crossing_midnight = report_window(start, at("2022-05-05T01:00:00Z")).unwrap();
+        assert_eq!(crossing_midnight.0, window.0);
+        assert!(!directory.covers(crossing_midnight));
+        for (start, end) in [
+            (0, DAY),
+            (DAY, DAY),
+            (DAY, 9 * DAY),
+            (i64::MAX - 1, i64::MAX),
+        ] {
+            assert!(report_window(start, end).is_none());
+        }
+    }
     #[test]
     fn five_hours_of_streaming_before_raid_and_late_discovery_do_not_change_pull_positions() {
         let video = replay();
@@ -1009,6 +1088,32 @@ mod tests {
         assert_eq!(pulls[1].seconds, 5 * 3600 + 30 * 60);
         assert!(pulls[1].kill);
     }
+    #[test]
+    fn pull_phase_uses_wcl_numbering_and_preserves_unknown_and_intermission() {
+        let video = replay();
+        let fights: Vec<_> = [json!(2), json!(1), Value::Null, json!(0), json!(-1)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, phase)| {
+                json!({
+                    "id":index + 1,"encounterID":123,"name":"Boss",
+                    "startTime":index * 180000,"endTime":index * 180000 + 120000,
+                    "kill":index == 4,"lastPhase":phase,
+                    "lastPhaseIsIntermission":index == 1,"lastPhaseAsAbsoluteIndex":4
+                })
+            })
+            .collect();
+        let report = json!({"code":"abcdefghABCDEFGH","startTime":video.start_ms().unwrap(),"fights":fights});
+        let pulls = map_pulls(&report, &video).unwrap();
+        assert_eq!(
+            pulls.iter().map(|pull| pull.last_phase).collect::<Vec<_>>(),
+            vec![Some(2), Some(1), None, None, None]
+        );
+        assert!(!pulls[0].last_phase_is_intermission);
+        assert!(pulls[1].last_phase_is_intermission);
+        assert!(pulls[4].kill);
+    }
+
     #[test]
     fn stream_starting_mid_raid_only_offers_pulls_present_in_the_recording() {
         let mut video = replay();
@@ -1051,6 +1156,7 @@ mod tests {
             .map(|pull| {
                 json!({
                     "report":pull.report,"fightId":pull.id,"name":pull.name,"kill":pull.kill,
+                    "lastPhase":pull.last_phase,"lastPhaseIsIntermission":pull.last_phase_is_intermission,
                     "startMs":pull.start_ms,"endMs":pull.end_ms,"seconds":pull.seconds,
                     "url":review.replay.public_url(pull.seconds.saturating_sub(5))
                 })
@@ -1102,6 +1208,8 @@ mod tests {
             remaining: Some(50.0),
             name: "Boss".into(),
             kill: false,
+            last_phase: None,
+            last_phase_is_intermission: false,
             start_ms: 1_005_000,
             end_ms: 1_015_000,
             seconds: 5,

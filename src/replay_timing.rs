@@ -6,6 +6,7 @@ const MAX_BYTES: usize = 16 * 1024;
 const MAX_ENTRIES: usize = 64;
 const MAX_SECONDS: i64 = 600;
 const SAVE_ERROR: &str = "Couldn't save the video alignment.";
+pub const DEFAULT_SECONDS: i64 = 6;
 
 pub struct Store {
     path: Option<PathBuf>,
@@ -63,11 +64,12 @@ impl Store {
     pub fn get(&self, provider: &str, video: &str, report: &str) -> i64 {
         context_key(provider, video, report)
             .and_then(|key| self.corrections.get(&key).copied())
-            .unwrap_or_default()
+            .unwrap_or(DEFAULT_SECONDS)
     }
 
     /// Positive seconds move the video later for the same event in the log.
-    /// Saving zero restores automatic timing and removes the saved correction.
+    /// Zero is an explicit saved choice. Resetting to the visible default removes
+    /// only this recording/report's override.
     pub fn set(
         &mut self,
         provider: &str,
@@ -78,12 +80,18 @@ impl Store {
         let key = context_key(provider, video, report)
             .filter(|_| (-MAX_SECONDS..=MAX_SECONDS).contains(&seconds))
             .ok_or("Invalid video alignment.")?;
-        if self.corrections.get(&key).copied().unwrap_or_default() == seconds {
+        if self
+            .corrections
+            .get(&key)
+            .copied()
+            .unwrap_or(DEFAULT_SECONDS)
+            == seconds
+        {
             return Ok(());
         }
         let path = self.path.as_ref().ok_or(SAVE_ERROR)?;
         let mut next = self.corrections.clone();
-        if seconds == 0 {
+        if seconds == DEFAULT_SECONDS {
             next.remove(&key);
         } else {
             if !next.contains_key(&key) && next.len() >= MAX_ENTRIES {
@@ -156,7 +164,7 @@ mod tests {
     fn corrections_persist_without_ids_and_stay_with_their_recording_and_report() {
         let root = TestDirectory::new();
         let mut store = Store::load_from(Some(root.path()));
-        assert_eq!(store.get("youtube", "video-a", "report-a"), 0);
+        assert_eq!(store.get("youtube", "video-a", "report-a"), DEFAULT_SECONDS);
         store.set("youtube", "video-a", "report-a", 9).unwrap();
         store.set("youtube", "video-b", "report-a", -12).unwrap();
         store.set("youtube", "video-a", "report-b", 4).unwrap();
@@ -168,11 +176,17 @@ mod tests {
         assert_eq!(restored.get("youtube", "video-a", "report-a"), 9);
         assert_eq!(restored.get("youtube", "video-b", "report-a"), -12);
         assert_eq!(restored.get("youtube", "video-a", "report-b"), 4);
-        assert_eq!(restored.get("twitch", "video-a", "report-a"), 0);
-        assert_eq!(restored.get("youtube", "video-b", "report-b"), 0);
+        assert_eq!(
+            restored.get("twitch", "video-a", "report-a"),
+            DEFAULT_SECONDS
+        );
+        assert_eq!(
+            restored.get("youtube", "video-b", "report-b"),
+            DEFAULT_SECONDS
+        );
         // Distinct component boundaries must not share a correction.
         restored.set("youtube", "ab", "c", 15).unwrap();
-        assert_eq!(restored.get("youtube", "a", "bc"), 0);
+        assert_eq!(restored.get("youtube", "a", "bc"), DEFAULT_SECONDS);
         restored.set("youtube", "video-a", "report-a", 0).unwrap();
         let reset = Store::load_from(Some(root.path()));
         assert_eq!(reset.get("youtube", "video-a", "report-a"), 0);
@@ -180,7 +194,25 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_oversized_saved_data_never_adjusts_playback() {
+    fn explicit_zero_survives_restart_and_reset_only_removes_its_override() {
+        let root = TestDirectory::new();
+        let mut store = Store::load_from(Some(root.path()));
+        assert_eq!(store.get("youtube", "video", "report"), 6);
+        store.set("youtube", "video", "report", 0).unwrap();
+        store.set("twitch", "other", "report", 9).unwrap();
+        let mut restored = Store::load_from(Some(root.path()));
+        assert_eq!(restored.get("youtube", "video", "report"), 0);
+        restored
+            .set("youtube", "video", "report", DEFAULT_SECONDS)
+            .unwrap();
+        let reset = Store::load_from(Some(root.path()));
+        assert_eq!(reset.get("youtube", "video", "report"), DEFAULT_SECONDS);
+        assert_eq!(reset.get("twitch", "other", "report"), 9);
+        assert_eq!(reset.corrections.len(), 1);
+    }
+
+    #[test]
+    fn malformed_or_oversized_saved_data_uses_the_visible_default() {
         let root = TestDirectory::new();
         let key = context_key("youtube", "video", "report").unwrap();
         let too_many: BTreeMap<_, _> = (0..=MAX_ENTRIES)
@@ -201,14 +233,14 @@ mod tests {
             fs::write(root.path(), invalid).unwrap();
             let store = Store::load_from(Some(root.path()));
             assert!(store.corrections.is_empty());
-            assert_eq!(store.get("youtube", "video", "report"), 0);
+            assert_eq!(store.get("youtube", "video", "report"), DEFAULT_SECONDS);
         }
         let mut oversized = format!(r#"{{"{key}":9}}"#).into_bytes();
         oversized.resize(MAX_BYTES + 1, b' ');
         fs::write(root.path(), oversized).unwrap();
         assert_eq!(
             Store::load_from(Some(root.path())).get("youtube", "video", "report"),
-            0
+            DEFAULT_SECONDS
         );
     }
 
@@ -229,7 +261,7 @@ mod tests {
             ("youtube", "video", "☃"),
         ] {
             assert!(store.set(provider, video, report, 10).is_err());
-            assert_eq!(store.get(provider, video, report), 0);
+            assert_eq!(store.get(provider, video, report), DEFAULT_SECONDS);
         }
         assert!(store
             .set("youtube", &"x".repeat(129), "report", 10)

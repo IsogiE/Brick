@@ -1,9 +1,11 @@
 import path from "node:path";
 import { constants, promises as fs } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { HttpError } from "./security.mjs";
 
 const MAX_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_HISTORY = 10_000;
+const MAX_REMOVED = 20_000;
 const MAX_ACTIVE = 2_000;
 const MAX_OBSERVATIONS = 4_000;
 const RETRY_MS = 60_000;
@@ -20,6 +22,7 @@ const channelValid = (provider, channel) => provider === "youtube" ? videoId(cha
   : provider === "twitch" && typeof channel === "string" && /^[a-z0-9_]{1,25}$/.test(channel);
 const sessionKey = item => `${item.provider}:${item.provider === "youtube" ? item.channelId : item.streamId}`;
 const historyKey = item => `${item.userId}:${item.provider}:${item.id}`;
+const recordingKey = item => `${item.provider}:${item.id}`;
 const vodUrl = (provider, id) => provider === "youtube"
   ? `https://www.youtube.com/watch?v=${id}` : `https://www.twitch.tv/videos/${id}`;
 
@@ -50,6 +53,11 @@ export function createVodService({ dataDir, now = Date.now, twitchRequest }) {
         || parsed.active.length > MAX_ACTIVE || parsed.history.length > MAX_HISTORY) {
         throw new Error("Invalid stream history");
       }
+      parsed.removed ??= [];
+      if (!Array.isArray(parsed.removed) || parsed.removed.length > MAX_REMOVED
+        || parsed.removed.some(key => typeof key !== "string" || !/^(?:twitch:[0-9]{1,32}|youtube:[a-zA-Z0-9_-]{11})$/.test(key))) {
+        throw new Error("Invalid removed recording history");
+      }
       for (const entry of parsed.active) {
         if (!channelValid(entry?.provider, entry.channelId) || !Array.isArray(entry.owners)
           || !entry.owners.length || entry.owners.length > 1000 || !entry.owners.every(memberId)
@@ -70,6 +78,8 @@ export function createVodService({ dataDir, now = Date.now, twitchRequest }) {
           userId: entry.userId, provider: entry.provider, id: entry.id,
           url: vodUrl(entry.provider, entry.id), title: title(entry.title),
           ...(entry.startedAt ? { startedAt: timestamp(entry.startedAt) } : {}),
+          ...(opaqueId(entry.broadcastId) ? { broadcastId: entry.broadcastId } : {}),
+          ...(twitchId(entry.twitchUserId) ? { twitchUserId: entry.twitchUserId } : {}),
           endedAt: timestamp(entry.endedAt),
         };
       });
@@ -104,12 +114,14 @@ export function createVodService({ dataDir, now = Date.now, twitchRequest }) {
   }
 
   function addArchive(next, session, id, archiveTitle) {
+    if (next.removed.includes(recordingKey({ provider: session.provider, id }))) return;
     const index = new Set(next.history.map(historyKey));
     for (const userId of session.owners) {
       const row = {
         userId, provider: session.provider, id, url: vodUrl(session.provider, id),
         title: title(archiveTitle) || session.title,
         ...(session.startedAt ? { startedAt: session.startedAt } : {}),
+        ...(session.provider === "twitch" ? { broadcastId: session.streamId, twitchUserId: session.twitchUserId } : {}),
         endedAt: session.endedAt,
       };
       if (!index.has(historyKey(row))) {
@@ -234,5 +246,25 @@ export function createVodService({ dataDir, now = Date.now, twitchRequest }) {
     return [...unique.values()];
   }
 
-  return { observe, list, targets };
+  async function remove(provider, id) {
+    if (!(provider === "youtube" ? videoId(id) : provider === "twitch" && twitchId(id))) {
+      throw new HttpError(400, "Invalid recording.");
+    }
+    const operation = queue.catch(() => {}).then(async () => {
+      const next = structuredClone(await load());
+      const key = recordingKey({ provider, id });
+      if (next.removed.includes(key)) return;
+      if (!next.history.some(row => recordingKey(row) === key)) throw new HttpError(404, "This recording is no longer available.");
+      if (next.removed.length >= MAX_REMOVED) throw new HttpError(503, "Recording storage is full.");
+      next.history = next.history.filter(row => recordingKey(row) !== key);
+      // Keep a tombstone so routine polling and service restarts cannot restore
+      // a recording an authorized guild member deliberately removed.
+      next.removed.push(key);
+      await persist(next);
+    });
+    queue = operation.catch(() => {});
+    await operation;
+  }
+
+  return { observe, list, targets, remove };
 }

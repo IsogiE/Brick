@@ -36,7 +36,7 @@ async function fixture(t, upstream = () => { throw new Error("Unexpected provide
     if (discordFailure) return json({}, discordFailure);
     const token = options.headers.authorization?.split(" ")[1];
     if (token === "invalid") return json({}, 401);
-    const id = token === "bob-token" ? "22" : token === "removed-token" ? "33" : "11";
+    const id = token === "bob-token" ? "22" : token === "special-token" ? "341518802208423957" : token === "removed-token" ? "33" : "11";
     const member = currentMembers.find(member => member.user.id === id);
     if (url.endsWith("/users/@me")) return json(member?.user || { id, username: "Removed" });
     if (url.endsWith("/member")) return member ? json(member) : json({}, 403);
@@ -811,10 +811,13 @@ test("YouTube actual end wins over live snippet; upcoming, missing, and nonembed
   await f.save(`https://youtu.be/${videoId}`);
   assert.equal((await f.list()).streams[0].viewerCount, 123);
   assert.equal((await f.list()).ownStreams[0].broadcastState, "live");
+  assert.equal((await f.list()).streams[0].replayStartMs, Date.parse("2023-11-14T20:00:00Z"));
+  assert.equal((await f.list()).streams[0].replayEndMs, 1_700_000_000_000 - 30_000);
   video.liveStreamingDetails.actualEndTime = "2023-11-14T21:00:00Z";
   f.advance(30_000);
   assert.equal((await f.list()).ownStream.status, "offline");
   assert.equal((await f.list()).ownStreams[0].broadcastState, "ended");
+  assert.equal((await f.list()).ownStreams[0].replayEndMs, Date.parse("2023-11-14T21:00:00Z"));
   delete video.liveStreamingDetails.actualEndTime;
   video.status.embeddable = false;
   f.advance(30_000);
@@ -830,6 +833,8 @@ test("YouTube actual end wins over live snippet; upcoming, missing, and nonembed
   f.advance(30_000);
   assert.equal((await f.list()).ownStream.status, "unknown");
   assert.equal((await f.list()).ownStreams[0].broadcastState, undefined);
+  assert.equal((await f.list()).ownStreams[0].replayStartMs, undefined);
+  assert.equal((await f.list()).ownStreams[0].replayEndMs, undefined);
   fail = false;
   const privateId = "abcDEF_12-4";
   video = { id: privateId, snippet: { title: "Private recording", liveBroadcastContent: "none" },
@@ -994,4 +999,79 @@ test("player origins are configured HTTPS origins with loopback HTTP for local t
   assert.equal(parsePlayerOrigin("http://127.0.0.1:8080").origin, "http://127.0.0.1:8080");
   assert.equal(parsePlayerOrigin(undefined), null);
   for (const origin of ["http://brick.example.com", "https://user:pass@brick.example.com", "https://brick.example.com/path", "https://brick.example.com/?key=x", "javascript:alert(1)"]) assert.throws(() => parsePlayerOrigin(origin));
+});
+
+async function seedRecording(f) {
+  await writeFile(path.join(f.data, "stream-vods.json"), JSON.stringify({ version: 1, active: [], history: [{
+    userId: "11", provider: "youtube", id: videoId, title: "Saved raid", startedAt: "2023-11-14T20:00:00Z", endedAt: "2023-11-14T21:00:00Z",
+  }] }), { mode: 0o600 });
+}
+
+test("saved recording review and playback work without any live registration and retain authentication", async t => {
+  let providerCalls = 0;
+  const f = await fixture(t, url => {
+    providerCalls++;
+    const request = new URL(url);
+    assert.equal(request.origin, "https://www.googleapis.com");
+    assert.equal(request.searchParams.get("id"), videoId);
+    assert(request.searchParams.get("part").includes("contentDetails"));
+    return json({ items: [{ id: videoId, status: { embeddable: true, privacyStatus: "public" }, contentDetails: { duration: "PT59M55S" },
+      liveStreamingDetails: { actualStartTime: "2023-11-14T20:00:00Z", actualEndTime: "2023-11-14T21:00:00Z" } }] });
+  }, providerEnv);
+  await seedRecording(f);
+  const review = `/v1/streams/vods/11/youtube/${videoId}/review`;
+  const player = `/v1/streams/player/11/youtube?recording=${videoId}&at=123.875&broadcast=${videoId}&paused=1`;
+  for (const route of [review, player]) assert.equal((await f.request(route)).status, 401);
+  assert.equal(providerCalls, 0);
+  const metadata = await f.authorized(review);
+  assert.equal(metadata.status, 200);
+  assert.equal((await metadata.json()).availableSeconds, 3595);
+  assert.equal((await f.list()).streams.length, 0);
+  const response = await f.authorized(player);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  const html = await response.text();
+  assert.match(html, /data-start="123.875"/);
+  assert.match(html, /autoplay=0/);
+  assert(!html.includes("Saved raid"));
+  assert(!html.includes("alice-token"));
+  assert.equal(providerCalls, 1);
+  assert.equal((await f.authorized(review.replace("/11/", "/33/"))).status, 404);
+  assert.equal((await f.authorized(player.replace("at=123.875", "at=3595"))).status, 409);
+  assert.equal((await f.authorized(player + "&recording=../../secret")).status, 400);
+  assert.equal((await f.authorized(player.replace("at=123.875", "at=NaN"))).status, 400);
+  assert.equal(providerCalls, 1);
+});
+
+test("only current officers and the designated eligible user may remove saved recordings", async t => {
+  const f = await fixture(t, () => assert.fail("Deleting must not contact providers"), { ROSTER_CACHE_SECONDS: "1" });
+  await seedRecording(f);
+  const route = `/v1/streams/vods/youtube/${videoId}`;
+  assert.equal((await f.request(route, { method: "DELETE" })).status, 401);
+  assert.equal((await (await f.authorized("/v1/streams/vods")).json()).canDeleteRecordings, false);
+  assert.equal((await f.authorized(route, { method: "DELETE", headers: { "x-user-id": "341518802208423957" } })).status, 403);
+  assert.equal((await (await f.authorized("/v1/streams/vods", {}, "bob-token")).json()).canDeleteRecordings, true);
+  // Downgrade an officer while the same OAuth token is cached.
+  f.setMembers(members.map(member => member.user.id === "22" ? { ...member, roles: ["raider"] } : member));
+  f.advance(2000);
+  await new Promise(resolve => setTimeout(resolve, 1050));
+  assert.equal((await f.authorized(route, { method: "DELETE" }, "bob-token")).status, 403);
+  assert.equal((await (await f.authorized("/v1/streams/vods")).json()).vods.length, 1);
+  f.setMembers([...members, { user: { id: "341518802208423957", username: "Authorized reviewer" }, roles: ["raider"] }]);
+  f.advance(2000);
+  await new Promise(resolve => setTimeout(resolve, 1050));
+  assert.equal((await (await f.authorized("/v1/streams/vods", {}, "special-token")).json()).canDeleteRecordings, true);
+  assert.equal((await f.authorized(route, { method: "DELETE" }, "special-token")).status, 200);
+  await f.restart();
+  assert.deepEqual((await (await f.authorized("/v1/streams/vods")).json()).vods, []);
+  assert.equal((await f.authorized(`/v1/streams/vods/11/youtube/${videoId}/review`)).status, 404);
+});
+
+test("officer removal succeeds and a designated user without guild access cannot delete", async t => {
+  const f = await fixture(t);
+  await seedRecording(f);
+  const route = `/v1/streams/vods/youtube/${videoId}`;
+  assert.equal((await f.authorized(route, { method: "DELETE" }, "special-token")).status, 403);
+  assert.equal((await f.authorized(route, { method: "DELETE" }, "bob-token")).status, 200);
+  assert.deepEqual((await (await f.authorized("/v1/streams/vods")).json()).vods, []);
 });

@@ -13,12 +13,15 @@ mod defensives;
 mod discord_auth;
 mod download;
 mod presence;
+mod recordings_ui;
 mod replay_health;
 mod replay_observer;
 mod replay_ocr;
 #[cfg(test)]
 mod replay_smoke;
 mod replay_timing;
+mod review_compare;
+mod review_compare_ui;
 mod review_ui;
 mod single_instance;
 mod stream_player;
