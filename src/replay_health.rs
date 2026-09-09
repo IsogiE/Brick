@@ -211,6 +211,7 @@ pub struct Assessment {
     pub mappings: Vec<Mapping>,
 }
 
+#[cfg(test)]
 impl Assessment {
     pub fn unique_mapping(&self) -> Option<&Mapping> {
         (self.mappings.len() == 1).then(|| &self.mappings[0])

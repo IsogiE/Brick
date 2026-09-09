@@ -3193,7 +3193,6 @@ mod tests {
         };
         let mut observation = crate::replay_observer::Observation {
             identity,
-            generation: 1,
             width: 1000,
             height: 600,
             observed_at: Instant::now(),
@@ -4228,10 +4227,10 @@ mod tests {
         review_ui.review = Some(review);
         review_ui.select(pull);
         let ctx = egui::Context::default();
-        let mut style = (*ctx.style()).clone();
+        let mut style = (*ctx.global_style()).clone();
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
         style.spacing.button_padding = egui::vec2(14.0, 8.0);
-        ctx.set_style(style);
+        ctx.set_global_style(style);
         let mut expected = None;
         for mode in 0..6 {
             let mut state = PlaybackState::default();

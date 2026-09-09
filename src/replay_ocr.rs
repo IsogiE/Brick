@@ -113,16 +113,6 @@ pub struct HealthCandidate {
     pub percent_region: ClockRegion,
 }
 
-impl HealthCandidate {
-    pub fn region(&self) -> HealthRegion {
-        HealthRegion {
-            boss_name_id: self.boss_name_id,
-            name_region: self.name_region,
-            percent_region: self.percent_region,
-        }
-    }
-}
-
 #[derive(Clone)]
 struct Word {
     text: String,

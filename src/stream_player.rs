@@ -534,6 +534,7 @@ impl StreamPlayer {
         self.fullscreen.active()
     }
 
+    #[cfg(test)]
     pub fn enter_fullscreen(&self) {
         if self.visible.get() {
             self.capture.cancel();
@@ -1545,14 +1546,14 @@ mod tests {
     fn a_near_poll_deadline_does_not_request_immediate_egui_frames() {
         let ctx = egui::Context::default();
         for _ in 0..3 {
-            let _ = ctx.run(egui::RawInput::default(), |_| {});
+            let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
         }
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = requests.clone();
         ctx.set_request_repaint_callback(move |info| recorded.lock().unwrap().push(info.delay));
         let wait = Duration::from_millis(1);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            schedule_state_poll(ctx, wait)
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            schedule_state_poll(ui.ctx(), wait)
         });
         let requests = requests.lock().unwrap();
         assert!(!requests.is_empty());

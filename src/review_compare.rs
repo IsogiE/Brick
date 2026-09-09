@@ -737,6 +737,7 @@ impl Controller {
 
     /// The host should immediately drop its optional secondary StreamPlayer.
     /// Primary playback continues when the comparison view is dismissed.
+    #[cfg(test)]
     pub fn leave(self) -> Commands {
         Commands {
             primary: None,

@@ -53,6 +53,7 @@ impl Controller {
         self.bridge.state.lock().is_ok_and(|state| state.active)
     }
 
+    #[cfg(test)]
     pub fn enter(&self) {
         self.bridge.request(true);
     }

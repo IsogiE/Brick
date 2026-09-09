@@ -78,9 +78,7 @@ pub enum Phase {
 #[derive(Clone)]
 pub struct Reading {
     pub region_id: u32,
-    pub region: ClockRegion,
     pub elapsed_seconds: u32,
-    pub explicit_separator: bool,
 }
 
 #[derive(Clone)]
@@ -92,12 +90,12 @@ pub struct HealthReading {
 /// Candidate clocks from one frame, never a verified encounter time or offset.
 pub struct Observation {
     pub identity: Identity,
-    pub generation: u64,
     pub width: u32,
     pub height: u32,
     pub observed_at: Instant,
     pub before_seconds: f64,
     pub after_seconds: f64,
+    #[cfg(test)]
     pub sampling_uncertainty_seconds: f64,
     pub readings: Vec<Reading>,
     pub health_readings: Vec<HealthReading>,
@@ -383,9 +381,11 @@ impl Observer {
         self.directory.is_some()
     }
 
+    #[cfg(test)]
     pub fn status(&self) -> Status {
         self.status
     }
+    #[cfg(test)]
     pub fn statistics(&self) -> Statistics {
         self.statistics
     }
@@ -443,6 +443,7 @@ impl Observer {
         }
     }
 
+    #[cfg(test)]
     pub fn tick(
         &mut self,
         ctx: &egui::Context,
@@ -973,12 +974,12 @@ fn recognize(
     Ok((
         Observation {
             identity: job.epoch.identity.clone(),
-            generation: job.frame.generation,
             width: image.width(),
             height: image.height(),
             observed_at: job.frame.observed_at,
             before_seconds: job.frame.before_seconds,
             after_seconds: job.frame.after_seconds,
+            #[cfg(test)]
             sampling_uncertainty_seconds: job.frame.sampling_uncertainty_seconds,
             readings,
             health_readings,
@@ -1036,9 +1037,7 @@ fn discover_regions(
         };
         readings.push(Reading {
             region_id: regions[index].id,
-            region: regions[index].bounds,
             elapsed_seconds: candidate.elapsed_seconds,
-            explicit_separator: true,
         });
     }
     if readings.is_empty() {
@@ -1068,9 +1067,7 @@ fn track_region(
         .filter(|candidate| candidate.explicit_separator || region.increasing_samples >= 3)
         .map(|candidate| Reading {
             region_id: region.id,
-            region: region.bounds,
             elapsed_seconds: candidate.elapsed_seconds,
-            explicit_separator: candidate.explicit_separator,
         })
         .collect();
     if let [reading] = readings.as_slice() {
@@ -1142,10 +1139,9 @@ mod tests {
             },
         }
     }
-    fn observation(generation: u64) -> Observation {
+    fn observation() -> Observation {
         Observation {
             identity: identity(),
-            generation,
             width: 1,
             height: 1,
             observed_at: Instant::now(),
@@ -1203,7 +1199,7 @@ mod tests {
         }
     }
     fn health_observation(seconds: f64) -> Observation {
-        let mut result = observation(1);
+        let mut result = observation();
         result.before_seconds = seconds;
         result.after_seconds = seconds + 0.1;
         result.health_readings = vec![HealthReading {
@@ -1414,7 +1410,7 @@ mod tests {
         responses
             .send(Completed {
                 key: CompletionKey::from(&epoch(1)),
-                result: Ok((observation(1), Vec::new(), Vec::new())),
+                result: Ok((observation(), Vec::new(), Vec::new())),
             })
             .unwrap();
         observer.receive(true);
@@ -1433,12 +1429,12 @@ mod tests {
         responses
             .send(Completed {
                 key: CompletionKey::from(&epoch(1)),
-                result: Ok((observation(1), Vec::new(), Vec::new())),
+                result: Ok((observation(), Vec::new(), Vec::new())),
             })
             .unwrap();
         observer.receive(true);
         assert!(observer.observation().is_none());
-        let mut stale = observation(2);
+        let mut stale = observation();
         stale.observed_at = Instant::now() - MAX_RESULT_AGE - Duration::from_secs(1);
         observer.in_flight = Some(Arc::new(AtomicBool::new(false)));
         responses
@@ -1478,7 +1474,7 @@ mod tests {
         observer.discoveries = 2;
         observer.in_flight = Some(Arc::new(AtomicBool::new(false)));
         let (regions, readings) = discover_regions(vec![candidate(30, true)], 100.0).unwrap();
-        let mut observation = observation(1);
+        let mut observation = observation();
         observation.readings = readings;
         responses
             .send(Completed {

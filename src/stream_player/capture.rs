@@ -2,9 +2,10 @@
 
 use super::PlaybackState;
 use eframe::egui;
+#[cfg(any(target_os = "linux", test))]
+use std::io::{self, Write};
 use std::{
     cell::{Cell, RefCell},
-    io::{self, Write},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, Weak,
@@ -32,9 +33,12 @@ pub struct FrameCapture {
     pub after_seconds: f64,
     pub playing: bool,
     pub observed_at: Instant,
+    #[cfg(test)]
     pub bracket_duration: Duration,
+    #[cfg(test)]
     pub capture_duration: Duration,
     /// Measured sampling window, excluding any unobservable SDK/decoder latency.
+    #[cfg(test)]
     pub sampling_uncertainty_seconds: f64,
 }
 
@@ -69,11 +73,13 @@ struct Sample {
 }
 
 enum Pixels {
+    #[cfg(any(target_os = "linux", test))]
     Rgb {
         width: u32,
         height: u32,
         bytes: Vec<u8>,
     },
+    #[cfg(target_os = "windows")]
     Png(Vec<u8>),
 }
 
@@ -488,8 +494,8 @@ fn frame(
     pixels: Pixels,
     before: Sample,
     after: Sample,
-    started: Instant,
-    finished: Instant,
+    _started: Instant,
+    _finished: Instant,
     job: &Weak<Mutex<Job>>,
 ) -> Result<FrameCapture, String> {
     let generation = job
@@ -506,6 +512,7 @@ fn frame(
         return Err("Playback changed during the media snapshot.".into());
     }
     let (png, width, height) = match pixels {
+        #[cfg(any(target_os = "linux", test))]
         Pixels::Rgb {
             width,
             height,
@@ -525,6 +532,7 @@ fn frame(
             .map_err(|_| "The media snapshot could not be encoded within its limit.".to_string())?;
             (output.bytes, width, height)
         }
+        #[cfg(target_os = "windows")]
         Pixels::Png(bytes) => {
             if bytes.len() < 24
                 || bytes.len() > MAX_BYTES
@@ -548,16 +556,21 @@ fn frame(
         after_seconds: after.state.seconds,
         playing: before.state.playing,
         observed_at: before.requested + elapsed / 2,
+        #[cfg(test)]
         bracket_duration: elapsed,
-        capture_duration: finished.duration_since(started),
+        #[cfg(test)]
+        capture_duration: _finished.duration_since(_started),
+        #[cfg(test)]
         sampling_uncertainty_seconds: elapsed.as_secs_f64().max(movement.abs()),
     })
 }
 
+#[cfg(any(target_os = "linux", test))]
 struct BoundedWriter {
     bytes: Vec<u8>,
     job: Weak<Mutex<Job>>,
 }
+#[cfg(any(target_os = "linux", test))]
 impl Write for BoundedWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if self.job.strong_count() == 0 || bytes.len() > MAX_BYTES.saturating_sub(self.bytes.len())

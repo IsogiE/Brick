@@ -403,10 +403,6 @@ impl StreamsUi {
         false
     }
 
-    pub(crate) fn replay_observation(&self) -> Option<&crate::replay_observer::Observation> {
-        self.observer.observation()
-    }
-
     pub fn repaint_after(&self, active: bool) -> Duration {
         #[cfg(target_os = "linux")]
         if self.player.is_some() {

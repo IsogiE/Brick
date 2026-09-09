@@ -27,7 +27,9 @@ const CANCELLED: &str = "The Warcraft Logs request was cancelled.";
 
 #[path = "warcraftlogs_health.rs"]
 mod health;
-pub(crate) use health::{HealthBand, HealthPoint, HealthTarget, HealthTrace, HealthWindow};
+pub(crate) use health::{HealthBand, HealthTarget, HealthWindow};
+#[cfg(test)]
+pub(crate) use health::{HealthPoint, HealthTrace};
 
 /// Blocking transport has a bounded timeout, but cannot be interrupted here.
 /// Check both sides so obsolete requests cannot start another page or publish

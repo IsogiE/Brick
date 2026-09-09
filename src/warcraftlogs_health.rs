@@ -198,6 +198,7 @@ impl Client {
         Ok(window)
     }
 
+    #[cfg(test)]
     pub(crate) fn health_window(
         &mut self,
         discord_token: &str,
@@ -496,6 +497,7 @@ fn append_page(
     Ok(())
 }
 
+#[cfg(test)]
 fn acquire(
     pull: &Pull,
     start: i64,
