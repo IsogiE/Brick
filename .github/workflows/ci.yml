@@ -30,7 +30,7 @@ jobs:
           # Brick does not use the runner's optional Chrome package repository.
           sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/google-chrome*.sources
           sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav gnome-keyring
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav gnome-keyring xvfb
 
       - name: Check formatting
         if: runner.os == 'Linux'
@@ -47,9 +47,9 @@ jobs:
           node-version: 22
           package-manager-cache: false
 
-      - name: Test presence API and stream preferences
+      - name: Test presence API and player scripts
         if: runner.os == 'Linux'
-        run: node --test presence/*.test.mjs tests/stream-preferences.test.mjs
+        run: node --test presence/*.test.mjs tests/*.test.mjs
 
       - name: Test AppImage sandbox relocation
         if: runner.os == 'Linux'
@@ -63,6 +63,12 @@ jobs:
         env:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo test
+
+      - name: Test native player resizing
+        if: runner.os == 'Linux'
+        env:
+          RUSTFLAGS: '-D warnings'
+        run: xvfb-run -a cargo test --locked stream_player::resize::tests::native_player_viewport_shrinks_for_compare_and_grows_for_single_view -- --exact --ignored --test-threads=1
 
       - name: Test Windows signature verification
         if: runner.os == 'Windows'

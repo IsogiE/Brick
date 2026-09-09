@@ -123,44 +123,6 @@ pub fn remember_main_window(frame: &eframe::Frame, ctx: &egui::Context) {
 }
 
 #[cfg(target_os = "linux")]
-pub fn withdraw_minimized_window(frame: &eframe::Frame) {
-    use x11rb::{
-        connection::Connection as _,
-        protocol::xproto::{ConnectionExt as _, EventMask, UnmapNotifyEvent, UNMAP_NOTIFY_EVENT},
-    };
-    let Some(window) = x11_window_id(frame) else {
-        return;
-    };
-    let withdraw = || -> Result<(), Box<dyn std::error::Error>> {
-        let (connection, screen) = x11rb::connect(None)?;
-        let root = connection.setup().roots[screen].root;
-        connection.unmap_window(window)?;
-        // An iconified window is already unmapped. ICCCM withdrawal also sends
-        // the WM a synthetic unmap event so it removes the taskbar entry.
-        connection.send_event(
-            false,
-            root,
-            EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
-            UnmapNotifyEvent {
-                response_type: UNMAP_NOTIFY_EVENT,
-                sequence: 0,
-                event: root,
-                window,
-                from_configure: false,
-            },
-        )?;
-        connection.flush()?;
-        Ok(())
-    };
-    if let Err(error) = withdraw() {
-        let _ = crate::addon::record_log(
-            crate::addon::LogLevel::Warn,
-            format!("Could not hide minimized window: {error}"),
-        );
-    }
-}
-
-#[cfg(target_os = "linux")]
 mod platform {
     use std::{
         sync::{mpsc, LazyLock},

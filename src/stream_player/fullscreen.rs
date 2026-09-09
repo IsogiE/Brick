@@ -34,6 +34,15 @@ impl Bridge {
 
 pub(super) struct Controller {
     bridge: Bridge,
+    #[cfg(target_os = "linux")]
+    linux: std::cell::RefCell<Option<LinuxBinding>>,
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxBinding {
+    manager: webkit2gtk::UserContentManager,
+    handler: gtk::glib::SignalHandlerId,
+    script: webkit2gtk::UserScript,
 }
 
 impl Controller {
@@ -46,6 +55,8 @@ impl Controller {
                 })),
                 ctx: ctx.clone(),
             },
+            #[cfg(target_os = "linux")]
+            linux: std::cell::RefCell::new(None),
         }
     }
 
@@ -81,31 +92,61 @@ impl Controller {
     #[cfg(target_os = "linux")]
     pub fn attach(&self, view: &WebView) -> Result<(), String> {
         use gtk::prelude::*;
-        use webkit2gtk::{SettingsExt, WebViewExt};
+        use webkit2gtk::{SettingsExt, UserContentManagerExt, WebViewExt};
         use wry::WebViewExtUnix;
 
         let view = view.webview();
         if let Some(settings) = WebViewExt::settings(&view) {
-            settings.set_enable_fullscreen(true);
+            // Even an unexpected native request must not reach the broken
+            // fullscreen implementation in the bundled WebKitGTK 2.50.4.
+            settings.set_enable_fullscreen(false);
         }
+        let manager = view
+            .user_content_manager()
+            .ok_or("The player could not enable fullscreen controls.")?;
         let bridge = self.bridge.clone();
-        view.connect_enter_fullscreen(move |_| {
-            bridge.request(true);
-            // Suppress WebKit's default window-mode transition. Brick expands
-            // only the existing media child's bounds within its current window.
-            true
+        let handler =
+            manager.connect_script_message_received(Some("brickFullscreen"), move |_, result| {
+                // This channel can only change this player's layout. It carries no
+                // URLs, commands, credentials, or access to application data.
+                if let Some(value) = result.js_value() {
+                    match value.to_string().as_str() {
+                        "enter" => bridge.request(true),
+                        "exit" => bridge.request(false),
+                        _ => (),
+                    }
+                }
+            });
+        if !manager.register_script_message_handler("brickFullscreen") {
+            manager.disconnect(handler);
+            return Err("The player could not enable fullscreen controls.".to_string());
+        }
+        let script = webkit2gtk::UserScript::new(
+            include_str!("fullscreen.js"),
+            webkit2gtk::UserContentInjectedFrames::AllFrames,
+            webkit2gtk::UserScriptInjectionTime::Start,
+            &[],
+            &[],
+        );
+        manager.add_script(&script);
+        *self.linux.borrow_mut() = Some(LinuxBinding {
+            manager,
+            handler,
+            script,
         });
         let bridge = self.bridge.clone();
-        view.connect_leave_fullscreen(move |_| {
-            bridge.request(false);
-            true
-        });
-        let bridge = self.bridge.clone();
-        view.connect_key_press_event(move |_, event| {
+        view.connect_key_press_event(move |view, event| {
             if event.keyval() == gtk::gdk::keys::constants::Escape {
                 bridge.request(false);
+                // GTK can receive Escape before the document. Keep provider
+                // state in sync as well as restoring the native child bounds.
+                #[allow(deprecated)]
+                view.run_javascript(
+                    "document.exitFullscreen?.()",
+                    None::<&gtk::gio::Cancellable>,
+                    |_| {},
+                );
             }
-            // WebKit must also process Escape to leave DOM fullscreen.
             gtk::glib::Propagation::Proceed
         });
         Ok(())
@@ -160,6 +201,16 @@ impl Drop for Controller {
     fn drop(&mut self) {
         // Late callbacks from a closed or replaced child cannot re-enter.
         self.set_enabled(false);
+        #[cfg(target_os = "linux")]
+        if let Some(binding) = self.linux.get_mut().take() {
+            use gtk::prelude::*;
+            use webkit2gtk::UserContentManagerExt;
+            binding.manager.remove_script(&binding.script);
+            binding
+                .manager
+                .unregister_script_message_handler("brickFullscreen");
+            binding.manager.disconnect(binding.handler);
+        }
     }
 }
 
@@ -358,6 +409,9 @@ mod tests {
             baseline: Option<WindowGeometry>,
             provider_url: Option<String>,
             trusted_click: bool,
+            cycles: u8,
+            completed: u8,
+            exit_mode: String,
             phase: u8,
             phase_started: Instant,
             started: Instant,
@@ -402,7 +456,12 @@ mod tests {
                     && expanded
                     && elapsed > Duration::from_millis(150)
                 {
-                    key_escape(player.webview.as_ref().unwrap(), frame);
+                    match self.exit_mode.as_str() {
+                        "provider" => (), // The driver clicks Twitch's own exit control.
+                        "brick" => player.exit_fullscreen(),
+                        "escape" => key_escape(player.webview.as_ref().unwrap(), frame),
+                        _ => panic!("Unknown fullscreen test exit mode"),
+                    }
                     self.phase = 2;
                     self.phase_started = Instant::now();
                 } else if self.phase == 2
@@ -410,6 +469,12 @@ mod tests {
                     && player.bounds == normal
                     && elapsed > Duration::from_millis(150)
                 {
+                    if self.trusted_click && self.completed + 1 < self.cycles {
+                        self.completed += 1;
+                        self.phase = 1;
+                        self.phase_started = Instant::now();
+                        return;
+                    }
                     if self.trusted_click {
                         *self.outcome.lock().unwrap() = Ok(true);
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -458,9 +523,10 @@ mod tests {
                         super::super::initialize_gtk().unwrap();
                         // This local media surface verifies native expansion without
                         // requiring the provider DOM fullscreen/user-activation API.
-                        let view = WebViewBuilder::new().with_bounds(super::super::wry_bounds(super::super::physical_bounds(rect, ctx.pixels_per_point()).unwrap())).with_html("<!doctype html><style>html,body{margin:0;height:100%;background:#123;color:white}</style><button style='margin:20px;width:300px;height:100px' onclick='document.documentElement.requestFullscreen().catch(e=>document.title=e.message)'>Expand through trusted click</button>").with_focused(true).build_as_child(frame).unwrap();
+                        let view = WebViewBuilder::new().with_bounds(super::super::wry_bounds(super::super::physical_bounds(rect, ctx.pixels_per_point()).unwrap())).with_focused(true).build_as_child(frame).unwrap();
                         let fullscreen = Controller::new(&ctx);
                         fullscreen.attach(&view).unwrap();
+                        view.load_html("<!doctype html><style>html,body{margin:0;height:100%;background:#123;color:white}</style><button style='margin:20px;width:300px;height:100px' onclick='document.documentElement.requestFullscreen().catch(e=>document.title=e.message)'>Expand through trusted click</button>").unwrap();
                         #[cfg(target_os = "linux")]
                         if let Some(settings) = webkit2gtk::WebViewExt::settings(&view.webview()) { webkit2gtk::SettingsExt::set_hardware_acceleration_policy(&settings, webkit2gtk::HardwareAccelerationPolicy::Never); }
                         view.focus_parent().unwrap();
@@ -529,6 +595,13 @@ mod tests {
                     baseline: None,
                     provider_url,
                     trusted_click,
+                    cycles: std::env::var("BRICK_EXPANSION_CYCLES")
+                        .ok()
+                        .map(|s| s.parse::<u8>().unwrap().clamp(1, 20))
+                        .unwrap_or(1),
+                    completed: 0,
+                    exit_mode: std::env::var("BRICK_EXPANSION_EXIT")
+                        .unwrap_or_else(|_| "escape".into()),
                     phase: 0,
                     phase_started: Instant::now(),
                     started: Instant::now(),

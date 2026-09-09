@@ -1064,14 +1064,21 @@ impl StreamsUi {
         if !self.edit_open {
             return;
         }
-        let mut open = true;
         let mut action = None;
         let mut done = false;
-        egui::Window::new("Your streams")
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .collapsible(false).resizable(false).default_width(470.0)
+        // The eframe root and ordinary egui windows share the middle layer.
+        // A modal stays above the stream placeholder and blocks background clicks.
+        let modal = egui::Modal::new(egui::Id::new("stream-editor"))
             .frame(egui::Frame::new().fill(Color32::from_rgb(29, 33, 41)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(51, 58, 70))).corner_radius(10).inner_margin(18))
-            .open(&mut open).show(ctx, |ui| {
+            .show(ctx, |ui| {
+                ui.set_width(470.0_f32.min((ctx.content_rect().width() - 72.0).max(280.0)));
+                ui.horizontal(|ui| {
+                    ui.heading("Your streams");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        done |= ui.button("×").on_hover_text("Close").clicked();
+                    });
+                });
+                ui.separator();
                 ui.label(RichText::new("Add one or both platforms.").strong());
                 ui.add_space(10.0);
                 egui::ScrollArea::vertical().id_salt("stream-setup-help").max_height((ctx.content_rect().height() - 220.0).max(220.0)).show(ui, |ui| {
@@ -1133,13 +1140,13 @@ impl StreamsUi {
                     }
                 });
                 ui.add_space(8.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { done = ui.add(action_button("Done")).clicked(); });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { done |= ui.add(action_button("Done")).clicked(); });
             });
         if let Some(action) = action {
             self.notice = None;
             self.start(ctx, action);
         }
-        if !open || done {
+        if done || modal.should_close() {
             self.edit_open = false;
             self.drafts = [String::new(), String::new()];
             self.confirm_remove = None;
@@ -2021,6 +2028,54 @@ mod tests {
             assert_eq!(current.unverified_count, unverified);
             assert!(ui.selected.is_none());
         }
+    }
+
+    #[test]
+    fn stream_editor_stays_above_the_player_placeholder_and_closes_with_escape() {
+        let mut streams = StreamsUi::default();
+        let current = snapshot();
+        streams.selected = current.streams.first().cloned();
+        streams.snapshot = Some(Rc::new(current));
+        streams.edit_open = true;
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(980.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let covered = egui::pos2(490.0, 400.0);
+        // Exercise the real editor above a root-layer video surface even in
+        // development builds with no presence API configured.
+        for _ in 0..3 {
+            let _ = ctx.run_ui(input.clone(), |ui| {
+                ui.painter().rect_filled(ui.max_rect(), 0.0, Color32::BLACK);
+                streams.draw_editor(ui.ctx());
+            });
+        }
+        let modal_layer = ctx
+            .memory(|memory| memory.top_modal_layer())
+            .expect("Editor blocks background input");
+        assert_eq!(
+            ctx.layer_id_at(covered),
+            Some(modal_layer),
+            "The stream must not cover the registration fields"
+        );
+        let mut escape = input;
+        escape.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run_ui(escape, |ui| streams.draw_editor(ui.ctx()));
+        assert!(!streams.edit_open);
+        assert!(
+            streams.selected.is_some(),
+            "Closing setup preserves the stream selection"
+        );
     }
 
     #[test]
