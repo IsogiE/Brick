@@ -31,21 +31,23 @@ function youtube({ paused = false, start = 19800.125, live = false } = {}) {
     status: value => { status = value; events.onStateChange({ data: value }); } };
 }
 
-function twitch({ paused = false, deferredSeek = false } = {}) {
+function twitch({ paused = false, deferredSeek = false, deferredPause = false, pauseStatusLag = false } = {}) {
   const calls = []; const listeners = new Map(); let options; let seconds = 95.125; let isPaused = true; let ended = false;
   const seeks = [];
+  const pauses = [];
   const emit = event => {
-    if (event === "pause") isPaused = true;
+    if (event === "pause" && !pauseStatusLag) isPaused = true;
     if (event === "play" || event === "playing") isPaused = false;
     if (event === "ended") ended = true;
     for (const callback of listeners.get(event) || []) callback();
+    if (event === "pause" && pauseStatusLag) isPaused = true;
   };
   const player = {
     addEventListener: (event, callback) => { listeners.set(event, [...(listeners.get(event) || []), callback]); },
     setMuted: value => calls.push(["mute", value]),
     seek: value => { seconds = value; calls.push(["seek", value]); if (deferredSeek) seeks.push("seek"); else emit("seek"); },
     play: () => { calls.push("play"); if (isPaused) emit("play"); },
-    pause: () => { calls.push("pause"); if (!isPaused) emit("pause"); },
+    pause: () => { calls.push("pause"); if (!isPaused) { if (deferredPause) pauses.push("pause"); else emit("pause"); } },
     getCurrentTime: () => seconds, isPaused: () => isPaused, getEnded: () => ended,
   };
   class Player {
@@ -62,6 +64,7 @@ function twitch({ paused = false, deferredSeek = false } = {}) {
   });
   return { media: window.brickMedia, calls, options, emit, ready: () => emit("ready"),
     deliverSeeks: () => { for (const event of seeks.splice(0)) emit(event); },
+    deliverPauses: () => { for (const event of pauses.splice(0)) emit(event); },
     advance: value => { seconds += value; } };
 }
 
@@ -181,6 +184,58 @@ test("Twitch paused entry decodes a muted frame then seeks with its paused inten
   queued.media.pause(); queued.ready();
   queued.emit("playing");
   assert.equal(queued.media.state().playing, false);
+});
+
+test("Twitch seeks an already paused video without redundant pause commands", () => {
+  const f = twitch({ paused: true });
+  f.ready(); f.emit("playing");
+  const before = f.calls.length;
+  f.media.seek(12.375, false);
+  assert.deepEqual(f.calls.slice(before), [["seek", 12.375]]);
+  assert.equal(f.media.state().seconds, 12.375);
+  assert.equal(f.media.state().playing, false);
+  assert.equal(f.media.state().buffering, false);
+});
+
+test("Twitch waits for asynchronous pause before seeking and applies the newest target", () => {
+  const f = twitch({ deferredPause: true });
+  f.ready(); f.emit("playing");
+  const before = f.calls.length;
+  f.media.seek(12.375, false);
+  f.media.seek(20.625, false);
+  f.media.pause();
+  assert.deepEqual(f.calls.slice(before), ["pause"]);
+  assert.equal(f.media.state().buffering, true);
+  assert.equal(f.media.state().playing, false);
+  f.deliverPauses();
+  assert.deepEqual(f.calls.slice(before), ["pause", ["seek", 20.625]]);
+  assert.equal(f.media.state().seconds, 20.625);
+  assert.equal(f.media.state().buffering, false);
+});
+
+test("Twitch resume during an outstanding pause preserves the requested seek", () => {
+  const f = twitch({ deferredPause: true });
+  f.ready(); f.emit("playing");
+  const before = f.calls.length;
+  f.media.seek(12.375, false);
+  f.media.play();
+  assert.deepEqual(f.calls.slice(before), ["pause"]);
+  f.deliverPauses();
+  assert.deepEqual(f.calls.slice(before), ["pause", ["seek", 12.375], "play"]);
+  f.emit("playing");
+  assert.equal(f.media.state().seconds, 12.375);
+  assert.equal(f.media.state().playing, true);
+});
+
+test("Twitch PAUSE acknowledgement can precede the SDK's cached paused status", () => {
+  const f = twitch({ deferredPause: true, pauseStatusLag: true });
+  f.ready(); f.emit("playing");
+  const before = f.calls.length;
+  f.media.seek(12.375, false);
+  f.deliverPauses();
+  assert.deepEqual(f.calls.slice(before), ["pause", ["seek", 12.375]]);
+  assert.equal(f.media.state().seconds, 12.375);
+  assert.equal(f.media.state().buffering, false);
 });
 
 test("both provider controls reject invalid seek values and resume flags before changing state", () => {

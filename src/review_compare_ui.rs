@@ -1053,6 +1053,13 @@ mod native_test {
 
     const START: i64 = 1_800_000_000_000;
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SeekProbe {
+        Playing,
+        Paused,
+        Replace,
+    }
+
     struct Driver {
         players: [Option<StreamPlayer>; 2],
         urls: [String; 2],
@@ -1070,6 +1077,8 @@ mod native_test {
         captures: [bool; 2],
         output: Option<std::path::PathBuf>,
         finished: bool,
+        seek_probe: Option<SeekProbe>,
+        trace_at: Instant,
     }
     impl Driver {
         fn finish(&mut self, ctx: &egui::Context, result: Result<(), String>) {
@@ -1165,8 +1174,12 @@ mod native_test {
                 }
             }
             if std::env::var_os("BRICK_COMPARE_TRACE").is_some()
-                && (commands.primary.is_some() || commands.secondary.is_some())
+                && (commands.primary.is_some()
+                    || commands.secondary.is_some()
+                    || (self.seek_probe.is_some()
+                        && self.trace_at.elapsed() >= Duration::from_millis(500)))
             {
+                self.trace_at = Instant::now();
                 let command = |value: Option<PlaybackCommand>| match value {
                     Some(PlaybackCommand::Play) => "play".into(),
                     Some(PlaybackCommand::Pause) => "pause".into(),
@@ -1182,8 +1195,8 @@ mod native_test {
                         ]
                     });
                     format!(
-                        "at={:.3},playing={},buffering={},pending={:?},sample_ages={ages:?}",
-                        state.seconds, state.playing, state.buffering, state.playback_intent
+                        "at={:.3},playing={},buffering={},seek={:?},pending={:?},sample_ages={ages:?}",
+                        state.seconds, state.playing, state.buffering, state.seeking, state.playback_intent
                     )
                 });
                 eprintln!(
@@ -1203,6 +1216,23 @@ mod native_test {
                 1 if self.controller.position_ms() >= self.anchor + 1500
                     && self.phase_at.elapsed() >= self.hold =>
                 {
+                    if let Some(probe) = self.seek_probe {
+                        if probe == SeekProbe::Paused {
+                            self.controller.set_playing(false, Instant::now());
+                            self.next(31);
+                        } else {
+                            let target = if probe == SeekProbe::Replace {
+                                90_375
+                            } else {
+                                72_125
+                            };
+                            self.controller
+                                .seek(START + target, true, Instant::now())
+                                .map_err(|error| error.to_string())?;
+                            self.next(30);
+                        }
+                        return Ok(false);
+                    }
                     if let Some(output) = &self.output {
                         for (side, player) in self.players.iter().enumerate() {
                             let player = player.as_ref().unwrap();
@@ -1342,6 +1372,45 @@ mod native_test {
                         return Err("The second native child was retained after exit".into());
                     }
                     self.next(10);
+                }
+                30 if self.seek_probe == Some(SeekProbe::Replace)
+                    && self.phase_at.elapsed() >= Duration::from_millis(150) =>
+                {
+                    self.controller
+                        .seek(START + 72_125, true, Instant::now())
+                        .map_err(|error| error.to_string())?;
+                    self.next(33);
+                }
+                31 if self.controller.status() == Status::Paused => {
+                    self.controller
+                        .seek(START + 72_125, false, Instant::now())
+                        .map_err(|error| error.to_string())?;
+                    self.next(32);
+                }
+                30 | 32 | 33
+                    if self.controller.status()
+                        == if self.phase == 32 {
+                            Status::Paused
+                        } else {
+                            Status::Playing
+                        } =>
+                {
+                    for side in 0..2 {
+                        let state = self.players[side].as_ref().unwrap().playback_state();
+                        let target = self.timing_offsets[side] + 72.125;
+                        if state.seeking.is_some()
+                            || state.buffering
+                            || state.playing != (self.phase != 32)
+                            || (state.seconds - target).abs()
+                                > if self.phase == 32 { 0.5 } else { 2.0 }
+                        {
+                            return Err(format!(
+                                "Backward seek missed side {side}: target={target:.3},actual={:.3}",
+                                state.seconds
+                            ));
+                        }
+                    }
+                    return Ok(true);
                 }
                 _ => (),
             }
@@ -1494,11 +1563,26 @@ mod native_test {
                 / 1000.0;
         let offsets = [primary_offset, secondary_offset];
         let replays = [first, second];
+        let seek_probe = std::env::var("BRICK_COMPARE_BACKWARD_SEEK")
+            .ok()
+            .map(|value| match value.as_str() {
+                "playing" => SeekProbe::Playing,
+                "paused" => SeekProbe::Paused,
+                "replace" => SeekProbe::Replace,
+                _ => panic!("Backward seek mode must be playing, paused, or replace"),
+            });
+        let initial_ms = if seek_probe.is_some() { 145_125 } else { 0 };
+        let end_ms = if seek_probe.is_some() {
+            300_000
+        } else {
+            60_000
+        };
         let urls = std::array::from_fn(|side| {
             assert!(
                 offsets[side].is_finite()
                     && offsets[side] >= 0.0
-                    && offsets[side] + 90.0 < replays[side].available_seconds.min(604800) as f64
+                    && offsets[side] + end_ms as f64 / 1000.0 + 30.0
+                        < replays[side].available_seconds.min(604800) as f64
             );
             let default_member = if side == 0 {
                 "101"
@@ -1523,7 +1607,10 @@ mod native_test {
                 replays[side].provider.key()
             ));
             url.query_pairs_mut()
-                .append_pair("at", &format!("{:.3}", offsets[side]))
+                .append_pair(
+                    "at",
+                    &format!("{:.3}", offsets[side] + initial_ms as f64 / 1000.0),
+                )
                 .append_pair("broadcast", &replays[side].broadcast_id)
                 .append_pair("paused", "1");
             url.to_string()
@@ -1546,8 +1633,14 @@ mod native_test {
         );
         let hold = Duration::from_secs(hold);
         let now = Instant::now();
-        let controller =
-            Controller::new(clocks, [START, START + 60_000], START, true, now).unwrap();
+        let controller = Controller::new(
+            clocks,
+            [START, START + end_ms],
+            START + initial_ms,
+            true,
+            now,
+        )
+        .unwrap();
         let outcome = Arc::new(Mutex::new(None));
         let result = outcome.clone();
         let output = std::env::var_os("BRICK_COMPARE_CAPTURE_DIR").map(std::path::PathBuf::from);
@@ -1596,6 +1689,8 @@ mod native_test {
                     captures: [false, false],
                     output,
                     finished: false,
+                    seek_probe,
+                    trace_at: now,
                 }))
             }),
         )

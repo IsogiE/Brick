@@ -80,6 +80,7 @@ export const twitchControls = `(() => {
   let resume = url.searchParams.get("autoplay") !== "false";
   let decoded = false;
   let priming = null;
+  let pauseThenSeek = false;
   const video = url.searchParams.get("video");
   const player = new Twitch.Player("media", {width:"100%", height:"100%",
     video, parent:[url.searchParams.get("parent")],
@@ -91,10 +92,19 @@ export const twitchControls = `(() => {
     player.play();
   };
   const apply = () => {
-    if (resume) priming = null;
-    else { playing = false; player.pause(); }
+    if (!resume) {
+      playing = false;
+      if (!player.isPaused()) {
+        pauseThenSeek = true;
+        player.pause();
+        return;
+      }
+    }
+    pauseThenSeek = false;
+    // A redundant pause around a backwards seek can discard that seek in
+    // Twitch. Seek only after pause is acknowledged, without pausing again.
     player.seek(pending);
-    if (resume) player.play(); else player.pause();
+    if (resume) { priming = null; player.play(); }
   };
   player.addEventListener(Twitch.Player.READY, () => {
     ready = true;
@@ -115,7 +125,13 @@ export const twitchControls = `(() => {
     }
   });
   player.addEventListener(Twitch.Player.PAUSE, () => {
-    if (!resume && priming === "pausing") {
+    if (pauseThenSeek) {
+      // PAUSE itself acknowledges the command; the SDK's cached isPaused()
+      // value may arrive separately and must not trigger another pause here.
+      pauseThenSeek = false;
+      player.seek(pending);
+      if (resume) { priming = null; player.play(); }
+    } else if (!resume && priming === "pausing") {
       priming = null; player.seek(pending);
     }
   });
@@ -124,19 +140,19 @@ export const twitchControls = `(() => {
       if (!Number.isFinite(seconds) || seconds < 0 || seconds > 604800 || typeof shouldResume !== "boolean") return;
       pending = seconds;
       resume = shouldResume;
-      if (ready) { if (!decoded) load(); else apply(); }
+      if (ready) { if (!decoded) load(); else if (!pauseThenSeek) apply(); }
     },
     pause: () => {
       resume = false; playing = false;
-      if (ready) { if (!decoded) load(); else if (!priming) player.pause(); }
+      if (ready) { if (!decoded) load(); else if (!priming && !pauseThenSeek) player.pause(); }
     },
     play: () => {
       resume = true; priming = null;
-      if (ready) { if (!decoded) load(); else player.play(); }
+      if (ready && !pauseThenSeek) { if (!decoded) load(); else player.play(); }
     },
     state: () => ({ ready, seconds: ready ? player.getCurrentTime() : pending,
-      playing: ready && playing && !player.isPaused() && !player.getEnded(),
-      buffering: ready && (priming !== null || (!playing && !player.isPaused() && !player.getEnded())) })
+      playing: ready && !pauseThenSeek && playing && !player.isPaused() && !player.getEnded(),
+      buffering: ready && (pauseThenSeek || priming !== null || (!playing && !player.isPaused() && !player.getEnded())) })
   };
 })();`;
 export const playerScriptPolicy = youtubeScriptPolicy.replace("; ", ` 'sha256-${createHash("sha256").update(twitchControls).digest("base64")}' https://player.twitch.tv/js/embed/v1.js; `);

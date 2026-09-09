@@ -187,6 +187,7 @@ pub struct ReviewUi {
     event_notice: Option<String>,
     search: String,
     scrub: Option<f64>,
+    timeline_position: Option<f64>,
     pending_focus: Option<(Pull, i64, bool)>,
     pull_menu_cursor: Option<usize>,
     pov_menu: PovMenuState,
@@ -238,6 +239,7 @@ impl Default for ReviewUi {
             event_notice: None,
             search: String::new(),
             scrub: None,
+            timeline_position: None,
             pending_focus: None,
             pull_menu_cursor: None,
             pov_menu: PovMenuState::default(),
@@ -864,6 +866,7 @@ impl ReviewUi {
             self.selected_event = None;
             self.scroll_to_event = false;
             self.scrub = None;
+            self.timeline_position = None;
             self.aligning = false;
             self.event_notice = None;
         } else if let Some(current) = current {
@@ -880,6 +883,7 @@ impl ReviewUi {
                 self.clear_health();
                 self.range_epoch = Instant::now();
                 self.range_pause_sent = false;
+                self.timeline_position = None;
             }
             self.pull = Some(current.clone());
         }
@@ -1565,14 +1569,26 @@ impl ReviewUi {
         let duration = (pull.end_ms - pull.start_ms) as f64 / 1000.0;
         let video_start = pull_video_start(self.review.as_ref()?, &pull);
         let confirmed_position = self.confirmed_video_position(state);
-        let elapsed = confirmed_position
+        if let Some(seconds) = confirmed_position {
+            self.timeline_position = Some(seconds);
+        }
+        // A seek target is useful feedback even before the decoder reaches it.
+        // Keep it visible, then hold the last observed position during buffering;
+        // neither value acknowledges a seek or advances the playback clock.
+        let display_position = state
+            .seeking
+            .filter(|seconds| seconds.is_finite() && state.is_fresh_since(self.range_epoch))
+            .or(confirmed_position)
+            .or(self.timeline_position)
             .or_else(|| self.playback.as_ref().map(|playback| playback.seconds))
+            .filter(|seconds| seconds.is_finite());
+        let elapsed = display_position
             .map(|seconds| seconds - video_start)
             .unwrap_or(0.0);
         let current = elapsed.clamp(0.0, duration);
         let mut command = None;
-        if let Some(target) = state.seeking {
-            let target = target - video_start;
+        if state.seeking.is_some() {
+            let target = display_position.unwrap_or(video_start) - video_start;
             ui.label(
                 RichText::new(format!("Seeking to {}…", relative_clock(target)))
                     .small()
@@ -1604,6 +1620,7 @@ impl ReviewUi {
         let playing = playback_intent(state, self.playback.as_ref());
         let replay = confirmed_position.is_some() && elapsed >= duration && !self.aligning;
         let mut seek_range = None;
+        let mut cursor_position = self.scrub.unwrap_or(current);
         let label_gutter = ui.next_widget_position().x + 132.0;
         ui.horizontal(|ui| {
             if ui
@@ -1639,7 +1656,7 @@ impl ReviewUi {
             ui.label(
                 RichText::new(format!(
                     "{} / {}",
-                    if self.scrub.is_some() || confirmed_position.is_some() {
+                    if self.scrub.is_some() || display_position.is_some() {
                         relative_clock(self.scrub.unwrap_or(elapsed))
                     } else {
                         "–:––".into()
@@ -1674,6 +1691,7 @@ impl ReviewUi {
                     playback_intent(state, self.playback.as_ref()),
                 );
             }
+            cursor_position = position;
         });
 
         let (rect, response) = ui.allocate_exact_size(
@@ -1808,13 +1826,10 @@ impl ReviewUi {
                         Color32::from_rgb(15, 18, 24),
                     );
                 } else if group.is_none() {
-                    painter.text(
-                        center,
-                        egui::Align2::CENTER_CENTER,
-                        "×",
-                        egui::FontId::proportional(11.0),
-                        Color32::from_rgb(15, 18, 24),
-                    );
+                    let stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(15, 18, 24));
+                    for delta in [egui::vec2(2.0, 2.0), egui::vec2(2.0, -2.0)] {
+                        painter.line_segment([center - delta, center + delta], stroke);
+                    }
                 }
                 marker.widget_info(|| {
                     egui::WidgetInfo::labeled(
@@ -1846,13 +1861,12 @@ impl ReviewUi {
                 });
             }
         }
-        // A clamped cursor implies this frame belongs to the selected pull.
-        // Keep the true elapsed label and hide it while viewing other footage.
+        // Keep the cursor at the requested moment while seeking. Actual footage
+        // outside the pull still has its true elapsed label and no clamped cursor.
         if self.scrub.is_some()
-            || (confirmed_position.is_some() && (0.0..=duration).contains(&elapsed))
+            || (display_position.is_some() && (0.0..=duration).contains(&elapsed))
         {
-            let x =
-                grid.left() + self.scrub.unwrap_or(current) as f32 / duration as f32 * grid.width();
+            let x = grid.left() + cursor_position as f32 / duration as f32 * grid.width();
             painter.line_segment(
                 [egui::pos2(x, grid.top()), egui::pos2(x, grid.bottom())],
                 egui::Stroke::new(1.5_f32, Color32::WHITE),
@@ -1883,6 +1897,7 @@ impl ReviewUi {
     fn reset_playback_range(&mut self) {
         self.range_epoch = Instant::now();
         self.range_pause_sent = false;
+        self.timeline_position = None;
     }
 
     fn confirmed_video_position(&self, state: &PlaybackState) -> Option<f64> {
@@ -4272,16 +4287,162 @@ mod tests {
         let (thumb, cursor, _) = timeline_paint(&output);
         assert!((thumb.x - cursor).abs() < 0.1);
         assert!((thumb.x - target.x).abs() < 0.1);
-        let (_, command) = frame(vec![egui::Event::PointerButton {
+        let (output, command) = frame(vec![egui::Event::PointerButton {
             pos: target,
             button: egui::PointerButton::Primary,
             pressed: false,
             modifiers: egui::Modifiers::NONE,
         }]);
+        let (thumb, cursor, _) = timeline_paint(&output);
+        assert!(
+            (thumb.x - cursor).abs() < 0.1,
+            "Release must keep the cursor under the thumb"
+        );
         let Some(PlaybackCommand::SeekPaused(seconds)) = command else {
             panic!("Paused drag must emit a paused seek");
         };
         assert!((seconds - start - 210.0 * 0.687).abs() < 0.002);
+    }
+
+    #[test]
+    fn timeline_keeps_requested_cursor_until_seek_finishes_then_holds_during_buffering() {
+        let (review, pull, _) = fixture();
+        let start = pull_video_start(&review, &pull);
+        let mut review_ui = ReviewUi::default();
+        review_ui.review = Some(review);
+        review_ui.select(pull.clone());
+        let ctx = egui::Context::default();
+        let mut state = PlaybackState::default();
+        state.ready = true;
+        state.playing = true;
+        state.seconds = start + 140.0;
+        state.mark_polled_now();
+        let draw = |review_ui: &mut ReviewUi, state: &PlaybackState, expected: f64| {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(980.0, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    assert!(review_ui.draw_timeline(ui, state).is_none());
+                },
+            );
+            let (thumb, cursor, grid) = timeline_paint(&output);
+            assert!((thumb.x - cursor).abs() < 0.1);
+            assert!((cursor - egui::lerp(grid.x_range(), expected as f32 / 210.0)).abs() < 0.1);
+            fn has_unknown(shape: &egui::Shape) -> bool {
+                match shape {
+                    egui::Shape::Vec(shapes) => shapes.iter().any(has_unknown),
+                    egui::Shape::Text(text) => text.galley.text().contains("–:––"),
+                    _ => false,
+                }
+            }
+            assert!(!output.shapes.iter().any(|shape| has_unknown(&shape.shape)));
+        };
+        draw(&mut review_ui, &state, 140.0);
+        let command = review_ui.seek_absolute_with_playback(pull.start_ms + 72_000, true);
+        assert!(matches!(command, Some(PlaybackCommand::Seek(_))));
+        // The first frame can still carry the sample from before the gesture.
+        draw(&mut review_ui, &state, 72.0);
+        state.seeking = Some(start + 72.0);
+        state.buffering = true;
+        state.playing = false;
+        state.playback_intent = Some(true);
+        state.mark_polled_now();
+        draw(&mut review_ui, &state, 72.0);
+        assert!(review_ui.confirmed_video_position(&state).is_none());
+        assert!(review_ui.pause_at_pull_end(&state).is_none());
+        // Settling replaces the target with actual media time.
+        state.seeking = None;
+        state.buffering = false;
+        state.playing = true;
+        state.playback_intent = None;
+        state.seconds = start + 73.25;
+        state.mark_polled_now();
+        draw(&mut review_ui, &state, 73.25);
+        state.buffering = true;
+        draw(&mut review_ui, &state, 73.25);
+        assert!(review_ui.confirmed_video_position(&state).is_none());
+    }
+
+    #[test]
+    fn timeline_click_seeks_once_and_accepts_a_new_target_while_waiting() {
+        let (review, pull, _) = fixture();
+        let start = pull_video_start(&review, &pull);
+        let mut review_ui = ReviewUi::default();
+        review_ui.review = Some(review);
+        review_ui.select(pull);
+        let ctx = egui::Context::default();
+        let mut state = PlaybackState::default();
+        state.ready = true;
+        state.playing = true;
+        state.seconds = start + 145.0;
+        state.mark_polled_now();
+        let mut frame = |events, state: &PlaybackState| {
+            let mut command = None;
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(980.0, 300.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    command = review_ui.draw_timeline(ui, state);
+                },
+            );
+            (output, command)
+        };
+        frame(vec![], &state);
+        for target in [72.125, 110.375] {
+            let (output, _) = frame(vec![], &state);
+            let (_, _, grid) = timeline_paint(&output);
+            let pos = egui::pos2(
+                egui::lerp(grid.x_range(), target as f32 / 210.0),
+                grid.bottom() - 1.0,
+            );
+            frame(
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                &state,
+            );
+            let (_, command) = frame(
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                &state,
+            );
+            let Some(PlaybackCommand::Seek(seconds)) = command else {
+                panic!("Clicking timeline moment {target} must seek and resume playback");
+            };
+            assert!((seconds - start - target).abs() < 0.002);
+            state.seeking = Some(seconds);
+            state.playing = false;
+            state.buffering = true;
+            state.playback_intent = Some(true);
+            state.mark_polled_now();
+            for _ in 0..3 {
+                assert!(
+                    frame(vec![], &state).1.is_none(),
+                    "Waiting must not resend a seek"
+                );
+            }
+        }
     }
 
     #[test]
