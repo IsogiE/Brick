@@ -5,6 +5,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { HttpError, RateLimit, readBounded, clientAddress } from "./security.mjs";
 import { createStreamService, streamPlayerPage } from "./streams.mjs";
+import { playerScriptPolicy } from "./player_control.mjs";
+import { createLogsHandoff } from "./stream_review.mjs";
 
 export async function createPresenceServer({ env = process.env, fetch = globalThis.fetch, now = Date.now, firstStreamCheckWaitMs = 5_000 } = {}) {
   const DISCORD_API = "https://discord.com/api/v10";
@@ -36,6 +38,11 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   const gatewayEnabled = env.DISCORD_GATEWAY_ENABLED?.trim().toLowerCase() !== "false";
   const streams = await createStreamService({ dataDir, env, fetch, now, firstCheckWaitMs: firstStreamCheckWaitMs });
   const requestDeadlines = new WeakMap();
+  const logsHandoff = createLogsHandoff({ now });
+  // This is a public PKCE client ID. No WCL tokens or private logs live here.
+  const logsClientId = env.WARCRAFTLOGS_CLIENT_ID?.trim() || "";
+  if (logsClientId && !/^[a-zA-Z0-9_-]{1,128}$/.test(logsClientId)) throw new Error("Invalid Warcraft Logs client ID");
+  const logsGuildId = parsePositiveInt(env.WARCRAFTLOGS_GUILD_ID, 580482);
 
   let rosterCache = null;
   let rosterInFlight = null;
@@ -81,7 +88,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     response.writeHead(status, {
       "x-content-type-options": "nosniff",
       "referrer-policy": player ? "strict-origin-when-cross-origin" : "no-referrer",
-      "content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; ${player ? "frame-src https://player.twitch.tv https://www.youtube.com; " : ""}frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
+      "content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; ${player ? `frame-src https://player.twitch.tv https://www.youtube.com; ${playerScriptPolicy}` : ""}frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
       ...(status === 429 || status === 503 ? { "retry-after": "5" } : {}),
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
@@ -576,6 +583,17 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     // Apply current guild eligibility to reads and writes alike, even while the
     // OAuth identity token remains in its short verification cache.
     if (!members.some(member => member.userId === requester.id)) throw new HttpError(403, "Discord user does not have the required guild role.");
+    const canDeleteRecordings = requester.id === "341518802208423957"
+      || members.find(member => member.userId === requester.id)?.role === "Officer";
+    if (request.method === "GET" && url.pathname === "/v1/streams/review/config") {
+      sendJson(response, 200, { clientId: logsClientId, guildId: logsGuildId, userId: requester.id });
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/v1/streams/review/callback") {
+      const payload = logsHandoff.take(url.searchParams.get("state"));
+      sendJson(response, payload ? 200 : 202, payload || { status: "pending" });
+      return;
+    }
     if (url.pathname === "/v1/streams/me" && ["PUT", "DELETE"].includes(request.method)) {
       streamChanges.take(requester.id);
       const body = await readJsonBody(request);
@@ -586,34 +604,105 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     }
     const player = url.pathname.match(/^\/v1\/streams\/player\/([0-9]{1,20})(?:\/(twitch|youtube))?$/);
     const recording = url.pathname.match(/^\/v1\/streams\/vods(?:\/([0-9]{1,20}))?$/);
-    if (request.method !== "GET" || (url.pathname !== "/v1/streams" && !player && !recording)) {
+    const removeRecording = url.pathname.match(/^\/v1\/streams\/vods\/(twitch|youtube)\/([a-zA-Z0-9_-]{1,32})$/);
+    const recordingReview = url.pathname.match(/^\/v1\/streams\/vods\/([0-9]{1,20})\/(twitch|youtube)\/([a-zA-Z0-9_-]{1,32})\/review$/);
+    const replay = url.pathname.match(/^\/v1\/streams\/review\/([0-9]{1,20})\/(twitch|youtube)$/);
+    if (request.method === "DELETE" && removeRecording) {
+      if (!canDeleteRecordings) throw new HttpError(403, "You don't have permission to remove recordings.");
+      streamChanges.take(requester.id);
+      const visible = (await streams.recordings()).some(vod => vod.provider === removeRecording[1] && vod.id === removeRecording[2]
+        && members.some(member => member.userId === vod.userId));
+      if (!visible) throw new HttpError(404, "This recording is no longer available.");
+      sendJson(response, 200, await streams.removeRecording(removeRecording[1], removeRecording[2]));
+      return;
+    }
+    if (request.method !== "GET" || (url.pathname !== "/v1/streams" && !player && !recording && !replay && !recordingReview)) {
       throw new HttpError(404, "Not found.");
     }
+    const requestedPlayback = player && url.search ? parsePlaybackRequest(url, url.searchParams.has("recording")) : null;
     if (recording) {
       const eligible = new Map(members.map(member => [member.userId, member.name]));
       if (recording[1] && !eligible.has(recording[1])) throw new HttpError(404, "This member is unavailable.");
       const vods = (await streams.recordings()).filter(vod => eligible.has(vod.userId) && (!recording[1] || recording[1] === vod.userId))
         .map(vod => ({ ...vod, name: eligible.get(vod.userId) }));
-      sendJson(response, 200, { vods });
+      sendJson(response, 200, { vods, canDeleteRecordings });
+      return;
+    }
+    async function findRecording(userId, provider, id) {
+      if (!members.some(member => member.userId === userId)) throw new HttpError(404, "This recording is no longer available.");
+      const record = (await streams.recordings()).find(vod => vod.userId === userId && vod.provider === provider && vod.id === id);
+      if (!record) throw new HttpError(404, "This recording is no longer available.");
+      return record;
+    }
+    if (recordingReview) {
+      const record = await findRecording(recordingReview[1], recordingReview[2], recordingReview[3]);
+      sendJson(response, 200, await streams.recordingReplay(record));
+      return;
+    }
+    if (player && url.searchParams.has("recording")) {
+      if (!player[2] || url.searchParams.getAll("recording").length !== 1) throw new HttpError(400, "Invalid recording.");
+      const record = await findRecording(player[1], player[2], url.searchParams.get("recording"));
+      const current = await streams.recordingReplay(record);
+      const playback = playbackFor(requestedPlayback, current);
+      // The saved registry identity authorizes this exact video after its live
+      // registration disappears. Provider HTML receives no log or guild data.
+      sendHtml(response, 200, streamPlayerPage({ provider: record.provider, channelId: record.id }, streams.playerOrigin, playback), true);
       return;
     }
     const snapshot = await streams.snapshot(requester, members);
+    if (replay) {
+      const stream = snapshot.streams.find(entry => entry.userId === replay[1] && entry.provider === replay[2]);
+      if (!stream) throw new HttpError(404, "This stream is no longer live.");
+      sendJson(response, 200, await streams.replay(stream));
+      return;
+    }
     if (player) {
       const stream = snapshot.streams.find(entry => entry.userId === player[1] && (!player[2] || entry.provider === player[2]));
       if (!stream) throw new HttpError(404, "This stream is no longer live.");
-      sendHtml(response, 200, streamPlayerPage(stream, streams.playerOrigin), true);
+      let playback = null;
+      if (requestedPlayback) playback = playbackFor(requestedPlayback, await streams.replay(stream));
+      sendHtml(response, 200, streamPlayerPage(stream, streams.playerOrigin, playback), true);
     } else sendJson(response, 200, snapshot);
+  }
+
+  function parsePlaybackRequest(url, recording = false) {
+    const allowed = ["at", "broadcast", "paused", ...(recording ? ["recording"] : [])];
+    const minimum = recording ? 3 : 2;
+    const at = url.searchParams.get("at");
+    if (![minimum, minimum + 1].includes(url.searchParams.size)
+      || url.searchParams.getAll("at").length !== 1 || url.searchParams.getAll("broadcast").length !== 1
+      || [...url.searchParams.keys()].some(key => !allowed.includes(key))
+      || (url.searchParams.has("paused") && (url.searchParams.getAll("paused").length !== 1 || url.searchParams.get("paused") !== "1"))
+      || !/^[0-9]{1,7}(?:\.[0-9]{1,3})?$/.test(at) || Number(at) > 7 * 86400) {
+      throw new HttpError(400, "Invalid replay position.");
+    }
+    return { seconds: Number(at), broadcastId: url.searchParams.get("broadcast"), paused: url.searchParams.has("paused") };
+  }
+
+  function playbackFor(requested, current) {
+    if (requested.broadcastId !== current.broadcastId || requested.seconds >= current.availableSeconds) {
+      throw new HttpError(409, "This part of the recording is no longer available.");
+    }
+    return { videoId: current.videoId, seconds: requested.seconds, paused: requested.paused };
   }
 
   async function streamMembers() {
     return (await fetchRosterMembers({ strict: true }))
       .filter(member => roleFromIds(member.roles) && !member.user?.bot && /^[0-9]{1,20}$/.test(member.user?.id))
-      .map(member => ({ userId: member.user.id, name: displayName(member, member.user) }));
+      .map(member => ({ userId: member.user.id, name: displayName(member, member.user), role: roleFromIds(member.roles) }));
   }
 
   async function handleRequest(request, response) {
     requests.take(address(request));
     const url = requestUrl(request);
+
+    if (request.method === "GET" && url.pathname === "/warcraftlogs/callback") {
+      callbacks.take(address(request));
+      if (!logsClientId) throw new HttpError(503, "Warcraft Logs sign-in is not configured.");
+      logsHandoff.receive(url.searchParams);
+      sendHtml(response, 200, callbackPage("Warcraft Logs", "You can return to Brick to finish signing in."));
+      return;
+    }
 
     if (request.method === "GET" && url.pathname === "/discord/callback") {
       callbacks.take(address(request));

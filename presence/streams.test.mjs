@@ -36,7 +36,7 @@ async function fixture(t, upstream = () => { throw new Error("Unexpected provide
     if (discordFailure) return json({}, discordFailure);
     const token = options.headers.authorization?.split(" ")[1];
     if (token === "invalid") return json({}, 401);
-    const id = token === "bob-token" ? "22" : token === "removed-token" ? "33" : "11";
+    const id = token === "bob-token" ? "22" : token === "special-token" ? "341518802208423957" : token === "removed-token" ? "33" : "11";
     const member = currentMembers.find(member => member.user.id === id);
     if (url.endsWith("/users/@me")) return json(member?.user || { id, username: "Removed" });
     if (url.endsWith("/member")) return member ? json(member) : json({}, 403);
@@ -125,6 +125,45 @@ const liveYoutubeBatch = url => json({ items: url.searchParams.get("id").split("
   id, snippet: { title: "Live raid", liveBroadcastContent: "live" }, status: { embeddable: true },
   liveStreamingDetails: {},
 })) });
+
+test("private-log setup and replay reads require current Discord eligibility; PKCE codes stay isolated", async t => {
+  const f = await fixture(t, twitchLive, { WARCRAFTLOGS_CLIENT_ID: "public-pkce-id", ROSTER_CACHE_SECONDS: "1" });
+  assert.equal((await f.request("/v1/streams/review/config")).status, 401);
+  assert.deepEqual(await (await f.authorized("/v1/streams/review/config")).json(), { clientId: "public-pkce-id", guildId: 580482, userId: "11" });
+  const state = "a".repeat(64);
+  assert.equal((await f.request(`/warcraftlogs/callback?state=${state}&code=private-code`)).status, 200);
+  assert.equal((await f.request(`/v1/streams/review/callback?state=${state}`)).status, 401);
+  assert.equal((await f.request(`/v1/auth/callback?state=${state}`)).status, 202, "Discord cannot consume a WCL callback");
+  assert.deepEqual(await (await f.authorized(`/v1/streams/review/callback?state=${state}`)).json(), { code: "private-code" });
+  assert.equal((await f.authorized(`/v1/streams/review/callback?state=${state}`)).status, 202);
+  f.setMembers(members.filter(m => m.user.id !== "11"));
+  await new Promise(resolve => setTimeout(resolve, 1050));
+  assert.equal((await f.authorized("/v1/streams/review/config")).status, 403);
+});
+
+test("replay endpoints and embedded seeking cannot cross broadcast identities or seek beyond availability", async t => {
+  const startedAt = new Date(1_700_000_000_000 - 6 * 3600_000).toISOString();
+  const f = await fixture(t, (url, options) => {
+    if (url === "https://id.twitch.tv/oauth2/token") return json({ access_token: "app-token", expires_in: 3600 });
+    if (url.includes("/helix/streams?")) return json({ data: [{ user_login: "alice", type: "live", id: "123", user_id: "42", started_at: startedAt }] });
+    if (url.includes("/helix/videos?")) return json({ data: [{ id: "456", stream_id: "123", user_id: "42", type: "archive", duration: "5h59m" }] });
+    throw new Error("Unexpected provider request");
+  }, providerEnv);
+  await f.save("https://twitch.tv/alice");
+  const replay = await (await f.authorized("/v1/streams/review/11/twitch")).json();
+  assert.equal(replay.broadcastId, "123"); assert.equal(replay.videoId, "456"); assert.equal(Date.parse(replay.startedAt), Date.parse(startedAt));
+  assert.equal((await f.request("/v1/streams/review/11/twitch")).status, 401);
+  assert.equal((await f.authorized("/v1/streams/review/33/twitch")).status, 404);
+  const valid = await f.authorized("/v1/streams/player/11/twitch?at=19800&broadcast=123");
+  assert.equal(valid.status, 200); assert.match(await valid.text(), /video=v456.*time=19800s/);
+  const paused = await f.authorized("/v1/streams/player/11/twitch?at=19800.875&broadcast=123&paused=1");
+  assert.equal(paused.status, 200);
+  const html = await paused.text();
+  assert.match(html, /autoplay=false/); assert.match(html, /time=19800.875s/);
+  for (const query of ["at=19800&broadcast=122", "at=21600&broadcast=123", "at=-1&broadcast=123", "at=2&at=3&broadcast=123", "at=2&broadcast=123&broadcast=123", "at=2&broadcast=123&extra=x", "broadcast=123", "paused=1", "at=1&paused=1", "at=1&broadcast=123&paused=0", "at=1&broadcast=123&paused=true", "at=1&broadcast=123&paused=1&paused=1", "at=1.0001&broadcast=123", "at=1.&broadcast=123", "at=.5&broadcast=123", "at=1e2&broadcast=123", "at=NaN&broadcast=123", "at=604800.001&broadcast=123"]) {
+    assert.ok((await f.authorized(`/v1/streams/player/11/twitch?${query}`)).status >= 400, query);
+  }
+});
 
 test("large YouTube directories reduce quota use while verified entries never outlive the freshness limit", async t => {
   const small = await quotaFixture(t, 200, liveYoutubeBatch);
@@ -619,28 +658,59 @@ test("concurrent first checks deduplicate canonical targets and keep every submi
   assert.equal(calls, 1, "a fresh canonical target reuses its verified cache");
 });
 
-test("a persisted save succeeds after its check deadline and after concurrent removal", async t => {
-  let release;
-  const f = await fixture(t, (url, options) => url.includes("oauth2/token") ? twitchLive(url, options)
-    : new Promise(resolve => { release = () => resolve(twitchLive(url, options)); }), providerEnv, { firstStreamCheckWaitMs: 120 });
+test("a persisted save succeeds after its provider check deadline", { timeout: 10_000 }, async t => {
+  const provider = Promise.withResolvers();
+  const f = await fixture(t, async (url, options) => {
+    if (!url.includes("oauth2/token")) await provider.promise;
+    return twitchLive(url, options);
+  }, providerEnv, { firstStreamCheckWaitMs: 120 });
+  try {
+    const saved = await f.save("https://twitch.tv/alice");
+    assert.equal(saved.status, 200);
+    assert.equal((await saved.json()).ownStream.status, "checking");
+    assert.equal(JSON.parse(await readFile(path.join(f.data, "streams.json"), "utf8")).users["11"].twitch.channelId, "alice");
+  } finally {
+    provider.resolve();
+  }
+});
+
+test("a save finishing after concurrent removal reports no registration", { timeout: 10_000 }, async t => {
+  const replacementStarted = Promise.withResolvers();
+  const provider = Promise.withResolvers();
+  const f = await fixture(t, async (url, options) => {
+    if (new URL(url).searchParams.getAll("user_login").includes("alice_next")) {
+      replacementStarted.resolve();
+      await provider.promise;
+    }
+    return twitchLive(url, options);
+  }, providerEnv, { firstStreamCheckWaitMs: 5_000 });
   const saved = await f.save("https://twitch.tv/alice");
   assert.equal(saved.status, 200);
-  assert.equal((await saved.json()).ownStream.status, "checking");
-  assert.equal(JSON.parse(await readFile(path.join(f.data, "streams.json"), "utf8")).users["11"].twitch.channelId, "alice");
-  assert(release);
-  const waiting = f.save("https://twitch.tv/alice_next");
-  for (let i = 0; i < 200; i++) {
+  assert.equal((await saved.json()).ownStream.status, "live");
+  let saveFinished = false;
+  const waiting = f.save("https://twitch.tv/alice_next").then(response => {
+    saveFinished = true;
+    return response;
+  });
+  try {
+    await replacementStarted.promise;
     const registry = JSON.parse(await readFile(path.join(f.data, "streams.json"), "utf8"));
-    if (registry.users["11"].twitch.channelId === "alice_next") break;
-    await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(registry.users["11"].twitch.channelId, "alice_next");
+    assert.equal(saveFinished, false, "the replacement check must still be pending before removal");
+    assert.equal((await f.authorized("/v1/streams/me", { method: "DELETE" })).status, 200);
+    assert.equal(JSON.parse(await readFile(path.join(f.data, "streams.json"), "utf8")).users["11"], undefined);
+    assert.equal(saveFinished, false, "removal must finish before the replacement save returns");
+  } finally {
+    provider.resolve();
   }
-  assert.equal((await f.authorized("/v1/streams/me", { method: "DELETE" })).status, 200);
-  release();
   const response = await waiting;
   assert.equal(response.status, 200);
   const removed = await response.json();
   assert.equal(removed.ownStream, null);
   assert.deepEqual(removed.ownStreams, []);
+  const current = await f.list();
+  assert.equal(current.ownStream, null);
+  assert.deepEqual(current.ownStreams, []);
 });
 
 test("a save finishing after a replacement reports the current registration instead of the old URL", async t => {
@@ -772,10 +842,13 @@ test("YouTube actual end wins over live snippet; upcoming, missing, and nonembed
   await f.save(`https://youtu.be/${videoId}`);
   assert.equal((await f.list()).streams[0].viewerCount, 123);
   assert.equal((await f.list()).ownStreams[0].broadcastState, "live");
+  assert.equal((await f.list()).streams[0].replayStartMs, Date.parse("2023-11-14T20:00:00Z"));
+  assert.equal((await f.list()).streams[0].replayEndMs, 1_700_000_000_000 - 30_000);
   video.liveStreamingDetails.actualEndTime = "2023-11-14T21:00:00Z";
   f.advance(30_000);
   assert.equal((await f.list()).ownStream.status, "offline");
   assert.equal((await f.list()).ownStreams[0].broadcastState, "ended");
+  assert.equal((await f.list()).ownStreams[0].replayEndMs, Date.parse("2023-11-14T21:00:00Z"));
   delete video.liveStreamingDetails.actualEndTime;
   video.status.embeddable = false;
   f.advance(30_000);
@@ -791,6 +864,8 @@ test("YouTube actual end wins over live snippet; upcoming, missing, and nonembed
   f.advance(30_000);
   assert.equal((await f.list()).ownStream.status, "unknown");
   assert.equal((await f.list()).ownStreams[0].broadcastState, undefined);
+  assert.equal((await f.list()).ownStreams[0].replayStartMs, undefined);
+  assert.equal((await f.list()).ownStreams[0].replayEndMs, undefined);
   fail = false;
   const privateId = "abcDEF_12-4";
   video = { id: privateId, snippet: { title: "Private recording", liveBroadcastContent: "none" },
@@ -817,7 +892,7 @@ test("authenticated players use only official iframes, trusted parent and safe r
     const html = await response.text();
     assert(html.includes(provider));
     assert(html.includes("brick.example.com"));
-    for (const secret of ["alice-token", "test-bot", "test-secret", "test-app-token", "test-key", "evil.example", "<script>"]) assert(!html.includes(secret));
+    for (const secret of ["alice-token", "test-bot", "test-secret", "test-app-token", "test-key", "evil.example", '<script>alert("x")</script>']) assert(!html.includes(secret));
   }
   const anonymous = await f.request("/v1/streams/player/11?token=alice-token");
   assert.equal(anonymous.status, 401);
@@ -955,4 +1030,79 @@ test("player origins are configured HTTPS origins with loopback HTTP for local t
   assert.equal(parsePlayerOrigin("http://127.0.0.1:8080").origin, "http://127.0.0.1:8080");
   assert.equal(parsePlayerOrigin(undefined), null);
   for (const origin of ["http://brick.example.com", "https://user:pass@brick.example.com", "https://brick.example.com/path", "https://brick.example.com/?key=x", "javascript:alert(1)"]) assert.throws(() => parsePlayerOrigin(origin));
+});
+
+async function seedRecording(f) {
+  await writeFile(path.join(f.data, "stream-vods.json"), JSON.stringify({ version: 1, active: [], history: [{
+    userId: "11", provider: "youtube", id: videoId, title: "Saved raid", startedAt: "2023-11-14T20:00:00Z", endedAt: "2023-11-14T21:00:00Z",
+  }] }), { mode: 0o600 });
+}
+
+test("saved recording review and playback work without any live registration and retain authentication", async t => {
+  let providerCalls = 0;
+  const f = await fixture(t, url => {
+    providerCalls++;
+    const request = new URL(url);
+    assert.equal(request.origin, "https://www.googleapis.com");
+    assert.equal(request.searchParams.get("id"), videoId);
+    assert(request.searchParams.get("part").includes("contentDetails"));
+    return json({ items: [{ id: videoId, status: { embeddable: true, privacyStatus: "public" }, contentDetails: { duration: "PT59M55S" },
+      liveStreamingDetails: { actualStartTime: "2023-11-14T20:00:00Z", actualEndTime: "2023-11-14T21:00:00Z" } }] });
+  }, providerEnv);
+  await seedRecording(f);
+  const review = `/v1/streams/vods/11/youtube/${videoId}/review`;
+  const player = `/v1/streams/player/11/youtube?recording=${videoId}&at=123.875&broadcast=${videoId}&paused=1`;
+  for (const route of [review, player]) assert.equal((await f.request(route)).status, 401);
+  assert.equal(providerCalls, 0);
+  const metadata = await f.authorized(review);
+  assert.equal(metadata.status, 200);
+  assert.equal((await metadata.json()).availableSeconds, 3595);
+  assert.equal((await f.list()).streams.length, 0);
+  const response = await f.authorized(player);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  const html = await response.text();
+  assert.match(html, /data-start="123.875"/);
+  assert.match(html, /autoplay=0/);
+  assert(!html.includes("Saved raid"));
+  assert(!html.includes("alice-token"));
+  assert.equal(providerCalls, 1);
+  assert.equal((await f.authorized(review.replace("/11/", "/33/"))).status, 404);
+  assert.equal((await f.authorized(player.replace("at=123.875", "at=3595"))).status, 409);
+  assert.equal((await f.authorized(player + "&recording=../../secret")).status, 400);
+  assert.equal((await f.authorized(player.replace("at=123.875", "at=NaN"))).status, 400);
+  assert.equal(providerCalls, 1);
+});
+
+test("only current officers and the designated eligible user may remove saved recordings", async t => {
+  const f = await fixture(t, () => assert.fail("Deleting must not contact providers"), { ROSTER_CACHE_SECONDS: "1" });
+  await seedRecording(f);
+  const route = `/v1/streams/vods/youtube/${videoId}`;
+  assert.equal((await f.request(route, { method: "DELETE" })).status, 401);
+  assert.equal((await (await f.authorized("/v1/streams/vods")).json()).canDeleteRecordings, false);
+  assert.equal((await f.authorized(route, { method: "DELETE", headers: { "x-user-id": "341518802208423957" } })).status, 403);
+  assert.equal((await (await f.authorized("/v1/streams/vods", {}, "bob-token")).json()).canDeleteRecordings, true);
+  // Downgrade an officer while the same OAuth token is cached.
+  f.setMembers(members.map(member => member.user.id === "22" ? { ...member, roles: ["raider"] } : member));
+  f.advance(2000);
+  await new Promise(resolve => setTimeout(resolve, 1050));
+  assert.equal((await f.authorized(route, { method: "DELETE" }, "bob-token")).status, 403);
+  assert.equal((await (await f.authorized("/v1/streams/vods")).json()).vods.length, 1);
+  f.setMembers([...members, { user: { id: "341518802208423957", username: "Authorized reviewer" }, roles: ["raider"] }]);
+  f.advance(2000);
+  await new Promise(resolve => setTimeout(resolve, 1050));
+  assert.equal((await (await f.authorized("/v1/streams/vods", {}, "special-token")).json()).canDeleteRecordings, true);
+  assert.equal((await f.authorized(route, { method: "DELETE" }, "special-token")).status, 200);
+  await f.restart();
+  assert.deepEqual((await (await f.authorized("/v1/streams/vods")).json()).vods, []);
+  assert.equal((await f.authorized(`/v1/streams/vods/11/youtube/${videoId}/review`)).status, 404);
+});
+
+test("officer removal succeeds and a designated user without guild access cannot delete", async t => {
+  const f = await fixture(t);
+  await seedRecording(f);
+  const route = `/v1/streams/vods/youtube/${videoId}`;
+  assert.equal((await f.authorized(route, { method: "DELETE" }, "special-token")).status, 403);
+  assert.equal((await f.authorized(route, { method: "DELETE" }, "bob-token")).status, 200);
+  assert.deepEqual((await (await f.authorized("/v1/streams/vods")).json()).vods, []);
 });

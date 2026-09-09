@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     rc::Rc,
     sync::mpsc,
     thread,
@@ -26,12 +26,14 @@ enum Action {
     Save(Provider, String),
     Remove(Provider),
     Recordings,
+    RemoveRecording(Provider, String),
 }
 enum ResultData {
     Snapshot(Snapshot),
     Saved(Provider),
     Removed,
-    Recordings(Vec<Vod>),
+    Recordings(streams::Recordings),
+    RecordingRemoved(Provider, String),
 }
 type WorkResult = Result<ResultData, streams::Error>;
 type PlayerResult = Result<(String, String, Option<Preferences>), streams::Error>;
@@ -45,10 +47,21 @@ pub struct StreamsUi {
     focused: Option<(String, String)>,
     recordings_open: bool,
     recordings: Option<Rc<Vec<Vod>>>,
+    recordings_library: crate::recordings_ui::Library,
+    recordings_attempted: bool,
+    can_delete_recordings: bool,
+    confirm_remove_recording: Option<Vod>,
+    pov_revision: u64,
+    pov_cache_key: Option<(u64, Option<(i64, i64)>, String)>,
+    pov_cache: Vec<Stream>,
     player: Option<StreamPlayer>,
+    comparison: Option<crate::review_compare_ui::Comparison>,
+    player_switch_pending: bool,
     preferences: Option<Preferences>,
     player_work: Option<mpsc::Receiver<PlayerResult>>,
     player_attempted: bool,
+    player_retries: u8,
+    player_retry_at: Option<Instant>,
     player_rect: Option<egui::Rect>,
     player_error: Option<String>,
     notice: Option<String>,
@@ -57,6 +70,8 @@ pub struct StreamsUi {
     edit_open: bool,
     drafts: [String; 2],
     confirm_remove: Option<Provider>,
+    review: crate::review_ui::ReviewUi,
+    observer: crate::replay_observer::Observer,
 }
 
 impl Default for StreamsUi {
@@ -70,10 +85,21 @@ impl Default for StreamsUi {
             focused: None,
             recordings_open: false,
             recordings: None,
+            recordings_library: crate::recordings_ui::Library::default(),
+            recordings_attempted: false,
+            can_delete_recordings: false,
+            confirm_remove_recording: None,
+            pov_revision: 0,
+            pov_cache_key: None,
+            pov_cache: Vec::new(),
             player: None,
+            comparison: None,
+            player_switch_pending: false,
             preferences: None,
             player_work: None,
             player_attempted: false,
+            player_retries: 0,
+            player_retry_at: None,
             player_rect: None,
             player_error: None,
             notice: None,
@@ -82,20 +108,128 @@ impl Default for StreamsUi {
             edit_open: false,
             drafts: [String::new(), String::new()],
             confirm_remove: None,
+            review: crate::review_ui::ReviewUi::default(),
+            observer: crate::replay_observer::Observer::default(),
         }
     }
 }
 
 impl StreamsUi {
+    pub fn reviewing(&self) -> bool {
+        self.review.active() && !self.recordings_open
+    }
+
+    pub fn fullscreen(&self) -> bool {
+        self.player
+            .as_ref()
+            .is_some_and(StreamPlayer::is_fullscreen)
+            || self
+                .comparison
+                .as_ref()
+                .is_some_and(|comparison| comparison.fullscreen())
+    }
+
+    pub fn draw_fullscreen(&mut self, ui: &mut egui::Ui) {
+        let mut exit = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(12, 4))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    exit |= ui.button("Exit fullscreen").clicked();
+                    ui.label(RichText::new("Esc").small().color(MUTED));
+                    let expanded = self
+                        .comparison
+                        .as_ref()
+                        .and_then(|comparison| comparison.expanded_stream())
+                        .or(self.selected.as_ref());
+                    if let Some(stream) = expanded {
+                        ui.add_space(12.0);
+                        ui.add(
+                            egui::Label::new(format!(
+                                "{} · {}",
+                                stream.name,
+                                stream.provider.label()
+                            ))
+                            .truncate(),
+                        );
+                    }
+                });
+            });
+        let rect = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
+        if let Some(comparison) = self
+            .comparison
+            .as_mut()
+            .filter(|comparison| comparison.fullscreen())
+        {
+            comparison.fullscreen_rect(rect, exit);
+            self.player_rect = None;
+            return;
+        }
+        self.player_rect = Some(rect);
+        if let Some(player) = &mut self.player {
+            if exit {
+                player.exit_fullscreen();
+            }
+            if self.review.active() {
+                if let Some(command) = self.review.pause_at_pull_end(&player.playback_state()) {
+                    if let Some(comparison) = &mut self.comparison {
+                        comparison.command(command, &self.review);
+                    } else if let Err(error) = player.command(command) {
+                        self.player_error = Some(error);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
+        let mut observer = std::mem::take(&mut self.observer);
+        observer.reset();
         *self = Self::default();
+        self.observer = observer;
     }
 
     pub fn stop_player(&mut self) {
+        self.comparison = None;
+        self.review.set_comparing(false);
+        self.observer.reset();
         self.player = None;
+        self.player_switch_pending = false;
         self.player_work = None;
         self.player_attempted = false;
+        self.player_retries = 0;
+        self.player_retry_at = None;
         self.player_rect = None;
+    }
+
+    fn leave_unavailable_comparison(&mut self) {
+        if self
+            .comparison
+            .as_ref()
+            .is_some_and(|comparison| comparison.unavailable_for_review(&self.review))
+        {
+            if let Some(comparison) = self.comparison.take() {
+                comparison.leave(self.player.as_mut(), &self.review);
+            }
+            self.review.set_comparing(false);
+        }
+    }
+
+    fn recover_player(&mut self, error: String) {
+        self.player = None;
+        self.player_work = None;
+        self.player_switch_pending = false;
+        self.player_attempted = true;
+        if self.player_retries == 0 {
+            self.player_retries = 1;
+            self.player_retry_at = Some(Instant::now() + Duration::from_secs(1));
+            self.player_error = None;
+        } else {
+            self.player_retry_at = None;
+            self.player_error = Some(error);
+        }
     }
 
     pub fn tick(&mut self, ctx: &egui::Context, authorized: bool, active: bool) -> bool {
@@ -107,9 +241,16 @@ impl StreamsUi {
             self.stop_player();
         }
         if self.received_at.is_some_and(|at| at.elapsed() >= MAX_STALE) {
+            self.pov_revision = self.pov_revision.wrapping_add(1);
             self.snapshot = None;
-            self.selected = None;
-            self.stop_player();
+            if !self
+                .selected
+                .as_ref()
+                .is_some_and(|s| s.recording_id.is_some())
+            {
+                self.selected = None;
+                self.stop_player();
+            }
             self.received_at = None;
             self.notice = Some("Live status couldn't be verified. Reconnecting…".into());
             self.notice_provider = None;
@@ -126,8 +267,11 @@ impl StreamsUi {
                 self.work = None;
                 match result {
                     Ok(ResultData::Snapshot(snapshot)) => {
+                        self.pov_revision = self.pov_revision.wrapping_add(1);
                         self.saved_provider = None;
-                        if let Some(selected) = &self.selected {
+                        if let Some(selected) =
+                            self.selected.as_ref().filter(|s| s.recording_id.is_none())
+                        {
                             let current = snapshot
                                 .streams
                                 .iter()
@@ -135,7 +279,7 @@ impl StreamsUi {
                                     stream.user_id == selected.user_id
                                         && stream.channel_id == selected.channel_id
                                         && stream.provider == selected.provider
-                                        && stream.status == Status::Live
+                                        && (self.review.active() || stream.status == Status::Live)
                                 })
                                 .cloned();
                             if current.is_none() {
@@ -155,7 +299,33 @@ impl StreamsUi {
                         self.confirm_remove = None;
                         self.start(ctx, Action::Refresh);
                     }
-                    Ok(ResultData::Recordings(vods)) => self.recordings = Some(Rc::new(vods)),
+                    Ok(ResultData::Recordings(recordings)) => {
+                        self.pov_revision = self.pov_revision.wrapping_add(1);
+                        self.can_delete_recordings = recordings.can_delete_recordings;
+                        if !self.can_delete_recordings {
+                            self.confirm_remove_recording = None;
+                        }
+                        let missing = self.selected.as_ref().is_some_and(|stream| {
+                            stream.recording_id.as_ref().is_some_and(|id| {
+                                !recordings.vods.iter().any(|vod| {
+                                    vod.id == *id
+                                        && vod.provider == stream.provider
+                                        && vod.user_id == stream.user_id
+                                })
+                            })
+                        });
+                        self.recordings = Some(Rc::new(recordings.vods));
+                        if missing {
+                            self.selected = None;
+                            self.recordings_open = true;
+                            self.stop_player();
+                            self.notice = Some("This VOD is no longer in Brick.".into());
+                        }
+                    }
+                    Ok(ResultData::RecordingRemoved(provider, id)) => {
+                        self.apply_recording_removal(&provider, &id);
+                        self.notice = Some("VOD removed from Brick.".into());
+                    }
                     Err(error) => {
                         self.saved_provider = None;
                         if error.access_denied {
@@ -167,20 +337,68 @@ impl StreamsUi {
                 }
             }
         }
-        if active
-            && presence::configured()
-            && self.work.is_none()
-            && self.last_attempt.is_none_or(|at| at.elapsed() >= REFRESH)
-        {
-            self.start(ctx, Action::Refresh);
+        if active && presence::configured() && self.work.is_none() {
+            if (self.recordings_open || self.review.active()) && !self.recordings_attempted {
+                self.start(ctx, Action::Recordings);
+            } else if self.last_attempt.is_none_or(|at| at.elapsed() >= REFRESH) {
+                self.start(ctx, Action::Refresh);
+            }
         }
-        if self.player.is_some() {
+        if self.review.tick(
+            ctx,
+            self.selected
+                .as_ref()
+                .filter(|_| active && !self.recordings_open),
+        ) && (!self.player_switch_pending || !self.review.active())
+        {
+            if self.review.active() && self.comparison.is_some() {
+                self.player = None;
+                self.player_work = None;
+                self.player_attempted = false;
+                self.player_switch_pending = false;
+                if let Some(comparison) = &mut self.comparison {
+                    comparison.primary_changed();
+                }
+            } else {
+                self.stop_player();
+            }
+        }
+        if let Some(player) = &mut self.player {
+            if self.review.active() {
+                player.poll_playback(ctx);
+            }
             crate::stream_player::pump_events();
         }
         if let Some(error) = self.player.as_ref().and_then(StreamPlayer::failure) {
-            self.player = None;
-            self.player_error = Some(error);
-            self.player_attempted = true;
+            self.recover_player(error);
+        }
+        self.leave_unavailable_comparison();
+        if let Some(comparison) = &mut self.comparison {
+            comparison.tick(
+                ctx,
+                self.player.as_mut().filter(|_| !self.player_switch_pending),
+                &self.review,
+            );
+        }
+        self.leave_unavailable_comparison();
+        if self.observer.enabled() {
+            if active && !self.recordings_open && !self.player_switch_pending {
+                self.review.prepare_health_observation();
+            }
+            let identity = (active && !self.recordings_open && !self.player_switch_pending)
+                .then(|| self.review.observation_context())
+                .flatten()
+                .map(|(replay, pull)| crate::replay_observer::Identity::new(replay, pull));
+            self.observer.tick_with_health(
+                ctx,
+                self.player.as_ref(),
+                identity,
+                self.review.observation_boss_names(),
+                self.review.observation_health_window(),
+            );
+            if let Some(observation) = self.observer.observation() {
+                self.review.observe_health(observation);
+            }
         }
         false
     }
@@ -189,6 +407,9 @@ impl StreamsUi {
         #[cfg(target_os = "linux")]
         if self.player.is_some() {
             return Duration::from_millis(33);
+        }
+        if self.player.is_some() && self.review.active() {
+            return Duration::from_millis(500);
         }
         if active && presence::configured() && self.work.is_none() {
             return self
@@ -204,6 +425,9 @@ impl StreamsUi {
             return;
         }
         self.notice = None;
+        if matches!(action, Action::Recordings) {
+            self.recordings_attempted = true;
+        }
         self.notice_provider = match &action {
             Action::Save(provider, _) | Action::Remove(provider) => Some(provider.clone()),
             _ => None,
@@ -244,7 +468,11 @@ impl StreamsUi {
                 Action::Remove(provider) => {
                     streams::remove(&token, &provider).map(|()| ResultData::Removed)
                 }
-                Action::Recordings => streams::fetch_vods(&token).map(ResultData::Recordings),
+                Action::Recordings => streams::fetch_recordings(&token).map(ResultData::Recordings),
+                Action::RemoveRecording(provider, id) => {
+                    streams::remove_recording(&token, &provider, &id)
+                        .map(|()| ResultData::RecordingRemoved(provider, id))
+                }
             });
             let _ = tx.send(result);
             ctx.request_repaint();
@@ -255,10 +483,172 @@ impl StreamsUi {
 
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         self.player_rect = None;
+        if self.review.active() && !self.recordings_open {
+            if let Some(stream) = self.selected.clone() {
+                let span = self.review.report_span();
+                let key = (
+                    self.pov_revision,
+                    span,
+                    format!(
+                        "{}:{}:{}:{}",
+                        stream.user_id,
+                        stream.provider.key(),
+                        stream.channel_id,
+                        stream.recording_id.as_deref().unwrap_or("")
+                    ),
+                );
+                if self.pov_cache_key.as_ref() != Some(&key) {
+                    self.pov_cache = review_povs(
+                        self.snapshot
+                            .as_ref()
+                            .map(|s| s.streams.as_slice())
+                            .unwrap_or_default(),
+                        self.recordings
+                            .as_deref()
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                        &stream,
+                        span,
+                    );
+                    self.review.set_recording_labels(recording_labels(
+                        self.recordings
+                            .as_deref()
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                        &self.pov_cache,
+                    ));
+                    self.pov_cache_key = Some(key);
+                }
+                let state = if self.player_switch_pending {
+                    // A retained hidden child still belongs to the previous
+                    // POV until its new authenticated navigation starts.
+                    let mut state = crate::stream_player::PlaybackState::default();
+                    state.playback_intent =
+                        self.review.playback().map(|playback| playback.autoplay);
+                    state
+                } else {
+                    self.player
+                        .as_ref()
+                        .map(StreamPlayer::playback_state)
+                        .unwrap_or_default()
+                };
+                let state = self.comparison.as_ref().map_or_else(
+                    || state.clone(),
+                    |comparison| comparison.state_for_controls(state.clone()),
+                );
+                let action = self.review.draw_workspace(
+                    ui,
+                    &stream,
+                    &self.pov_cache,
+                    &state,
+                    self.player_error.as_deref(),
+                    self.comparison.as_mut(),
+                );
+                if action.close_comparison {
+                    if let Some(comparison) = self.comparison.take() {
+                        comparison.leave(self.player.as_mut(), &self.review);
+                    }
+                    self.review.set_comparing(false);
+                }
+                self.player_rect = self.comparison.as_mut().map_or(action.rect, |comparison| {
+                    comparison.split_video(action.rect)
+                });
+                if action.compare {
+                    if let Some((at_ms, playing)) = self.review.comparison_position(&state) {
+                        if let Some(other) = self
+                            .pov_cache
+                            .iter()
+                            .find(|candidate| {
+                                (candidate.user_id != stream.user_id
+                                    || candidate.provider != stream.provider
+                                    || candidate.recording_id != stream.recording_id)
+                                    && (candidate.recording_id.is_some()
+                                        || candidate.status == Status::Live)
+                                    && self.review.pov_selection_context(&state).is_some_and(
+                                        |(pull, moment)| {
+                                            self.review.pov_covers_moment(candidate, pull, moment)
+                                        },
+                                    )
+                            })
+                            .cloned()
+                        {
+                            self.comparison = Some(crate::review_compare_ui::Comparison::new(
+                                &self.review,
+                                other,
+                                at_ms,
+                                playing,
+                            ));
+                            self.review.set_comparing(true);
+                            if let Some(player) = &mut self.player {
+                                let _ =
+                                    player.command(crate::stream_player::PlaybackCommand::Pause);
+                            }
+                            self.player_rect = self
+                                .comparison
+                                .as_mut()
+                                .and_then(|comparison| comparison.split_video(action.rect));
+                        }
+                    }
+                }
+                if action.reload {
+                    self.stop_player();
+                    self.player_rect = action.rect;
+                    self.player_error = None;
+                }
+                if let Some(command) = action.command {
+                    if let Some(comparison) = &mut self.comparison {
+                        comparison.command(command, &self.review);
+                    } else if let Some(player) = &mut self.player {
+                        if let Err(error) = player.command(command) {
+                            self.player_error = Some(error);
+                        }
+                    }
+                }
+                if let Some(next_stream) = action.stream {
+                    self.player_retries = 0;
+                    self.player_retry_at = None;
+                    if let Some(comparison) = &mut self.comparison {
+                        comparison.avoid_duplicate(ui.ctx(), &next_stream, &stream);
+                        comparison.primary_changed();
+                    }
+                    let stream = next_stream;
+                    // Keep one paused, hidden media child while the selected
+                    // POV's authenticated replay metadata is checked.
+                    let retain = self
+                        .player
+                        .as_ref()
+                        .is_some_and(StreamPlayer::can_reuse_for_replay);
+                    if retain {
+                        if let Some(player) = &mut self.player {
+                            let _ = player.command(crate::stream_player::PlaybackCommand::Pause);
+                            player.set_visible(false);
+                        }
+                        self.player_switch_pending = true;
+                        self.player_work = None;
+                        self.player_attempted = false;
+                    } else {
+                        self.player = None;
+                        self.player_work = None;
+                        self.player_attempted = false;
+                        self.player_switch_pending = false;
+                    }
+                    self.player_error = None;
+                    self.focused = Some((stream.user_id.clone(), stream.name.clone()));
+                    self.selected = Some(stream);
+                }
+                if !self.review.active() && stream.recording_id.is_some() {
+                    self.recordings_open = true;
+                    self.selected = None;
+                    self.stop_player();
+                }
+                return;
+            }
+        }
+
         ui.horizontal(|ui| {
             if self.recordings_open {
                 ui.label(
-                    RichText::new("Recordings")
+                    RichText::new("VODs")
                         .size(18.0)
                         .strong()
                         .color(Color32::from_rgb(239, 242, 247)),
@@ -325,12 +715,13 @@ impl StreamsUi {
                         action_button(if self.recordings_open {
                             "Live streams"
                         } else {
-                            "Recordings"
+                            "VODs"
                         }),
                     )
                     .clicked()
                 {
                     self.recordings_open = !self.recordings_open;
+                    self.confirm_remove_recording = None;
                     self.focused = None;
                     self.selected = None;
                     self.notice = None;
@@ -342,8 +733,20 @@ impl StreamsUi {
             });
         });
         ui.add_space(12.0);
+        if self.recordings_open && self.confirm_remove_recording.is_none() {
+            if let Some(notice) = &self.notice {
+                ui.label(RichText::new(notice).small().color(MUTED));
+                ui.add_space(6.0);
+            }
+        }
         if !presence::configured() {
             ui.label("Streams aren't available in this build yet.");
+            return;
+        }
+        if self.recordings_open {
+            self.draw_recordings(ui);
+            self.draw_editor(ui.ctx());
+            self.draw_recording_removal(ui.ctx());
             return;
         }
         let snapshot = self.snapshot.clone();
@@ -359,9 +762,6 @@ impl StreamsUi {
             "No one is live right now."
         };
         let people = live_people(live);
-        let recordings = self.recordings.clone();
-        let recorded_people =
-            recording_people(recordings.as_deref().map(Vec::as_slice).unwrap_or_default());
         let height = ui.available_height().max(330.0);
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
@@ -370,29 +770,15 @@ impl StreamsUi {
                 |ui| {
                     ui.set_width(176.0);
                     ui.label(
-                        RichText::new(if self.recordings_open {
-                            format!("MEMBERS  {}", recorded_people.len())
-                        } else {
-                            format!("LIVE NOW  {}", people.len())
-                        })
-                        .small()
-                        .strong()
-                        .color(MUTED),
+                        RichText::new(format!("LIVE NOW  {}", people.len()))
+                            .small()
+                            .strong()
+                            .color(MUTED),
                     );
                     ui.add_space(10.0);
-                    let count = if self.recordings_open {
-                        recorded_people.len()
-                    } else {
-                        people.len()
-                    };
+                    let count = people.len();
                     if count == 0 {
-                        let message = if self.recordings_open {
-                            if self.work.is_some() {
-                                "Loading recordings…"
-                            } else {
-                                "No recordings yet."
-                            }
-                        } else if self.snapshot.is_none() && self.work.is_some() {
+                        let message = if self.snapshot.is_none() && self.work.is_some() {
                             "Checking who's live…"
                         } else {
                             empty_message
@@ -405,40 +791,17 @@ impl StreamsUi {
                         .max_height((height - 36.0).max(80.0))
                         .show_rows(ui, MEMBER_ROW_HEIGHT, count, |ui, rows| {
                             for index in rows {
-                                if self.recordings_open {
-                                    let person = &recorded_people[index];
-                                    let selected = self
-                                        .focused
-                                        .as_ref()
-                                        .is_some_and(|(id, _)| id == person.user_id);
-                                    if member_row(
-                                        ui,
-                                        person.name,
-                                        Some(person.count),
-                                        selected,
-                                        false,
-                                    )
-                                    .clicked()
-                                    {
-                                        self.focused = Some((
-                                            person.user_id.to_owned(),
-                                            person.name.to_owned(),
-                                        ));
-                                    }
-                                } else {
-                                    let stream = people[index];
-                                    let selected = self
-                                        .focused
-                                        .as_ref()
-                                        .is_some_and(|(id, _)| id == &stream.user_id);
-                                    if member_row(ui, &stream.name, None, selected, true).clicked()
-                                    {
-                                        self.stop_player();
-                                        self.player_error = None;
-                                        self.focused =
-                                            Some((stream.user_id.clone(), stream.name.clone()));
-                                        self.selected = Some(stream.clone());
-                                    }
+                                let stream = people[index];
+                                let selected = self
+                                    .focused
+                                    .as_ref()
+                                    .is_some_and(|(id, _)| id == &stream.user_id);
+                                if member_row(ui, &stream.name, None, selected, true).clicked() {
+                                    self.stop_player();
+                                    self.player_error = None;
+                                    self.focused =
+                                        Some((stream.user_id.clone(), stream.name.clone()));
+                                    self.selected = Some(stream.clone());
                                 }
                             }
                         });
@@ -447,9 +810,7 @@ impl StreamsUi {
             ui.separator();
             ui.vertical(|ui| {
                 ui.set_width(ui.available_width());
-                if self.recordings_open {
-                    self.draw_recordings(ui);
-                } else if let Some(stream) = self.selected.clone() {
+                if let Some(stream) = self.selected.clone() {
                     ui.allocate_ui_with_layout(
                         egui::vec2(ui.available_width(), 32.0),
                         egui::Layout::left_to_right(egui::Align::Center),
@@ -508,8 +869,7 @@ impl StreamsUi {
                     let size = egui::vec2(
                         ui.available_width(),
                         (ui.available_width() * 9.0 / 16.0)
-                            .max(300.0)
-                            .min((height - 120.0).max(300.0)),
+                            .min((ui.available_height() - 112.0).max(160.0)),
                     );
                     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
                     ui.painter()
@@ -533,7 +893,11 @@ impl StreamsUi {
                     });
                     let mut caption = egui::text::LayoutJob::default();
                     caption.append(
-                        "LIVE  ·  ",
+                        if self.review.playback().is_some() {
+                            "REPLAY  ·  "
+                        } else {
+                            "LIVE  ·  "
+                        },
                         0.0,
                         egui::TextFormat {
                             font_id: egui::FontId::proportional(11.0),
@@ -565,12 +929,16 @@ impl StreamsUi {
                             .halign(egui::Align::Center)
                             .truncate(),
                     );
+                    if self.review.draw(ui, &stream) {
+                        self.stop_player();
+                        self.player_rect = Some(rect);
+                        self.player_error = None;
+                    }
+                    if let Some(playback) = self.review.playback() {
+                        ui.hyperlink_to("Open replay in browser", &playback.public_url);
+                    }
                     if let Some(error) = &self.player_error {
                         ui.label(RichText::new(error).small().color(MUTED));
-                        if ui.button("Retry player").clicked() {
-                            self.player_attempted = false;
-                            self.player_error = None;
-                        }
                     }
                 } else {
                     empty_view(
@@ -585,89 +953,111 @@ impl StreamsUi {
             });
         });
         self.draw_editor(ui.ctx());
+        self.draw_recording_removal(ui.ctx());
     }
 
     fn draw_recordings(&mut self, ui: &mut egui::Ui) {
-        let Some((member_id, name)) = &self.focused else {
-            empty_view(
-                ui,
-                if self.recordings.as_ref().is_some_and(|v| v.is_empty()) {
-                    "No recordings yet."
-                } else {
-                    "Select a player"
-                },
-            );
+        let recordings = self.recordings.clone().unwrap_or_default();
+        let action = self.recordings_library.draw(
+            ui,
+            &recordings,
+            self.work.is_some(),
+            self.can_delete_recordings,
+            self.work.is_some(),
+        );
+        match action {
+            Some(crate::recordings_ui::Action::Review(index)) => {
+                self.open_recording(&recordings[index]);
+            }
+            Some(crate::recordings_ui::Action::OpenBrowser(index)) => {
+                if let Err(error) = crate::browser::open(&recordings[index].url) {
+                    self.notice = Some(error);
+                }
+            }
+            Some(crate::recordings_ui::Action::Remove(index)) => {
+                self.notice = None;
+                self.confirm_remove_recording = Some(recordings[index].clone());
+            }
+            None => {}
+        }
+    }
+
+    fn open_recording(&mut self, vod: &Vod) {
+        self.stop_player();
+        self.selected = Some(vod.as_stream());
+        self.focused = Some((vod.user_id.clone(), vod.name.clone()));
+        self.recordings_open = false;
+        self.confirm_remove_recording = None;
+        self.player_error = None;
+        self.notice = None;
+        self.review.open_recording();
+    }
+
+    fn apply_recording_removal(&mut self, provider: &Provider, id: &str) {
+        self.pov_revision = self.pov_revision.wrapping_add(1);
+        if let Some(recordings) = &mut self.recordings {
+            Rc::make_mut(recordings).retain(|vod| &vod.provider != provider || vod.id != id);
+        }
+        if self.selected.as_ref().is_some_and(|stream| {
+            &stream.provider == provider && stream.recording_id.as_deref() == Some(id)
+        }) {
+            self.selected = None;
+            self.recordings_open = true;
+            self.stop_player();
+        }
+        self.confirm_remove_recording = None;
+    }
+
+    fn draw_recording_removal(&mut self, ctx: &egui::Context) {
+        let Some(vod) = self.confirm_remove_recording.clone() else {
             return;
         };
-        ui.add_sized(
-            egui::vec2(ui.available_width(), 32.0),
-            egui::Label::new(RichText::new(name).size(18.0).strong()).truncate(),
-        );
-        ui.add_space(8.0);
-        let vods = self
-            .recordings
-            .as_deref()
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let mut filtered: Vec<_> = vods
-            .iter()
-            .filter(|vod| &vod.user_id == member_id)
-            .collect();
-        filtered.sort_by(|a, b| recording_time(b).cmp(recording_time(a)));
-        if filtered.is_empty() {
-            ui.label(
-                RichText::new(if self.work.is_some() {
-                    "Loading recordings…"
-                } else {
-                    "No recordings yet."
-                })
-                .color(MUTED),
-            );
-        }
-        egui::ScrollArea::vertical()
-            .id_salt(("stream-recordings", member_id))
-            .max_height(ui.available_height())
-            .show_rows(ui, 152.0, filtered.len(), |ui, range| {
-                for index in range {
-                    let vod = filtered[index];
-                    let day = recording_day(vod);
-                    ui.allocate_ui(egui::vec2(ui.available_width(), 24.0), |ui| {
-                        if index == 0 || recording_day(filtered[index - 1]) != day {
-                            ui.label(
-                                RichText::new(recording_day_label(day))
-                                    .strong()
-                                    .color(MUTED),
-                            );
-                        }
-                    });
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(25, 28, 36))
-                        .corner_radius(8)
-                        .inner_margin(12)
-                        .show(ui, |ui| {
-                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                            ui.set_min_height(100.0);
-                            ui.set_width((ui.available_width() - 1.0).max(200.0));
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(vod.provider.label()).strong());
-                                let time = recording_time(vod).get(11..16).unwrap_or("");
-                                if !time.is_empty() {
-                                    ui.label(
-                                        RichText::new(format!("{time} UTC")).small().color(MUTED),
-                                    );
-                                }
-                            });
-                            ui.hyperlink_to("Open recording", &vod.url);
-                            ui.add(
-                                egui::Label::new(RichText::new(&vod.url).small().color(MUTED))
-                                    .truncate(),
-                            );
-                            if ui.small_button("Copy link").clicked() {
-                                ui.ctx().copy_text(vod.url.clone());
-                            }
-                        });
-                }
+        let mut cancel = false;
+        let mut remove = false;
+        let modal = egui::Modal::new(egui::Id::new("remove-recording")).show(ctx, |ui| {
+            ui.set_width(400.0_f32.min((ctx.content_rect().width() - 64.0).max(240.0)));
+            ui.heading("Remove VOD from Brick?");
+            ui.add_space(8.0);
+            ui.label(RichText::new(recording_title(&vod)).strong());
+            ui.label(format!(
+                "{} · {} · {}",
+                vod.name,
+                vod.provider.label(),
+                recording_day_label(recording_day(&vod))
+            ));
+            ui.add_space(8.0);
+            ui.label(format!(
+                "This removes the saved link from Brick. The video stays on {}.",
+                vod.provider.label()
+            ));
+            if let Some(notice) = &self.notice {
+                ui.add_space(8.0);
+                ui.label(RichText::new(notice).color(Color32::from_rgb(244, 144, 144)));
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                cancel = ui
+                    .add_enabled(self.work.is_none(), egui::Button::new("Cancel"))
+                    .clicked();
+                remove = ui
+                    .add_enabled(
+                        self.work.is_none() && self.can_delete_recordings,
+                        egui::Button::new(if self.work.is_some() {
+                            "Removing…"
+                        } else {
+                            "Remove from Brick"
+                        }),
+                    )
+                    .clicked();
             });
+        });
+        cancel |= self.work.is_none() && modal.should_close();
+        if cancel {
+            self.confirm_remove_recording = None;
+            self.notice = None;
+        } else if remove {
+            self.start(ctx, Action::RemoveRecording(vod.provider, vod.id));
+        }
     }
 
     fn draw_editor(&mut self, ctx: &egui::Context) {
@@ -765,20 +1155,95 @@ impl StreamsUi {
         ctx: &egui::Context,
         allowed: bool,
     ) -> bool {
+        let obscured = self
+            .comparison
+            .as_ref()
+            .is_some_and(|comparison| comparison.obscures_player());
+        let secondary_fullscreen = self
+            .comparison
+            .as_ref()
+            .is_some_and(|comparison| comparison.fullscreen());
+        let denied = if secondary_fullscreen && allowed {
+            if let Some(player) = &self.player {
+                player.set_visible(false);
+            }
+            false
+        } else {
+            self.update_primary_player(frame, ctx, allowed, obscured)
+        };
+        let primary_fullscreen = self
+            .player
+            .as_ref()
+            .is_some_and(StreamPlayer::is_fullscreen);
+        if let Some(comparison) = &mut self.comparison {
+            comparison.update_player(
+                frame,
+                ctx,
+                &self.review,
+                self.preferences.clone(),
+                allowed
+                    && !denied
+                    && !primary_fullscreen
+                    && (secondary_fullscreen || (!self.review.obscures_player() && !obscured)),
+            );
+        }
+        denied
+    }
+
+    fn update_primary_player(
+        &mut self,
+        frame: &eframe::Frame,
+        ctx: &egui::Context,
+        allowed: bool,
+        comparison_popup: bool,
+    ) -> bool {
         if !allowed || self.edit_open || self.recordings_open {
             self.stop_player();
+            return false;
+        }
+        if self.review.active() && self.review.playback().is_none() {
+            if self.player_switch_pending {
+                if let Some(player) = &self.player {
+                    player.set_visible(false);
+                }
+            } else if self.comparison.is_some() {
+                self.player = None;
+                self.player_attempted = false;
+                self.player_work = None;
+            } else {
+                self.stop_player();
+            }
+            return false;
+        }
+        if let Some(player) = &self.player {
+            player.set_visible(
+                !self.review.obscures_player() && !self.player_switch_pending && !comparison_popup,
+            );
+        }
+        if self.review.obscures_player() || comparison_popup {
             return false;
         }
         let Some(rect) = self.player_rect else {
             self.stop_player();
             return false;
         };
+        if let Some(at) = self.player_retry_at {
+            if let Some(wait) = at.checked_duration_since(Instant::now()) {
+                ctx.request_repaint_after(wait);
+                return false;
+            }
+            self.player_retry_at = None;
+            self.player_attempted = false;
+        }
         if let Some(player) = &mut self.player {
             if let Err(error) = player.set_bounds(rect, ctx.pixels_per_point()) {
                 self.player_error = Some(error);
                 self.player = None;
+                self.player_switch_pending = false;
             }
-            return false;
+            if !self.player_switch_pending {
+                return false;
+            }
         }
         if let Some(rx) = &self.player_work {
             let result = match rx.try_recv() {
@@ -794,7 +1259,26 @@ impl StreamsUi {
                 self.player_work = None;
                 match result {
                     Ok((url, token, preferences)) => {
+                        // Preparation may finish after another pull was selected.
+                        // Only its credentials/preferences are reusable; read the
+                        // latest playback intent before constructing the player.
+                        let url = player_url_for_playback(&url, self.review.playback());
                         self.preferences = preferences;
+                        if let Some(player) = &mut self.player {
+                            if self.player_switch_pending {
+                                match player.load_replay(ctx, &url, &token) {
+                                    Ok(()) => {
+                                        player.set_visible(true);
+                                    }
+                                    Err(error) => {
+                                        self.player_error = Some(error);
+                                        self.player = None;
+                                    }
+                                }
+                                self.player_switch_pending = false;
+                                return false;
+                            }
+                        }
                         match StreamPlayer::new(
                             frame,
                             ctx,
@@ -804,7 +1288,10 @@ impl StreamsUi {
                             ctx.pixels_per_point(),
                             self.preferences.clone(),
                         ) {
-                            Ok(player) => self.player = Some(player),
+                            Ok(player) => {
+                                self.player = Some(player);
+                                self.player_switch_pending = false;
+                            }
                             Err(error) => self.player_error = Some(error),
                         }
                     }
@@ -821,19 +1308,16 @@ impl StreamsUi {
             let Some(stream) = &self.selected else {
                 return false;
             };
-            let user_id = stream.user_id.clone();
-            let provider = stream.provider.clone();
+            let stream = stream.clone();
             let preferences = self.preferences.clone();
+            let playback = self.review.playback().cloned();
             let (tx, rx) = mpsc::channel();
             let ctx = ctx.clone();
             thread::spawn(move || {
                 let result = access_token().and_then(|token| {
-                    streams::player_url(&user_id, &provider).map(|url| {
-                        let preferences = if provider == Provider::Twitch {
-                            Some(preferences.unwrap_or_else(Preferences::load))
-                        } else {
-                            preferences
-                        };
+                    let preferences = Some(preferences.unwrap_or_else(Preferences::load));
+                    streams::player_url_for_stream(&stream).map(|url| {
+                        let url = player_url_for_playback(&url, playback.as_ref());
                         (url, token, preferences)
                     })
                 });
@@ -950,34 +1434,169 @@ fn member_row(
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-struct RecordingMember<'a> {
-    user_id: &'a str,
-    name: &'a str,
-    count: usize,
-}
-
-fn recording_people(vods: &[Vod]) -> Vec<RecordingMember<'_>> {
-    let mut members = HashMap::new();
-    for vod in vods {
-        let member = members
-            .entry(vod.user_id.as_str())
-            .or_insert(RecordingMember {
-                user_id: &vod.user_id,
-                name: &vod.name,
-                count: 0,
-            });
-        member.count += 1;
-    }
-    let mut members: Vec<_> = members.into_values().collect();
-    members.sort_by_cached_key(|member| (member.name.to_lowercase(), member.user_id));
-    members
-}
-
 fn recording_time(vod: &Vod) -> &str {
     vod.started_at
         .as_deref()
         .or(vod.ended_at.as_deref())
         .unwrap_or("")
+}
+
+fn recording_title(vod: &Vod) -> &str {
+    if vod.title.trim().is_empty() {
+        "VOD"
+    } else {
+        &vod.title
+    }
+}
+
+fn recording_overlaps(vod: &Vod, (start, end): (i64, i64)) -> bool {
+    let parse = |text: &str| {
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+            .ok()
+            .and_then(|time| i64::try_from(time.unix_timestamp_nanos() / 1_000_000).ok())
+    };
+    let Some(recording_start) = vod.started_at.as_deref().and_then(parse) else {
+        return false;
+    };
+    if start >= end || recording_start >= end {
+        return false;
+    }
+    match vod.ended_at.as_deref() {
+        Some(text) => parse(text)
+            .is_some_and(|recording_end| recording_end > start && recording_end > recording_start),
+        // An archive still being finalized can have no end yet. The authenticated
+        // replay metadata decides whether the selected pull is actually available.
+        None => true,
+    }
+}
+
+fn review_povs(
+    live: &[Stream],
+    vods: &[Vod],
+    selected: &Stream,
+    span: Option<(i64, i64)>,
+) -> Vec<Stream> {
+    // A saved raid's menu should not list unrelated broadcasts live today.
+    let mut povs = if selected.recording_id.is_some() {
+        Vec::new()
+    } else {
+        live.to_vec()
+    };
+    if let Some(span) = span {
+        povs.extend(
+            vods.iter()
+                .filter(|vod| recording_overlaps(vod, span))
+                .map(Vod::as_stream),
+        );
+    }
+    // Refreshes of live status must never remove the selected saved recording.
+    let same = |stream: &Stream| {
+        stream.user_id == selected.user_id
+            && stream.provider == selected.provider
+            && stream.channel_id == selected.channel_id
+            && stream.recording_id == selected.recording_id
+    };
+    if !povs.iter().any(same) {
+        povs.push(selected.clone());
+    }
+    let selected_identity = pov_recording_identity(selected);
+    // A live YouTube registration and its saved video are exact aliases. Keep
+    // the active transport, but retain known archive bounds when deduplicating.
+    let archive_ranges: std::collections::HashMap<_, _> = vods
+        .iter()
+        .filter_map(|vod| {
+            let stream = vod.as_stream();
+            Some((pov_recording_identity(&stream), stream.replay_range()?))
+        })
+        .collect();
+    for stream in &mut povs {
+        if stream.replay_range().is_none() {
+            if let Some(&(start, end)) = archive_ranges.get(&pov_recording_identity(stream)) {
+                stream.replay_start_ms = Some(start);
+                stream.replay_end_ms = Some(end);
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    povs.retain(|stream| {
+        let identity = pov_recording_identity(stream);
+        // Preserve the selected transport identity even if it was appended
+        // after a saved/live alias. Never interrupt the current player to dedup.
+        (identity != selected_identity || same(stream)) && seen.insert(identity)
+    });
+    povs
+}
+
+fn pov_recording_identity(stream: &Stream) -> (String, &'static str, String, Option<String>) {
+    // YouTube registrations contain a video ID, so matching live/saved IDs are
+    // exact aliases. Twitch registrations contain only a channel name; do not
+    // infer an archive match from member/provider or raid-date proximity.
+    let exact_youtube = stream.provider == Provider::Youtube
+        && stream.channel_id.len() == 11
+        && stream
+            .channel_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        && stream
+            .recording_id
+            .as_deref()
+            .is_none_or(|id| id == stream.channel_id);
+    (
+        stream.user_id.clone(),
+        stream.provider.key(),
+        stream.channel_id.clone(),
+        if exact_youtube {
+            None
+        } else {
+            stream.recording_id.clone()
+        },
+    )
+}
+
+fn recording_labels(vods: &[Vod], povs: &[Stream]) -> crate::review_ui::RecordingLabels {
+    let wanted: HashSet<_> = povs
+        .iter()
+        .filter_map(|stream| {
+            stream
+                .recording_id
+                .as_deref()
+                .or_else(|| {
+                    (stream.provider == Provider::Youtube).then_some(stream.channel_id.as_str())
+                })
+                .map(|id| format!("{}:{id}", stream.provider.key()))
+        })
+        .collect();
+    vods.iter()
+        .filter_map(|vod| {
+            let key = format!("{}:{}", vod.provider.key(), vod.id);
+            if !wanted.contains(&key) {
+                return None;
+            }
+            let when = time::OffsetDateTime::parse(
+                recording_time(vod),
+                &time::format_description::well_known::Rfc3339,
+            )
+            .ok()
+            .map(|at| {
+                let at = at.to_offset(time::UtcOffset::UTC);
+                format!(
+                    "{} {} · {:02}:{:02} UTC",
+                    at.day(),
+                    &at.month().to_string()[..3],
+                    at.hour(),
+                    at.minute()
+                )
+            })
+            .unwrap_or_else(|| "VOD date unavailable".into());
+            Some((
+                key,
+                crate::review_ui::RecordingLabel {
+                    when,
+                    title: recording_title(vod).to_owned(),
+                },
+            ))
+        })
+        .collect()
 }
 
 fn recording_day(vod: &Vod) -> &str {
@@ -1046,12 +1665,316 @@ fn access_token() -> Result<String, streams::Error> {
     })
 }
 
+pub(crate) fn player_url_for_playback(
+    url: &str,
+    playback: Option<&crate::review_ui::Playback>,
+) -> String {
+    let mut url = url::Url::parse(url).expect("Validated player URL");
+    let recording = url
+        .query_pairs()
+        .find(|(key, _)| key == "recording")
+        .map(|(_, id)| id.into_owned());
+    url.set_query(None);
+    if let Some(recording) = recording {
+        url.query_pairs_mut().append_pair("recording", &recording);
+    }
+    if let Some(playback) = playback {
+        url.query_pairs_mut()
+            .append_pair("at", &format!("{:.3}", playback.seconds))
+            .append_pair("broadcast", &playback.broadcast_id);
+        if !playback.autoplay {
+            url.query_pairs_mut().append_pair("paused", "1");
+        }
+    }
+    url.into()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_wrapper_recovery_is_automatic_bounded_and_resets_on_new_selection() {
+        let mut streams = super::StreamsUi::default();
+        streams.recover_player("Temporary loading failure".into());
+        assert!(streams.player_error.is_none());
+        assert!(streams.player_attempted);
+        assert!(streams.player_retry_at.is_some());
+        assert_eq!(streams.player_retries, 1);
+        streams.recover_player("Recording unavailable".into());
+        assert!(streams.player_retry_at.is_none());
+        assert_eq!(
+            streams.player_error.as_deref(),
+            Some("Recording unavailable")
+        );
+        assert_eq!(streams.player_retries, 1);
+        streams.stop_player();
+        streams.recover_player("A different recording".into());
+        assert!(streams.player_error.is_none());
+        assert!(streams.player_retry_at.is_some());
+    }
+
+    #[test]
+    fn comparison_is_disposed_on_exit_inactive_view_and_authorization_loss() {
+        let selected = crate::streams::Stream {
+            user_id: "101".into(),
+            name: "Example player".into(),
+            provider: crate::streams::Provider::Youtube,
+            channel_id: "test-channel".into(),
+            url: "https://www.youtube.com/watch?v=abcDEF_12-3".into(),
+            status: crate::streams::Status::Offline,
+            broadcast_state: None,
+            recording_id: Some("abcDEF_12-3".into()),
+            replay_start_ms: None,
+            replay_end_ms: None,
+        };
+        for exit in 0..3 {
+            let mut host = super::StreamsUi::default();
+            host.comparison = Some(crate::review_compare_ui::Comparison::new(
+                &host.review,
+                selected.clone(),
+                1000,
+                false,
+            ));
+            match exit {
+                0 => host.stop_player(),
+                1 => {
+                    host.tick(&eframe::egui::Context::default(), false, true);
+                }
+                _ => {
+                    host.tick(&eframe::egui::Context::default(), true, false);
+                }
+            }
+            assert!(host.comparison.is_none());
+            assert!(host.player.is_none());
+        }
+    }
+
     use super::*;
 
     fn snapshot() -> Snapshot {
         serde_json::from_value(serde_json::json!({"streams":[{"userId":"1","name":"Guildmate","provider":"twitch","channelId":"guildmate","url":"https://www.twitch.tv/guildmate","status":"live"}],"ownStream":null,"providers":{"twitch":true,"youtube":true}})).unwrap()
+    }
+
+    fn recording(id: &str, member: &str) -> Vod {
+        serde_json::from_value(serde_json::json!({
+            "id":id,"userId":member,"name":"Guildmate","provider":"twitch",
+            "url":format!("https://www.twitch.tv/videos/{id}"),"title":"Raid recording",
+            "startedAt":"2026-09-08T08:00:00Z","endedAt":"2026-09-08T22:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn offline_recording_selection_survives_live_refresh_and_expiry() {
+        let ctx = egui::Context::default();
+        let mut ui = StreamsUi::default();
+        ui.open_recording(&recording("987", "1"));
+        ui.snapshot = Some(Rc::new(snapshot()));
+        ui.received_at = Some(Instant::now() - MAX_STALE);
+        let mut live = snapshot();
+        live.streams.clear();
+        let (tx, rx) = mpsc::channel();
+        ui.work = Some(rx);
+        tx.send(Ok(ResultData::Snapshot(live))).unwrap();
+        ui.tick(&ctx, true, false);
+        assert_eq!(
+            ui.selected.as_ref().unwrap().recording_id.as_deref(),
+            Some("987")
+        );
+    }
+
+    #[test]
+    fn removal_clears_matching_associations_and_player_preparation_only() {
+        let removed = recording("987", "1");
+        let other = recording("654", "1");
+        let mut ui = StreamsUi::default();
+        ui.recordings = Some(Rc::new(vec![removed.clone(), recording("987", "2"), other]));
+        ui.open_recording(&removed);
+        ui.confirm_remove_recording = Some(removed);
+        let (tx, rx) = mpsc::channel();
+        ui.player_work = Some(rx);
+        ui.apply_recording_removal(&Provider::Twitch, "987");
+        assert!(ui.selected.is_none());
+        assert!(ui.recordings_open);
+        assert!(ui.confirm_remove_recording.is_none());
+        assert_eq!(ui.recordings.as_ref().unwrap()[0].id, "654");
+        assert_eq!(ui.recordings.as_ref().unwrap().len(), 1);
+        assert!(tx
+            .send(Err("Obsolete player preparation".to_owned().into()))
+            .is_err());
+    }
+
+    #[test]
+    fn library_permission_and_confirmation_are_cleared_with_authorization() {
+        let mut ui = StreamsUi::default();
+        ui.can_delete_recordings = true;
+        ui.recordings = Some(Rc::new(vec![recording("987", "1")]));
+        ui.confirm_remove_recording = Some(recording("987", "1"));
+        ui.tick(&egui::Context::default(), false, false);
+        assert!(!ui.can_delete_recordings);
+        assert!(ui.recordings.is_none());
+        assert!(ui.confirm_remove_recording.is_none());
+    }
+
+    #[test]
+    fn recorded_povs_include_long_preraid_and_unknown_end_without_other_nights() {
+        let at = |s| {
+            time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                .unwrap()
+                .unix_timestamp()
+                * 1000
+        };
+        let span = (at("2026-09-08T18:00:00Z"), at("2026-09-08T21:00:00Z"));
+        let first = recording("987", "1");
+        let mut unknown_end = recording("654", "2");
+        unknown_end.ended_at = None;
+        let mut previous = recording("321", "3");
+        previous.started_at = Some("2026-09-07T18:00:00Z".into());
+        previous.ended_at = Some("2026-09-07T22:00:00Z".into());
+        let mut future = recording("111", "4");
+        future.started_at = Some("2026-09-09T18:00:00Z".into());
+        let mut malformed = recording("222", "5");
+        malformed.ended_at = Some("invalid".into());
+        let vods = vec![first.clone(), unknown_end, previous, future, malformed];
+        let result = review_povs(&[], &vods, &first.as_stream(), Some(span));
+        assert_eq!(
+            result
+                .iter()
+                .map(|s| s.recording_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["987", "654"]
+        );
+        assert_eq!(review_povs(&[], &[], &first.as_stream(), None).len(), 1);
+    }
+
+    #[test]
+    fn youtube_aliases_deduplicate_but_distinct_archives_and_twitch_do_not() {
+        let mut vod = recording("abcDEF_12-3", "1");
+        vod.provider = Provider::Youtube;
+        vod.url = "https://www.youtube.com/watch?v=abcDEF_12-3".into();
+        let saved = vod.as_stream();
+        let mut live = saved.clone();
+        live.recording_id = None;
+        live.status = Status::Live;
+        live.replay_start_ms = None;
+        live.replay_end_ms = None;
+        assert_eq!(
+            pov_recording_identity(&saved),
+            pov_recording_identity(&live)
+        );
+        let start = time::OffsetDateTime::parse(
+            "2026-09-08T18:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+        .unix_timestamp()
+            * 1000;
+        let span = (start, start + 10_800_000);
+        let mut other = vod.clone();
+        other.id = "xyzDEF_12-3".into();
+        let result = review_povs(&[live.clone()], &[vod.clone(), other], &live, Some(span));
+        assert_eq!(
+            result
+                .iter()
+                .filter(|stream| stream.channel_id == live.channel_id)
+                .count(),
+            1
+        );
+        assert_eq!(result.len(), 2, "Distinct archives must remain available");
+        assert_eq!(
+            result
+                .iter()
+                .find(|stream| stream.channel_id == live.channel_id)
+                .unwrap()
+                .replay_range(),
+            saved.replay_range()
+        );
+        assert!(saved.replay_range().is_some());
+        assert!(result
+            .iter()
+            .any(|stream| stream.channel_id == live.channel_id && stream.recording_id.is_none()));
+        let result = review_povs(&[live], &[vod], &saved, Some(span));
+        assert!(result
+            .iter()
+            .any(|stream| stream.recording_id == saved.recording_id));
+        let twitch_saved = recording("987", "1").as_stream();
+        let mut twitch_live = twitch_saved.clone();
+        twitch_live.recording_id = None;
+        assert_ne!(
+            pov_recording_identity(&twitch_live),
+            pov_recording_identity(&twitch_saved)
+        );
+        let mut different = saved.clone();
+        different.recording_id = Some("xyzDEF_12-3".into());
+        different.channel_id = "xyzDEF_12-3".into();
+        assert_ne!(
+            pov_recording_identity(&saved),
+            pov_recording_identity(&different)
+        );
+    }
+
+    #[test]
+    fn archive_labels_use_cached_date_time_and_title_without_changing_member_name() {
+        let first = recording("987", "1");
+        let mut second = recording("654", "1");
+        second.started_at = Some("2026-09-08T16:15:00Z".into());
+        second.title = "Second recording".into();
+        let povs = [first.as_stream(), second.as_stream()];
+        let labels = recording_labels(&[first, second], &povs);
+        let a = crate::review_ui::recording_label(&labels, &povs[0]).unwrap();
+        let b = crate::review_ui::recording_label(&labels, &povs[1]).unwrap();
+        assert_ne!(a.when, b.when);
+        assert_eq!(b.title, "Second recording");
+        assert!(b.when.contains("16:15 UTC"));
+        assert_eq!(povs[0].name, povs[1].name);
+    }
+
+    #[test]
+    fn preparing_saved_replay_keeps_its_recording_identity_for_latest_seek() {
+        let url =
+            "https://brick.example/v1/streams/player/1/twitch?recording=987&at=1&broadcast=old";
+        let playback = crate::review_ui::Playback {
+            seconds: 125.25,
+            autoplay: false,
+            broadcast_id: "321".into(),
+            public_url: String::new(),
+        };
+        let parsed = url::Url::parse(&player_url_for_playback(url, Some(&playback))).unwrap();
+        let query: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+        assert_eq!(query["recording"], "987");
+        assert_eq!(query["at"], "125.250");
+        assert_eq!(query["broadcast"], "321");
+        assert_eq!(query["paused"], "1");
+        let plain = url::Url::parse(&player_url_for_playback(url, None)).unwrap();
+        assert_eq!(plain.query(), Some("recording=987"));
+    }
+
+    #[test]
+    fn player_preparation_uses_the_latest_pull_position_and_pause_intent() {
+        let earlier =
+            "https://brick.example/v1/streams/player/101/youtube?at=30&broadcast=abcDEF_12-3";
+        let latest = crate::review_ui::Playback {
+            seconds: 151.375,
+            autoplay: false,
+            broadcast_id: "abcDEF_12-3".into(),
+            public_url: String::new(),
+        };
+        let url = url::Url::parse(&player_url_for_playback(earlier, Some(&latest))).unwrap();
+        assert_eq!(
+            url.query_pairs().find(|(key, _)| key == "at").unwrap().1,
+            "151.375"
+        );
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "paused")
+                .unwrap()
+                .1,
+            "1"
+        );
+        assert_eq!(url.query_pairs().count(), 3);
+        assert!(url::Url::parse(&player_url_for_playback(earlier, None))
+            .unwrap()
+            .query()
+            .is_none());
     }
 
     #[test]
@@ -1152,20 +2075,12 @@ mod tests {
     }
 
     #[test]
-    fn recording_members_are_independent_of_live_status_and_group_both_platforms() {
+    fn recording_dates_remain_readable_and_auth_loss_clears_history() {
         let vods: Vec<Vod> = serde_json::from_value(serde_json::json!([
             {"userId":"2", "name":"Zed", "provider":"youtube", "url":"https://www.youtube.com/watch?v=abcDEF_12-3", "title":"Raid", "startedAt":"2026-09-08T18:00:00Z"},
             {"userId":"1", "name":"Andy", "provider":"twitch", "url":"https://www.twitch.tv/videos/1", "title":"Raid", "startedAt":"2026-09-07T18:00:00Z"},
             {"userId":"1", "name":"Andy", "provider":"youtube", "url":"https://www.youtube.com/watch?v=abcDEF_12-3", "title":"Raid", "startedAt":"2026-09-07T18:00:00Z"}
         ])).unwrap();
-        let people = recording_people(&vods);
-        assert_eq!(
-            people
-                .iter()
-                .map(|person| (person.user_id, person.count))
-                .collect::<Vec<_>>(),
-            [("1", 2), ("2", 1)]
-        );
         assert_eq!(recording_day(&vods[1]), recording_day(&vods[2]));
         assert_eq!(
             recording_day_label(recording_day(&vods[0])),

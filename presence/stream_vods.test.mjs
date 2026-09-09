@@ -166,3 +166,19 @@ test("oversized owner association growth preserves readable archive storage and 
   assert.deepEqual(await f.service.list(), history);
   assert.equal((await f.service.targets()).length, active.length);
 });
+
+test("removing a recording deletes every owner association and survives concurrent polling and restart", async t => {
+  const f = await fixture(t);
+  const ended = { ...liveYoutube, status: "offline", owners: ["11", "22"], endedAt };
+  await f.service.observe([ended]);
+  assert.equal((await f.service.list()).length, 2);
+  await Promise.all([f.service.remove("youtube", youtubeId), f.service.observe([ended])]);
+  assert.deepEqual(await f.service.list(), []);
+  f.restart();
+  await f.service.observe([ended]);
+  assert.deepEqual(await f.service.list(), []);
+  await f.service.remove("youtube", youtubeId);
+  assert.deepEqual(JSON.parse(await readFile(path.join(f.dataDir, "stream-vods.json"), "utf8")).removed, [`youtube:${youtubeId}`]);
+  await assert.rejects(f.service.remove("youtube", "../secret"), { status: 400 });
+  await assert.rejects(f.service.remove("twitch", "999"), { status: 404 });
+});

@@ -40,12 +40,13 @@ function capture(remembered = {}, providerOrigin = twitch) {
   };
 }
 
-function relay() {
+function relay(address = wrapper) {
   const frame = {};
   const native = [];
   const listeners = new Map();
   const context = vm.createContext({
-    location: { href: wrapper },
+    URL,
+    location: { href: address, origin: new URL(address).origin },
     document: { querySelector: () => ({ contentWindow: frame }) },
     addEventListener: (name, fn) => listeners.set(name, fn),
     ipc: { postMessage: body => native.push(JSON.parse(body)) },
@@ -54,7 +55,7 @@ function relay() {
   vm.runInContext(relaySource
     .replace('__BRICK_WRAPPER_URL__', JSON.stringify(wrapper))
     .replace('__BRICK_NONCE__', JSON.stringify(nonce)), context);
-  return { frame, native, receive: event => listeners.get('message')(event) };
+  return { frame, native, receive: event => listeners.get('message')?.(event) };
 }
 
 test('captures a real storage change and restores precisely those unexpired choices on reopening', () => {
@@ -108,6 +109,16 @@ test('relay trusts browser supplied origin and its direct iframe identity, not m
   assert.equal(player.native.length, 0);
   player.receive({ origin: twitch, source: player.frame, data });
   assert.deepEqual(player.native, [{ nonce, acknowledgements: {} }]);
+});
+
+test('the reusable relay stays within its protected origin', () => {
+  const data = JSON.stringify({ kind: 'brick-twitch-consent', acknowledgements: {} });
+  const next = relay('https://brick.example/v1/streams/player/2/twitch?at=10');
+  next.receive({ origin: twitch, source: next.frame, data });
+  assert.equal(next.native.length, 1);
+  const other = relay('https://attacker.example/v1/streams/player/2/twitch');
+  other.receive({ origin: twitch, source: other.frame, data });
+  assert.equal(other.native.length, 0);
 });
 
 test('capture stays inactive outside the exact Twitch player origin', () => {

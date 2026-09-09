@@ -797,12 +797,17 @@ impl BrickApp {
             return;
         }
 
-        self.draw_header(ui);
-        let compact_streams =
-            self.active_tab == MainTab::Streams && ui.ctx().content_rect().height() < 640.0;
-        ui.add_space(if compact_streams { 4.0 } else { 14.0 });
-        self.draw_tab_bar(ui);
-        ui.add_space(if compact_streams { 4.0 } else { 18.0 });
+        if self.review_workspace_open() {
+            self.draw_review_header(ui);
+            ui.add_space(8.0);
+        } else {
+            self.draw_header(ui);
+            let compact_streams =
+                self.active_tab == MainTab::Streams && ui.ctx().content_rect().height() < 640.0;
+            ui.add_space(if compact_streams { 4.0 } else { 14.0 });
+            self.draw_tab_bar(ui);
+            ui.add_space(if compact_streams { 4.0 } else { 18.0 });
+        }
         match self.active_tab {
             MainTab::Updates => self.draw_scrollable_updates_tab(ui),
             MainTab::Roster => self.draw_roster_tab(ui),
@@ -832,18 +837,83 @@ impl BrickApp {
     }
 
     fn draw_tab_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if tab_button(ui, "Updates", self.active_tab == MainTab::Updates).clicked() {
-                self.active_tab = MainTab::Updates;
-            }
-            if tab_button(ui, "Roster", self.active_tab == MainTab::Roster).clicked() {
-                self.active_tab = MainTab::Roster;
-                self.start_roster_refresh_if_stale();
-            }
-            if tab_button(ui, "Streams", self.active_tab == MainTab::Streams).clicked() {
-                self.active_tab = MainTab::Streams;
-            }
-        });
+        ui.horizontal(|ui| self.draw_tab_buttons(ui));
+    }
+
+    fn draw_tab_buttons(&mut self, ui: &mut egui::Ui) {
+        if tab_button(ui, "Updates", self.active_tab == MainTab::Updates).clicked() {
+            self.active_tab = MainTab::Updates;
+        }
+        if tab_button(ui, "Roster", self.active_tab == MainTab::Roster).clicked() {
+            self.active_tab = MainTab::Roster;
+            self.start_roster_refresh_if_stale();
+        }
+        if tab_button(ui, "Streams", self.active_tab == MainTab::Streams).clicked() {
+            self.active_tab = MainTab::Streams;
+        }
+    }
+
+    fn review_workspace_open(&self) -> bool {
+        self.auth_state.is_authorized()
+            && self.active_tab == MainTab::Streams
+            && self.streams.reviewing()
+    }
+
+    fn draw_review_header(&mut self, ui: &mut egui::Ui) {
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 34.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                draw_icon(ui, self.brick_texture.as_ref(), 28.0);
+                ui.label(
+                    RichText::new("Brick")
+                        .size(18.0)
+                        .strong()
+                        .color(primary_text()),
+                );
+                ui.label(
+                    RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                        .small()
+                        .color(muted_text()),
+                );
+                ui.add_space(10.0);
+                self.draw_tab_buttons(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let available = matches!(self.app_update_state, AppUpdateUiState::Available(_));
+                    let busy = self.app_update_rx.is_some() || self.app_update_install_rx.is_some();
+                    let text = if available {
+                        "Update now"
+                    } else {
+                        "Check updates"
+                    };
+                    if ui
+                        .add_enabled(!busy, compact_update_button(text, available))
+                        .clicked()
+                    {
+                        if available {
+                            self.start_app_update_install();
+                        } else {
+                            self.start_app_update_check();
+                        }
+                    }
+                    if busy {
+                        busy_indicator(ui, 12.0, info_accent());
+                    }
+                    let status = app_update_status_text(&self.app_update_state);
+                    let attention =
+                        available || matches!(self.app_update_state, AppUpdateUiState::Error(_));
+                    ui.add(
+                        egui::Label::new(RichText::new(&status).small().color(if attention {
+                            warning_accent()
+                        } else {
+                            muted_text()
+                        }))
+                        .truncate(),
+                    )
+                    .on_hover_text(status);
+                });
+            },
+        );
     }
 
     fn draw_roster_tab(&mut self, ui: &mut egui::Ui) {
@@ -1522,7 +1592,15 @@ impl eframe::App for BrickApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let vertical_margin = if self.auth_state.is_authorized()
+        let fullscreen = self.auth_state.is_authorized()
+            && self.window_visible
+            && self.active_tab == MainTab::Streams
+            && !self.confirm_logout
+            && self.streams.fullscreen();
+        let reviewing = self.review_workspace_open();
+        let vertical_margin = if reviewing {
+            12
+        } else if self.auth_state.is_authorized()
             && self.active_tab == MainTab::Streams
             && ctx.content_rect().height() < 640.0
         {
@@ -1534,11 +1612,19 @@ impl eframe::App for BrickApp {
             .frame(
                 egui::Frame::NONE
                     .fill(app_background())
-                    .inner_margin(egui::Margin::symmetric(28, vertical_margin)),
+                    .inner_margin(if fullscreen {
+                        egui::Margin::ZERO
+                    } else {
+                        egui::Margin::symmetric(if reviewing { 20 } else { 28 }, vertical_margin)
+                    }),
             )
             .show_inside(ui, |ui| {
                 ui.set_width(ui.available_width());
-                self.draw_content(ui);
+                if fullscreen {
+                    self.streams.draw_fullscreen(ui);
+                } else {
+                    self.draw_content(ui);
+                }
             });
         self.draw_logout_confirmation(&ctx);
         if self.streams.update_player(
@@ -2339,6 +2425,56 @@ mod tests {
 
     fn overdue() -> Instant {
         Instant::now() - Duration::from_secs(600)
+    }
+
+    #[test]
+    fn review_header_keeps_navigation_and_update_states_in_one_bounded_row() {
+        for size in [egui::vec2(980.0, 600.0), egui::vec2(1440.0, 900.0)] {
+            for state in [
+                AppUpdateUiState::UpToDate,
+                AppUpdateUiState::Checking,
+                AppUpdateUiState::Available("0.4.2".into()),
+                AppUpdateUiState::Installing,
+                AppUpdateUiState::Error("Update not trusted".into()),
+                AppUpdateUiState::Error("An unexpectedly long update failure message ".repeat(20)),
+            ] {
+                let mut app = app();
+                app.active_tab = MainTab::Streams;
+                app.app_update_state = state.clone();
+                if matches!(
+                    state,
+                    AppUpdateUiState::Checking | AppUpdateUiState::Installing
+                ) {
+                    app.app_update_rx = Some(mpsc::channel().1);
+                }
+                let ctx = egui::Context::default();
+                configure_style(&ctx);
+                for _ in 0..2 {
+                    let _ = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            egui::Frame::NONE
+                                .inner_margin(egui::Margin::symmetric(20, 12))
+                                .show(ui, |ui| {
+                                    let before = ui.available_rect_before_wrap();
+                                    app.draw_review_header(ui);
+                                    assert!(
+                                        ui.min_rect().right() <= before.right() + 1.0,
+                                        "Header expanded beyond the window"
+                                    );
+                                    assert!(
+                                        ui.min_rect().bottom() <= before.top() + 35.0,
+                                        "Header wrapped into the replay workspace"
+                                    );
+                                });
+                        },
+                    );
+                }
+            }
+        }
     }
 
     #[test]

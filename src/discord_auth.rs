@@ -3,7 +3,6 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    process::Command,
     sync::{LazyLock, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -203,7 +202,7 @@ pub fn saved_session_status() -> Result<SessionStatus, String> {
 pub fn login_with_browser() -> Result<AuthorizedUser, String> {
     let config = auth_config()?;
     let request = login_request(&config)?;
-    open_browser(&request.authorize_url)?;
+    crate::browser::open(&request.authorize_url)?;
     let code = wait_for_remote_callback(&request.state)?;
     let token = exchange_code(&config, &code, &request.verifier)?;
     let session = verified_session_from_token(&config, token, None)?;
@@ -1054,43 +1053,6 @@ fn random_token() -> String {
 fn pkce_challenge(verifier: &str) -> String {
     let digest = Sha256::digest(verifier.as_bytes());
     URL_SAFE_NO_PAD.encode(digest)
-}
-
-fn open_browser(url: &str) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        Command::new("rundll32")
-            .args(["url.dll,FileProtocolHandler", url])
-            .spawn()
-            .map_err(|error| format!("Failed to open Discord in your browser: {error}"))?;
-        return Ok(());
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("open")
-            .arg(url)
-            .spawn()
-            .map_err(|error| format!("Failed to open Discord in your browser: {error}"))?;
-        return Ok(());
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        for command in ["xdg-open", "gio", "kde-open", "gnome-open"] {
-            let result = if command == "gio" {
-                Command::new(command).args(["open", url]).spawn()
-            } else {
-                Command::new(command).arg(url).spawn()
-            };
-
-            if result.is_ok() {
-                return Ok(());
-            }
-        }
-
-        Err("Failed to open Discord in your browser.".to_string())
-    }
 }
 
 #[cfg(test)]

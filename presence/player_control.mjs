@@ -1,0 +1,189 @@
+import { createHash } from "node:crypto";
+
+// Only playback controls live in the wrapper. Private reports and credentials
+// never enter this page or the provider's player API.
+export const youtubeControls = `window.onYouTubeIframeAPIReady = () => {
+  const frame = document.getElementById("media");
+  const url = new URL(frame.src);
+  const replay = frame.dataset.start !== undefined;
+  const start = Number(frame.dataset.start || url.searchParams.get("start") || 0);
+  let ready = false;
+  let pending = start;
+  let resume = url.searchParams.get("autoplay") !== "0";
+  let priming = null;
+  let decoded = false;
+  const load = () => {
+    priming = resume ? null : "starting";
+    player.loadVideoById({videoId: url.pathname.split("/").pop(), startSeconds: pending});
+  };
+  const apply = () => {
+    // A never-played paused iframe can report its target while painting black.
+    // Decode its first frame muted, then seek again once the SDK is paused.
+    if (!resume && priming === "starting") {
+      player.seekTo(pending, true);
+      player.playVideo();
+      return;
+    }
+    if (!resume) player.pauseVideo();
+    player.seekTo(pending, true);
+    if (resume) player.playVideo(); else player.pauseVideo();
+  };
+  const player = new YT.Player("media", {events: {onReady: event => {
+    ready = true;
+    event.target.mute();
+    if (replay) load(); else event.target.playVideo();
+    // WebKit may announce readiness before its initial media setup accepts
+    // playback. Retry preparation once after that setup, without seeking again.
+    if (replay) setTimeout(() => {
+      if (!decoded && [-1, 5].includes(player.getPlayerState())) load();
+    }, 500);
+  }, onStateChange: event => {
+    if (event.data === 1) decoded = true;
+    if (resume) { priming = null; return; }
+    if (priming === "starting" && event.data === 1) {
+      priming = "pausing";
+      player.pauseVideo();
+    } else if (priming === "pausing" && event.data === 2) {
+      priming = null;
+      player.seekTo(pending, true);
+    }
+  }}});
+  window.brickMedia = {
+    seek: (seconds, shouldResume = true) => {
+      if (!Number.isFinite(seconds) || seconds < 0 || seconds > 604800 || typeof shouldResume !== "boolean") return;
+      pending = seconds;
+      resume = shouldResume;
+      if (ready) { if (!decoded) load(); else apply(); }
+    },
+    pause: () => {
+      resume = false;
+      if (ready && !decoded) load();
+      else if (ready && !priming) player.pauseVideo();
+    },
+    play: () => {
+      resume = true; priming = null;
+      if (ready) { if (!decoded) load(); else player.playVideo(); }
+    },
+    state: () => ({ ready, seconds: ready ? player.getCurrentTime() : pending,
+      playing: ready && !priming && player.getPlayerState() === 1,
+      buffering: ready && (priming !== null || player.getPlayerState() === 3) })
+  };
+};`;
+export const youtubeScriptPolicy = `script-src 'sha256-${createHash("sha256").update(youtubeControls).digest("base64")}' https://www.youtube.com/iframe_api https://www.youtube.com/s/player/; `;
+export const youtubeControlTags = `<script>${youtubeControls}</script><script src="https://www.youtube.com/iframe_api"></script>`;
+
+export const twitchControls = `(() => {
+  const url = new URL(document.getElementById("media").dataset.src);
+  let pending = Number((url.searchParams.get("time") || "0s").replace(/s$/, ""));
+  let ready = false;
+  let playing = false;
+  let pauseIntent = false;
+  let playIntent = false;
+  let expectedPause = false;
+  let resume = url.searchParams.get("autoplay") !== "false";
+  let decoded = false;
+  let priming = null;
+  let pauseThenSeek = false;
+  const video = url.searchParams.get("video");
+  const player = new Twitch.Player("media", {width:"100%", height:"100%",
+    video, parent:[url.searchParams.get("parent")],
+    time:Math.floor(pending) + "s", autoplay:resume, muted:true});
+  const pause = () => {
+    // Preserve command provenance until its event, even if a native Play is
+    // submitted first. Actual PLAY/PLAYING starts a new provider interaction.
+    expectedPause = true;
+    player.pause();
+  };
+  const load = () => {
+    playing = false;
+    priming = resume ? null : "starting";
+    player.seek(pending);
+    player.play();
+  };
+  const apply = () => {
+    if (!resume) {
+      playing = false;
+      if (!player.isPaused()) {
+        pauseThenSeek = true;
+        pause();
+        return;
+      }
+    }
+    pauseThenSeek = false;
+    // A redundant pause around a backwards seek can discard that seek in
+    // Twitch. Seek only after pause is acknowledged, without pausing again.
+    player.seek(pending);
+    if (resume) { priming = null; player.play(); }
+  };
+  player.addEventListener(Twitch.Player.READY, () => {
+    ready = true;
+    player.setMuted(true);
+    load();
+  });
+  // SEEK is a position notification, not a playback-state transition. Twitch
+  // need not emit PLAYING again when a seek continues an already playing video.
+  for (const event of [Twitch.Player.PLAY, Twitch.Player.PAUSE, Twitch.Player.ENDED]) {
+    player.addEventListener(event, () => {
+      playing = false;
+      pauseIntent = event === Twitch.Player.PAUSE && !expectedPause;
+      expectedPause = false;
+      if (event === Twitch.Player.PLAY) {
+        if (decoded && !priming && !resume) playIntent = true;
+      } else playIntent = false;
+    });
+  }
+  player.addEventListener(Twitch.Player.PLAYING, () => {
+    const first = !decoded;
+    pauseIntent = false;
+    expectedPause = false;
+    playing = true; decoded = true;
+    if (first && resume) player.seek(pending);
+    if (!resume && priming === "starting") {
+      playing = false; priming = "pausing"; pause();
+    }
+  });
+  player.addEventListener(Twitch.Player.PAUSE, () => {
+    if (!pauseThenSeek && !resume && priming === "pausing") {
+      priming = null; player.seek(pending);
+    }
+  });
+  window.brickMedia = {
+    seek: (seconds, shouldResume = true) => {
+      if (!Number.isFinite(seconds) || seconds < 0 || seconds > 604800 || typeof shouldResume !== "boolean") return;
+      pauseIntent = false;
+      playIntent = false;
+      pending = seconds;
+      resume = shouldResume;
+      if (ready) { if (!decoded) load(); else if (!pauseThenSeek) apply(); }
+    },
+    pause: () => {
+      pauseIntent = false;
+      playIntent = false;
+      resume = false; playing = false;
+      if (ready) { if (!decoded) load(); else if (!priming && !pauseThenSeek) pause(); }
+    },
+    play: () => {
+      pauseIntent = false;
+      playIntent = false;
+      resume = true; priming = null;
+      if (ready && !pauseThenSeek) { if (!decoded) load(); else player.play(); }
+    },
+    state: () => {
+      // Twitch can emit PAUSE before the transition accepts a new seek. Wait
+      // for a later SDK read, outside that callback, without another pause or
+      // a timer. This also handles a missed event when the SDK is already paused.
+      if (ready && pauseThenSeek && player.isPaused()) {
+        pauseThenSeek = false;
+        player.seek(pending);
+        if (resume) { priming = null; player.play(); }
+      }
+      return { ready, seconds: ready ? player.getCurrentTime() : pending,
+        pause_intent: pauseIntent,
+        play_intent: playIntent,
+        playing: ready && !pauseThenSeek && playing && !player.isPaused() && !player.getEnded(),
+        buffering: ready && (pauseThenSeek || priming !== null || (!playing && !player.isPaused() && !player.getEnded())) };
+    }
+  };
+})();`;
+export const playerScriptPolicy = youtubeScriptPolicy.replace("; ", ` 'sha256-${createHash("sha256").update(twitchControls).digest("base64")}' https://player.twitch.tv/js/embed/v1.js; `);
+export const twitchControlTags = `<script src="https://player.twitch.tv/js/embed/v1.js"></script><script>${twitchControls}</script>`;

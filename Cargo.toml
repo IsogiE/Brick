@@ -1,6 +1,6 @@
 [package]
 name = "brick"
-version = "0.4.1"
+version = "0.4.2"
 description = "Advance"
 authors = ["Advance Raid Tools"]
 license = "MIT"
@@ -14,6 +14,9 @@ ed25519-dalek = "2"
 eframe = { version = "=0.34.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
+ocrs = { version = "=0.13.0", default-features = false, features = ["rten"] }
+rten = { version = "=0.26.0", default-features = false, features = ["rten_format"] }
+rten-imageproc = "=0.26.0"
 fs2 = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "http2", "json", "rustls-tls"] }
 rfd = "0.16"
@@ -40,7 +43,11 @@ tray-icon = { version = "0.24", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 webview2-com = "=0.38.2"
+windows = { version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+winit = { version = "=0.30.13", default-features = false }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
@@ -49,3 +56,19 @@ winresource = "0.1"
 codegen-units = 1
 lto = "thin"
 opt-level = "z"
+
+# Keep the app small while optimizing the opt-in OCR tensor loops for latency.
+[profile.release.package.ocrs]
+opt-level = 3
+[profile.release.package.rten]
+opt-level = 3
+[profile.release.package.rten-gemm]
+opt-level = 3
+[profile.release.package.rten-imageproc]
+opt-level = 3
+[profile.release.package.rten-simd]
+opt-level = 3
+[profile.release.package.rten-tensor]
+opt-level = 3
+[profile.release.package.rten-vecmath]
+opt-level = 3
