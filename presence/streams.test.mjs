@@ -658,28 +658,59 @@ test("concurrent first checks deduplicate canonical targets and keep every submi
   assert.equal(calls, 1, "a fresh canonical target reuses its verified cache");
 });
 
-test("a persisted save succeeds after its check deadline and after concurrent removal", async t => {
-  let release;
-  const f = await fixture(t, (url, options) => url.includes("oauth2/token") ? twitchLive(url, options)
-    : new Promise(resolve => { release = () => resolve(twitchLive(url, options)); }), providerEnv, { firstStreamCheckWaitMs: 120 });
+test("a persisted save succeeds after its provider check deadline", { timeout: 10_000 }, async t => {
+  const provider = Promise.withResolvers();
+  const f = await fixture(t, async (url, options) => {
+    if (!url.includes("oauth2/token")) await provider.promise;
+    return twitchLive(url, options);
+  }, providerEnv, { firstStreamCheckWaitMs: 120 });
+  try {
+    const saved = await f.save("https://twitch.tv/alice");
+    assert.equal(saved.status, 200);
+    assert.equal((await saved.json()).ownStream.status, "checking");
+    assert.equal(JSON.parse(await readFile(path.join(f.data, "streams.json"), "utf8")).users["11"].twitch.channelId, "alice");
+  } finally {
+    provider.resolve();
+  }
+});
+
+test("a save finishing after concurrent removal reports no registration", { timeout: 10_000 }, async t => {
+  const replacementStarted = Promise.withResolvers();
+  const provider = Promise.withResolvers();
+  const f = await fixture(t, async (url, options) => {
+    if (new URL(url).searchParams.getAll("user_login").includes("alice_next")) {
+      replacementStarted.resolve();
+      await provider.promise;
+    }
+    return twitchLive(url, options);
+  }, providerEnv, { firstStreamCheckWaitMs: 5_000 });
   const saved = await f.save("https://twitch.tv/alice");
   assert.equal(saved.status, 200);
-  assert.equal((await saved.json()).ownStream.status, "checking");
-  assert.equal(JSON.parse(await readFile(path.join(f.data, "streams.json"), "utf8")).users["11"].twitch.channelId, "alice");
-  assert(release);
-  const waiting = f.save("https://twitch.tv/alice_next");
-  for (let i = 0; i < 200; i++) {
+  assert.equal((await saved.json()).ownStream.status, "live");
+  let saveFinished = false;
+  const waiting = f.save("https://twitch.tv/alice_next").then(response => {
+    saveFinished = true;
+    return response;
+  });
+  try {
+    await replacementStarted.promise;
     const registry = JSON.parse(await readFile(path.join(f.data, "streams.json"), "utf8"));
-    if (registry.users["11"].twitch.channelId === "alice_next") break;
-    await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(registry.users["11"].twitch.channelId, "alice_next");
+    assert.equal(saveFinished, false, "the replacement check must still be pending before removal");
+    assert.equal((await f.authorized("/v1/streams/me", { method: "DELETE" })).status, 200);
+    assert.equal(JSON.parse(await readFile(path.join(f.data, "streams.json"), "utf8")).users["11"], undefined);
+    assert.equal(saveFinished, false, "removal must finish before the replacement save returns");
+  } finally {
+    provider.resolve();
   }
-  assert.equal((await f.authorized("/v1/streams/me", { method: "DELETE" })).status, 200);
-  release();
   const response = await waiting;
   assert.equal(response.status, 200);
   const removed = await response.json();
   assert.equal(removed.ownStream, null);
   assert.deepEqual(removed.ownStreams, []);
+  const current = await f.list();
+  assert.equal(current.ownStream, null);
+  assert.deepEqual(current.ownStreams, []);
 });
 
 test("a save finishing after a replacement reports the current registration instead of the old URL", async t => {

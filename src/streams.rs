@@ -173,7 +173,7 @@ fn validate_recording_id(provider: &Provider, id: &str) -> Result<(), Error> {
 }
 
 pub fn review_path(stream: &Stream) -> Result<String, Error> {
-    player_url(&stream.user_id, &stream.provider)?;
+    player_path(&stream.user_id, &stream.provider)?;
     if let Some(id) = &stream.recording_id {
         validate_recording_id(&stream.provider, id)?;
         Ok(format!(
@@ -191,8 +191,14 @@ pub fn review_path(stream: &Stream) -> Result<String, Error> {
 }
 
 pub fn player_url_for_stream(stream: &Stream) -> Result<String, Error> {
-    let mut url = url::Url::parse(&player_url(&stream.user_id, &stream.provider)?)
-        .expect("Validated player URL");
+    player_url_for_stream_using(stream, presence::endpoint_url)
+}
+
+fn player_url_for_stream_using(
+    stream: &Stream,
+    endpoint: impl FnOnce(&str) -> Result<url::Url, String>,
+) -> Result<String, Error> {
+    let mut url = endpoint(&player_path(&stream.user_id, &stream.provider)?)?;
     if let Some(id) = &stream.recording_id {
         validate_recording_id(&stream.provider, id)?;
         url.query_pairs_mut().append_pair("recording", id);
@@ -286,11 +292,11 @@ pub fn remove(access_token: &str, provider: &Provider) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn player_url(user_id: &str, provider: &Provider) -> Result<String, Error> {
+fn player_path(user_id: &str, provider: &Provider) -> Result<String, Error> {
     if user_id.is_empty() || user_id.len() > 20 || !user_id.bytes().all(|b| b.is_ascii_digit()) {
         return Err("This stream could not be opened.".to_string().into());
     }
-    Ok(presence::endpoint_url(&format!("/v1/streams/player/{user_id}/{}", provider.key()))?.into())
+    Ok(format!("/v1/streams/player/{user_id}/{}", provider.key()))
 }
 
 pub(crate) fn request(
@@ -378,7 +384,7 @@ mod tests {
             "https://evil.example",
             "123456789012345678901",
         ] {
-            assert!(player_url(id, &Provider::Twitch).is_err());
+            assert!(player_path(id, &Provider::Twitch).is_err());
         }
     }
 
@@ -394,6 +400,12 @@ mod tests {
     }
     #[test]
     fn saved_recording_keeps_its_identity_in_review_and_player_routes() {
+        let endpoint = |path: &str| {
+            url::Url::parse("https://brick.example.test")
+                .unwrap()
+                .join(path)
+                .map_err(|error| error.to_string())
+        };
         let vod: Vod = serde_json::from_value(serde_json::json!({
             "id":"abcDEF_12-3", "userId":"11", "name":"Guildmate", "provider":"youtube",
             "url":"https://www.youtube.com/watch?v=abcDEF_12-3", "title":"Saved raid"
@@ -406,7 +418,12 @@ mod tests {
             review_path(&stream).unwrap(),
             "/v1/streams/vods/11/youtube/abcDEF_12-3/review"
         );
-        let url = url::Url::parse(&player_url_for_stream(&stream).unwrap()).unwrap();
+        let url =
+            url::Url::parse(&player_url_for_stream_using(&stream, endpoint).unwrap()).unwrap();
+        assert_eq!(
+            url.origin().ascii_serialization(),
+            "https://brick.example.test"
+        );
         assert_eq!(url.path(), "/v1/streams/player/11/youtube");
         assert_eq!(url.query(), Some("recording=abcDEF_12-3"));
         for bad in [
@@ -419,7 +436,7 @@ mod tests {
             let mut invalid = stream.clone();
             invalid.recording_id = Some(bad.into());
             assert!(review_path(&invalid).is_err());
-            assert!(player_url_for_stream(&invalid).is_err());
+            assert!(player_url_for_stream_using(&invalid, endpoint).is_err());
         }
     }
 }
