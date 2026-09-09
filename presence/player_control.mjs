@@ -91,8 +91,8 @@ export const twitchControls = `(() => {
     player.play();
   };
   const apply = () => {
-    playing = false;
-    if (!resume) player.pause();
+    if (resume) priming = null;
+    else { playing = false; player.pause(); }
     player.seek(pending);
     if (resume) player.play(); else player.pause();
   };
@@ -101,7 +101,9 @@ export const twitchControls = `(() => {
     player.setMuted(true);
     load();
   });
-  for (const event of [Twitch.Player.PLAY, Twitch.Player.SEEK, Twitch.Player.PAUSE, Twitch.Player.ENDED]) {
+  // SEEK is a position notification, not a playback-state transition. Twitch
+  // need not emit PLAYING again when a seek continues an already playing video.
+  for (const event of [Twitch.Player.PLAY, Twitch.Player.PAUSE, Twitch.Player.ENDED]) {
     player.addEventListener(event, () => { playing = false; });
   }
   player.addEventListener(Twitch.Player.PLAYING, () => {

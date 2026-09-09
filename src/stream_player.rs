@@ -462,9 +462,7 @@ impl StreamPlayer {
         }
         if let Some((target, resume, requested)) = self.pending_seek {
             let state = self.playback_state();
-            if state.polled_at.is_some_and(|at| at >= requested)
-                && seek_landed(target, resume, requested.elapsed(), &state)
-            {
+            if seek_acknowledged(target, resume, requested, &state) {
                 self.pending_seek = None;
             }
         }
@@ -744,6 +742,12 @@ fn playback_call(command: PlaybackCommand) -> Result<String, String> {
     }
 }
 
+fn seek_acknowledged(target: f64, resume: bool, requested: Instant, state: &PlaybackState) -> bool {
+    // A delayed SDK callback may describe the correct target but an obsolete
+    // playback state. Require both a post-command request and a recent sample.
+    state.is_fresh_since(requested) && seek_landed(target, resume, requested.elapsed(), state)
+}
+
 fn seek_landed(target: f64, resume: bool, elapsed: Duration, state: &PlaybackState) -> bool {
     state.ready
         && state.playing == resume
@@ -760,10 +764,7 @@ fn seek_landed(target: f64, resume: bool, elapsed: Duration, state: &PlaybackSta
 }
 
 fn playback_acknowledged(playing: bool, requested: Instant, state: &PlaybackState) -> bool {
-    state.polled_at.is_some_and(|at| at >= requested)
-        && state.ready
-        && !state.buffering
-        && state.playing == playing
+    state.is_fresh_since(requested) && state.ready && !state.buffering && state.playing == playing
 }
 
 impl Drop for StreamPlayer {
@@ -1320,6 +1321,32 @@ mod tests {
         state.seconds = 120.0;
         state.ready = false;
         assert!(!seek_landed(120.0, false, Duration::ZERO, &state));
+    }
+
+    #[test]
+    fn a_delayed_post_command_sample_cannot_acknowledge_seek_play_or_pause() {
+        let now = Instant::now();
+        let requested = now - Duration::from_secs(5);
+        for resume in [false, true] {
+            let mut state = PlaybackState {
+                ready: true,
+                seconds: 120.0,
+                playing: resume,
+                polled_at: Some(requested + Duration::from_millis(100)),
+                ..Default::default()
+            };
+            // The request began after the command and its position matches,
+            // but its callback is arriving several seconds late.
+            assert!(!seek_acknowledged(120.0, resume, requested, &state));
+            assert!(!playback_acknowledged(resume, requested, &state));
+            state.polled_at = Some(now);
+            assert!(seek_acknowledged(120.0, resume, requested, &state));
+            assert!(playback_acknowledged(resume, requested, &state));
+            // Freshness alone must not acknowledge data preceding a new action.
+            let newer_request = now + Duration::from_millis(1);
+            assert!(!seek_acknowledged(120.0, resume, newer_request, &state));
+            assert!(!playback_acknowledged(resume, newer_request, &state));
+        }
     }
 
     #[test]

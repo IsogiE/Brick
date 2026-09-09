@@ -663,6 +663,13 @@ impl ReviewUi {
     fn seek_absolute(&mut self, at_ms: i64) -> Option<PlaybackCommand> {
         self.seek_absolute_with_playback(at_ms, true)
     }
+    fn watch_event(&mut self, event: RaidEvent) -> Option<PlaybackCommand> {
+        // Both the event list and timeline promise the selected moment.
+        // Context before an event is available through the ordinary seek bar.
+        let command = self.seek_absolute(event.at_ms)?;
+        self.selected_event = Some((event.at_ms, event.actor));
+        Some(command)
+    }
     fn seek_absolute_with_playback(
         &mut self,
         at_ms: i64,
@@ -1115,11 +1122,11 @@ impl ReviewUi {
         let pull = self.pull.clone()?;
         let duration = (pull.end_ms - pull.start_ms) as f64 / 1000.0;
         let video_start = pull_video_start(self.review.as_ref()?, &pull);
-        let elapsed = if state.ready && state.seconds.is_finite() {
-            state.seconds - video_start
-        } else {
-            0.0
-        };
+        let confirmed_position = self.confirmed_video_position(state);
+        let elapsed = confirmed_position
+            .or_else(|| self.playback.as_ref().map(|playback| playback.seconds))
+            .map(|seconds| seconds - video_start)
+            .unwrap_or(0.0);
         let current = elapsed.clamp(0.0, duration);
         let mut command = None;
         if let Some(target) = state.seeking {
@@ -1131,13 +1138,15 @@ impl ReviewUi {
             );
         } else if state.buffering {
             ui.label(RichText::new("Buffering…").small().color(MUTED));
-        } else if state.ready && elapsed < 0.0 {
+        } else if confirmed_position.is_none() {
+            ui.label(RichText::new("Waiting for video…").small().color(MUTED));
+        } else if elapsed < 0.0 {
             ui.label(
                 RichText::new(format!("Pull starts in {}", clock(-elapsed)))
                     .small()
                     .color(MUTED),
             );
-        } else if state.ready && elapsed >= duration {
+        } else if elapsed >= duration {
             ui.label(
                 RichText::new(if elapsed - duration >= 1.0 {
                     format!("Video is {} past this pull", clock(elapsed - duration))
@@ -1151,7 +1160,7 @@ impl ReviewUi {
             ui.add_space(18.0);
         }
         let playing = playback_intent(state, self.playback.as_ref());
-        let replay = state.ready && elapsed >= duration && !self.aligning;
+        let replay = confirmed_position.is_some() && elapsed >= duration && !self.aligning;
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
@@ -1186,7 +1195,11 @@ impl ReviewUi {
             ui.label(
                 RichText::new(format!(
                     "{} / {}",
-                    relative_clock(self.scrub.unwrap_or(elapsed)),
+                    if self.scrub.is_some() || confirmed_position.is_some() {
+                        relative_clock(self.scrub.unwrap_or(elapsed))
+                    } else {
+                        "–:––".into()
+                    },
                     clock(duration)
                 ))
                 .color(MUTED),
@@ -1424,7 +1437,9 @@ impl ReviewUi {
         }
         // A clamped cursor implies this frame belongs to the selected pull.
         // Keep the true elapsed label and hide it while viewing other footage.
-        if self.scrub.is_some() || (0.0..=duration).contains(&elapsed) {
+        if self.scrub.is_some()
+            || (confirmed_position.is_some() && (0.0..=duration).contains(&elapsed))
+        {
             let x =
                 grid.left() + self.scrub.unwrap_or(current) as f32 / duration as f32 * grid.width();
             painter.line_segment(
@@ -1437,8 +1452,7 @@ impl ReviewUi {
             self.search.clear();
             self.scroll_to_event = true;
             self.show_all_deaths = true;
-            self.selected_event = Some((event.at_ms, event.actor));
-            command = self.seek_absolute(event.at_ms.saturating_sub(2000).max(pull.start_ms));
+            command = self.watch_event(event);
         } else if response.clicked() {
             if let Some(pos) = response
                 .interact_pointer_pos()
@@ -1458,6 +1472,15 @@ impl ReviewUi {
     fn reset_playback_range(&mut self) {
         self.range_epoch = Instant::now();
         self.range_pause_sent = false;
+    }
+
+    fn confirmed_video_position(&self, state: &PlaybackState) -> Option<f64> {
+        (state.ready
+            && state.seconds.is_finite()
+            && state.is_fresh_since(self.range_epoch)
+            && state.seeking.is_none()
+            && !state.buffering)
+            .then_some(state.seconds)
     }
 
     fn pause_at_pull_end(&mut self, state: &PlaybackState) -> Option<PlaybackCommand> {
@@ -1660,22 +1683,14 @@ impl ReviewUi {
                     }
                     response.on_hover_text(format!(
                         "{} · {}
-Click to watch 2 seconds before",
+Click to watch this moment",
                         clock(offset),
                         event_description(event)
                     ));
                 }
             },
         );
-        chosen.and_then(|event| {
-            self.selected_event = Some((event.at_ms, event.actor));
-            self.seek_absolute(
-                event
-                    .at_ms
-                    .saturating_sub(2000)
-                    .max(self.pull.as_ref()?.start_ms),
-            )
-        })
+        chosen.and_then(|event| self.watch_event(event))
     }
 }
 #[derive(Default)]
@@ -2347,6 +2362,58 @@ mod tests {
         observation.health_readings[1].candidate.percent = 40.0;
         ui.observe_health(&observation);
         assert_eq!(ui.health_bands, original);
+    }
+
+    #[test]
+    fn event_click_preserves_the_log_millisecond_without_a_lead_in() {
+        let (review, pull, _) = fixture();
+        let mut ui = ReviewUi::default();
+        ui.review = Some(review.clone());
+        ui.select(pull.clone());
+        for offset in [375, 121_867] {
+            let at_ms = pull.start_ms + offset;
+            let event = RaidEvent {
+                at_ms,
+                actor: "Player".into(),
+                class: "Mage".into(),
+                ability: String::new(),
+                ability_id: 0,
+                target: None,
+                kind: EventKind::Deaths,
+                group: None,
+            };
+            let Some(PlaybackCommand::Seek(seconds)) = ui.watch_event(event) else {
+                panic!("An event click must seek and play");
+            };
+            assert_eq!(encounter_moment(&review, &pull, seconds), at_ms);
+            assert_eq!(ui.selected_event, Some((at_ms, "Player".into())));
+        }
+    }
+
+    #[test]
+    fn timeline_position_waits_for_current_settled_video_after_a_seek() {
+        let (review, pull, _) = fixture();
+        let mut ui = ReviewUi::default();
+        ui.review = Some(review);
+        ui.select(pull.clone());
+        let mut state = PlaybackState::default();
+        state.ready = true;
+        state.seconds = ui.playback().unwrap().seconds;
+        state.mark_polled_now();
+        assert_eq!(ui.confirmed_video_position(&state), Some(state.seconds));
+
+        ui.seek_absolute(pull.start_ms + 121_867).unwrap();
+        // The old frame belongs to the same POV, but predates the click.
+        assert_eq!(ui.confirmed_video_position(&state), None);
+        state.mark_polled_now();
+        state.seconds = ui.playback().unwrap().seconds;
+        state.seeking = Some(state.seconds);
+        assert_eq!(ui.confirmed_video_position(&state), None);
+        state.seeking = None;
+        state.buffering = true;
+        assert_eq!(ui.confirmed_video_position(&state), None);
+        state.buffering = false;
+        assert_eq!(ui.confirmed_video_position(&state), Some(state.seconds));
     }
 
     #[test]

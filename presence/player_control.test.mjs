@@ -31,16 +31,22 @@ function youtube({ paused = false, start = 19800.125, live = false } = {}) {
     status: value => { status = value; events.onStateChange({ data: value }); } };
 }
 
-function twitch({ paused = false } = {}) {
-  const calls = []; const listeners = new Map(); let options; let seconds = 95.125; let isPaused = paused;
-  const emit = event => { for (const callback of listeners.get(event) || []) callback(); };
+function twitch({ paused = false, deferredSeek = false } = {}) {
+  const calls = []; const listeners = new Map(); let options; let seconds = 95.125; let isPaused = true; let ended = false;
+  const seeks = [];
+  const emit = event => {
+    if (event === "pause") isPaused = true;
+    if (event === "play" || event === "playing") isPaused = false;
+    if (event === "ended") ended = true;
+    for (const callback of listeners.get(event) || []) callback();
+  };
   const player = {
     addEventListener: (event, callback) => { listeners.set(event, [...(listeners.get(event) || []), callback]); },
     setMuted: value => calls.push(["mute", value]),
-    seek: value => { seconds = value; calls.push(["seek", value]); emit("seek"); },
-    play: () => { isPaused = false; calls.push("play"); emit("play"); },
-    pause: () => { isPaused = true; calls.push("pause"); emit("pause"); },
-    getCurrentTime: () => seconds, isPaused: () => isPaused, getEnded: () => false,
+    seek: value => { seconds = value; calls.push(["seek", value]); if (deferredSeek) seeks.push("seek"); else emit("seek"); },
+    play: () => { calls.push("play"); if (isPaused) emit("play"); },
+    pause: () => { calls.push("pause"); if (!isPaused) emit("pause"); },
+    getCurrentTime: () => seconds, isPaused: () => isPaused, getEnded: () => ended,
   };
   class Player {
     static READY = "ready"; static PLAY = "play"; static SEEK = "seek";
@@ -54,7 +60,9 @@ function twitch({ paused = false } = {}) {
       src: `https://player.twitch.tv/?video=v123&parent=brick.example&time=95.125s&autoplay=${!paused}`,
     } }) },
   });
-  return { media: window.brickMedia, calls, options, emit, ready: () => emit("ready") };
+  return { media: window.brickMedia, calls, options, emit, ready: () => emit("ready"),
+    deliverSeeks: () => { for (const event of seeks.splice(0)) emit(event); },
+    advance: value => { seconds += value; } };
 }
 
 test("YouTube keeps milliseconds and distinguishes paused seeks from resumed seeks", () => {
@@ -117,13 +125,44 @@ test("Twitch buffers until playback starts and preserves precise paused seek tar
   assert.deepEqual(f.calls, [["mute", true], ["seek", 100.375], "play"]);
   assert.equal(f.media.state().buffering, true);
   assert.equal(f.media.state().playing, false);
-  f.emit("playing"); f.emit("playing"); assert.equal(f.media.state().playing, true);
+  f.emit("playing"); assert.equal(f.media.state().playing, true);
   f.media.seek(130.875, false);
   assert.equal(f.media.state().seconds, 130.875);
   assert.equal(f.media.state().playing, false);
   assert.equal(f.media.state().buffering, false);
   f.media.seek(150.25, true); f.emit("playing");
   assert.equal(f.media.state().playing, true);
+});
+
+test("Twitch keeps affirmative playback across startup and playing seeks without a second PLAYING event", () => {
+  for (const deferredSeek of [false, true]) {
+    const f = twitch({ deferredSeek });
+    f.ready();
+    f.advance(20);
+    assert.equal(f.media.state().playing, false, "SDK clock movement does not establish playback");
+    assert.equal(f.media.state().buffering, true);
+    f.emit("playing");
+    f.deliverSeeks();
+    assert.equal(f.media.state().playing, true);
+    assert.equal(f.media.state().buffering, false);
+    f.media.seek(200.625, true);
+    f.deliverSeeks();
+    assert.equal(f.media.state().seconds, 200.625);
+    assert.equal(f.media.state().playing, true);
+    assert.equal(f.media.state().buffering, false);
+    f.emit("pause");
+    assert.equal(f.media.state().playing, false);
+    f.media.seek(300.875, true);
+    f.deliverSeeks();
+    f.advance(10);
+    assert.equal(f.media.state().playing, false, "unpausing still awaits affirmative PLAYING");
+    assert.equal(f.media.state().buffering, true);
+    f.emit("playing");
+    assert.equal(f.media.state().playing, true);
+    f.emit("ended");
+    assert.equal(f.media.state().playing, false);
+    assert.equal(f.media.state().buffering, false);
+  }
 });
 
 test("Twitch paused entry decodes a muted frame then seeks with its paused intent", () => {
