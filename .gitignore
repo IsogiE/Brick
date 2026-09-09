@@ -6,7 +6,7 @@ target/
 presence/.env
 presence/secrets/
 
-# Keep documentation and investigation notes local.
+# Keep investigation notes local; retain the public project documents below.
 *.[mM][dD]
 *.[mM][dD][xX]
 *.[mM][aA][rR][kK][dD][oO][wW][nN]
@@ -14,3 +14,5 @@ presence/secrets/
 *.[mM][kK][dD]
 *.[mM][kK][dD][nN]
 [Rr][Ee][Aa][Dd][Mm][Ee]*
+!/README.md
+!/SECURITY.md
