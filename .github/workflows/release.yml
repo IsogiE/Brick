@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'SemVer version to publish, for example 0.1.0'
+        description: 'SemVer version to publish'
         required: true
-        default: '0.1.0'
+        default: '0.4.2'
       publish:
         description: 'Publish publicly after smoke testing; leave off to build unpublished candidate artifacts'
         type: boolean
