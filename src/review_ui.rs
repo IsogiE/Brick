@@ -1376,7 +1376,7 @@ impl ReviewUi {
             workspace.min,
             egui::pos2(workspace.right() - rail_width - gap, workspace.bottom()),
         );
-        let timeline_height = if self.aligning { 238.0 } else { 198.0 };
+        let timeline_height = if self.aligning { 220.0 } else { 180.0 };
         let video = egui::Rect::from_min_max(
             left.min,
             egui::pos2(
@@ -1587,53 +1587,27 @@ impl ReviewUi {
             .unwrap_or(0.0);
         let current = elapsed.clamp(0.0, duration);
         let mut command = None;
-        if state.seeking.is_some() {
-            let target = display_position.unwrap_or(video_start) - video_start;
-            ui.label(
-                RichText::new(format!("Seeking to {}…", relative_clock(target)))
-                    .small()
-                    .color(MUTED),
-            );
-        } else if state.buffering {
-            ui.label(RichText::new("Buffering…").small().color(MUTED));
-        } else if confirmed_position.is_none() {
-            ui.label(RichText::new("Waiting for video…").small().color(MUTED));
-        } else if elapsed < 0.0 {
-            ui.label(
-                RichText::new(format!("Pull starts in {}", clock(-elapsed)))
-                    .small()
-                    .color(MUTED),
-            );
-        } else if elapsed >= duration {
-            ui.label(
-                RichText::new(if elapsed - duration >= 1.0 {
-                    format!("Video is {} past this pull", clock(elapsed - duration))
-                } else {
-                    "Pull finished".into()
-                })
-                .small()
-                .color(MUTED),
-            );
-        } else {
-            ui.add_space(18.0);
-        }
         let playing = playback_intent(state, self.playback.as_ref());
         let replay = confirmed_position.is_some() && elapsed >= duration && !self.aligning;
         let mut seek_range = None;
         let mut cursor_position = self.scrub.unwrap_or(current);
-        let label_gutter = ui.next_widget_position().x + 132.0;
+        let label_gutter = ui.next_widget_position().x + 176.0;
         ui.horizontal(|ui| {
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
             if ui
-                .add_enabled(
-                    state.ready,
-                    egui::Button::new(if replay {
-                        "Replay pull"
-                    } else if playing {
-                        "Pause"
-                    } else {
-                        "Play"
-                    }),
-                )
+                .add_enabled_ui(state.ready, |ui| {
+                    ui.add_sized(
+                        egui::vec2(64.0, 30.0),
+                        egui::Button::new(if replay {
+                            "Replay"
+                        } else if playing {
+                            "Pause"
+                        } else {
+                            "Play"
+                        }),
+                    )
+                })
+                .inner
                 .on_hover_text(if replay {
                     "Watch this pull from its start"
                 } else if playing {
@@ -1653,17 +1627,22 @@ impl ReviewUi {
                     })
                 };
             }
-            ui.label(
-                RichText::new(format!(
-                    "{} / {}",
-                    if self.scrub.is_some() || display_position.is_some() {
-                        relative_clock(self.scrub.unwrap_or(elapsed))
-                    } else {
-                        "–:––".into()
-                    },
-                    clock(duration)
-                ))
-                .color(MUTED),
+            ui.add_sized(
+                egui::vec2(92.0, 30.0),
+                egui::Label::new(
+                    RichText::new(format!(
+                        "{} / {}",
+                        if self.scrub.is_some() || display_position.is_some() {
+                            relative_clock(self.scrub.unwrap_or(elapsed))
+                        } else {
+                            "–:––".into()
+                        },
+                        clock(duration)
+                    ))
+                    .size(12.0)
+                    .color(MUTED),
+                )
+                .truncate(),
             );
             let mut position = self.scrub.unwrap_or(current);
             ui.add_space((label_gutter - ui.next_widget_position().x).max(0.0));
@@ -4237,6 +4216,88 @@ mod tests {
                     assert!((thumb.x - egui::lerp(grid.x_range(), fraction as f32)).abs() < 0.1);
                     assert!(grid.left() >= 132.0 && grid.right() < width, "Timeline {grid:?} escaped width={width}, scale={scale}, position={fraction}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn playback_controls_and_timeline_do_not_move_when_playback_state_changes() {
+        let (review, pull, _) = fixture();
+        let start = pull_video_start(&review, &pull);
+        let mut review_ui = ReviewUi::default();
+        review_ui.review = Some(review);
+        review_ui.select(pull);
+        let ctx = egui::Context::default();
+        let mut style = (*ctx.style()).clone();
+        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        style.spacing.button_padding = egui::vec2(14.0, 8.0);
+        ctx.set_style(style);
+        let mut expected = None;
+        for mode in 0..6 {
+            let mut state = PlaybackState::default();
+            state.ready = mode != 4;
+            state.playing = mode == 0;
+            state.seconds = start + if mode == 5 { 210.0 } else { 72.0 };
+            state.buffering = matches!(mode, 2 | 3);
+            state.seeking = (mode == 2).then_some(start + 72.0);
+            state.mark_polled_now();
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(980.0, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    assert!(review_ui.draw_timeline(ui, &state).is_none());
+                },
+            );
+            fn collect(shape: &egui::Shape, buttons: &mut Vec<egui::Rect>, text: &mut String) {
+                match shape {
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            collect(shape, buttons, text);
+                        }
+                    }
+                    egui::Shape::Rect(rect)
+                        if (rect.rect.width() - 64.0).abs() < 0.1
+                            && (rect.rect.height() - 30.0).abs() < 0.1 =>
+                    {
+                        buttons.push(rect.rect)
+                    }
+                    egui::Shape::Text(label) => {
+                        text.push_str(label.galley.text());
+                        text.push('\n');
+                    }
+                    _ => (),
+                }
+            }
+            let mut buttons = Vec::new();
+            let mut text = String::new();
+            for shape in &output.shapes {
+                collect(&shape.shape, &mut buttons, &mut text);
+            }
+            let button = *buttons
+                .first()
+                .expect("Playback button must retain its allocation");
+            let (_, _, grid) = timeline_paint(&output);
+            if let Some((old_button, old_grid)) = expected {
+                assert_eq!(button, old_button);
+                assert_eq!(
+                    grid, old_grid,
+                    "Playback status must not move the seek target"
+                );
+            } else {
+                expected = Some((button, grid));
+            }
+            for status in [
+                "Seeking to",
+                "Buffering",
+                "Waiting for video",
+                "Pull finished",
+            ] {
+                assert!(!text.contains(status));
             }
         }
     }

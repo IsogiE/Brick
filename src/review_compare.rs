@@ -117,6 +117,7 @@ impl Commands {
 #[derive(Clone, Copy)]
 enum Phase {
     Prepare,
+    Resume,
     Seeking(Instant),
     Starting(Instant),
     Holding {
@@ -251,11 +252,19 @@ impl Controller {
                 // A user's Pause then Play supersedes an unfinished seek.
                 // Reissue its target once; old acknowledgments cannot release
                 // the new barrier, and repeated Play must not restart it again.
-                self.phase = Phase::Prepare;
+                self.phase = if resume_pending_seek {
+                    Phase::Prepare
+                } else {
+                    Phase::Resume
+                };
                 self.operation_started = now;
-                self.sample_epoch = now;
+                if resume_pending_seek {
+                    self.sample_epoch = now;
+                }
                 self.cause = Status::Preparing;
             }
+        } else if matches!(self.phase, Phase::Resume) {
+            self.phase = Phase::Paused;
         } else if matches!(
             self.phase,
             Phase::Running | Phase::Starting(_) | Phase::CatchingUp { .. }
@@ -295,6 +304,28 @@ impl Controller {
             .then(|| self.clocks[side].encounter_ms(state.seconds))
             .flatten()
             .map(|at| at.clamp(self.range[0], self.range[1]))
+    }
+
+    fn aligned_paused_position(
+        &self,
+        states: [&PlaybackState; PLAYER_COUNT],
+        since: Instant,
+    ) -> Option<i64> {
+        if !states
+            .iter()
+            .all(|state| Self::settled(state, since, false))
+        {
+            return None;
+        }
+        let [Some(primary), Some(secondary)] =
+            std::array::from_fn(|side| self.clocks[side].encounter_ms(states[side].seconds))
+        else {
+            return None;
+        };
+        ((self.range[0]..=self.range[1]).contains(&primary)
+            && (self.range[0]..=self.range[1]).contains(&secondary)
+            && (primary - secondary).abs() <= SETTLED_TOLERANCE_MS)
+            .then_some(primary)
     }
 
     fn playback_drift(&self, states: [&PlaybackState; PLAYER_COUNT]) -> Option<[f64; 2]> {
@@ -338,11 +369,26 @@ impl Controller {
         since: Instant,
         now: Instant,
     ) -> Option<Commands> {
-        let position = states.iter().enumerate().find_map(|(side, state)| {
-            Self::settled(state, since, true)
-                .then(|| self.position(side, state))
+        let observed = states.iter().enumerate().find_map(|(side, state)| {
+            let provider_gesture = state.play_intent
+                && state.ready
+                && state.playing
+                && !state.buffering
+                && state.is_fresh_after(since)
+                && state.playback_intent != Some(true);
+            (Self::settled(state, since, true) || provider_gesture)
+                .then(|| self.clocks[side].encounter_ms(state.seconds))
                 .flatten()
+                .map(|at| at.clamp(self.range[0], self.range[1]))
         })?;
+        // Play during an unfinished seek changes playback intent, not the
+        // moment the user selected. SDK clocks can still describe the old
+        // position, or have advanced before our first useful observation.
+        let position = if matches!(self.phase, Phase::Seeking(_)) {
+            self.at_ms
+        } else {
+            observed
+        };
         if let Err(error) = self.seek(position, true, now) {
             self.phase = Phase::Failed {
                 error,
@@ -355,6 +401,29 @@ impl Controller {
     /// Call after polling both native players. Apply each returned command once.
     /// State snapshots from before a seek/POV change cannot release the barrier.
     pub fn tick(&mut self, states: [&PlaybackState; PLAYER_COUNT], now: Instant) -> Commands {
+        let user_pause = states.iter().enumerate().find_map(|(side, state)| {
+            let can_pause = match self.phase {
+                Phase::Running | Phase::Starting(_) => true,
+                Phase::CatchingUp { ahead, .. } => side != ahead,
+                _ => false,
+            };
+            (can_pause
+                && self.wants_playing
+                && state.ready
+                && state.pause_intent
+                && !state.playing
+                && state.is_fresh_after(self.sample_epoch)
+                && state.seeking.is_none()
+                && state.playback_intent.is_none())
+            .then_some(side)
+        });
+        if let Some(side) = user_pause {
+            // A provider's Pause event can precede its cached paused state.
+            // Honor the intent now, then wait for real settlement as usual.
+            self.at_ms = self.position(side, states[side]).unwrap_or(self.at_ms);
+            self.wants_playing = false;
+            self.hold(now, Status::Preparing);
+        }
         if !matches!(
             self.phase,
             Phase::Running | Phase::Paused | Phase::Failed { .. }
@@ -394,8 +463,52 @@ impl Controller {
                     secondary: Some(PlaybackCommand::SeekPaused(secondary)),
                 }
             }
+            Phase::Resume => {
+                if let Some(at_ms) = self.aligned_paused_position(states, self.sample_epoch) {
+                    self.at_ms = at_ms;
+                    self.phase = Phase::Starting(now);
+                    self.sample_epoch = now;
+                    Commands::both(PlaybackCommand::Play)
+                } else {
+                    self.phase = Phase::Prepare;
+                    self.tick(states, now)
+                }
+            }
             Phase::Seeking(since) => {
                 if !self.wants_playing {
+                    if let Some(commands) = self.provider_play(states, since, now) {
+                        return commands;
+                    }
+                }
+                if self.wants_playing
+                    && states.iter().any(|state| state.playing)
+                    && states.iter().enumerate().all(|(side, state)| {
+                        state.ready
+                            && state.is_fresh_after(since)
+                            && !state.buffering
+                            && state.playback_intent != Some(true)
+                            && state.seeking.is_none_or(|target| {
+                                self.clocks[side].encounter_ms(target) == Some(self.at_ms)
+                            })
+                            && self.clocks[side]
+                                .encounter_ms(state.seconds)
+                                .is_some_and(|at| (at - self.at_ms).abs() <= SETTLED_TOLERANCE_MS)
+                    })
+                {
+                    // A provider Play can supersede our paused seek before
+                    // its Pause is sampled. Both SDK clocks already reached
+                    // the target, so send the desired Play now. These commands
+                    // replace the old intent; fresh acknowledgments are still
+                    // required by Starting and by each native player.
+                    self.phase = Phase::Starting(now);
+                    self.sample_epoch = now;
+                    return Commands::both(PlaybackCommand::Play);
+                }
+                if self.wants_playing && states.iter().any(|state| state.play_intent) {
+                    // The first useful provider sample can arrive after it
+                    // has advanced beyond the shared target. Its explicit
+                    // newer Play still wins: re-arm the selected moment once
+                    // instead of waiting for an obsolete Pause retry.
                     if let Some(commands) = self.provider_play(states, since, now) {
                         return commands;
                     }
@@ -445,6 +558,23 @@ impl Controller {
                     .iter()
                     .all(|state| Self::settled(state, since, false))
                 {
+                    if let Some(primary) = self.aligned_paused_position(states, since) {
+                        // Pausing an aligned pair already establishes the
+                        // user's moment. Seeking back to an older sample
+                        // adds latency and rewinds the video on every toggle.
+                        self.at_ms = primary;
+                        self.phase = if self.wants_playing {
+                            self.sample_epoch = now;
+                            Phase::Starting(now)
+                        } else {
+                            Phase::Paused
+                        };
+                        return if self.wants_playing {
+                            Commands::both(PlaybackCommand::Play)
+                        } else {
+                            Commands::default()
+                        };
+                    }
                     self.phase = Phase::Prepare;
                 }
                 Commands::default()
@@ -1021,6 +1151,237 @@ mod tests {
     }
 
     #[test]
+    fn an_aligned_pause_keeps_the_actual_moment_without_seeking_on_rapid_resume() {
+        for resume in [false, true] {
+            let mut c = controller(true);
+            let empty = PlaybackState::default();
+            c.tick([&empty, &empty], test_now());
+            prepared(&mut c, true);
+            c.set_playing(false, test_now());
+            let commands = c.tick([&empty, &empty], test_now());
+            assert!(matches!(commands.primary, Some(PlaybackCommand::Pause)));
+            assert!(matches!(commands.secondary, Some(PlaybackCommand::Pause)));
+            // These are where the decoders really stopped, later than the
+            // controller's last playing sample and within its existing tolerance.
+            let paused = [sample(114.625, false), sample(915.5, false)];
+            if resume {
+                c.set_playing(true, test_now());
+            }
+            let commands = c.tick([&paused[0], &paused[1]], test_now());
+            assert_eq!(c.position_ms(), START + 14_500);
+            if resume {
+                assert!(matches!(commands.primary, Some(PlaybackCommand::Play)));
+                assert!(matches!(commands.secondary, Some(PlaybackCommand::Play)));
+                let playing = [sample(114.75, true), sample(915.625, true)];
+                let commands = c.tick([&playing[0], &playing[1]], test_now());
+                assert!(commands.primary.is_none() && commands.secondary.is_none());
+                assert_eq!(c.status(), Status::Playing);
+            } else {
+                assert!(commands.primary.is_none() && commands.secondary.is_none());
+                assert_eq!(c.status(), Status::Paused);
+            }
+        }
+    }
+
+    #[test]
+    fn pause_fast_path_requires_both_fresh_settled_and_aligned_positions() {
+        for invalid in 0..5 {
+            let mut c = controller(true);
+            let empty = PlaybackState::default();
+            c.tick([&empty, &empty], test_now());
+            prepared(&mut c, true);
+            c.set_playing(false, test_now());
+            c.tick([&empty, &empty], test_now());
+            let mut paused = [sample(114.625, false), sample(915.375, false)];
+            match invalid {
+                0 => paused[1].mark_polled_at(c.sample_epoch),
+                1 => paused[1].buffering = true,
+                2 => paused[1].seeking = Some(915.375),
+                3 => paused[1].seconds += 0.501,
+                _ => {
+                    paused[0].seconds = 99.0;
+                    paused[1].seconds = 899.75;
+                }
+            }
+            let commands = c.tick([&paused[0], &paused[1]], test_now());
+            assert!(commands.primary.is_none() && commands.secondary.is_none());
+            assert_ne!(c.status(), Status::Paused);
+            assert_eq!(c.position_ms(), START + 12_375);
+        }
+    }
+
+    #[test]
+    fn resuming_a_confirmed_pause_plays_once_and_rechecks_alignment() {
+        for action in 0..3 {
+            let mut c = controller(false);
+            let empty = PlaybackState::default();
+            c.tick([&empty, &empty], test_now());
+            prepared(&mut c, false);
+            let mut states = [sample(112.5, false), sample(913.25, false)];
+            c.set_playing(true, test_now());
+            c.set_playing(true, test_now());
+            match action {
+                1 => c.set_playing(false, test_now()),
+                2 => states[1].seconds += 3.0,
+                _ => (),
+            }
+            let commands = c.tick([&states[0], &states[1]], test_now());
+            match action {
+                0 => {
+                    assert!(matches!(commands.primary, Some(PlaybackCommand::Play)));
+                    assert!(matches!(commands.secondary, Some(PlaybackCommand::Play)));
+                    let commands = c.tick([&states[0], &states[1]], test_now());
+                    assert!(commands.primary.is_none() && commands.secondary.is_none());
+                    assert_ne!(
+                        c.status(),
+                        Status::Playing,
+                        "Old paused samples cannot acknowledge Play"
+                    );
+                }
+                1 => {
+                    assert!(commands.primary.is_none() && commands.secondary.is_none());
+                    assert_eq!(c.status(), Status::Paused);
+                }
+                _ => {
+                    assert_eq!(command_seconds(commands.primary), 112.5);
+                    assert_eq!(command_seconds(commands.secondary), 913.25);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_pause_intent_wins_before_its_cached_state_finishes_changing() {
+        for side in 0..2 {
+            let mut c = controller(true);
+            let empty = PlaybackState::default();
+            c.tick([&empty, &empty], test_now());
+            prepared(&mut c, true);
+            let mut states = [sample(112.5, true), sample(913.25, true)];
+            states[side].playing = false;
+            states[side].buffering = true;
+            states[side].pause_intent = true;
+            let commands = c.tick([&states[0], &states[1]], test_now());
+            assert!(matches!(commands.primary, Some(PlaybackCommand::Pause)));
+            assert!(matches!(commands.secondary, Some(PlaybackCommand::Pause)));
+            assert!(!c.wants_playing());
+            let states = [sample(112.5, false), sample(913.25, false)];
+            let commands = c.tick([&states[0], &states[1]], test_now());
+            assert!(commands.primary.is_none() && commands.secondary.is_none());
+            assert_eq!(c.status(), Status::Paused);
+        }
+    }
+
+    #[test]
+    fn a_playing_provider_at_the_shared_seek_target_releases_its_ready_peer() {
+        for side in 0..2 {
+            let mut c = controller(true);
+            let empty = PlaybackState::default();
+            c.tick([&empty, &empty], test_now());
+            let mut states = [sample(112.5, false), sample(913.25, false)];
+            states[side].playing = true;
+            states[side].seeking = Some(states[side].seconds);
+            states[side].playback_intent = Some(false);
+            let commands = c.tick([&states[0], &states[1]], test_now());
+            assert!(matches!(commands.primary, Some(PlaybackCommand::Play)));
+            assert!(matches!(commands.secondary, Some(PlaybackCommand::Play)));
+            assert_ne!(c.status(), Status::Playing);
+            assert_eq!(c.position_ms(), START + 12_375);
+            let commands = c.tick([&states[0], &states[1]], test_now());
+            assert!(commands.primary.is_none() && commands.secondary.is_none());
+            assert_ne!(
+                c.status(),
+                Status::Playing,
+                "Old intent is not a Play acknowledgment"
+            );
+            let playing = [sample(112.625, true), sample(913.375, true)];
+            c.tick([&playing[0], &playing[1]], test_now());
+            assert_eq!(c.status(), Status::Playing);
+        }
+    }
+
+    #[test]
+    fn an_explicit_provider_play_supersedes_a_pending_paused_seek() {
+        for wants_playing in [false, true] {
+            for side in 0..2 {
+                for offset in [-56.0, 1.589] {
+                    let mut c = controller(wants_playing);
+                    let empty = PlaybackState::default();
+                    c.tick([&empty, &empty], test_now());
+                    let mut states = [sample(112.5, false), sample(913.25, false)];
+                    states[side].playing = true;
+                    states[side].seeking = Some(states[side].seconds);
+                    states[side].seconds += offset;
+                    states[side].playback_intent = Some(false);
+                    states[side].play_intent = true;
+                    let commands = c.tick([&states[0], &states[1]], test_now());
+                    assert!(c.wants_playing());
+                    assert_eq!(command_seconds(commands.primary), 112.5);
+                    assert_eq!(command_seconds(commands.secondary), 913.25);
+                    assert_eq!(c.position_ms(), START + 12_375);
+                    assert_ne!(c.status(), Status::Playing);
+                    let commands = c.tick([&states[0], &states[1]], test_now());
+                    assert!(
+                        commands.primary.is_none() && commands.secondary.is_none(),
+                        "The same old event cannot restart alignment"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn early_seek_resume_rejects_stale_unready_or_wrong_target_samples() {
+        for invalid in 0..7 {
+            let mut c = controller(true);
+            let empty = PlaybackState::default();
+            c.tick([&empty, &empty], test_now());
+            let mut states = [sample(112.5, true), sample(913.25, false)];
+            states[0].seeking = Some(112.5);
+            states[0].playback_intent = Some(false);
+            match invalid {
+                0 => states[1].mark_polled_at(c.sample_epoch),
+                1 => states[1].buffering = true,
+                2 => states[1].seconds += 0.501,
+                3 => states[0].seeking = Some(111.0),
+                4 => states[0].playback_intent = Some(true),
+                5 => states[0].playing = false,
+                _ => states[1].ready = false,
+            }
+            let commands = c.tick([&states[0], &states[1]], test_now());
+            assert!(commands.primary.is_none() && commands.secondary.is_none());
+            assert_ne!(c.status(), Status::Playing);
+        }
+    }
+
+    #[test]
+    fn native_pending_or_held_pause_intent_is_not_a_new_user_pause() {
+        let mut c = controller(true);
+        let empty = PlaybackState::default();
+        c.tick([&empty, &empty], test_now());
+        prepared(&mut c, true);
+        let mut states = [sample(112.5, true), sample(913.25, true)];
+        states[0].playing = false;
+        states[0].pause_intent = true;
+        states[0].playback_intent = Some(false);
+        c.tick([&states[0], &states[1]], test_now());
+        assert!(c.wants_playing());
+
+        let mut c = controller(true);
+        c.tick([&empty, &empty], test_now());
+        prepared(&mut c, true);
+        let states = [sample(112.5, true), sample(914.75, true)];
+        c.tick([&states[0], &states[1]], test_now());
+        let mut held = [sample(112.5, true), sample(914.75, false)];
+        held[1].pause_intent = true;
+        c.tick([&held[0], &held[1]], test_now());
+        assert!(
+            c.wants_playing(),
+            "The ahead POV was paused by our catch-up plan"
+        );
+    }
+
+    #[test]
     fn startup_buffering_on_either_provider_does_not_restart_the_same_seek() {
         for side in 0..2 {
             let mut c = controller(true);
@@ -1082,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn buffering_pauses_once_then_aligns_before_resuming() {
+    fn buffering_pauses_once_then_resumes_already_aligned_players() {
         let mut c = controller(true);
         let empty = PlaybackState::default();
         c.tick([&empty, &empty], test_now());
@@ -1097,14 +1458,12 @@ mod tests {
         assert_eq!(c.position_ms(), START + 14_625);
         assert!(c.tick([&primary, &secondary], test_now()).primary.is_none());
         let states = [sample(115.0, false), sample(915.5, false)];
-        c.tick([&states[0], &states[1]], test_now());
-        let commands = c.tick([&states[0], &states[1]], test_now());
-        assert_eq!(command_seconds(commands.primary), 114.75);
-        assert_eq!(command_seconds(commands.secondary), 915.5);
-        let states = [sample(114.75, false), sample(915.5, false)];
         let commands = c.tick([&states[0], &states[1]], test_now());
         assert!(matches!(commands.primary, Some(PlaybackCommand::Play)));
         assert!(matches!(commands.secondary, Some(PlaybackCommand::Play)));
+        assert_eq!(c.position_ms(), START + 14_875);
+        let commands = c.tick([&states[0], &states[1]], test_now());
+        assert!(commands.primary.is_none() && commands.secondary.is_none());
     }
 
     #[test]

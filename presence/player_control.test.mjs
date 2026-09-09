@@ -31,18 +31,18 @@ function youtube({ paused = false, start = 19800.125, live = false } = {}) {
     status: value => { status = value; events.onStateChange({ data: value }); } };
 }
 
-function twitch({ paused = false, deferredSeek = false, deferredPause = false, pauseStatusLag = false, dropSeekInPause = false } = {}) {
+function twitch({ paused = false, deferredSeek = false, deferredPause = false, pauseStatusLag = false, dropSeekInPause = false, omitPauseState = false } = {}) {
   const calls = []; const listeners = new Map(); let options; let seconds = 95.125; let isPaused = true; let ended = false;
   const seeks = [];
   const pauses = [];
   let insidePause = false;
   const emit = event => {
     insidePause = event === "pause";
-    if (event === "pause" && !pauseStatusLag) isPaused = true;
+    if (event === "pause" && !pauseStatusLag && !omitPauseState) isPaused = true;
     if (event === "play" || event === "playing") isPaused = false;
     if (event === "ended") ended = true;
     for (const callback of listeners.get(event) || []) callback();
-    if (event === "pause" && pauseStatusLag) isPaused = true;
+    if (event === "pause" && pauseStatusLag && !omitPauseState) isPaused = true;
     insidePause = false;
   };
   const player = {
@@ -274,6 +274,97 @@ test("Twitch missed PAUSE event cannot strand later native play or seek", () => 
   f.emit("playing");
   assert.equal(f.media.state().playing, true);
   assert.equal(f.media.state().seconds, 30123.375);
+});
+
+test("Twitch exposes PAUSE intent before cached paused state without claiming settlement", () => {
+  const f = twitch({ omitPauseState: true });
+  f.ready(); f.emit("playing");
+  f.emit("pause");
+  const pending = f.media.state();
+  assert.equal(pending.pause_intent, true);
+  assert.equal(pending.playing, false);
+  assert.equal(pending.buffering, true, "event intent must not fake a settled SDK pause");
+  f.pausedSnapshot();
+  assert.equal(f.media.state().pause_intent, true);
+  assert.equal(f.media.state().buffering, false);
+  f.emit("play");
+  assert.equal(f.media.state().pause_intent, false);
+  f.emit("pause"); f.emit("playing");
+  assert.equal(f.media.state().pause_intent, false);
+});
+
+test("Twitch native commands clear an earlier provider pause intent", () => {
+  for (const command of [media => media.seek(20.125, false), media => media.pause(), media => media.play()]) {
+    const f = twitch();
+    f.ready(); f.emit("playing"); f.emit("pause");
+    assert.equal(f.media.state().pause_intent, true);
+    command(f.media);
+    assert.equal(f.media.state().pause_intent, false);
+  }
+});
+
+test("Twitch suppresses native PAUSE events without masking later provider gestures", () => {
+  const f = twitch();
+  f.ready(); f.emit("playing");
+  f.media.pause();
+  assert.equal(f.media.state().pause_intent, false, "native Pause is not a provider gesture");
+  f.media.pause(); // Already paused: the SDK emits no second PAUSE.
+  f.emit("play"); f.emit("playing"); f.emit("pause");
+  assert.equal(f.media.state().pause_intent, true, "redundant native Pause must not swallow the next real gesture");
+  const priming = twitch({ paused: true });
+  priming.ready(); priming.emit("playing");
+  assert.equal(priming.media.state().pause_intent, false, "initial muted frame decoding pauses internally");
+});
+
+test("Twitch retains native pause provenance until its delayed event after a Play submission", () => {
+  const f = twitch({ deferredPause: true });
+  f.ready(); f.emit("playing");
+  f.media.pause();
+  f.media.play(); // SDK has not announced PLAY yet; the prior PAUSE is still ours.
+  f.deliverPauses();
+  assert.equal(f.media.state().pause_intent, false);
+  f.emit("play"); f.emit("playing"); f.emit("pause");
+  assert.equal(f.media.state().pause_intent, true, "a user Pause after actual playback supersedes native Play");
+});
+
+test("Twitch distinguishes provider Play during paused seek from native playback", () => {
+  const f = twitch({ paused: true });
+  f.ready();
+  assert.equal(f.media.state().play_intent, false, "muted initial decoding is not a user action");
+  f.emit("playing");
+  f.media.seek(120.625, false);
+  f.emit("play");
+  assert.equal(f.media.state().play_intent, true);
+  assert.equal(f.media.state().playing, false, "intent must not claim decoded playback");
+  assert.equal(f.media.state().buffering, true);
+  f.emit("playing");
+  assert.equal(f.media.state().play_intent, true, "retain the gesture until the native poll sees it");
+  assert.equal(f.media.state().playing, true);
+  f.emit("pause");
+  assert.equal(f.media.state().play_intent, false);
+  f.media.play(); f.emit("playing");
+  assert.equal(f.media.state().play_intent, false, "native Play is not a user gesture");
+  f.media.seek(150.875, true);
+  assert.equal(f.media.state().play_intent, false);
+});
+
+test("Twitch clears provider Play intent on replacement native commands and end", () => {
+  for (const command of [media => media.seek(20.125, false), media => media.pause(), media => media.play()]) {
+    const f = twitch({ paused: true });
+    f.ready(); f.emit("playing"); f.emit("play");
+    assert.equal(f.media.state().play_intent, true);
+    command(f.media);
+    assert.equal(f.media.state().play_intent, false);
+  }
+  const f = twitch({ paused: true });
+  f.ready(); f.emit("playing"); f.emit("play"); f.emit("ended");
+  assert.equal(f.media.state().play_intent, false);
+  const pendingPause = twitch({ deferredPause: true });
+  pendingPause.ready(); pendingPause.emit("playing");
+  pendingPause.media.seek(20.125, false);
+  pendingPause.media.play();
+  pendingPause.deliverPauses(); pendingPause.media.state();
+  assert.equal(pendingPause.media.state().play_intent, false, "a queued native Play remains native");
 });
 
 test("both provider controls reject invalid seek values and resume flags before changing state", () => {

@@ -77,6 +77,9 @@ export const twitchControls = `(() => {
   let pending = Number((url.searchParams.get("time") || "0s").replace(/s$/, ""));
   let ready = false;
   let playing = false;
+  let pauseIntent = false;
+  let playIntent = false;
+  let expectedPause = false;
   let resume = url.searchParams.get("autoplay") !== "false";
   let decoded = false;
   let priming = null;
@@ -85,6 +88,12 @@ export const twitchControls = `(() => {
   const player = new Twitch.Player("media", {width:"100%", height:"100%",
     video, parent:[url.searchParams.get("parent")],
     time:Math.floor(pending) + "s", autoplay:resume, muted:true});
+  const pause = () => {
+    // Preserve command provenance until its event, even if a native Play is
+    // submitted first. Actual PLAY/PLAYING starts a new provider interaction.
+    expectedPause = true;
+    player.pause();
+  };
   const load = () => {
     playing = false;
     priming = resume ? null : "starting";
@@ -96,7 +105,7 @@ export const twitchControls = `(() => {
       playing = false;
       if (!player.isPaused()) {
         pauseThenSeek = true;
-        player.pause();
+        pause();
         return;
       }
     }
@@ -114,14 +123,23 @@ export const twitchControls = `(() => {
   // SEEK is a position notification, not a playback-state transition. Twitch
   // need not emit PLAYING again when a seek continues an already playing video.
   for (const event of [Twitch.Player.PLAY, Twitch.Player.PAUSE, Twitch.Player.ENDED]) {
-    player.addEventListener(event, () => { playing = false; });
+    player.addEventListener(event, () => {
+      playing = false;
+      pauseIntent = event === Twitch.Player.PAUSE && !expectedPause;
+      expectedPause = false;
+      if (event === Twitch.Player.PLAY) {
+        if (decoded && !priming && !resume) playIntent = true;
+      } else playIntent = false;
+    });
   }
   player.addEventListener(Twitch.Player.PLAYING, () => {
     const first = !decoded;
+    pauseIntent = false;
+    expectedPause = false;
     playing = true; decoded = true;
     if (first && resume) player.seek(pending);
     if (!resume && priming === "starting") {
-      playing = false; priming = "pausing"; player.pause();
+      playing = false; priming = "pausing"; pause();
     }
   });
   player.addEventListener(Twitch.Player.PAUSE, () => {
@@ -132,15 +150,21 @@ export const twitchControls = `(() => {
   window.brickMedia = {
     seek: (seconds, shouldResume = true) => {
       if (!Number.isFinite(seconds) || seconds < 0 || seconds > 604800 || typeof shouldResume !== "boolean") return;
+      pauseIntent = false;
+      playIntent = false;
       pending = seconds;
       resume = shouldResume;
       if (ready) { if (!decoded) load(); else if (!pauseThenSeek) apply(); }
     },
     pause: () => {
+      pauseIntent = false;
+      playIntent = false;
       resume = false; playing = false;
-      if (ready) { if (!decoded) load(); else if (!priming && !pauseThenSeek) player.pause(); }
+      if (ready) { if (!decoded) load(); else if (!priming && !pauseThenSeek) pause(); }
     },
     play: () => {
+      pauseIntent = false;
+      playIntent = false;
       resume = true; priming = null;
       if (ready && !pauseThenSeek) { if (!decoded) load(); else player.play(); }
     },
@@ -154,6 +178,8 @@ export const twitchControls = `(() => {
         if (resume) { priming = null; player.play(); }
       }
       return { ready, seconds: ready ? player.getCurrentTime() : pending,
+        pause_intent: pauseIntent,
+        play_intent: playIntent,
         playing: ready && !pauseThenSeek && playing && !player.isPaused() && !player.getEnded(),
         buffering: ready && (pauseThenSeek || priming !== null || (!playing && !player.isPaused() && !player.getEnded())) };
     }

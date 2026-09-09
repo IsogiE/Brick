@@ -26,6 +26,61 @@ pub use capture::FrameCapture;
 const WRAPPER_LOAD_TIMEOUT: Duration = Duration::from_secs(25);
 const COMMAND_RETRY_AFTER: Duration = Duration::from_secs(4);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const VISIBLE_STATE_INTERVAL: Duration = Duration::from_millis(100);
+const HIDDEN_STATE_INTERVAL: Duration = Duration::from_millis(500);
+const STATE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, PartialEq, Eq)]
+enum StatePoll {
+    Waiting(Duration),
+    Pending,
+    Started,
+}
+
+fn state_poll_interval(visible: bool) -> Duration {
+    if visible {
+        VISIBLE_STATE_INTERVAL
+    } else {
+        HIDDEN_STATE_INTERVAL
+    }
+}
+
+fn schedule_state_poll(ctx: &egui::Context, wait: Duration) {
+    // egui subtracts its predicted frame time from every repaint delay. These
+    // are real SDK deadlines, so compensate that subtraction; otherwise the
+    // final fraction of each 100 ms interval repeatedly requests immediate frames.
+    let frame_time =
+        ctx.input(|input| Duration::try_from_secs_f32(input.predicted_dt).unwrap_or_default());
+    ctx.request_repaint_after(wait.saturating_add(frame_time));
+}
+
+fn begin_state_poll(
+    last: &mut Option<Instant>,
+    pending: &AtomicBool,
+    now: Instant,
+    visible: bool,
+) -> StatePoll {
+    // A slow renderer keeps its one outstanding request. Navigation replaces
+    // this document's flag, and a callback or submission error releases it.
+    if pending.load(Ordering::Relaxed) {
+        return StatePoll::Pending;
+    }
+    let interval = state_poll_interval(visible);
+    if let Some(wait) = last.and_then(|at| interval.checked_sub(now.saturating_duration_since(at)))
+    {
+        if !wait.is_zero() {
+            return StatePoll::Waiting(wait);
+        }
+    }
+    if pending
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return StatePoll::Pending;
+    }
+    *last = Some(now);
+    StatePoll::Started
+}
 
 #[derive(Clone, Default, serde::Deserialize)]
 #[serde(default)]
@@ -34,6 +89,10 @@ pub struct PlaybackState {
     pub seconds: f64,
     pub playing: bool,
     pub buffering: bool,
+    /// Provider Pause event evidence; never substitutes for settled SDK state.
+    pub pause_intent: bool,
+    /// Provider Play opposing the wrapper's paused intent; not a settled ACK.
+    pub play_intent: bool,
     #[serde(skip)]
     pub seeking: Option<f64>,
     /// A native action awaiting a fresh provider acknowledgement.
@@ -499,13 +558,22 @@ impl StreamPlayer {
         state
     }
     pub fn poll_playback(&mut self, ctx: &egui::Context) {
+        let visible =
+            self.visible.get() && ctx.input(|input| input.viewport().visible().unwrap_or(true));
         if let Some(view) = &self.webview {
-            self.capture.tick(
-                view,
-                &self.playback_state(),
-                self.visible.get() && ctx.input(|input| input.viewport().visible().unwrap_or(true)),
-                ctx,
-            );
+            self.capture
+                .tick(view, &self.playback_state(), visible, ctx);
+        }
+        if newer_provider_pause(
+            &self.playback_state(),
+            self.pending_playback,
+            self.pending_seek.is_some(),
+        ) {
+            // The user's provider Pause supersedes an older native Play. This
+            // cancels that action; it does not acknowledge a paused SDK frame.
+            self.pending_playback = None;
+            self.queued_command = None;
+            self.command_retried = false;
         }
         // Forward the user's native replay action when the provider is ready.
         // This also preserves a seek made while the first document is loading.
@@ -546,21 +614,24 @@ impl StreamPlayer {
         if !self.loaded.load(Ordering::Relaxed) {
             return;
         }
-        if self
-            .last_state_poll
-            .is_some_and(|at| at.elapsed() > Duration::from_secs(2))
-        {
-            self.state_pending.store(false, Ordering::Relaxed);
-        }
-        if self
-            .last_state_poll
-            .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
-            || self.state_pending.swap(true, Ordering::Relaxed)
-        {
-            return;
-        }
-        self.last_state_poll = Some(Instant::now());
         let polled_at = Instant::now();
+        match begin_state_poll(
+            &mut self.last_state_poll,
+            &self.state_pending,
+            polled_at,
+            visible,
+        ) {
+            StatePoll::Waiting(wait) => {
+                schedule_state_poll(ctx, wait);
+                return;
+            }
+            StatePoll::Pending => return,
+            StatePoll::Started => (),
+        }
+        // Windows need not repaint at the video frame rate. Schedule the next
+        // bounded state read explicitly, including while paused so a provider
+        // Play gesture is noticed promptly. This reads SDK state, not frames.
+        schedule_state_poll(ctx, state_poll_interval(visible));
         let state = self.playback_state.clone();
         let pending = self.state_pending.clone();
         let ctx = ctx.clone();
@@ -582,14 +653,9 @@ impl StreamPlayer {
                         next.polled_at = Some(polled_at);
                         next.poll_finished_at = Some(poll_finished_at);
                         if next.seconds.is_finite() && (0.0..=604800.0).contains(&next.seconds) {
-                            if let Ok(mut state) = state.lock() {
-                                // A callback retried after a timeout must not
-                                // replace a newer observed playback position.
-                                if state.polled_at.is_none_or(|previous| previous <= polled_at) {
-                                    *state = next;
-                                }
+                            if publish_playback_state(&state, next) {
+                                ctx.request_repaint();
                             }
-                            ctx.request_repaint();
                         }
                     }
                 },
@@ -661,6 +727,16 @@ impl StreamPlayer {
     pub fn failure(&self) -> Option<String> {
         if let Some(message) = self.failure.lock().ok().and_then(|failure| failure.clone()) {
             return Some(message);
+        }
+        if self.state_pending.load(Ordering::Relaxed)
+            && self
+                .last_state_poll
+                .is_some_and(|at| at.elapsed() >= STATE_POLL_TIMEOUT)
+        {
+            // A hung renderer must not strand the controls forever. Let the
+            // existing bounded wrapper recovery handle failure; never queue
+            // another evaluation behind its unfinished request.
+            return Some("The stream player stopped responding.".into());
         }
         if !self.loaded.load(Ordering::Relaxed) && self.created.elapsed() >= WRAPPER_LOAD_TIMEOUT {
             return Some("The stream player took too long to load. Please try again.".to_string());
@@ -752,11 +828,29 @@ impl StreamPlayer {
 
     #[cfg(test)]
     pub fn diagnostic_provider_command(&self, command: PlaybackCommand) -> Result<(), String> {
-        let call = playback_call(command)?;
+        let (twitch, youtube) = match command {
+            PlaybackCommand::Play => (3, "playVideo"),
+            PlaybackCommand::Pause => (2, "pauseVideo"),
+            _ => return Err("The diagnostic provider action must be Play or Pause".into()),
+        };
+        // Exercise the provider SDK's actual command/event path. Calling
+        // brickMedia here would replace native intent and hide provider races.
+        let script = format!(
+            r#"(() => {{
+                const frame = document.querySelector('iframe');
+                if (!frame) return;
+                const origin = new URL(frame.src).origin;
+                if (origin === 'https://player.twitch.tv') {{
+                    frame.contentWindow.postMessage({{namespace:'twitch-embed-player-proxy',eventName:{twitch},params:null}}, origin);
+                }} else if (origin === 'https://www.youtube.com' || origin === 'https://www.youtube-nocookie.com') {{
+                    frame.contentWindow.postMessage(JSON.stringify({{event:'command',func:'{youtube}',args:[]}}), origin);
+                }}
+            }})()"#
+        );
         self.webview
             .as_ref()
             .ok_or("The diagnostic player closed")?
-            .evaluate_script(&format!("if(window.brickMedia)window.brickMedia.{call};"))
+            .evaluate_script(&script)
             .map_err(|_| "The diagnostic provider command failed".to_string())
     }
 
@@ -858,6 +952,36 @@ fn playback_call(command: PlaybackCommand) -> Result<String, String> {
         PlaybackCommand::Play => Ok("play()".into()),
         PlaybackCommand::Pause => Ok("pause()".into()),
     }
+}
+
+fn newer_provider_pause(
+    state: &PlaybackState,
+    pending: Option<(bool, Instant)>,
+    seeking: bool,
+) -> bool {
+    let Some((true, requested)) = pending else {
+        return false;
+    };
+    !seeking
+        && state.ready
+        && state.pause_intent
+        && !state.playing
+        && state.is_fresh_after(requested)
+}
+
+fn publish_playback_state(state: &Mutex<PlaybackState>, next: PlaybackState) -> bool {
+    let Some(polled_at) = next.polled_at else {
+        return false;
+    };
+    let Ok(mut state) = state.lock() else {
+        return false;
+    };
+    // Native observation epochs, never provider JSON, order callbacks.
+    if state.polled_at.is_some_and(|previous| previous > polled_at) {
+        return false;
+    }
+    *state = next;
+    true
 }
 
 fn seek_acknowledged(target: f64, resume: bool, requested: Instant, state: &PlaybackState) -> bool {
@@ -1418,6 +1542,188 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_near_poll_deadline_does_not_request_immediate_egui_frames() {
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |_| {});
+        }
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        ctx.set_request_repaint_callback(move |info| recorded.lock().unwrap().push(info.delay));
+        let wait = Duration::from_millis(1);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            schedule_state_poll(ctx, wait)
+        });
+        let requests = requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        assert!(
+            requests.iter().all(|delay| *delay >= wait),
+            "A near deadline must not spin until the SDK is due: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn visible_state_reads_have_a_bounded_rate_even_while_paused() {
+        let now = Instant::now();
+        for (visible, expected) in [(true, 10), (false, 2)] {
+            let mut last = None;
+            let pending = AtomicBool::new(false);
+            let mut requests = 0;
+            // Much faster UI redraws must not turn into frame-rate SDK reads.
+            for elapsed in 0..1000 {
+                if begin_state_poll(
+                    &mut last,
+                    &pending,
+                    now + Duration::from_millis(elapsed),
+                    visible,
+                ) == StatePoll::Started
+                {
+                    requests += 1;
+                    pending.store(false, Ordering::Relaxed);
+                }
+            }
+            assert_eq!(requests, expected);
+        }
+        // No playing-state condition: a visible paused player's own Play
+        // gesture needs the same prompt observation as an advancing video.
+        assert_eq!(state_poll_interval(true), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn a_stalled_sdk_callback_never_allows_overlapping_requests() {
+        let now = Instant::now();
+        let mut last = None;
+        let pending = AtomicBool::new(false);
+        assert_eq!(
+            begin_state_poll(&mut last, &pending, now, true),
+            StatePoll::Started
+        );
+        for seconds in [1, 2, 5, 30] {
+            assert_eq!(
+                begin_state_poll(
+                    &mut last,
+                    &pending,
+                    now + Duration::from_secs(seconds),
+                    true
+                ),
+                StatePoll::Pending
+            );
+            assert_eq!(last, Some(now));
+        }
+        // Callback or submission error releases the only outstanding request.
+        pending.store(false, Ordering::Relaxed);
+        let resumed = now + Duration::from_secs(31);
+        assert_eq!(
+            begin_state_poll(&mut last, &pending, resumed, true),
+            StatePoll::Started
+        );
+        assert_eq!(last, Some(resumed));
+    }
+
+    #[test]
+    fn visible_poll_deadline_is_not_delayed_by_hidden_cadence() {
+        let now = Instant::now();
+        let mut last = Some(now);
+        let pending = AtomicBool::new(false);
+        assert_eq!(
+            begin_state_poll(&mut last, &pending, now + Duration::from_millis(40), true),
+            StatePoll::Waiting(Duration::from_millis(60))
+        );
+        assert_eq!(
+            begin_state_poll(&mut last, &pending, now + Duration::from_millis(150), false),
+            StatePoll::Waiting(Duration::from_millis(350))
+        );
+        assert_eq!(
+            begin_state_poll(&mut last, &pending, now + Duration::from_millis(150), true),
+            StatePoll::Started
+        );
+    }
+
+    #[test]
+    fn a_new_provider_pause_cancels_only_an_older_native_play() {
+        let now = Instant::now();
+        let mut state = PlaybackState::default();
+        state.ready = true;
+        state.pause_intent = true;
+        state.buffering = true; // Intent can arrive before cached paused state.
+        for at in [now - Duration::from_millis(1), now] {
+            state.mark_polled_at(at);
+            assert!(!newer_provider_pause(&state, Some((true, now)), false));
+        }
+        let requested = now - Duration::from_millis(1);
+        state.mark_polled_at(now);
+        assert!(newer_provider_pause(&state, Some((true, requested)), false));
+        assert!(
+            !playback_acknowledged(false, requested, &state),
+            "Cancellation is not a fabricated paused acknowledgement"
+        );
+        assert!(!newer_provider_pause(
+            &state,
+            Some((false, requested)),
+            false
+        ));
+        assert!(!newer_provider_pause(&state, Some((true, requested)), true));
+        assert!(!newer_provider_pause(&state, None, false));
+        state.pause_intent = false;
+        assert!(!newer_provider_pause(
+            &state,
+            Some((true, requested)),
+            false
+        ));
+        state.pause_intent = true;
+        state.playing = true;
+        assert!(!newer_provider_pause(
+            &state,
+            Some((true, requested)),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_provider_pause_hint_is_optional_and_cannot_acknowledge_playback() {
+        let mut state: PlaybackState = serde_json::from_str(
+            r#"{"ready":true,"seconds":72.125,"playing":false,"buffering":true,"pause_intent":true}"#,
+        ).unwrap();
+        assert!(state.pause_intent);
+        let requested = Instant::now();
+        state.mark_polled_at(requested);
+        assert!(!playback_acknowledged(false, requested, &state));
+        assert!(!seek_acknowledged(72.125, false, requested, &state));
+        let legacy: PlaybackState = serde_json::from_str(r#"{"ready":true}"#).unwrap();
+        assert!(!legacy.pause_intent);
+        assert!(!legacy.play_intent);
+        let mut play: PlaybackState = serde_json::from_str(
+            r#"{"ready":true,"seconds":72.125,"playing":false,"buffering":true,"play_intent":true}"#,
+        ).unwrap();
+        play.mark_polled_at(requested);
+        assert!(play.play_intent);
+        assert!(!playback_acknowledged(true, requested, &play));
+        assert!(!seek_acknowledged(72.125, true, requested, &play));
+    }
+
+    #[test]
+    fn a_late_paused_callback_cannot_replace_newer_play_acknowledgment() {
+        let now = Instant::now();
+        let mut paused = PlaybackState::default();
+        paused.ready = true;
+        paused.seconds = 72.125;
+        paused.mark_polled_at(now - Duration::from_millis(80));
+        let requested = now - Duration::from_millis(40);
+        assert!(!playback_acknowledged(false, requested, &paused));
+        let mut playing = paused.clone();
+        playing.playing = true;
+        playing.seconds = 72.375;
+        playing.mark_polled_at(now);
+        let state = Mutex::new(PlaybackState::default());
+        assert!(publish_playback_state(&state, playing));
+        assert!(!publish_playback_state(&state, paused));
+        let state = state.lock().unwrap();
+        assert_eq!(state.seconds, 72.375);
+        assert!(playback_acknowledged(true, requested, &state));
+        assert!(!playback_acknowledged(false, requested, &state));
+    }
+
+    #[test]
     fn playback_intent_waits_for_a_fresh_matching_provider_sample() {
         let requested = Instant::now();
         let mut state = PlaybackState::default();
@@ -1891,6 +2197,23 @@ mod tests {
             player.playback_state().seconds,
             123.5,
             "Never fabricate a successful seek"
+        );
+        player.state_pending.store(true, Ordering::Relaxed);
+        player.last_state_poll = Some(Instant::now() - Duration::from_secs(3));
+        assert!(
+            player.failure().is_none(),
+            "A slow callback is still allowed to finish"
+        );
+        player.last_state_poll = Some(Instant::now() - STATE_POLL_TIMEOUT);
+        assert!(player.failure().unwrap().contains("stopped responding"));
+        assert!(
+            player.state_pending.load(Ordering::Relaxed),
+            "Failure must not queue an overlapping request"
+        );
+        player.state_pending.store(false, Ordering::Relaxed);
+        assert!(
+            player.failure().is_none(),
+            "A completed callback releases the watchdog"
         );
         *player.failure.lock().unwrap() =
             Some("The stream player stopped unexpectedly.".to_string());

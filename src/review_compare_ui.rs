@@ -1061,6 +1061,8 @@ mod native_test {
         Forward,
         ForwardPaused,
         ForwardToggle,
+        ForwardBurst,
+        ForwardProvider,
     }
 
     struct Driver {
@@ -1082,6 +1084,8 @@ mod native_test {
         finished: bool,
         seek_probe: Option<SeekProbe>,
         trace_at: Instant,
+        burst_step: u8,
+        provider_play_since: Option<Instant>,
     }
     impl Driver {
         fn finish(&mut self, ctx: &egui::Context, result: Result<(), String>) {
@@ -1198,8 +1202,8 @@ mod native_test {
                         ]
                     });
                     format!(
-                        "at={:.3},playing={},buffering={},seek={:?},pending={:?},sample_ages={ages:?}",
-                        state.seconds, state.playing, state.buffering, state.seeking, state.playback_intent
+                        "at={:.3},playing={},buffering={},seek={:?},pending={:?},pause_hint={},play_hint={},sample_ages={ages:?}",
+                        state.seconds, state.playing, state.buffering, state.seeking, state.playback_intent, state.pause_intent, state.play_intent
                     )
                 });
                 eprintln!(
@@ -1213,6 +1217,34 @@ mod native_test {
             apply_commands(commands, first, second)?;
             if let Status::Failed(error) = self.controller.status() {
                 return Err(error.to_string());
+            }
+            if self.phase == 39 {
+                let first = self.players[0].as_ref().unwrap().playback_state();
+                let second = self.players[1].as_ref().unwrap().playback_state();
+                let first_ready = first.ready
+                    && first.is_fresh()
+                    && !first.playing
+                    && !first.buffering
+                    && first.seeking.is_none()
+                    && first.playback_intent.is_none()
+                    && (first.seconds - (self.timing_offsets[0] + 178.125)).abs() <= 0.25;
+                let second_advancing = second.ready
+                    && second.is_fresh()
+                    && second.playing
+                    && !second.buffering
+                    && second.seconds >= self.timing_offsets[1] + 177.875;
+                if first_ready && second_advancing {
+                    if self
+                        .provider_play_since
+                        .get_or_insert_with(Instant::now)
+                        .elapsed()
+                        >= Duration::from_secs(1)
+                    {
+                        return Err("Provider Play left its ready peer and shared timeline paused while video advanced".into());
+                    }
+                } else {
+                    self.provider_play_since = None;
+                }
             }
             match self.phase {
                 0 if self.controller.status() == Status::Playing => self.next(1),
@@ -1228,7 +1260,9 @@ mod native_test {
                                 SeekProbe::Replace => 90_375,
                                 SeekProbe::Forward
                                 | SeekProbe::ForwardPaused
-                                | SeekProbe::ForwardToggle => 178_125,
+                                | SeekProbe::ForwardToggle
+                                | SeekProbe::ForwardBurst
+                                | SeekProbe::ForwardProvider => 178_125,
                                 _ => 72_125,
                             };
                             self.controller
@@ -1396,6 +1430,46 @@ mod native_test {
                     self.controller.set_playing(true, Instant::now());
                     self.next(35);
                 }
+                30 if self.seek_probe == Some(SeekProbe::ForwardBurst)
+                    && self.phase_at.elapsed() >= Duration::from_millis(50) =>
+                {
+                    self.controller.set_playing(false, Instant::now());
+                    self.next(36);
+                }
+                36 if self.phase_at.elapsed() >= Duration::from_millis(50) => {
+                    let now = Instant::now();
+                    match self.burst_step {
+                        0 => self
+                            .controller
+                            .seek(START + 180_125, false, now)
+                            .map_err(|e| e.to_string())?,
+                        1 | 4 => self.controller.set_playing(true, now),
+                        2 => self
+                            .controller
+                            .seek(START + 177_125, true, now)
+                            .map_err(|e| e.to_string())?,
+                        3 => self.controller.set_playing(false, now),
+                        5 => self
+                            .controller
+                            .seek(START + 178_125, true, now)
+                            .map_err(|e| e.to_string())?,
+                        _ => return Err("Unexpected rapid command step".into()),
+                    }
+                    self.burst_step += 1;
+                    self.phase_at = now;
+                    if self.burst_step == 6 {
+                        self.next(37);
+                    }
+                }
+                30 if self.seek_probe == Some(SeekProbe::ForwardProvider)
+                    && self.phase_at.elapsed() >= Duration::from_millis(150) =>
+                {
+                    self.players[1]
+                        .as_ref()
+                        .unwrap()
+                        .diagnostic_provider_command(PlaybackCommand::Play)?;
+                    self.next(39);
+                }
                 31 if self.controller.status() == Status::Paused => {
                     self.controller
                         .seek(
@@ -1411,8 +1485,16 @@ mod native_test {
                         .map_err(|error| error.to_string())?;
                     self.next(32);
                 }
-                30 | 32 | 33 | 35
-                    if !(self.phase == 30 && self.seek_probe == Some(SeekProbe::ForwardToggle))
+                30 | 32 | 33 | 35 | 37 | 39
+                    if !(self.phase == 30
+                        && matches!(
+                            self.seek_probe,
+                            Some(
+                                SeekProbe::ForwardToggle
+                                    | SeekProbe::ForwardBurst
+                                    | SeekProbe::ForwardProvider
+                            )
+                        ))
                         && self.controller.status()
                             == if self.phase == 32 {
                                 Status::Paused
@@ -1429,6 +1511,8 @@ mod native_test {
                                     SeekProbe::Forward
                                         | SeekProbe::ForwardPaused
                                         | SeekProbe::ForwardToggle
+                                        | SeekProbe::ForwardBurst
+                                        | SeekProbe::ForwardProvider
                                 )
                             ) {
                                 178.125
@@ -1436,6 +1520,7 @@ mod native_test {
                                 72.125
                             };
                         if state.seeking.is_some()
+                            || state.playback_intent.is_some()
                             || state.buffering
                             || state.playing != (self.phase != 32)
                             || (state.seconds - target).abs()
@@ -1446,6 +1531,26 @@ mod native_test {
                                 state.seconds
                             ));
                         }
+                    }
+                    if self.seek_probe == Some(SeekProbe::ForwardBurst) {
+                        self.next(38);
+                    } else {
+                        return Ok(true);
+                    }
+                }
+                38 if self.phase_at.elapsed() >= Duration::from_secs(2)
+                    && self.controller.status() == Status::Playing
+                    && self.controller.position_ms() >= self.anchor + 1_000 =>
+                {
+                    if self.players.iter().any(|player| {
+                        let state = player.as_ref().unwrap().playback_state();
+                        !state.is_fresh()
+                            || !state.playing
+                            || state.buffering
+                            || state.seeking.is_some()
+                            || state.playback_intent.is_some()
+                    }) {
+                        return Err("Rapid controls left stale pending playback state".into());
                     }
                     return Ok(true);
                 }
@@ -1614,15 +1719,23 @@ mod native_test {
                 "playing" => SeekProbe::Forward,
                 "paused" => SeekProbe::ForwardPaused,
                 "toggle" => SeekProbe::ForwardToggle,
-                _ => panic!("Forward seek mode must be playing, paused, or toggle"),
+                "burst" => SeekProbe::ForwardBurst,
+                "provider" => SeekProbe::ForwardProvider,
+                _ => {
+                    panic!("Forward seek mode must be playing, paused, toggle, burst, or provider")
+                }
             })
         } else {
             seek_probe
         };
         let initial_ms = match seek_probe {
-            Some(SeekProbe::Forward | SeekProbe::ForwardPaused | SeekProbe::ForwardToggle) => {
-                10_000
-            }
+            Some(
+                SeekProbe::Forward
+                | SeekProbe::ForwardPaused
+                | SeekProbe::ForwardToggle
+                | SeekProbe::ForwardBurst
+                | SeekProbe::ForwardProvider,
+            ) => 10_000,
             Some(_) => 145_125,
             None => 0,
         };
@@ -1745,6 +1858,8 @@ mod native_test {
                     finished: false,
                     seek_probe,
                     trace_at: now,
+                    burst_step: 0,
+                    provider_play_since: None,
                 }))
             }),
         )
