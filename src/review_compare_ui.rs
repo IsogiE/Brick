@@ -1058,6 +1058,9 @@ mod native_test {
         Playing,
         Paused,
         Replace,
+        Forward,
+        ForwardPaused,
+        ForwardToggle,
     }
 
     struct Driver {
@@ -1217,14 +1220,16 @@ mod native_test {
                     && self.phase_at.elapsed() >= self.hold =>
                 {
                     if let Some(probe) = self.seek_probe {
-                        if probe == SeekProbe::Paused {
+                        if matches!(probe, SeekProbe::Paused | SeekProbe::ForwardPaused) {
                             self.controller.set_playing(false, Instant::now());
                             self.next(31);
                         } else {
-                            let target = if probe == SeekProbe::Replace {
-                                90_375
-                            } else {
-                                72_125
+                            let target = match probe {
+                                SeekProbe::Replace => 90_375,
+                                SeekProbe::Forward
+                                | SeekProbe::ForwardPaused
+                                | SeekProbe::ForwardToggle => 178_125,
+                                _ => 72_125,
                             };
                             self.controller
                                 .seek(START + target, true, Instant::now())
@@ -1381,23 +1386,55 @@ mod native_test {
                         .map_err(|error| error.to_string())?;
                     self.next(33);
                 }
+                30 if self.seek_probe == Some(SeekProbe::ForwardToggle)
+                    && self.phase_at.elapsed() >= Duration::from_millis(150) =>
+                {
+                    self.controller.set_playing(false, Instant::now());
+                    self.next(34);
+                }
+                34 if self.phase_at.elapsed() >= Duration::from_millis(150) => {
+                    self.controller.set_playing(true, Instant::now());
+                    self.next(35);
+                }
                 31 if self.controller.status() == Status::Paused => {
                     self.controller
-                        .seek(START + 72_125, false, Instant::now())
+                        .seek(
+                            START
+                                + if self.seek_probe == Some(SeekProbe::ForwardPaused) {
+                                    178_125
+                                } else {
+                                    72_125
+                                },
+                            false,
+                            Instant::now(),
+                        )
                         .map_err(|error| error.to_string())?;
                     self.next(32);
                 }
-                30 | 32 | 33
-                    if self.controller.status()
-                        == if self.phase == 32 {
-                            Status::Paused
-                        } else {
-                            Status::Playing
-                        } =>
+                30 | 32 | 33 | 35
+                    if !(self.phase == 30 && self.seek_probe == Some(SeekProbe::ForwardToggle))
+                        && self.controller.status()
+                            == if self.phase == 32 {
+                                Status::Paused
+                            } else {
+                                Status::Playing
+                            } =>
                 {
                     for side in 0..2 {
                         let state = self.players[side].as_ref().unwrap().playback_state();
-                        let target = self.timing_offsets[side] + 72.125;
+                        let target = self.timing_offsets[side]
+                            + if matches!(
+                                self.seek_probe,
+                                Some(
+                                    SeekProbe::Forward
+                                        | SeekProbe::ForwardPaused
+                                        | SeekProbe::ForwardToggle
+                                )
+                            ) {
+                                178.125
+                            } else {
+                                72.125
+                            };
                         if state.seeking.is_some()
                             || state.buffering
                             || state.playing != (self.phase != 32)
@@ -1405,7 +1442,7 @@ mod native_test {
                                 > if self.phase == 32 { 0.5 } else { 2.0 }
                         {
                             return Err(format!(
-                                "Backward seek missed side {side}: target={target:.3},actual={:.3}",
+                                "Comparison seek missed side {side}: target={target:.3},actual={:.3}",
                                 state.seconds
                             ));
                         }
@@ -1571,7 +1608,24 @@ mod native_test {
                 "replace" => SeekProbe::Replace,
                 _ => panic!("Backward seek mode must be playing, paused, or replace"),
             });
-        let initial_ms = if seek_probe.is_some() { 145_125 } else { 0 };
+        let seek_probe = if let Ok(value) = std::env::var("BRICK_COMPARE_FORWARD_SEEK") {
+            assert!(seek_probe.is_none(), "Choose only one seek probe");
+            Some(match value.as_str() {
+                "playing" => SeekProbe::Forward,
+                "paused" => SeekProbe::ForwardPaused,
+                "toggle" => SeekProbe::ForwardToggle,
+                _ => panic!("Forward seek mode must be playing, paused, or toggle"),
+            })
+        } else {
+            seek_probe
+        };
+        let initial_ms = match seek_probe {
+            Some(SeekProbe::Forward | SeekProbe::ForwardPaused | SeekProbe::ForwardToggle) => {
+                10_000
+            }
+            Some(_) => 145_125,
+            None => 0,
+        };
         let end_ms = if seek_probe.is_some() {
             300_000
         } else {

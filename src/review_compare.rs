@@ -243,9 +243,14 @@ impl Controller {
     pub fn set_playing(&mut self, playing: bool, now: Instant) {
         self.recovery_started = None;
         self.recovered_from_ms = None;
+        let resume_pending_seek =
+            playing && !self.wants_playing && matches!(self.phase, Phase::Seeking(_));
         self.wants_playing = playing;
         if playing {
-            if matches!(self.phase, Phase::Paused) {
+            if matches!(self.phase, Phase::Paused) || resume_pending_seek {
+                // A user's Pause then Play supersedes an unfinished seek.
+                // Reissue its target once; old acknowledgments cannot release
+                // the new barrier, and repeated Play must not restart it again.
                 self.phase = Phase::Prepare;
                 self.operation_started = now;
                 self.sample_epoch = now;
@@ -980,6 +985,39 @@ mod tests {
         c.set_playing(false, test_now());
         prepared(&mut c, false);
         assert_eq!(c.status(), Status::Paused);
+    }
+
+    #[test]
+    fn explicit_pause_then_play_restarts_a_pending_seek_once_at_the_same_moment() {
+        let mut c = controller(true);
+        let empty = PlaybackState::default();
+        c.tick([&empty, &empty], test_now());
+        let target = c.position_ms();
+        let initial_epoch = c.sample_epoch;
+        c.set_playing(true, test_now());
+        let unchanged = c.tick([&empty, &empty], test_now());
+        assert!(unchanged.primary.is_none() && unchanged.secondary.is_none());
+        assert_eq!(c.sample_epoch, initial_epoch);
+
+        c.set_playing(false, test_now());
+        // A delayed acknowledgment must not satisfy the user's new Play.
+        let old = [sample(112.5, false), sample(913.25, false)];
+        c.set_playing(true, test_now());
+        let commands = c.tick([&old[0], &old[1]], test_now());
+        assert_eq!(command_seconds(commands.primary), 112.5);
+        assert_eq!(command_seconds(commands.secondary), 913.25);
+        assert_eq!(c.position_ms(), target);
+        assert!(c.wants_playing());
+        assert!(c.sample_epoch > initial_epoch);
+        let restarted = c.sample_epoch;
+        for _ in 0..3 {
+            c.set_playing(true, test_now());
+            let commands = c.tick([&old[0], &old[1]], test_now());
+            assert!(commands.primary.is_none() && commands.secondary.is_none());
+            assert_eq!(c.sample_epoch, restarted);
+        }
+        prepared(&mut c, true);
+        assert_eq!(c.status(), Status::Playing);
     }
 
     #[test]

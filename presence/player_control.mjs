@@ -125,13 +125,7 @@ export const twitchControls = `(() => {
     }
   });
   player.addEventListener(Twitch.Player.PAUSE, () => {
-    if (pauseThenSeek) {
-      // PAUSE itself acknowledges the command; the SDK's cached isPaused()
-      // value may arrive separately and must not trigger another pause here.
-      pauseThenSeek = false;
-      player.seek(pending);
-      if (resume) { priming = null; player.play(); }
-    } else if (!resume && priming === "pausing") {
+    if (!pauseThenSeek && !resume && priming === "pausing") {
       priming = null; player.seek(pending);
     }
   });
@@ -150,9 +144,19 @@ export const twitchControls = `(() => {
       resume = true; priming = null;
       if (ready && !pauseThenSeek) { if (!decoded) load(); else player.play(); }
     },
-    state: () => ({ ready, seconds: ready ? player.getCurrentTime() : pending,
-      playing: ready && !pauseThenSeek && playing && !player.isPaused() && !player.getEnded(),
-      buffering: ready && (pauseThenSeek || priming !== null || (!playing && !player.isPaused() && !player.getEnded())) })
+    state: () => {
+      // Twitch can emit PAUSE before the transition accepts a new seek. Wait
+      // for a later SDK read, outside that callback, without another pause or
+      // a timer. This also handles a missed event when the SDK is already paused.
+      if (ready && pauseThenSeek && player.isPaused()) {
+        pauseThenSeek = false;
+        player.seek(pending);
+        if (resume) { priming = null; player.play(); }
+      }
+      return { ready, seconds: ready ? player.getCurrentTime() : pending,
+        playing: ready && !pauseThenSeek && playing && !player.isPaused() && !player.getEnded(),
+        buffering: ready && (pauseThenSeek || priming !== null || (!playing && !player.isPaused() && !player.getEnded())) };
+    }
   };
 })();`;
 export const playerScriptPolicy = youtubeScriptPolicy.replace("; ", ` 'sha256-${createHash("sha256").update(twitchControls).digest("base64")}' https://player.twitch.tv/js/embed/v1.js; `);
