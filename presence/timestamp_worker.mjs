@@ -12,9 +12,12 @@ try {
     const job = library.claim();
     if (job) {
       const started = Date.now();
-      const measured = library.finish(job, await scan(job, shutdown.signal));
+      const result = await scan(job, shutdown.signal);
+      const measured = library.finish(job, result);
+      const reason = !measured && ['youtube_auth_required', 'provider_rate_limited'].includes(result?.error)
+        ? result.error : undefined;
       // Log only public provider IDs and workload duration, never URLs or images.
-      console.log(JSON.stringify({ provider: job.key.provider, video: job.key.videoId, measured, milliseconds: Date.now()-started }));
+      console.log(JSON.stringify({ provider: job.key.provider, video: job.key.videoId, measured, reason, milliseconds: Date.now()-started }));
     }
     if (!shutdown.signal.aborted) {
       await delay(5000, undefined, { signal: shutdown.signal }).catch(error => {

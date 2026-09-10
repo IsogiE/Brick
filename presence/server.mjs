@@ -38,10 +38,10 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   const oauthHandoffTtlSeconds = parsePositiveInt(env.OAUTH_HANDOFF_TTL_SECONDS, 3 * 60);
   const oauthHandoffMaxEntries = parsePositiveInt(env.OAUTH_HANDOFF_MAX_ENTRIES, 512);
   const gatewayEnabled = env.DISCORD_GATEWAY_ENABLED?.trim().toLowerCase() !== "false";
-  const streams = await createStreamService({ dataDir, env, fetch, now, firstCheckWaitMs: firstStreamCheckWaitMs });
+  const replaySync = createReplaySyncLibrary({ dataDir, now });
+  const streams = await createStreamService({ dataDir, env, fetch, now, firstCheckWaitMs: firstStreamCheckWaitMs, correctReplay: replaySync.correctReplay });
   const requestDeadlines = new WeakMap();
   const logsHandoff = createLogsHandoff({ now });
-  const replaySync = createReplaySyncLibrary({ dataDir, now });
   const replayWarmup = createReplayWarmup({ streams, library: replaySync, now });
   const syncSubmissions = new RateLimit(120, 2, 20, 0.5);
   // This is a public PKCE client ID. No WCL tokens or private logs live here.

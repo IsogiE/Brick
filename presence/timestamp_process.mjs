@@ -8,7 +8,7 @@ const REMOVE = { recursive: true, force: true, maxRetries: 3, retryDelay: 50 };
 
 // One supervisor owns this private scratch root. Never sweep /tmp or /data.
 export async function createScanner({
-  root = path.join(tmpdir(), 'brick-timestamps'),
+  root = process.env.BRICK_TIMESTAMP_SCRATCH_DIR || path.join(tmpdir(), 'brick-timestamps'),
   command = 'python3', args = ['/app/timestamp_scan.py'], timeoutMs = 100_000,
 } = {}) {
   await mkdir(root, { mode: 0o700 }).catch(error => {

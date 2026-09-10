@@ -11,10 +11,11 @@ ENV NODE_ENV=production PATH=/opt/media/bin:$PATH
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg python3-venv ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/media \
-    && /opt/media/bin/pip install --no-cache-dir yt-dlp==2026.8.19
+    && /opt/media/bin/pip install --no-cache-dir yt-dlp==2026.8.19 yt-dlp-ejs==0.8.0
 WORKDIR /app
 COPY LICENSE src/assets/PTSansNarrow-LICENSE.txt ./
 COPY --from=reader /build/presence/reader/target/release/brick-timestamp-reader ./
-COPY presence/timestamp_worker.mjs presence/timestamp_process.mjs presence/timestamp_scan.py presence/replay_sync.mjs presence/security.mjs ./
+COPY presence/timestamp_worker.mjs presence/timestamp_process.mjs presence/timestamp_scan.py presence/timestamp_youtube.py presence/timestamp_frames.py presence/replay_sync.mjs presence/security.mjs ./
+RUN mkdir /scratch && chown node:node /scratch
 USER node
 CMD ["node", "timestamp_worker.mjs"]

@@ -65,6 +65,7 @@ export function createReplaySyncLibrary({ dataDir, now = Date.now }) {
         uncertainty REAL NOT NULL, checked_min INTEGER NOT NULL, checked_max INTEGER NOT NULL,
         stable INTEGER NOT NULL, updated_at INTEGER NOT NULL
       ) STRICT;
+      CREATE INDEX IF NOT EXISTS recording_media_clock ON recording_calibrations (json_extract(payload,'$.provider'),json_extract(payload,'$.videoId'),json_extract(payload,'$.broadcastId'),updated_at);
       CREATE TABLE IF NOT EXISTS report_clocks (
         first_report TEXT NOT NULL, second_report TEXT NOT NULL, shift REAL NOT NULL,
         updated_at INTEGER NOT NULL, PRIMARY KEY(first_report,second_report)
@@ -104,8 +105,24 @@ export function createReplaySyncLibrary({ dataDir, now = Date.now }) {
     return { videoSeconds, unixSeconds: best[0].unixSeconds, uncertaintySeconds,
       confirmations: best.length, verified: best.length >= 2 && best.length * 2 > rows.length && uncertaintySeconds <= 0.35 };
   }
+  function youtubeClock(value) {
+    if (value.provider !== 'youtube') return null;
+    const start = value.recordingStartMs ?? Date.parse(value.startedAt);
+    const rows = database.prepare(`SELECT * FROM recording_calibrations WHERE source_type='server' AND stable=1
+      AND json_extract(payload,'$.provider')='youtube' AND json_extract(payload,'$.videoId')=?
+      AND json_extract(payload,'$.broadcastId')=? AND updated_at>=? ORDER BY updated_at DESC LIMIT 8`)
+      .all(value.videoId, value.broadcastId, now()-RETENTION_MS);
+    for (const row of rows) {
+      const anchor = JSON.parse(row.payload);
+      const origin = Math.round(anchor.startMs-row.video_seconds*1000);
+      const shift = origin-anchor.recordingStartMs;
+      if (anchor.readerVersion === VERSION && Math.abs(shift)>60_000 && Math.abs(shift)<=3600_000
+          && (start===anchor.recordingStartMs || start===origin)) return {row, origin, shift};
+    }
+    return null;
+  }
   function calibration(key) {
-    return database.prepare('SELECT * FROM recording_calibrations WHERE id=? AND updated_at>=?').get(recordingId(key),now()-RETENTION_MS);
+    return database.prepare('SELECT * FROM recording_calibrations WHERE id=? AND updated_at>=?').get(recordingId(key),now()-RETENTION_MS) || youtubeClock(key)?.row;
   }
   function reportShift(from,to) {
     if(from===to)return 0;
@@ -154,7 +171,7 @@ export function createReplaySyncLibrary({ dataDir, now = Date.now }) {
       // A discontinuity disables extrapolation for this recording. Exact
       // measured pulls remain usable, and subsequent pulls are scanned.
       database.prepare('UPDATE recording_calibrations SET stable=?,checked_min=min(checked_min,?),checked_max=max(checked_max,?),updated_at=? WHERE id=?')
-        .run(stable?1:0,key.startMs,key.startMs,now(),recordingId(key));
+        .run(stable?1:0,key.startMs,key.startMs,now(),old.id);
     }
   }
   function lookup(value) {
@@ -165,14 +182,14 @@ export function createReplaySyncLibrary({ dataDir, now = Date.now }) {
     if (!row?.stable || (row.source_type==='peers' && !measured(row.source_key)?.verified)) return direct;
     const anchor = JSON.parse(row.payload);
     // Changed bounds for the original pull invalidate that exact observation.
-    if (anchor.report===key.report && anchor.pullId===key.pullId && row.source_key!==id) return direct;
+    if (anchor.report===key.report && anchor.pullId===key.pullId && (anchor.startMs!==key.startMs || anchor.endMs!==key.endMs || anchor.encounter!==key.encounter || anchor.difficulty!==key.difficulty)) return direct;
     if(overlap(anchor,key))linkReports(anchor.report,key.report,key.startMs-anchor.startMs);
     const shift=reportShift(anchor.report,key.report);
     if(shift===null)return direct;
     const delta = (key.startMs-anchor.startMs-shift)/1000;
     const videoSeconds = row.video_seconds+delta;
     const estimate = (key.startMs-key.recordingStartMs)/1000;
-    if (Math.abs(delta)>86400 || !finite(videoSeconds,0,604800) || Math.abs(videoSeconds-estimate)>60) return direct;
+    if (Math.abs(delta)>86400 || !finite(videoSeconds,0,604800) || Math.abs(videoSeconds-estimate)>(key.provider==='youtube' && row.source_type==='server'?3600:60)) return direct;
     return {videoSeconds,unixSeconds:Math.floor(row.unix_seconds+delta),
       uncertaintySeconds:Math.min(0.35,row.uncertainty+0.1),verified:true,verifiedBy:'server',confirmations:0,
       source:'recording-calibration',anchor:{report:anchor.report,pullId:anchor.pullId,startMs:anchor.startMs,
@@ -186,6 +203,15 @@ export function createReplaySyncLibrary({ dataDir, now = Date.now }) {
   }
   return {
     lookup,
+    correctReplay(replay, live = false) {
+      open();
+      const clock = youtubeClock(replay);
+      if (!clock || Date.parse(replay.startedAt)===clock.origin) return replay;
+      // A verified visual anchor establishes media second zero. Existing
+      // clients can then validate and seek the native YouTube timeline.
+      return {...replay, startedAt:new Date(clock.origin).toISOString(),
+        availableSeconds:live?Math.max(0,Math.floor(replay.availableSeconds-clock.shift/1000)):replay.availableSeconds};
+    },
     // These methods have no HTTP route. Only the bounded worker with the
     // shared data volume can lease work and publish server measurements.
     enqueue(values) {
@@ -206,10 +232,12 @@ export function createReplaySyncLibrary({ dataDir, now = Date.now }) {
           const changedBounds=pending.report===key.report && pending.pullId===key.pullId;
           if (!changedBounds && (existing.attempts===0 || existing.lease_until>now())) continue;
         }
+        // Browsing another pull must not bypass a failed recording's backoff.
+        const nextAt = Math.max(now(), existing?.next_at ?? 0);
         database.prepare(`INSERT INTO timestamp_jobs(id, identity, payload, priority, next_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(identity) DO UPDATE SET id=excluded.id,
           payload=excluded.payload, priority=excluded.priority, attempts=0, next_at=excluded.next_at,
-          lease=NULL, lease_until=0, updated_at=excluded.updated_at`).run(id, identity, JSON.stringify(key), key.startMs, now(), now());
+          lease=NULL, lease_until=0, updated_at=excluded.updated_at`).run(id, identity, JSON.stringify(key), key.startMs, nextAt, now());
         if (!existing) count++;
       }
     },
@@ -236,8 +264,9 @@ export function createReplaySyncLibrary({ dataDir, now = Date.now }) {
       const row = database.prepare('SELECT id FROM timestamp_jobs WHERE id=? AND lease=? AND lease_until>?').get(id, job.lease, now());
       if (!row || id !== job.id) return false;
       const estimate = (key.startMs-key.recordingStartMs)/1000;
+      const tolerance = key.provider==='youtube'?3600:60;
       const valid = alignment && integer(alignment.unixSeconds, Math.floor(key.startMs/1000)-3, Math.floor(key.startMs/1000)+3)
-        && finite(alignment.videoSeconds, Math.max(0,estimate-60), Math.min(604800,estimate+60))
+        && finite(alignment.videoSeconds, Math.max(0,estimate-tolerance), Math.min(604800,estimate+tolerance))
         && finite(alignment.uncertaintySeconds,0.05,0.225);
       if (valid) {
         database.prepare(`INSERT INTO server_alignments VALUES (?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET

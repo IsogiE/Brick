@@ -1135,3 +1135,38 @@ test("shared raid timestamps require guild authorization and a visible VOD befor
   f.setMembers([members[1]]); await f.restart();
   assert.equal((await f.authorized(lookup, request({ keys: [key] }), 'bob-token')).status, 404);
 });
+
+test("verified YouTube media clocks reach live and archived review HTTP responses", async t => {
+  const { createReplaySyncLibrary } = await import('./replay_sync.mjs');
+  for (const live of [true, false]) {
+    const f = await fixture(t, () => json({ items: [{ id: videoId,
+      snippet: { title: 'Raid', liveBroadcastContent: live ? 'live' : 'none' },
+      status: { embeddable: true, privacyStatus: 'public' }, contentDetails: { duration: 'PT59M55S' },
+      liveStreamingDetails: { actualStartTime: '2023-11-14T20:00:00Z',
+        ...(!live ? { actualEndTime: '2023-11-14T21:00:00Z' } : {}) } }] }), providerEnv);
+    if (live) { await f.save(`https://youtu.be/${videoId}`); await f.list(); }
+    else await seedRecording(f);
+    const route = live ? '/v1/streams/review/11/youtube' : `/v1/streams/vods/11/youtube/${videoId}/review`;
+    const original = await (await f.authorized(route)).json();
+    const recordingStartMs = Date.parse(original.startedAt);
+    const key = { readerVersion: 1, provider: 'youtube', videoId, broadcastId: videoId,
+      report: 'abcdefghABCDEFGH', pullId: 1, encounter: 3492, difficulty: 5,
+      recordingStartMs, startMs: recordingStartMs + 3000_000, endMs: recordingStartMs + 3200_000 };
+    const library = createReplaySyncLibrary({ dataDir: f.data, now: () => 1_700_000_000_000 });
+    try {
+      library.enqueue([key]);
+      assert.equal(library.finish(library.claim(), { videoSeconds: 2729.182,
+        unixSeconds: Math.floor(key.startMs/1000), uncertaintySeconds: .125 }), true);
+    } finally { library.close(); }
+    const corrected = await (await f.authorized(route)).json();
+    assert.equal(Date.parse(corrected.startedAt), recordingStartMs + 270818);
+    assert.equal(corrected.availableSeconds, live ? original.availableSeconds - 271 : original.availableSeconds);
+    const adjusted = { ...key, recordingStartMs: Date.parse(corrected.startedAt) };
+    const response = await f.authorized('/v1/streams/review/sync/lookup', {
+      method: 'POST', body: JSON.stringify({ keys: [adjusted] }) });
+    assert.equal(response.status, 200);
+    const alignment = (await response.json()).results[0].alignment;
+    assert.equal(alignment.verified, true);
+    assert.ok(Math.abs(alignment.videoSeconds - (adjusted.startMs-adjusted.recordingStartMs)/1000) < .001);
+  }
+});

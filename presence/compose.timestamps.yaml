@@ -17,11 +17,15 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: "2m"
-        max-file: "2"
+        max-size: "10m"
+        max-file: "20"
     tmpfs:
       - /tmp:size=134217728,uid=1000,gid=1000,mode=0700
     environment:
       DATA_DIR: /data
+      BRICK_TIMESTAMP_SCRATCH_DIR: /scratch/jobs
     volumes:
       - brick-presence-data:/data
+      - brick-timestamp-scratch:/scratch
+volumes:
+  brick-timestamp-scratch:
