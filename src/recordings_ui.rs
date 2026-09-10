@@ -14,6 +14,8 @@ const MUTED: Color32 = Color32::from_rgb(159, 169, 184);
 const TEXT: Color32 = Color32::from_rgb(239, 242, 247);
 const ROW_HEIGHT: f32 = 48.0;
 const MEMBER_HEIGHT: f32 = 30.0;
+const DATE_HEIGHT: f32 = 28.0;
+const ROW_SPACING: f32 = 2.0;
 
 pub enum Action {
     Review(usize),
@@ -25,9 +27,16 @@ struct Entry {
     index: usize,
     search: String,
     month: String,
+    day: String,
     date: String,
     clock: String,
     detail: String,
+}
+
+struct DisplayRow {
+    entry: usize,
+    top: f32,
+    heading: bool,
 }
 
 struct Member {
@@ -47,6 +56,8 @@ pub struct Library {
     month: Option<String>,
     query: String,
     filtered: Vec<usize>,
+    rows: Vec<DisplayRow>,
+    rows_height: f32,
     dirty: bool,
     reset_scroll: bool,
     #[cfg(test)]
@@ -69,7 +80,10 @@ impl Library {
         let mut months: HashMap<String, String> = HashMap::new();
         for (index, vod) in source.iter().enumerate() {
             let stamp = timestamp(vod);
-            let day = stamp.get(..10).unwrap_or("");
+            let day = stamp
+                .get(..10)
+                .filter(|day| parse_date(day).is_some())
+                .unwrap_or("");
             let month = stamp.get(..7).unwrap_or("").to_owned();
             let date = date_label(day);
             let clock = stamp
@@ -90,6 +104,7 @@ impl Library {
                 )
                 .to_lowercase(),
                 month: month.clone(),
+                day: day.to_owned(),
                 date,
                 clock,
                 detail,
@@ -112,6 +127,7 @@ impl Library {
         self.entries.sort_by_cached_key(|entry| {
             let vod = &source[entry.index];
             (
+                std::cmp::Reverse(entry.day.clone()),
                 profile::role_order(vod.raid_role),
                 vod.name.to_lowercase(),
                 std::cmp::Reverse(timestamp(vod).to_owned()),
@@ -171,6 +187,30 @@ impl Library {
                     .then_some(index)
                 }),
         );
+        // Build the date separators only when the source or filters change. The
+        // per-frame path binary-searches these offsets and paints visible rows.
+        self.rows.clear();
+        let mut previous_day = None;
+        let mut top = 0.0;
+        for &entry in &self.filtered {
+            let day = self.entries[entry].day.as_str();
+            if previous_day != Some(day) {
+                self.rows.push(DisplayRow {
+                    entry,
+                    top,
+                    heading: true,
+                });
+                top += DATE_HEIGHT + ROW_SPACING;
+                previous_day = Some(day);
+            }
+            self.rows.push(DisplayRow {
+                entry,
+                top,
+                heading: false,
+            });
+            top += ROW_HEIGHT + ROW_SPACING;
+        }
+        self.rows_height = (top - ROW_SPACING).max(0.0);
         self.dirty = false;
         self.reset_scroll = true;
     }
@@ -312,14 +352,51 @@ impl Library {
                 if std::mem::take(&mut self.reset_scroll) {
                     scroll = scroll.vertical_scroll_offset(0.0);
                 }
-                let output = scroll.show_rows(ui, ROW_HEIGHT, self.filtered.len(), |ui, rows| {
-                    for visible in rows {
-                        let entry = &self.entries[self.filtered[visible]];
-                        let vod = &source[entry.index];
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), ROW_HEIGHT),
-                            egui::Sense::hover(),
+                let output = scroll.show_viewport(ui, |ui, viewport| {
+                    ui.set_height(self.rows_height);
+                    let first = self
+                        .rows
+                        .partition_point(|row| row.top <= viewport.top())
+                        .saturating_sub(1);
+                    let end = self
+                        .rows
+                        .partition_point(|row| row.top <= viewport.bottom());
+                    for display in &self.rows[first..end] {
+                        let entry = &self.entries[display.entry];
+                        let rect = egui::Rect::from_min_size(
+                            egui::pos2(ui.max_rect().left(), ui.max_rect().top() + display.top),
+                            egui::vec2(
+                                ui.available_width(),
+                                if display.heading {
+                                    DATE_HEIGHT
+                                } else {
+                                    ROW_HEIGHT
+                                },
+                            ),
                         );
+                        if display.heading {
+                            let painter = ui.painter_at(rect);
+                            let label = painter.text(
+                                egui::pos2(rect.left() + 8.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                &entry.date,
+                                egui::FontId::proportional(12.0),
+                                TEXT,
+                            );
+                            let line_start = label.right() + 12.0;
+                            if line_start < rect.right() {
+                                painter.hline(
+                                    line_start..=rect.right(),
+                                    rect.center().y,
+                                    egui::Stroke::new(
+                                        1.0_f32,
+                                        ui.visuals().widgets.noninteractive.bg_stroke.color,
+                                    ),
+                                );
+                            }
+                            continue;
+                        }
+                        let vod = &source[entry.index];
                         #[cfg(test)]
                         self.row_rects.push(rect);
                         {
@@ -576,16 +653,18 @@ fn month_label(stamp: &str) -> String {
         .map(|(year, month)| format!("{month} {year}"))
         .unwrap_or_else(|| "Date unavailable".into())
 }
+fn parse_date(stamp: &str) -> Option<time::Date> {
+    let (year, month) = month_parts(stamp)?;
+    let day = stamp.get(8..10)?.parse::<u8>().ok()?;
+    time::Date::from_calendar_date(year, month, day).ok()
+}
 fn date_label(stamp: &str) -> String {
-    if let Some((year, month)) = month_parts(stamp) {
-        if let Some(day) = stamp.get(8..10).and_then(|day| day.parse::<u8>().ok()) {
-            if time::Date::from_calendar_date(year, month, day).is_ok() {
-                let month = month.to_string();
-                return format!("{day} {} {year}", &month[..3]);
-            }
-        }
-    }
-    "Date unavailable".into()
+    parse_date(stamp)
+        .map(|date| {
+            let month = date.month().to_string();
+            format!("{} {} {}", date.day(), &month[..3], date.year())
+        })
+        .unwrap_or_else(|| "Date unavailable".into())
 }
 
 #[cfg(test)]
@@ -665,6 +744,7 @@ mod tests {
             ("alpha", Some(RaidRole::Tank)),
             ("Healer", Some(RaidRole::Healer)),
         ]) {
+            vod.started_at = Some("2026-09-10T18:10:00Z".into());
             vod.name = name.into();
             vod.raid_role = role;
         }
@@ -687,6 +767,99 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["alpha", "zulu", "Healer", "Bravo", "Alpha"]
         );
+    }
+
+    #[test]
+    fn date_groups_are_newest_first_with_roles_inside_each_day_and_no_empty_headers() {
+        let mut items: Vec<_> = (0..7).map(archive).collect();
+        for (vod, (stamp, name, role)) in items.iter_mut().zip([
+            ("2026-09-09T18:00:00Z", "Old tank", Some(RaidRole::Tank)),
+            ("2026-09-10T18:00:00Z", "DPS", Some(RaidRole::Dps)),
+            ("2026-09-10T18:00:00Z", "Zulu", Some(RaidRole::Tank)),
+            ("2026-09-10T18:00:00Z", "alpha", Some(RaidRole::Tank)),
+            ("2026-09-10T18:00:00Z", "Healer", Some(RaidRole::Healer)),
+            ("", "Undated", None),
+            ("2026-02-30T18:00:00Z", "Invalid date", Some(RaidRole::Tank)),
+        ]) {
+            vod.started_at = Some(stamp.into());
+            vod.name = name.into();
+            vod.raid_role = role;
+        }
+        let source = Rc::new(items);
+        let mut library = Library::default();
+        library.prepare(&source);
+        library.filter(&source);
+        assert_eq!(
+            library
+                .filtered
+                .iter()
+                .map(|i| library.entries[*i].index)
+                .collect::<Vec<_>>(),
+            [3, 2, 4, 1, 0, 6, 5]
+        );
+        assert_eq!(
+            library
+                .rows
+                .iter()
+                .filter(|row| row.heading)
+                .map(|row| library.entries[row.entry].date.as_str())
+                .collect::<Vec<_>>(),
+            ["10 Sep 2026", "9 Sep 2026", "Date unavailable"]
+        );
+        assert_eq!(library.rows_height, 7.0 * 50.0 + 3.0 * 30.0 - 2.0);
+        library.query = "Old tank".into();
+        library.dirty = true;
+        library.filter(&source);
+        assert_eq!(library.rows.len(), 2);
+        assert!(library.rows[0].heading);
+        assert_eq!(library.entries[library.rows[0].entry].date, "9 Sep 2026");
+        assert_eq!(library.entries[library.rows[1].entry].index, 0);
+        library.query = "no match".into();
+        library.dirty = true;
+        library.filter(&source);
+        assert!(library.rows.is_empty());
+        assert_eq!(library.rows_height, 0.0);
+        assert_eq!(library.builds, 1);
+    }
+
+    #[test]
+    fn clicking_a_grouped_vod_opens_the_original_source_entry() {
+        let source = Rc::new(vec![archive(0), archive(3)]);
+        let ctx = egui::Context::default();
+        configure_context(&ctx);
+        let mut library = Library::default();
+        let size = egui::vec2(980.0, 600.0);
+        frame(&ctx, &mut library, &source, size);
+        frame(&ctx, &mut library, &source, size);
+        let position = library.row_rects[0].center();
+        let mut selected = None;
+        for pressed in [true, false] {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    events: vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show_inside(ui, |ui| {
+                        if let Some(Action::Review(index)) =
+                            library.draw(ui, &source, false, true, false)
+                        {
+                            selected = Some(index);
+                        }
+                    });
+                },
+            );
+        }
+        assert_eq!(selected, Some(1));
     }
 
     #[test]
@@ -764,7 +937,9 @@ mod tests {
                     assert!(!library.row_rects.is_empty());
                     for rows in library.row_rects.windows(2) {
                         assert!(
-                            (rows[1].top() - rows[0].top() - 50.0).abs() < 0.1,
+                            [50.0, 80.0]
+                                .iter()
+                                .any(|gap| (rows[1].top() - rows[0].top() - gap).abs() < 0.1),
                             "row spacing: {rows:?}"
                         );
                     }

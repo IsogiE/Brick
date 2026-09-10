@@ -1756,6 +1756,20 @@ pub(crate) fn player_url_for_playback(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn stream_actions_keep_painted_geometry_on_hover() {
+        crate::ui::tests::assert_static_button_hover(
+            &["Twitch", "VODs", "Refresh", "Your streams"],
+            |ui| {
+                ui.horizontal(|ui| {
+                    for label in ["Twitch", "VODs", "Refresh", "Your streams"] {
+                        ui.add(super::action_button(label));
+                    }
+                });
+            },
+        );
+    }
+
+    #[test]
     fn native_wrapper_recovery_is_automatic_bounded_and_resets_on_new_selection() {
         let mut streams = super::StreamsUi::default();
         streams.recover_player("Temporary loading failure".into());

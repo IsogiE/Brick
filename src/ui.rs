@@ -1768,10 +1768,23 @@ fn configure_style(ctx: &egui::Context) {
     style.spacing.button_padding = egui::vec2(14.0, 8.0);
     style.visuals.panel_fill = app_background();
     style.visuals.window_fill = app_background();
-    // Hover changes color, never the footprint of controls or their containing rows.
-    style.visuals.widgets.inactive.expansion = 0.0;
-    style.visuals.widgets.hovered.expansion = 0.0;
-    style.visuals.widgets.active.expansion = 0.0;
+    // egui computes button padding from the theme stroke before applying a
+    // Button::stroke override. Different state widths would resize our outlined
+    // buttons on hover even with expansion disabled. Keep all frame geometry
+    // constant; colors still communicate hover, focus and pressed states.
+    let widgets = &mut style.visuals.widgets;
+    let corner_radius = widgets.inactive.corner_radius;
+    for state in [
+        &mut widgets.noninteractive,
+        &mut widgets.inactive,
+        &mut widgets.hovered,
+        &mut widgets.active,
+        &mut widgets.open,
+    ] {
+        state.expansion = 0.0;
+        state.bg_stroke.width = 1.0;
+        state.corner_radius = corner_radius;
+    }
     style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(35, 39, 47);
     style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(45, 50, 60);
     style.visuals.widgets.active.bg_fill = Color32::from_rgb(55, 61, 72);
@@ -2477,7 +2490,7 @@ fn info_accent() -> Color32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use eframe::App as _;
 
@@ -2525,6 +2538,145 @@ mod tests {
             last_app_update_check: now,
             last_roster_refresh: now,
             roster_notice: None,
+        }
+    }
+
+    // Inspect both allocated rows and painted frames/text after the previous-frame
+    // WidgetState has caught up. A single hover frame misses egui's ButtonStyle path.
+    pub(crate) fn assert_static_button_hover(labels: &[&str], mut draw: impl FnMut(&mut egui::Ui)) {
+        #[derive(Debug, PartialEq)]
+        enum Geometry {
+            Rect(egui::Rect, egui::CornerRadius, f32),
+            Text(String, egui::Pos2, egui::Vec2),
+        }
+        fn collect(shape: &egui::Shape, out: &mut Vec<Geometry>) {
+            match shape {
+                egui::Shape::Rect(rect) => out.push(Geometry::Rect(
+                    rect.rect,
+                    rect.corner_radius,
+                    rect.stroke.width,
+                )),
+                egui::Shape::Text(text) => out.push(Geometry::Text(
+                    text.galley.text().into(),
+                    text.pos,
+                    text.galley.size(),
+                )),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            configure_style(&ctx);
+            ctx.set_pixels_per_point(scale);
+            let mut frame = |events| {
+                let mut bounds = egui::Rect::NOTHING;
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(980.0, 720.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        draw(ui);
+                        bounds = ui.min_rect();
+                    },
+                );
+                let mut geometry = Vec::new();
+                for shape in output.shapes {
+                    collect(&shape.shape, &mut geometry);
+                }
+                (bounds, geometry)
+            };
+            frame(vec![]);
+            frame(vec![]);
+            let baseline = frame(vec![]);
+            for label in labels {
+                let center = baseline
+                    .1
+                    .iter()
+                    .find_map(|part| match part {
+                        Geometry::Text(text, pos, size) if text == label => {
+                            Some(*pos + *size * 0.5)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("Missing button {label}"));
+                // The first frame discovers hover; later frames allocate with it.
+                for n in 0..4 {
+                    assert_eq!(
+                        baseline,
+                        frame(vec![egui::Event::PointerMoved(center)]),
+                        "Button {label}, hover frame {n}, scale {scale} changed geometry",
+                    );
+                }
+                for n in 0..4 {
+                    assert_eq!(
+                        baseline,
+                        frame(vec![egui::Event::PointerGone]),
+                        "Button {label}, exit frame {n}, scale {scale} changed geometry",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn common_buttons_keep_painted_geometry_on_hover() {
+        assert_static_button_hover(
+            &[
+                "Refresh",
+                "Choose Folder",
+                "Log out",
+                "Save profile",
+                "Advanced",
+            ],
+            |ui| {
+                ui.horizontal(|ui| {
+                    secondary_button(ui, "Refresh");
+                    primary_button(ui, "Choose Folder");
+                    danger_button(ui, "Log out");
+                    let _ = ui.button("Save profile");
+                    ui.add_sized(
+                        [80.0, 28.0],
+                        egui::Button::new("Advanced").stroke(Stroke::new(1.0_f32, panel_stroke())),
+                    );
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn both_update_headers_keep_painted_geometry_on_hover() {
+        for available in [false, true] {
+            for review in [false, true] {
+                let mut app = app();
+                if available {
+                    app.app_update_state = AppUpdateUiState::Available("0.4.7".into());
+                }
+                let label = if available {
+                    "Update now"
+                } else if review {
+                    "Check updates"
+                } else {
+                    "Check for updates"
+                };
+                assert_static_button_hover(&["Home", "Roster", "Streams", label], |ui| {
+                    if review {
+                        app.draw_review_header(ui);
+                    } else {
+                        app.draw_header(ui);
+                        app.draw_tab_bar(ui);
+                    }
+                });
+            }
         }
     }
 
