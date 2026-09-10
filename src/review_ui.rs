@@ -1,5 +1,5 @@
 use crate::{
-    defensives::DefensiveGroup,
+    defensives::{self, DefensiveGroup},
     discord_auth,
     stream_player::{PlaybackCommand, PlaybackState},
     streams::{Status, Stream},
@@ -49,11 +49,13 @@ enum Action {
     Connect,
     Disconnect,
     Events(Pull, EventKind),
+    SaveCooldowns(defensives::Preferences),
 }
 enum Data {
     Review(Review),
     Authentication,
-    Events(String, EventKind, Vec<RaidEvent>),
+    Events(String, EventKind, Vec<RaidEvent>, defensives::Preferences),
+    Cooldowns(defensives::Preferences),
 }
 type Outcome = (u64, String, Result<Data, String>, bool);
 
@@ -67,6 +69,50 @@ pub struct WorkspaceAction {
     pub stream: Option<Stream>,
 }
 
+struct ObservedSpellName {
+    display: String,
+    search: std::collections::BTreeSet<String>,
+}
+
+struct CooldownEditor {
+    draft: defensives::Preferences,
+    observed_names: std::collections::BTreeMap<u64, ObservedSpellName>,
+    search: String,
+    new_id: String,
+    new_group: DefensiveGroup,
+    error: Option<String>,
+}
+impl CooldownEditor {
+    fn new(draft: defensives::Preferences, events: &[RaidEvent]) -> Self {
+        let mut editor = Self {
+            draft,
+            observed_names: Default::default(),
+            search: String::new(),
+            new_id: String::new(),
+            new_group: DefensiveGroup::Healing,
+            error: None,
+        };
+        editor.refresh_names(events);
+        editor
+    }
+
+    // WCL events and labels are already bounded. Index names only when opening
+    // the editor or receiving event data, never once per tracked ID per frame.
+    fn refresh_names(&mut self, events: &[RaidEvent]) {
+        self.observed_names.clear();
+        for event in events {
+            let names = self
+                .observed_names
+                .entry(event.ability_id)
+                .or_insert_with(|| ObservedSpellName {
+                    display: event.ability.clone(),
+                    search: Default::default(),
+                });
+            names.search.insert(event.ability.to_lowercase());
+        }
+    }
+}
+
 pub struct ReviewUi {
     client: Arc<Mutex<Option<Client>>>,
     marker_cache: Arc<Mutex<crate::replay_sync::Cache>>,
@@ -78,6 +124,7 @@ pub struct ReviewUi {
     generation: u64,
     key: String,
     last_attempt: Option<Instant>,
+    refresh_period: Duration,
     review: Option<Review>,
     replay_coverage: Option<(i64, i64)>,
     notice: Option<String>,
@@ -94,6 +141,11 @@ pub struct ReviewUi {
     requested_events: Vec<EventKind>,
     loaded_events: Vec<EventKind>,
     show_all_deaths: bool,
+    cooldowns: defensives::Preferences,
+    cooldown_editor: Option<CooldownEditor>,
+    cooldown_save: Option<defensives::Preferences>,
+    cooldown_notice: Option<String>,
+    cooldown_filter: Option<DefensiveGroup>,
     selected_event: Option<(i64, String)>,
     scroll_to_event: bool,
     aligning: bool,
@@ -121,6 +173,7 @@ impl Default for ReviewUi {
             generation: 0,
             key: String::new(),
             last_attempt: None,
+            refresh_period: Duration::from_secs(60),
             review: None,
             replay_coverage: None,
             notice: None,
@@ -137,6 +190,11 @@ impl Default for ReviewUi {
             requested_events: Vec::new(),
             loaded_events: Vec::new(),
             show_all_deaths: false,
+            cooldowns: Default::default(),
+            cooldown_editor: None,
+            cooldown_save: None,
+            cooldown_notice: None,
+            cooldown_filter: None,
             selected_event: None,
             scroll_to_event: false,
             aligning: false,
@@ -160,9 +218,6 @@ impl Drop for ReviewUi {
 impl ReviewUi {
     pub fn active(&self) -> bool {
         self.active
-    }
-    pub fn obscures_player(&self) -> bool {
-        self.popup_open
     }
     pub fn playback(&self) -> Option<&Playback> {
         self.playback.as_ref()
@@ -358,6 +413,18 @@ impl ReviewUi {
     }
 
     pub fn tick(&mut self, ctx: &egui::Context, stream: Option<&Stream>) -> bool {
+        self.refresh_period = if !self.metadata_only
+            && stream.is_some_and(|stream| {
+                stream.status == Status::Live
+                    || stream.replay_range().is_some_and(|(_, end)| {
+                        let now = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+                        end >= now.saturating_sub(24 * 60 * 60 * 1000)
+                    })
+            }) {
+            Duration::from_secs(15)
+        } else {
+            Duration::from_secs(60)
+        };
         let key = stream.map(pov_key).unwrap_or_default();
         let mut changed = false;
         if self.key != key {
@@ -395,6 +462,9 @@ impl ReviewUi {
                         && key == self.key
                         && !self.cancel.load(Ordering::Relaxed)
                     {
+                        if matches!(action, Some(Action::Refresh)) {
+                            self.last_attempt = Some(Instant::now());
+                        }
                         self.connected = connected;
                         match result {
                             Ok(Data::Review(review)) => {
@@ -416,11 +486,27 @@ impl ReviewUi {
                                 self.notice = None;
                                 self.last_attempt = None;
                             }
-                            Ok(Data::Events(key, kind, events)) => {
+                            Ok(Data::Cooldowns(preferences)) => {
+                                self.cooldowns = preferences;
+                                self.cooldown_editor = None;
+                                self.cooldown_notice = None;
+                                self.event_notice = None;
+                                self.events
+                                    .retain(|event| event.kind != EventKind::Defensives);
+                                self.loaded_events
+                                    .retain(|kind| *kind != EventKind::Defensives);
+                                self.requested_events
+                                    .retain(|kind| *kind != EventKind::Defensives);
+                            }
+                            Ok(Data::Events(key, kind, events, preferences)) => {
+                                self.cooldowns = preferences;
                                 if self.pull.as_ref().is_some_and(|p| pull_key(p) == key) {
                                     self.events.retain(|event| event.kind != kind);
                                     self.events.extend(events);
                                     self.events.sort_by_key(|event| event.at_ms);
+                                    if let Some(editor) = &mut self.cooldown_editor {
+                                        editor.refresh_names(&self.events);
+                                    }
                                     self.loaded_events.push(kind);
                                 }
                             }
@@ -433,6 +519,8 @@ impl ReviewUi {
                                     {
                                         self.event_notice = Some(error);
                                     }
+                                } else if matches!(action, Some(Action::SaveCooldowns(_))) {
+                                    self.cooldown_notice = Some(error);
                                 } else {
                                     self.notice = Some(error);
                                 }
@@ -468,7 +556,25 @@ impl ReviewUi {
                 self.start(ctx, stream, action);
             }
         }
+        if stream.is_some() && self.work.is_none() {
+            // Do not depend on mouse input or a playing video for fresh pulls.
+            // A busy shared metadata worker retries at a bounded cadence.
+            let wait = self.last_attempt.map_or(Duration::from_secs(1), |at| {
+                self.refresh_interval()
+                    .saturating_sub(at.elapsed())
+                    .max(Duration::from_millis(250))
+            });
+            ctx.request_repaint_after(wait);
+        }
         changed
+    }
+
+    fn refresh_interval(&self) -> Duration {
+        if self.notice.is_some() {
+            Duration::from_secs(60)
+        } else {
+            self.refresh_period
+        }
     }
 
     // Keep the worker until it finishes its bounded current request. Derive the
@@ -505,7 +611,7 @@ impl ReviewUi {
             Some(Action::Events(pull, kind))
         } else if self
             .last_attempt
-            .is_none_or(|at| at.elapsed() >= Duration::from_secs(60))
+            .is_none_or(|at| at.elapsed() >= self.refresh_interval())
         {
             Some(Action::Refresh)
         } else {
@@ -669,9 +775,19 @@ impl ReviewUi {
                     Action::Refresh => client
                         .review(&token, stream.as_ref().ok_or("Choose a VOD first.")?)
                         .map(Data::Review),
-                    Action::Events(pull, kind) => client
-                        .events(&token, &pull, kind)
-                        .map(|events| Data::Events(pull_key(&pull), kind, events)),
+                    Action::Events(pull, kind) => {
+                        client.events(&token, &pull, kind).map(|events| {
+                            Data::Events(
+                                pull_key(&pull),
+                                kind,
+                                events,
+                                client.cooldown_preferences(),
+                            )
+                        })
+                    }
+                    Action::SaveCooldowns(preferences) => client
+                        .save_cooldown_preferences(&token, preferences)
+                        .map(Data::Cooldowns),
                 };
                 connected = client.connected();
                 result
@@ -936,7 +1052,7 @@ impl ReviewUi {
             });
         });
         // Query actual popup memory: an InnerResponse also exists on the frame
-        // a popup closes, which otherwise hides the player for an extra frame.
+        // a popup closes; use its actual state for marker synchronization.
         self.popup_open = egui::Popup::is_any_open(ui.ctx());
         if let Some(i) = selected.filter(|i| Some(*i) != index) {
             self.select(pulls[i].clone());
@@ -1021,7 +1137,7 @@ impl ReviewUi {
             workspace.min,
             egui::pos2(workspace.right() - rail_width - gap, workspace.bottom()),
         );
-        let timeline_height = if self.aligning { 220.0 } else { 180.0 };
+        let timeline_height = if self.aligning { 240.0 } else { 200.0 };
         let video = egui::Rect::from_min_max(
             left.min,
             egui::pos2(
@@ -1098,6 +1214,11 @@ impl ReviewUi {
                     action.command = Some(command);
                 }
             });
+        }
+        if self.work.is_none() {
+            if let Some(preferences) = self.cooldown_save.take() {
+                self.start(ui.ctx(), Some(stream), Action::SaveCooldowns(preferences));
+            }
         }
         if action.stream.is_some() {
             self.open_first_pull = false;
@@ -1331,7 +1452,7 @@ impl ReviewUi {
         });
 
         let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), 135.0),
+            egui::vec2(ui.available_width(), 155.0),
             egui::Sense::click(),
         );
         let seek_range = seek_range?;
@@ -1371,14 +1492,32 @@ impl ReviewUi {
                 Color32::from_rgb(185, 145, 222),
             ),
             (
-                "Raid cooldowns",
-                Some(DefensiveGroup::Raid),
+                "Healing CDs",
+                Some(DefensiveGroup::Healing),
                 Color32::from_rgb(99, 193, 159),
+            ),
+            (
+                "Damage reduction",
+                Some(DefensiveGroup::DamageReduction),
+                Color32::from_rgb(230, 184, 96),
+            ),
+            (
+                "Buffs / utility",
+                Some(DefensiveGroup::Utility),
+                Color32::from_rgb(112, 196, 210),
             ),
         ];
         let mut chosen = None;
-        for (lane, (label, group, color)) in lanes.iter().enumerate() {
-            let y = grid.top() + lane as f32 * 28.0 + 13.0;
+        for (lane, (label, group, color)) in lanes
+            .iter()
+            .filter(|(_, group, _)| {
+                group.is_none_or(|group| {
+                    self.cooldowns.visible(group) && self.cooldowns.has_enabled_spells(group)
+                })
+            })
+            .enumerate()
+        {
+            let y = grid.top() + lane as f32 * 22.0 + 11.0;
             painter.text(
                 egui::pos2(rect.left(), y),
                 egui::Align2::LEFT_CENTER,
@@ -1580,7 +1719,206 @@ impl ReviewUi {
         }
     }
 
+    fn draw_cooldown_editor(&mut self, ui: &mut egui::Ui, _height: f32) {
+        ui.spacing_mut().item_spacing = egui::vec2(5.0, 4.0);
+        ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+        ui.spacing_mut().interact_size.y = 20.0;
+        let mut close = false;
+        let mut save = false;
+        let busy = self.cooldown_save.is_some()
+            || matches!(self.work_action, Some(Action::SaveCooldowns(_)));
+        let editor = self.cooldown_editor.as_mut().unwrap();
+        ui.horizontal(|ui| {
+            ui.strong("Cooldown filters");
+            close = ui
+                .add_enabled(!busy, egui::Button::new("Back").small())
+                .clicked();
+            save = ui
+                .add_enabled(!busy, egui::Button::new("Save").small())
+                .clicked();
+        });
+        if let Some(error) = &self.cooldown_notice {
+            ui.colored_label(DEATH, error);
+        }
+        if busy {
+            ui.small("Saving…");
+        }
+        ui.add_enabled_ui(!busy, |ui| {
+            ui.small("Choose rows to show and spells to track.");
+            ui.horizontal_wrapped(|ui| {
+                for group in DefensiveGroup::ALL {
+                    let mut visible = editor.draft.visible(group);
+                    if ui.checkbox(&mut visible, group.label()).changed() {
+                        editor.draft.hidden_groups.retain(|hidden| *hidden != group);
+                        if !visible {
+                            editor.draft.hidden_groups.push(group);
+                        }
+                    }
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut editor.new_id)
+                        .hint_text("WCL spell ID")
+                        .char_limit(7)
+                        .desired_width(95.0),
+                );
+                if ui.small_button("Add").clicked() {
+                    let result = defensives::Preferences::parse_id(&editor.new_id).and_then(|id| {
+                        if !editor.draft.overrides.contains_key(&id)
+                            && editor.draft.overrides.len() >= defensives::MAX_OVERRIDES
+                        {
+                            return Err("Up to 128 spell changes can be saved.".into());
+                        }
+                        editor.draft.overrides.insert(
+                            id,
+                            defensives::Rule {
+                                group: Some(editor.new_group),
+                                observation: defensives::Observation::Cast,
+                            },
+                        );
+                        editor.search = id.to_string();
+                        editor.new_id.clear();
+                        Ok(())
+                    });
+                    editor.error = result.err();
+                }
+            });
+            let combo = egui::ComboBox::from_id_salt("new-cooldown-row")
+                .selected_text(editor.new_group.label())
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for group in DefensiveGroup::ALL {
+                        ui.selectable_value(&mut editor.new_group, group, group.label());
+                    }
+                });
+            self.popup_open |= combo.inner.is_some();
+            if let Some(error) = &editor.error {
+                ui.colored_label(DEATH, error);
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut editor.search)
+                    .hint_text("Find spell name or ID")
+                    .char_limit(80)
+                    .desired_width(f32::INFINITY),
+            );
+            let search = editor.search.to_lowercase();
+            let ids: Vec<_> = editor
+                .draft
+                .ids()
+                .into_iter()
+                .filter(|id| {
+                    search.is_empty()
+                        || id.to_string().contains(&search)
+                        || defensives::spell_name(*id)
+                            .is_some_and(|name| name.to_lowercase().contains(&search))
+                        || editor.observed_names.get(id).is_some_and(|names| {
+                            names.search.iter().any(|name| name.contains(&search))
+                        })
+                })
+                .collect();
+            // The enabled scope starts below the header. Use its remaining
+            // viewport, so the header/error text is not counted twice.
+            let list_height = (ui.available_height() - 28.0).max(0.0);
+            egui::ScrollArea::vertical()
+                .id_salt("cooldown-rules")
+                .max_height(list_height)
+                .show_rows(ui, 84.0, ids.len(), |ui, range| {
+                    for index in range {
+                        let id = ids[index];
+                        let Some(mut rule) = editor.draft.rule(id) else {
+                            continue;
+                        };
+                        let before = rule;
+                        let name = editor
+                            .observed_names
+                            .get(&id)
+                            .map(|names| names.display.as_str())
+                            .or_else(|| defensives::spell_name(id))
+                            .unwrap_or("Custom spell");
+                        ui.push_id(id, |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(format!("{name} · {id}")).small())
+                                    .truncate(),
+                            );
+                            ui.horizontal(|ui| {
+                                let combo = egui::ComboBox::from_id_salt("row")
+                                    .selected_text(
+                                        rule.group.map_or("Not tracked", DefensiveGroup::label),
+                                    )
+                                    .width(150.0)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut rule.group, None, "Not tracked");
+                                        for group in DefensiveGroup::ALL {
+                                            ui.selectable_value(
+                                                &mut rule.group,
+                                                Some(group),
+                                                group.label(),
+                                            );
+                                        }
+                                    });
+                                self.popup_open |= combo.inner.is_some();
+                                if editor.draft.overrides.contains_key(&id)
+                                    && ui
+                                        .small_button("↶")
+                                        .on_hover_text("Restore default / remove custom spell")
+                                        .clicked()
+                                {
+                                    editor.draft.overrides.remove(&id);
+                                }
+                            });
+                            let combo = egui::ComboBox::from_id_salt("evidence")
+                                .selected_text(rule.observation.label())
+                                .width(180.0)
+                                .show_ui(ui, |ui| {
+                                    for observation in defensives::Observation::ALL {
+                                        ui.selectable_value(
+                                            &mut rule.observation,
+                                            observation,
+                                            observation.label(),
+                                        );
+                                    }
+                                });
+                            self.popup_open |= combo.inner.is_some();
+                        });
+                        if before != rule {
+                            if editor.draft.overrides.len() < defensives::MAX_OVERRIDES
+                                || editor.draft.overrides.contains_key(&id)
+                            {
+                                editor.draft.overrides.insert(id, rule);
+                            } else {
+                                editor.error = Some("Up to 128 spell changes can be saved.".into());
+                            }
+                        }
+                    }
+                });
+            if ui.small_button("Restore all defaults").clicked() {
+                editor.draft = Default::default();
+                editor.error = None;
+                editor.search.clear();
+            }
+        });
+        if save {
+            match editor.draft.validate() {
+                Ok(()) => {
+                    self.cooldown_save = Some(editor.draft.clone());
+                    self.cooldown_notice = None;
+                }
+                Err(error) => editor.error = Some(error),
+            }
+        }
+        if close {
+            self.cooldown_editor = None;
+            self.cooldown_notice = None;
+        }
+    }
+
     fn draw_events(&mut self, ui: &mut egui::Ui, height: f32) -> Option<PlaybackCommand> {
+        if self.cooldown_editor.is_some() {
+            self.draw_cooldown_editor(ui, height);
+            return None;
+        }
         ui.horizontal(|ui| {
             for kind in [EventKind::Deaths, EventKind::Defensives] {
                 let count = self.events.iter().filter(|e| e.kind == kind).count();
@@ -1594,7 +1932,7 @@ impl ReviewUi {
         });
         ui.add(
             egui::TextEdit::singleline(&mut self.search)
-                .hint_text("Find a player or defensive")
+                .hint_text("Find a player or spell")
                 .desired_width(f32::INFINITY),
         );
         if self.kind == EventKind::Deaths {
@@ -1620,7 +1958,36 @@ impl ReviewUi {
                 }
             });
         } else {
-            ui.label(RichText::new("Major defensive casts").small().color(MUTED));
+            ui.horizontal(|ui| {
+                let selector = egui::ComboBox::from_id_salt("cooldown-category")
+                    .selected_text(
+                        self.cooldown_filter
+                            .map_or("All rows", DefensiveGroup::label),
+                    )
+                    .width(125.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.cooldown_filter, None, "All rows");
+                        for group in DefensiveGroup::ALL {
+                            ui.selectable_value(
+                                &mut self.cooldown_filter,
+                                Some(group),
+                                group.label(),
+                            );
+                        }
+                    });
+                self.popup_open |= selector.inner.is_some();
+                if ui
+                    .add_enabled(
+                        !self.loaded_events.is_empty(),
+                        egui::Button::new("Edit").small(),
+                    )
+                    .clicked()
+                {
+                    self.cooldown_editor =
+                        Some(CooldownEditor::new(self.cooldowns.clone(), &self.events));
+                    self.cooldown_notice = None;
+                }
+            });
         }
         ui.separator();
         if let Some(notice) = &self.event_notice {
@@ -1646,6 +2013,11 @@ impl ReviewUi {
             .iter()
             .filter(|e| {
                 e.kind == self.kind
+                    && (e.kind == EventKind::Deaths
+                        || (e.group.is_some_and(|group| self.cooldowns.visible(group))
+                            && self
+                                .cooldown_filter
+                                .is_none_or(|group| e.group == Some(group))))
                     && (search.is_empty()
                         || e.actor.to_lowercase().contains(&search)
                         || e.ability.to_lowercase().contains(&search)
@@ -1720,13 +2092,16 @@ impl ReviewUi {
                         egui::FontId::proportional(12.0),
                         class_color(&event.class),
                     );
-                    let detail = if event.kind == EventKind::Deaths {
+                    let mut detail = if event.kind == EventKind::Deaths {
                         "Died".into()
                     } else if let Some(target) = &event.target {
                         format!("{} on {}", event.ability, target)
                     } else {
                         event.ability.clone()
                     };
+                    if event.observed_buff {
+                        detail.push_str(" · buff applied");
+                    }
                     text_painter.text(
                         text_rect.min + egui::vec2(0.0, 24.0),
                         egui::Align2::LEFT_TOP,
@@ -2386,10 +2761,20 @@ fn class_color(class: &str) -> Color32 {
 fn event_description(event: &RaidEvent) -> String {
     if event.kind == EventKind::Deaths {
         format!("{} died", event.actor)
-    } else if let Some(target) = &event.target {
-        format!("{} · {} on {}", event.actor, event.ability, target)
     } else {
-        format!("{} · {}", event.actor, event.ability)
+        let evidence = if event.observed_buff {
+            " · buff applied"
+        } else {
+            ""
+        };
+        if let Some(target) = &event.target {
+            format!(
+                "{} · {} on {}{}",
+                event.actor, event.ability, target, evidence
+            )
+        } else {
+            format!("{} · {}{}", event.actor, event.ability, evidence)
+        }
     }
 }
 
@@ -2450,6 +2835,7 @@ mod tests {
                 .map(|start| start + replay.available_seconds as i64 * 1000),
             recording_id: None,
             user_id: "101".into(),
+            raid_role: None,
             name: "A guildmate with a long character name".into(),
             provider: Provider::Youtube,
             channel_id: replay.video_id.clone(),
@@ -2466,6 +2852,36 @@ mod tests {
             pull,
             stream,
         )
+    }
+
+    #[test]
+    fn current_pulls_schedule_a_wakeup_without_pointer_or_video_activity() {
+        let (_, _, stream) = fixture();
+        let ctx = egui::Context::default();
+        let mut review = ReviewUi::default();
+        review.key = pov_key(&stream);
+        review.last_attempt = Some(Instant::now());
+        let mut delay = Duration::ZERO;
+        for _ in 0..3 {
+            let output = ctx.run_ui(egui::RawInput::default(), |_| {
+                review.tick(&ctx, Some(&stream));
+            });
+            delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        }
+        assert!(delay > Duration::from_secs(1) && delay <= Duration::from_secs(15));
+        assert!(review.work.is_none());
+        review.last_attempt = Some(Instant::now() - Duration::from_secs(16));
+        assert!(matches!(review.next_action(), Some(Action::Refresh)));
+        review.notice = Some("Rate limited".into());
+        assert!(review.next_action().is_none(), "Errors must back off");
+        review.notice = None;
+        let mut archive = stream;
+        archive.status = Status::Offline;
+        review.last_attempt = Some(Instant::now());
+        review.tick(&ctx, Some(&archive));
+        assert_eq!(review.refresh_interval(), Duration::from_secs(60));
+        review.last_attempt = Some(Instant::now() - Duration::from_secs(16));
+        assert!(review.next_action().is_none());
     }
 
     #[test]
@@ -2633,6 +3049,9 @@ mod tests {
         for offset in [375, 121_867] {
             let at_ms = pull.start_ms + offset;
             let event = RaidEvent {
+                actor_id: 1,
+                observed_buff: false,
+                target_actor_id: None,
                 at_ms,
                 actor: "Player".into(),
                 class: "Mage".into(),
@@ -2862,6 +3281,9 @@ mod tests {
         assert_eq!(ui.playback().unwrap().seconds, seconds);
         assert!(!ui.playback().unwrap().autoplay);
         ui.events.push(RaidEvent {
+            actor_id: 1,
+            observed_buff: false,
+            target_actor_id: None,
             at_ms: pull.start_ms + 5_000,
             actor: "Guildmate".into(),
             class: "Priest".into(),
@@ -2901,6 +3323,9 @@ mod tests {
                 pull_key(&pull),
                 EventKind::Deaths,
                 vec![RaidEvent {
+                    actor_id: 1,
+                    observed_buff: false,
+                    target_actor_id: None,
                     at_ms: pull.start_ms + 5_000,
                     actor: "Previous pull".into(),
                     class: "Priest".into(),
@@ -2910,6 +3335,7 @@ mod tests {
                     kind: EventKind::Deaths,
                     group: None,
                 }],
+                defensives::Preferences::default(),
             )),
             true,
         ))
@@ -3938,9 +4364,12 @@ mod tests {
                         0 => None,
                         1 => Some(DefensiveGroup::Personal),
                         2 => Some(DefensiveGroup::External),
-                        _ => Some(DefensiveGroup::Raid),
+                        _ => Some(DefensiveGroup::Healing),
                     };
                     RaidEvent {
+                        actor_id: 1,
+                        observed_buff: false,
+                        target_actor_id: None,
                         at_ms: pull.start_ms + index * 210_000 / 8000,
                         actor: format!("Player {}", index % 30),
                         class: "Priest".into(),
@@ -4095,6 +4524,135 @@ mod tests {
     }
 
     #[test]
+    fn utility_timeline_row_appears_only_after_a_spell_is_explicitly_enabled() {
+        for enabled in [false, true] {
+            let (review, pull, _) = fixture();
+            let mut review_ui = ReviewUi::default();
+            review_ui.review = Some(review);
+            review_ui.select(pull);
+            if enabled {
+                review_ui.cooldowns.overrides.insert(
+                    197908,
+                    defensives::Rule {
+                        group: Some(DefensiveGroup::Utility),
+                        observation: defensives::Observation::Cast,
+                    },
+                );
+            }
+            let ctx = egui::Context::default();
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(980.0, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    review_ui.draw_timeline(ui, &PlaybackState::default());
+                },
+            );
+            let utility_row = output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "Buffs / utility")
+            });
+            assert_eq!(utility_row, enabled);
+        }
+    }
+
+    #[test]
+    fn cooldown_editor_caches_observed_names_and_refreshes_only_on_new_data() {
+        let event = RaidEvent {
+            at_ms: 0,
+            actor_id: 1,
+            observed_buff: false,
+            target_actor_id: None,
+            actor: String::new(),
+            class: String::new(),
+            ability: "Observed Name".into(),
+            ability_id: 1234567,
+            target: None,
+            kind: EventKind::Defensives,
+            group: Some(DefensiveGroup::Healing),
+        };
+        let mut events = vec![event.clone(); 20_000];
+        events[1].ability = "Alternate Name".into();
+        let mut editor = CooldownEditor::new(Default::default(), &events);
+        assert_eq!(editor.observed_names.len(), 1);
+        let names = &editor.observed_names[&event.ability_id];
+        assert_eq!(names.display, "Observed Name");
+        assert_eq!(names.search.len(), 2);
+        assert!(names.search.contains("observed name") && names.search.contains("alternate name"));
+        events.clear();
+        // Painting/search can continue from the snapshot without the event list.
+        assert_eq!(
+            editor.observed_names[&event.ability_id].display,
+            "Observed Name"
+        );
+        editor.refresh_names(&events);
+        assert!(editor.observed_names.is_empty());
+    }
+
+    #[test]
+    fn cooldown_editor_is_bounded_with_a_full_custom_spell_list() {
+        for size in [egui::vec2(924.0, 548.0), egui::vec2(1384.0, 728.0)] {
+            let (review, pull, stream) = fixture();
+            let mut review_ui = ReviewUi::default();
+            review_ui.review = Some(review);
+            review_ui.active = true;
+            review_ui.connected = true;
+            review_ui.select(pull);
+            let mut preferences = defensives::Preferences::default();
+            for id in 1..=defensives::MAX_OVERRIDES as u64 {
+                preferences.overrides.insert(
+                    id,
+                    defensives::Rule {
+                        group: Some(DefensiveGroup::Utility),
+                        observation: defensives::Observation::Buff,
+                    },
+                );
+            }
+            review_ui.cooldown_editor = Some(CooldownEditor::new(preferences, &review_ui.events));
+            let ctx = egui::Context::default();
+            for _ in 0..3 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let available = ui.available_rect_before_wrap();
+                        let action = review_ui.draw_workspace(
+                            ui,
+                            &stream,
+                            &pov_fixture(),
+                            &PlaybackState::default(),
+                            None,
+                            None,
+                        );
+                        assert!(available.contains_rect(action.rect.unwrap()));
+                        assert!(
+                            ui.min_rect().right() <= available.right() + 1.0,
+                            "Cooldown editor expanded beyond the rail"
+                        );
+                        assert!(
+                            ui.min_rect().bottom() <= available.bottom() + 1.0,
+                            "Cooldown editor expanded beyond the window"
+                        );
+                        assert!(
+                            action.command.is_none(),
+                            "Editing a filter must not seek or pause playback"
+                        );
+                    },
+                );
+                assert!(
+                    output.shapes.len() < 800,
+                    "Spell editor should virtualize its rows"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn review_controls_fit_small_and_default_windows_with_long_event_names() {
         for size in [egui::vec2(924.0, 548.0), egui::vec2(1384.0, 728.0)] {
             for aligning in [false, true] {
@@ -4106,6 +4664,9 @@ mod tests {
                 review_ui.aligning = aligning;
                 review_ui.events = (0..100)
                     .map(|i| RaidEvent {
+                        actor_id: 1,
+                        observed_buff: false,
+                        target_actor_id: None,
                         at_ms: pull.start_ms + i * 1000,
                         actor: "Long player name ".repeat(6),
                         class: "Priest".into(),

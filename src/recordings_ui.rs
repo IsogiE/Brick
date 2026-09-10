@@ -5,7 +5,10 @@ use std::{
 
 use eframe::egui::{self, Color32, RichText};
 
-use crate::streams::Vod;
+use crate::{
+    profile::{self, RaidRole},
+    streams::Vod,
+};
 
 const MUTED: Color32 = Color32::from_rgb(159, 169, 184);
 const TEXT: Color32 = Color32::from_rgb(239, 242, 247);
@@ -30,6 +33,7 @@ struct Entry {
 struct Member {
     id: String,
     name: String,
+    raid_role: Option<RaidRole>,
     count: usize,
 }
 
@@ -95,6 +99,7 @@ impl Library {
                 .or_insert_with(|| Member {
                     id: vod.user_id.clone(),
                     name: vod.name.clone(),
+                    raid_role: vod.raid_role,
                     count: 0,
                 })
                 .count += 1;
@@ -189,7 +194,8 @@ impl Library {
                     ui.label(RichText::new("PLAYERS").small().strong().color(MUTED));
                     ui.add_space(10.0);
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    if member_row(ui, "All players", source.len(), self.member.is_none()).clicked()
+                    if member_row(ui, "All players", None, source.len(), self.member.is_none())
+                        .clicked()
                         && self.member.take().is_some()
                     {
                         self.dirty = true;
@@ -203,6 +209,7 @@ impl Library {
                                 if member_row(
                                     ui,
                                     &member.name,
+                                    member.raid_role,
                                     member.count,
                                     self.member.as_ref() == Some(&member.id),
                                 )
@@ -382,10 +389,23 @@ impl Library {
                                 paint_line(
                                     ui,
                                     &entry.detail,
-                                    egui::pos2(title_left, rect.top() + 27.0),
-                                    text_width,
+                                    egui::pos2(
+                                        title_left
+                                            + if vod.raid_role.is_some() { 18.0 } else { 0.0 },
+                                        rect.top() + 27.0,
+                                    ),
+                                    (text_width - if vod.raid_role.is_some() { 18.0 } else { 0.0 })
+                                        .max(1.0),
                                     10.0,
                                     MUTED,
+                                );
+                                profile::paint_role_icon(
+                                    ui,
+                                    vod.raid_role,
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(title_left, rect.top() + 24.0),
+                                        egui::vec2(16.0, 16.0),
+                                    ),
                                 );
                                 painter.text(
                                     egui::pos2(date_right, rect.top() + 14.0),
@@ -458,7 +478,13 @@ impl Library {
     }
 }
 
-fn member_row(ui: &mut egui::Ui, name: &str, count: usize, selected: bool) -> egui::Response {
+fn member_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    role: Option<RaidRole>,
+    count: usize,
+    selected: bool,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), MEMBER_HEIGHT),
         egui::Sense::click(),
@@ -483,11 +509,20 @@ fn member_row(ui: &mut egui::Ui, name: &str, count: usize, selected: bool) -> eg
             egui::FontId::proportional(10.0),
             MUTED,
         );
+        let icon_width = if role.is_some() { 22.0 } else { 0.0 };
+        profile::paint_role_icon(
+            ui,
+            role,
+            egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 18.0, rect.center().y),
+                egui::vec2(18.0, 18.0),
+            ),
+        );
         paint_line(
             ui,
             name,
-            egui::pos2(rect.left() + 10.0, rect.center().y - 7.0),
-            (count_rect.left() - rect.left() - 22.0).max(1.0),
+            egui::pos2(rect.left() + 10.0 + icon_width, rect.center().y - 7.0),
+            (count_rect.left() - rect.left() - 22.0 - icon_width).max(1.0),
             13.0,
             TEXT,
         );
@@ -563,6 +598,7 @@ mod tests {
             id: format!("{}", index + 1),
             user_id: format!("{}", index % 30 + 1),
             name: format!("Player {:02}", index % 30 + 1),
+            raid_role: None,
             provider: crate::streams::Provider::Twitch,
             url: format!("https://www.twitch.tv/videos/{}", index + 1),
             started_at: Some(format!(

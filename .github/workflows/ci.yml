@@ -70,6 +70,12 @@ jobs:
           RUSTFLAGS: '-D warnings'
         run: xvfb-run -a cargo test --locked stream_player::resize::tests::native_player_viewport_shrinks_for_compare_and_grows_for_single_view -- --exact --ignored --test-threads=1
 
+      - name: Test native playback overlays
+        if: runner.os == 'Linux'
+        env:
+          RUSTFLAGS: '-D warnings'
+        run: xvfb-run -a cargo test --locked stream_player::occlusion::native_tests::native_overlays_preserve_media_visibility_size_and_playback -- --exact --ignored --test-threads=1
+
       - name: Test Windows signature verification
         if: runner.os == 'Windows'
         shell: pwsh

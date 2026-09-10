@@ -13,6 +13,7 @@ mod defensives;
 mod discord_auth;
 mod download;
 mod presence;
+mod profile;
 mod recordings_ui;
 mod replay_digits;
 mod replay_edge;

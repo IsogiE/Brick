@@ -14,6 +14,7 @@ use crate::{
     autostart,
     discord_auth::{self, AuthorizedUser, SessionStatus},
     presence::{self, Roster, RosterMember},
+    profile::{self, ProfileUi, RaidRole},
     single_instance,
     streams_ui::StreamsUi,
     tray,
@@ -37,6 +38,7 @@ pub struct BrickApp {
     auth_state: AuthUiState,
     presence_state: PresenceUiState,
     streams: StreamsUi,
+    profile: ProfileUi,
     active_tab: MainTab,
     sync_rx: Option<mpsc::Receiver<Result<SyncSummary, String>>>,
     auth_rx: Option<mpsc::Receiver<Result<AuthorizedUser, String>>>,
@@ -79,7 +81,7 @@ impl AuthUiState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MainTab {
-    Updates,
+    Home,
     Roster,
     Streams,
 }
@@ -149,7 +151,8 @@ impl BrickApp {
             auth_state,
             presence_state: initial_presence_state(),
             streams: StreamsUi::default(),
-            active_tab: MainTab::Updates,
+            profile: ProfileUi::default(),
+            active_tab: MainTab::Home,
             sync_rx: None,
             auth_rx: None,
             app_update_rx: None,
@@ -444,6 +447,7 @@ impl BrickApp {
                 self.roster_rx = None;
                 self.presence_state = initial_presence_state();
                 self.roster_notice = None;
+                self.profile = ProfileUi::default();
                 self.status = "Signed out of Discord.".to_string();
             }
             Err(error) => {
@@ -809,7 +813,7 @@ impl BrickApp {
             ui.add_space(if compact_streams { 4.0 } else { 18.0 });
         }
         match self.active_tab {
-            MainTab::Updates => self.draw_scrollable_updates_tab(ui),
+            MainTab::Home => self.draw_scrollable_updates_tab(ui),
             MainTab::Roster => self.draw_roster_tab(ui),
             MainTab::Streams => self.streams.draw(ui),
         }
@@ -841,8 +845,8 @@ impl BrickApp {
     }
 
     fn draw_tab_buttons(&mut self, ui: &mut egui::Ui) {
-        if tab_button(ui, "Updates", self.active_tab == MainTab::Updates).clicked() {
-            self.active_tab = MainTab::Updates;
+        if tab_button(ui, "Home", self.active_tab == MainTab::Home).clicked() {
+            self.active_tab = MainTab::Home;
         }
         if tab_button(ui, "Roster", self.active_tab == MainTab::Roster).clicked() {
             self.active_tab = MainTab::Roster;
@@ -931,6 +935,7 @@ impl BrickApp {
         ui.add_space(8.0);
 
         let state = self.presence_state.clone();
+        let mut role_change = None;
         panel_frame().show(ui, |ui| match state {
             PresenceUiState::Unavailable(error) => {
                 empty_panel_message(ui, "Roster unavailable", &friendly_roster_problem(&error));
@@ -966,9 +971,25 @@ impl BrickApp {
                             roster_notice(ui, notice);
                             ui.add_space(14.0);
                         }
-                        draw_roster_group(ui, "Officers", &roster.officers);
+                        if let Some(notice) = self.profile.notice() {
+                            ui.label(RichText::new(notice).small());
+                        }
+                        let can_edit = roster.can_edit_roles && !self.profile.busy();
+                        draw_roster_group(
+                            ui,
+                            "Officers",
+                            &roster.officers,
+                            can_edit,
+                            &mut role_change,
+                        );
                         ui.add_space(18.0);
-                        draw_roster_group(ui, "Raiders", &roster.raiders);
+                        draw_roster_group(
+                            ui,
+                            "Raiders",
+                            &roster.raiders,
+                            can_edit,
+                            &mut role_change,
+                        );
                         ui.add_space(12.0);
                         ui.label(
                             RichText::new(roster_refresh_label(
@@ -981,6 +1002,9 @@ impl BrickApp {
                     });
             }
         });
+        if let Some((id, role)) = role_change {
+            self.profile.set_member_role(ui.ctx(), id, role);
+        }
     }
 
     fn draw_login_screen(&mut self, ui: &mut egui::Ui) {
@@ -1324,6 +1348,8 @@ impl BrickApp {
             if let AuthUiState::Authorized(user) = self.auth_state.clone() {
                 ui.separator();
                 self.draw_discord_settings_row(ui, &user);
+                ui.separator();
+                self.profile.draw(ui, &user.display_name);
             }
         });
     }
@@ -1518,6 +1544,11 @@ impl BrickApp {
             }
         }
 
+        next = next.min(self.profile.repaint_after(
+            self.auth_state.is_authorized()
+                && self.window_visible
+                && self.active_tab == MainTab::Home,
+        ));
         next.min(self.streams.repaint_after(
             self.auth_state.is_authorized()
                 && self.window_visible
@@ -1578,6 +1609,18 @@ impl eframe::App for BrickApp {
             self.auth_state = AuthUiState::Denied("Sign in again to access guild streams.".into());
         }
         if self.auth_state.is_authorized() {
+            let user = match &self.auth_state {
+                AuthUiState::Authorized(user) => Some(user),
+                _ => None,
+            };
+            if self.profile.tick(
+                ctx,
+                user,
+                self.window_visible && self.active_tab == MainTab::Home,
+            ) {
+                self.start_roster_refresh();
+                self.streams.profiles_changed();
+            }
             self.poll_sync();
             self.poll_roster();
             self.start_roster_refresh_if_stale();
@@ -1997,7 +2040,13 @@ fn roster_notice(ui: &mut egui::Ui, detail: &str) {
         });
 }
 
-fn draw_roster_group(ui: &mut egui::Ui, title: &str, members: &[RosterMember]) {
+fn draw_roster_group(
+    ui: &mut egui::Ui,
+    title: &str,
+    members: &[RosterMember],
+    can_edit: bool,
+    change: &mut Option<(String, Option<RaidRole>)>,
+) {
     let online_count = members.iter().filter(|member| member.online).count();
     ui.horizontal(|ui| {
         ui.label(
@@ -2026,11 +2075,16 @@ fn draw_roster_group(ui: &mut egui::Ui, title: &str, members: &[RosterMember]) {
         if index > 0 {
             ui.separator();
         }
-        draw_roster_member_row(ui, member);
+        draw_roster_member_row(ui, member, can_edit, change);
     }
 }
 
-fn draw_roster_member_row(ui: &mut egui::Ui, member: &RosterMember) {
+fn draw_roster_member_row(
+    ui: &mut egui::Ui,
+    member: &RosterMember,
+    can_edit: bool,
+    change: &mut Option<(String, Option<RaidRole>)>,
+) {
     let row_height = 36.0;
     let row_width = ui.available_width().max(260.0);
     let (row_rect, _) =
@@ -2056,10 +2110,11 @@ fn draw_roster_member_row(ui: &mut egui::Ui, member: &RosterMember) {
     }
 
     let name_left = row_rect.left() + 34.0;
+    let role_width = if can_edit { 106.0 } else { 0.0 };
     let status_width = if row_width < 520.0 { 148.0 } else { 220.0 };
     let status_rect = egui::Rect::from_min_max(
-        egui::pos2(row_rect.right() - status_width, row_rect.top()),
-        row_rect.right_bottom(),
+        egui::pos2(row_rect.right() - status_width - role_width, row_rect.top()),
+        row_rect.right_bottom() - egui::vec2(role_width, 0.0),
     );
     let name_rect = egui::Rect::from_min_max(
         egui::pos2(name_left, row_rect.top()),
@@ -2075,6 +2130,7 @@ fn draw_roster_member_row(ui: &mut egui::Ui, member: &RosterMember) {
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
         |ui| {
             ui.shrink_clip_rect(name_rect);
+            profile::role_icon(ui, member.raid_role);
             ui.add(
                 egui::Label::new(
                     RichText::new(member.name.as_str())
@@ -2109,6 +2165,23 @@ fn draw_roster_member_row(ui: &mut egui::Ui, member: &RosterMember) {
             .on_hover_text(status);
         },
     );
+    if can_edit {
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(row_rect.right() - role_width + 6.0, row_rect.top()),
+            row_rect.right_bottom(),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                let mut role = member.raid_role;
+                if profile::role_picker(ui, ("roster-role", &member.user_id), &mut role) {
+                    *change = Some((member.user_id.clone(), role));
+                }
+            },
+        );
+    }
 }
 
 fn roster_member_status(member: &RosterMember) -> String {
@@ -2398,7 +2471,8 @@ mod tests {
             }),
             presence_state: PresenceUiState::Idle,
             streams: StreamsUi::default(),
-            active_tab: MainTab::Updates,
+            profile: ProfileUi::default(),
+            active_tab: MainTab::Home,
             sync_rx: None,
             auth_rx: None,
             app_update_rx: None,

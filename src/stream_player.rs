@@ -22,6 +22,7 @@ use crate::stream_preferences::{PreferenceBridge, Preferences};
 mod capture;
 mod diagnostics;
 mod fullscreen;
+mod occlusion;
 mod resize;
 pub use capture::FrameCapture;
 
@@ -178,6 +179,7 @@ pub struct StreamPlayer {
     command_retried: bool,
     capture: capture::Controller,
     fullscreen: fullscreen::Controller,
+    occlusion: occlusion::Controller,
     #[cfg(target_os = "linux")]
     preference_handler: Option<(webkit2gtk::UserContentManager, gtk::glib::SignalHandlerId)>,
 }
@@ -353,6 +355,7 @@ impl StreamPlayer {
             allowed_url,
             bounds,
             visible: Cell::new(true),
+            occlusion: occlusion::Controller::default(),
             loaded,
             created,
             failure,
@@ -524,6 +527,12 @@ impl StreamPlayer {
         webview
             .load_url_with_headers(url.as_str(), headers)
             .map_err(|_| "The player could not change recording.".into())
+    }
+
+    pub fn update_overlays(&self, ctx: &egui::Context) {
+        if let Some(view) = &self.webview {
+            self.occlusion.update(view, ctx, self.bounds);
+        }
     }
 
     pub fn set_visible(&self, visible: bool) {
@@ -2211,6 +2220,7 @@ mod tests {
                 allowed_url: Arc::new(Mutex::new(wrapper.clone())),
                 bounds: [0; 4],
                 visible: Cell::new(true),
+                occlusion: occlusion::Controller::default(),
                 loaded: Arc::new(AtomicBool::new(true)),
                 created: Instant::now(),
                 failure: Arc::new(Mutex::new(None)),
@@ -2306,6 +2316,7 @@ mod tests {
             preference_handler: None,
             bounds: [0; 4],
             visible: Cell::new(true),
+            occlusion: occlusion::Controller::default(),
             loaded: Arc::new(AtomicBool::new(false)),
             created: Instant::now() - WRAPPER_LOAD_TIMEOUT,
             failure: Arc::new(Mutex::new(None)),

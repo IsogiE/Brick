@@ -125,24 +125,27 @@ impl EventKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Deaths => "Deaths",
-            Self::Defensives => "Defensives",
+            Self::Defensives => "Cooldowns",
         }
     }
     fn api(self) -> &'static str {
         match self {
             Self::Deaths => "Deaths",
-            Self::Defensives => "Casts",
+            Self::Defensives => "All",
         }
     }
 }
 #[derive(Clone, Debug)]
 pub struct RaidEvent {
     pub at_ms: i64,
+    pub actor_id: u64,
+    pub observed_buff: bool,
     pub actor: String,
     pub class: String,
     pub ability: String,
     pub ability_id: u64,
     pub target: Option<String>,
+    pub target_actor_id: Option<u64>,
     pub kind: EventKind,
     pub group: Option<DefensiveGroup>,
 }
@@ -185,14 +188,18 @@ struct Token {
     token_type: String,
 }
 
+type EventCache = HashMap<(String, u64, EventKind), (Instant, Vec<RaidEvent>)>;
+const MAX_CACHED_EVENTS: usize = 40_000;
+
 pub struct Client {
     config: Option<Config>,
     session: Option<Session>,
+    cooldowns: Option<defensives::Preferences>,
     http: HttpClient,
     reports: HashMap<String, (Instant, Value)>,
     directory: Option<ReportDirectory>,
     retry_at: Option<Instant>,
-    events: HashMap<(String, u64, EventKind), (Instant, Vec<RaidEvent>)>,
+    events: EventCache,
     cancel: Arc<AtomicBool>,
 }
 
@@ -204,7 +211,7 @@ struct ReportDirectory {
 
 impl ReportDirectory {
     fn covers(&self, window: (i64, i64)) -> bool {
-        self.window == window && self.loaded_at.elapsed() < Duration::from_secs(60)
+        self.window == window && self.loaded_at.elapsed() < Duration::from_secs(15)
     }
 }
 
@@ -233,6 +240,7 @@ impl Client {
         Ok(Self {
             config: None,
             session: None,
+            cooldowns: None,
             http,
             reports: HashMap::new(),
             directory: None,
@@ -285,6 +293,7 @@ impl Client {
             return Err("Invalid Warcraft Logs configuration.".into());
         }
         if self.config.as_ref() != Some(&config) || !restore {
+            self.cooldowns = None;
             self.session = None;
             self.reports.clear();
             self.events.clear();
@@ -564,6 +573,28 @@ impl Client {
         Ok(review)
     }
 
+    pub fn cooldown_preferences(&self) -> defensives::Preferences {
+        self.cooldowns.clone().unwrap_or_default()
+    }
+
+    pub fn save_cooldown_preferences(
+        &mut self,
+        discord_token: &str,
+        preferences: defensives::Preferences,
+    ) -> Result<defensives::Preferences, String> {
+        self.configure(discord_token, true)?;
+        let account = &self
+            .config
+            .as_ref()
+            .ok_or("Sign in to save cooldown filters.")?
+            .user_id;
+        while_current(&self.cancel, || preferences.save(account))??;
+        self.events
+            .retain(|(_, _, kind), _| *kind != EventKind::Defensives);
+        self.cooldowns = Some(preferences.clone());
+        Ok(preferences)
+    }
+
     pub fn events(
         &mut self,
         discord_token: &str,
@@ -572,27 +603,39 @@ impl Client {
     ) -> Result<Vec<RaidEvent>, String> {
         self.configure(discord_token, true)?;
         self.access_token()?;
+        if self.cooldowns.is_none() {
+            let account = &self
+                .config
+                .as_ref()
+                .ok_or("Sign in to load cooldown filters.")?
+                .user_id;
+            self.cooldowns = Some(while_current(&self.cancel, || {
+                defensives::Preferences::load(account)
+            })??);
+        }
+        let preferences = self.cooldown_preferences();
+        let filter = (kind == EventKind::Defensives)
+            .then(|| preferences.filter_expression())
+            .transpose()?;
         let key = (pull.report.clone(), pull.id, kind);
         self.events
             .retain(|_, (at, _)| at.elapsed() < Duration::from_secs(600));
         if let Some((_, events)) = self.events.get(&key) {
             return Ok(events.clone());
         }
-        if self.events.len() >= 20 {
-            self.events.clear();
-        }
         let mut start = pull.start_ms - pull.report_start_ms;
         let end = pull.end_ms - pull.report_start_ms;
         let mut result = Vec::new();
         for page in 0..10 {
             check_cancelled(&self.cancel)?;
-            let data = self.query("query($code:String!,$fight:Int!,$type:EventDataType!,$start:Float!,$end:Float!,$filter:String){reportData{report(code:$code){masterData{actors{id name type subType} abilities{gameID name}} events(fightIDs:[$fight],dataType:$type,startTime:$start,endTime:$end,filterExpression:$filter,limit:2000){data nextPageTimestamp}}}}", json!({"code":pull.report,"fight":pull.id,"type":kind.api(),"start":start,"end":end,"filter":(kind == EventKind::Defensives).then(defensives::filter_expression)}))?;
+            let data = self.query("query($code:String!,$fight:Int!,$type:EventDataType!,$start:Float!,$end:Float!,$filter:String){reportData{report(code:$code){masterData{actors{id name type subType} abilities{gameID name}} events(fightIDs:[$fight],dataType:$type,startTime:$start,endTime:$end,filterExpression:$filter,limit:2000){data nextPageTimestamp}}}}", json!({"code":pull.report,"fight":pull.id,"type":kind.api(),"start":start,"end":end,"filter":filter}))?;
             let report = &data["reportData"]["report"];
             result.extend(map_events(
                 &report["events"]["data"],
                 &report["masterData"],
                 pull,
                 kind,
+                &preferences,
             )?);
             let next = &report["events"]["nextPageTimestamp"];
             if next.is_null() {
@@ -606,9 +649,9 @@ impl Client {
             }
             start = next;
         }
-        result.sort_by_key(|e| e.at_ms);
+        normalize_cooldown_events(&mut result, &preferences);
         check_cancelled(&self.cancel)?;
-        self.events.insert(key, (Instant::now(), result.clone()));
+        cache_events(&mut self.events, key, result.clone());
         Ok(result)
     }
 
@@ -686,7 +729,7 @@ impl Client {
             if !self
                 .reports
                 .get(code)
-                .is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(60))
+                .is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(15))
             {
                 let data = self.query("query($code:String!){reportData{report(code:$code){code startTime endTime fights{ id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime }}}}", json!({"code":code}))?;
                 let report = data["reportData"]["report"].clone();
@@ -798,6 +841,7 @@ fn map_events(
     master: &Value,
     pull: &Pull,
     kind: EventKind,
+    preferences: &defensives::Preferences,
 ) -> Result<Vec<RaidEvent>, String> {
     let entries = events
         .as_array()
@@ -805,9 +849,11 @@ fn map_events(
         .ok_or("Invalid Warcraft Logs events.")?;
     let actors = master["actors"]
         .as_array()
+        .filter(|actors| actors.len() <= 5000)
         .ok_or("Warcraft Logs player names are unavailable.")?;
     let abilities = master["abilities"]
         .as_array()
+        .filter(|abilities| abilities.len() <= 5000)
         .ok_or("Warcraft Logs spell names are unavailable.")?;
     let actors: HashMap<_, _> = actors
         .iter()
@@ -820,12 +866,16 @@ fn map_events(
     Ok(entries
         .iter()
         .filter_map(|event| {
-            let expected = if kind == EventKind::Deaths {
-                "death"
-            } else {
-                "cast"
-            };
-            if event["type"].as_str() != Some(expected) {
+            let event_type = event["type"].as_str()?;
+            let ability_id = event["abilityGameID"].as_u64().unwrap_or(0);
+            if kind == EventKind::Deaths {
+                if event_type != "death" {
+                    return None;
+                }
+            } else if !preferences
+                .rule(ability_id)
+                .is_some_and(|rule| rule.group.is_some() && rule.observation.accepts(event_type))
+            {
                 return None;
             }
             let at_ms = pull
@@ -839,7 +889,8 @@ fn map_events(
             } else {
                 "sourceID"
             };
-            let actor = actors.get(&event[actor_key].as_u64()?)?;
+            let actor_id = event[actor_key].as_u64()?;
+            let actor = actors.get(&actor_id)?;
             if actor["type"].as_str() != Some("Player") {
                 return None;
             }
@@ -847,9 +898,8 @@ fn map_events(
             if name.is_empty() {
                 return None;
             }
-            let ability_id = event["abilityGameID"].as_u64().unwrap_or(0);
             let group = (kind == EventKind::Defensives)
-                .then(|| defensives::classify(ability_id))
+                .then(|| preferences.classify(ability_id))
                 .flatten();
             if kind == EventKind::Defensives && group.is_none() {
                 return None;
@@ -865,20 +915,96 @@ fn map_events(
                 .get(&ability_id)
                 .and_then(|a| a["name"].as_str())
                 .map(clean_label)
-                .unwrap_or_default();
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| {
+                    defensives::spell_name(ability_id)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Spell {ability_id}"))
+                });
             Some(RaidEvent {
                 at_ms,
+                actor_id,
+                observed_buff: event_type == "applybuff",
                 actor: name,
                 class: clean_label(actor["subType"].as_str().unwrap_or("")),
                 ability,
                 ability_id,
                 target,
+                target_actor_id: event["targetID"].as_u64(),
                 kind,
                 group,
             })
         })
         .collect())
 }
+// Count both entries and events: aura-heavy pulls must not multiply the cache
+// into hundreds of thousands of independently allocated player/spell labels.
+fn cache_events(cache: &mut EventCache, key: (String, u64, EventKind), events: Vec<RaidEvent>) {
+    cache.remove(&key);
+    if events.len() > MAX_CACHED_EVENTS {
+        return;
+    }
+    let mut rows: usize = cache.values().map(|(_, events)| events.len()).sum();
+    while cache.len() >= 20 || rows.saturating_add(events.len()) > MAX_CACHED_EVENTS {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (at, _))| *at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        if let Some((_, removed)) = cache.remove(&oldest) {
+            rows = rows.saturating_sub(removed.len());
+        }
+    }
+    cache.insert(key, (Instant::now(), events));
+}
+
+/// WCL often records a cast and its aura application together. Keep the cast
+/// once; a buff without a nearby cast stays explicitly identified as an observed
+/// application, never as an inferred cast or remaining cooldown. Process after
+/// pagination so a cast/application pair split across pages is still collapsed.
+fn normalize_cooldown_events(events: &mut Vec<RaidEvent>, preferences: &defensives::Preferences) {
+    events.sort_by_key(|event| event.at_ms);
+    let mut casts: HashMap<(u64, u64), Vec<i64>> = HashMap::new();
+    for event in events
+        .iter()
+        .filter(|event| event.kind == EventKind::Defensives && !event.observed_buff)
+    {
+        casts
+            .entry((event.actor_id, event.ability_id))
+            .or_default()
+            .push(event.at_ms);
+    }
+    events.retain(|event| {
+        if !event.observed_buff
+            || preferences
+                .rule(event.ability_id)
+                .is_none_or(|rule| rule.observation != defensives::Observation::CastOrBuff)
+        {
+            return true;
+        }
+        let Some(times) = casts.get(&(event.actor_id, event.ability_id)) else {
+            return true;
+        };
+        let index = times.partition_point(|at| *at < event.at_ms.saturating_sub(1500));
+        times
+            .get(index)
+            .is_none_or(|at| *at > event.at_ms.saturating_add(1500))
+    });
+    let mut seen = std::collections::HashSet::new();
+    events.retain(|event| {
+        seen.insert((
+            event.at_ms,
+            event.actor_id,
+            event.ability_id,
+            event.kind,
+            event.observed_buff,
+            event.target_actor_id,
+        ))
+    });
+}
+
 fn clean_label(value: &str) -> String {
     value
         .chars()
@@ -986,6 +1112,21 @@ mod tests {
             started_at: "2026-09-08T12:00:00Z".into(),
             available_seconds: 8 * 3600,
         }
+    }
+
+    #[test]
+    fn metadata_cache_expires_before_the_next_current_raid_refresh() {
+        let mut directory = ReportDirectory {
+            window: (1, 2),
+            loaded_at: Instant::now(),
+            reports: Vec::new(),
+        };
+        assert!(directory.covers((1, 2)));
+        directory.loaded_at = Instant::now() - Duration::from_secs(15);
+        assert!(
+            !directory.covers((1, 2)),
+            "New uploads must not stay cached for a minute"
+        );
     }
 
     #[test]
@@ -1174,16 +1315,148 @@ mod tests {
             {"type":"cast","timestamp":16000,"sourceID":1,"targetID":2,"abilityGameID":33206},
             {"type":"death","timestamp":12000,"sourceID":3,"targetID":2},
             {"type":"death","timestamp":13000,"sourceID":2,"targetID":3}]);
-        let casts = map_events(&events, &master, &pull, EventKind::Defensives).unwrap();
+        let casts = map_events(
+            &events,
+            &master,
+            &pull,
+            EventKind::Defensives,
+            &defensives::Preferences::default(),
+        )
+        .unwrap();
         assert_eq!(casts.len(), 1);
         assert_eq!(casts[0].at_ms, 1_006_000);
         assert_eq!(casts[0].actor, "Healer");
         assert_eq!(casts[0].target.as_deref(), Some("Tank"));
         assert_eq!(casts[0].group, Some(DefensiveGroup::External));
-        let deaths = map_events(&events, &master, &pull, EventKind::Deaths).unwrap();
+        let deaths = map_events(
+            &events,
+            &master,
+            &pull,
+            EventKind::Deaths,
+            &defensives::Preferences::default(),
+        )
+        .unwrap();
         assert_eq!(deaths.len(), 1);
         assert_eq!(deaths[0].actor, "Tank");
         assert_eq!(deaths[0].group, None);
+    }
+
+    #[test]
+    fn cooldown_buff_fallbacks_do_not_duplicate_casts_or_cross_player_identities() {
+        let video = replay();
+        let report = json!({"code":"abcdefghABCDEFGH","startTime":video.start_ms().unwrap(),"fights":[
+            {"id":1,"encounterID":123,"difficulty":5,"name":"Boss","kill":false,"startTime":0,"endTime":120000}
+        ]});
+        let pull = map_pulls(&report, &video).unwrap().remove(0);
+        let master = json!({"actors":[
+            {"id":1,"type":"Player","name":"SameName","subType":"Priest"},
+            {"id":2,"type":"Player","name":"SameName","subType":"Priest"},
+            {"id":3,"type":"NPC","name":"Pet","subType":"Pet"}],
+            "abilities":[{"gameID":200183,"name":"Apotheosis"}]});
+        let mut preferences = defensives::Preferences::default();
+        // Buff fallback is an explicit choice; defaults keep a sparse cast timeline.
+        preferences.overrides.insert(
+            200183,
+            defensives::Rule {
+                group: Some(DefensiveGroup::Healing),
+                observation: defensives::Observation::CastOrBuff,
+            },
+        );
+        preferences.overrides.insert(
+            1234567,
+            defensives::Rule {
+                group: Some(DefensiveGroup::Healing),
+                observation: defensives::Observation::Buff,
+            },
+        );
+        let page_one = json!([
+            {"type":"cast","timestamp":6000,"sourceID":1,"targetID":1,"abilityGameID":200183},
+            {"type":"cast","timestamp":6001,"sourceID":1,"targetID":1,"abilityGameID":1234567}
+        ]);
+        let page_two = json!([
+            {"type":"applybuff","timestamp":6020,"sourceID":1,"targetID":1,"abilityGameID":200183},
+            {"type":"applybuff","timestamp":6020,"sourceID":2,"targetID":2,"abilityGameID":200183},
+            {"type":"applybuff","timestamp":6020,"sourceID":3,"targetID":3,"abilityGameID":200183},
+            {"type":"refreshbuff","timestamp":6500,"sourceID":1,"targetID":1,"abilityGameID":200183},
+            {"type":"removebuff","timestamp":26000,"sourceID":1,"targetID":1,"abilityGameID":200183},
+            {"type":"applybuff","timestamp":7000,"sourceID":1,"targetID":2,"abilityGameID":1234567},
+            {"type":"applybuff","timestamp":7000,"sourceID":1,"targetID":2,"abilityGameID":1234567}
+        ]);
+        let mut events = map_events(
+            &page_one,
+            &master,
+            &pull,
+            EventKind::Defensives,
+            &preferences,
+        )
+        .unwrap();
+        events.extend(
+            map_events(
+                &page_two,
+                &master,
+                &pull,
+                EventKind::Defensives,
+                &preferences,
+            )
+            .unwrap(),
+        );
+        normalize_cooldown_events(&mut events, &preferences);
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            (events[0].actor_id, events[0].observed_buff, events[0].group),
+            (1, false, Some(DefensiveGroup::Healing))
+        );
+        assert_eq!((events[1].actor_id, events[1].observed_buff), (2, true));
+        assert_eq!(events[2].ability, "Spell 1234567");
+        assert!(events[2].observed_buff);
+        assert_eq!(events[2].target.as_deref(), Some("SameName"));
+    }
+
+    #[test]
+    fn event_cache_evicts_oldest_pulls_under_aggregate_memory_budget() {
+        let event = RaidEvent {
+            at_ms: 0,
+            actor_id: 1,
+            observed_buff: false,
+            actor: String::new(),
+            class: String::new(),
+            ability: String::new(),
+            ability_id: 1,
+            target: None,
+            target_actor_id: None,
+            kind: EventKind::Defensives,
+            group: Some(DefensiveGroup::Healing),
+        };
+        let mut cache = EventCache::new();
+        let key = |id| ("abcdefghABCDEFGH".to_string(), id, EventKind::Defensives);
+        cache.insert(
+            key(1),
+            (
+                Instant::now() - Duration::from_secs(2),
+                vec![event.clone(); 20_000],
+            ),
+        );
+        cache.insert(
+            key(2),
+            (
+                Instant::now() - Duration::from_secs(1),
+                vec![event.clone(); 20_000],
+            ),
+        );
+        cache_events(&mut cache, key(3), vec![event]);
+        assert!(!cache.contains_key(&key(1)));
+        assert!(cache.contains_key(&key(2)) && cache.contains_key(&key(3)));
+        assert!(
+            cache
+                .values()
+                .map(|(_, events)| events.len())
+                .sum::<usize>()
+                <= MAX_CACHED_EVENTS
+        );
+        for id in 4..30 {
+            cache_events(&mut cache, key(id), Vec::new());
+        }
+        assert_eq!(cache.len(), 20);
     }
 
     #[test]

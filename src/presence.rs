@@ -37,6 +37,8 @@ pub struct Roster {
     pub online_window_seconds: u64,
     pub officers: Vec<RosterMember>,
     pub raiders: Vec<RosterMember>,
+    #[serde(default)]
+    pub can_edit_roles: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +46,8 @@ pub struct Roster {
 pub struct RosterMember {
     pub user_id: String,
     pub name: String,
+    #[serde(default)]
+    pub raid_role: Option<crate::profile::RaidRole>,
     pub role: String,
     pub online: bool,
     pub last_seen_at: Option<String>,
@@ -128,6 +132,36 @@ pub fn fetch_roster(access_token: &str) -> Result<Roster, String> {
 
     serde_json::from_slice(&body)
         .map_err(|error| format!("Roster refresh failed: invalid server response: {error}"))
+}
+
+pub(crate) fn profile_request(
+    method: reqwest::Method,
+    path: &str,
+    access_token: &str,
+    expected_user: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<crate::profile::Profile, String> {
+    let mut request = http_client()?
+        .request(method, endpoint_url(path)?)
+        .bearer_auth(access_token)
+        .header("x-brick-profile-user", expected_user);
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    let response = request
+        .send()
+        .map_err(|_| "Profile service could not be reached. Try again.".to_string())?;
+    let status = response.status();
+    let bytes = download::read_response(
+        response,
+        MAX_STATUS_RESPONSE_BYTES,
+        "Profile request failed",
+    )?;
+    if !status.is_success() {
+        return Err(api_error("Profile request failed", status.as_u16(), &bytes));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| "Profile service returned invalid settings.".to_string())
 }
 
 fn expect_success(response: reqwest::blocking::Response, prefix: &str) -> Result<(), String> {

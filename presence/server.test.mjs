@@ -38,6 +38,44 @@ function discordFixture(url, options) {
   return json([{ user: { id: "12345", username: "Tester" }, roles: ["789"] }]);
 }
 
+test("profiles require current guild membership; officers can set roles but cannot rename others", async t => {
+  let officer = true;
+  const members = () => [
+    { user: { id: "111", username: "Officer" }, roles: officer ? ["456"] : ["789"] },
+    { user: { id: "222", username: "Raider" }, roles: ["789"] },
+  ];
+  const f = await fixture(t, (url, options) => {
+    const id = options.headers.authorization === "Bearer officer" ? "111" : "222";
+    if (url.endsWith("/users/@me")) return json({ id, username: id });
+    if (url.endsWith("/member")) return json({ roles: id === "111" ? ["456"] : ["789"] });
+    return json(members());
+  }, { PROFILE_ENCRYPTION_KEY: "be".repeat(32), ROSTER_CACHE_SECONDS: "1" });
+  const put = (route, token, body) => f.authorized(route, token, { method: "PUT", body: JSON.stringify(body) });
+  assert.equal((await f.request("/v1/profile/me")).status, 401);
+  assert.equal((await f.authorized("/v1/profile/me", "raider", {
+    method: "PUT", headers: { "x-brick-profile-user": "111" }, body: JSON.stringify({ customName: "Wrong account" }),
+  })).status, 409);
+  assert.equal((await put("/v1/profile/me", "raider", { customName: "Raid Name", raidRole: "healer" })).status, 200);
+  assert.equal((await put("/v1/profiles/111/role", "raider", { raidRole: "tank" })).status, 403);
+  assert.equal((await put("/v1/profiles/222/role", "officer", { raidRole: "tank" })).status, 200);
+  assert.equal((await put("/v1/profiles/222/role", "officer", { customName: "Impersonation", raidRole: "tank" })).status, 400);
+  assert.equal((await put("/v1/profiles/333/role", "officer", { raidRole: "tank" })).status, 404);
+  const own = await (await f.authorized("/v1/profile/me", "raider")).json();
+  assert.deepEqual(own, { customName: "Raid Name", raidRole: "tank", available: true });
+  const roster = await (await f.authorized("/v1/roster", "officer")).json();
+  assert.equal(roster.raiders[0].name, "Raid Name");
+  assert.equal(roster.raiders[0].raidRole, "tank");
+  assert.equal(roster.canEditRoles, true);
+  // The OAuth identity is still cached; the current roster must revoke its
+  // officer capability independently when the role is removed.
+  officer = false;
+  await new Promise(resolve => setTimeout(resolve, 1050));
+  assert.equal((await put("/v1/profiles/222/role", "officer", { raidRole: "dps" })).status, 403);
+  const encrypted = await readFile(path.join(f.data, "profiles.enc"), "utf8");
+  assert(!encrypted.includes("Raid Name"));
+  assert(!encrypted.includes("officer"));
+});
+
 test("authorized heartbeat and roster persist no credentials", async t => {
   let calls = 0;
   const f = await fixture(t, (...args) => { calls++; return discordFixture(...args); });

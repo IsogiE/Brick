@@ -164,8 +164,10 @@ impl Comparison {
         self.metadata.tick(ctx, Some(&self.selected));
     }
 
-    pub fn obscures_player(&self) -> bool {
-        self.popup
+    pub fn update_overlays(&self, ctx: &egui::Context) {
+        if let Some(player) = &self.player {
+            player.update_overlays(ctx);
+        }
     }
 
     pub fn state_for_controls(&self, mut state: PlaybackState) -> PlaybackState {
@@ -1005,6 +1007,7 @@ mod tests {
             replay_start_ms: None,
             replay_end_ms: None,
             user_id: "101".into(),
+            raid_role: None,
             name: "Test player".into(),
             provider: streams::Provider::Youtube,
             channel_id: "test-channel".into(),

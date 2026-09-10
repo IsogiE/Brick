@@ -39,6 +39,8 @@ pub enum Status {
 pub struct Stream {
     pub user_id: String,
     pub name: String,
+    #[serde(default)]
+    pub raid_role: Option<crate::profile::RaidRole>,
     pub provider: Provider,
     pub channel_id: String,
     pub url: String,
@@ -77,6 +79,8 @@ pub struct Vod {
     pub id: String,
     pub user_id: String,
     pub name: String,
+    #[serde(default)]
+    pub raid_role: Option<crate::profile::RaidRole>,
     pub provider: Provider,
     pub url: String,
     pub started_at: Option<String>,
@@ -90,6 +94,7 @@ impl Vod {
         Stream {
             user_id: self.user_id.clone(),
             name: self.name.clone(),
+            raid_role: self.raid_role,
             provider: self.provider.clone(),
             channel_id: self.id.clone(),
             url: self.url.clone(),
