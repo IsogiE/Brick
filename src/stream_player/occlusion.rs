@@ -49,8 +49,9 @@ fn overlay_rects(ctx: &egui::Context, bounds: [i32; 4]) -> Vec<[i32; 4]> {
         let rect = ctx
             .layer_transform_to_global(layer)
             .map_or(rect, |t| t * rect);
-        // Include the frame border and shadow as well as the interactive area.
-        let cut = (rect.expand(8.0) * scale).intersect(player);
+        // Reveal only the floating UI itself. Cutting extra space for shadows
+        // exposes the opaque app background around the video as a black halo.
+        let cut = (rect * scale).intersect(player);
         if cut.is_positive() && cut.is_finite() {
             cuts.push([
                 (cut.left() - player.left()).floor() as i32,
@@ -321,6 +322,12 @@ mod tests {
             });
             if show {
                 assert!(!cuts.is_empty());
+                assert!(
+                    cuts.iter().all(|cut| {
+                        cut[0] >= 50 && cut[1] >= 50 && cut[2] <= 250 && cut[3] <= 290
+                    }),
+                    "Player must remain visible outside the floating UI bounds"
+                );
             }
         }
         assert!(

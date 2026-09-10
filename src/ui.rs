@@ -922,7 +922,6 @@ impl BrickApp {
 
     fn draw_roster_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            section_title(ui, "Guild Roster");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if secondary_button(ui, "Refresh").clicked() {
                     self.start_roster_refresh();
@@ -971,15 +970,14 @@ impl BrickApp {
                             roster_notice(ui, notice);
                             ui.add_space(14.0);
                         }
-                        if let Some(notice) = self.profile.notice() {
-                            ui.label(RichText::new(notice).small());
-                        }
-                        let can_edit = roster.can_edit_roles && !self.profile.busy();
+                        let can_edit = roster.can_edit_roles;
+                        let roles_enabled = !self.profile.busy();
                         draw_roster_group(
                             ui,
                             "Officers",
                             &roster.officers,
                             can_edit,
+                            roles_enabled,
                             &mut role_change,
                         );
                         ui.add_space(18.0);
@@ -988,6 +986,7 @@ impl BrickApp {
                             "Raiders",
                             &roster.raiders,
                             can_edit,
+                            roles_enabled,
                             &mut role_change,
                         );
                         ui.add_space(12.0);
@@ -2045,6 +2044,7 @@ fn draw_roster_group(
     title: &str,
     members: &[RosterMember],
     can_edit: bool,
+    roles_enabled: bool,
     change: &mut Option<(String, Option<RaidRole>)>,
 ) {
     let online_count = members.iter().filter(|member| member.online).count();
@@ -2075,7 +2075,7 @@ fn draw_roster_group(
         if index > 0 {
             ui.separator();
         }
-        draw_roster_member_row(ui, member, can_edit, change);
+        draw_roster_member_row(ui, member, can_edit, roles_enabled, change);
     }
 }
 
@@ -2083,6 +2083,7 @@ fn draw_roster_member_row(
     ui: &mut egui::Ui,
     member: &RosterMember,
     can_edit: bool,
+    roles_enabled: bool,
     change: &mut Option<(String, Option<RaidRole>)>,
 ) {
     let row_height = 36.0;
@@ -2175,10 +2176,13 @@ fn draw_roster_member_row(
                 .max_rect(rect)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
             |ui| {
-                let mut role = member.raid_role;
-                if profile::role_picker(ui, ("roster-role", &member.user_id), &mut role) {
-                    *change = Some((member.user_id.clone(), role));
-                }
+                // Keep the picker and its reserved space while a save is pending.
+                ui.add_enabled_ui(roles_enabled, |ui| {
+                    let mut role = member.raid_role;
+                    if profile::role_picker(ui, ("roster-role", &member.user_id), &mut role) {
+                        *change = Some((member.user_id.clone(), role));
+                    }
+                });
             },
         );
     }

@@ -55,11 +55,30 @@ fn role_texture(ctx: &egui::Context, role: RaidRole) -> egui::TextureHandle {
     texture
 }
 
+fn role_control_height(ui: &egui::Ui) -> f32 {
+    ui.spacing().interact_size.y.max(
+        ui.text_style_height(&egui::TextStyle::Button)
+            .max(ui.spacing().icon_width)
+            .max(18.0)
+            + 2.0 * ui.spacing().button_padding.y,
+    )
+}
+
 pub fn role_icon(ui: &mut egui::Ui, role: Option<RaidRole>) {
     if let Some(role) = role {
-        let texture = role_texture(ui.ctx(), role);
-        ui.add(egui::Image::new(&texture).fit_to_exact_size(egui::vec2(18.0, 18.0)))
-            .on_hover_text(role.label());
+        let (slot, response) = ui.allocate_exact_size(
+            egui::vec2(18.0, ui.spacing().interact_size.y.max(18.0)),
+            egui::Sense::hover(),
+        );
+        paint_role_icon(
+            ui,
+            Some(role),
+            egui::Rect::from_center_size(slot.center(), egui::vec2(18.0, 18.0)),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Image, ui.is_enabled(), role.label())
+        });
+        response.on_hover_text(role.label());
     }
 }
 
@@ -80,27 +99,49 @@ pub fn role_picker(
     value: &mut Option<RaidRole>,
 ) -> bool {
     let before = *value;
-    egui::ComboBox::from_id_salt(id)
-        .width(90.0)
-        .selected_text(value.map(RaidRole::label).unwrap_or("No role"))
-        .show_ui(ui, |ui| {
-            if ui.selectable_label(value.is_none(), "No role").clicked() {
-                *value = None;
-                ui.close();
-            }
-            for role in [RaidRole::Dps, RaidRole::Healer, RaidRole::Tank] {
-                ui.horizontal(|ui| {
-                    role_icon(ui, Some(role));
+    let height = role_control_height(ui);
+    // ComboBox inherits its parent's layout for its padded contents. Allocate the
+    // whole control first so a centered horizontal row cannot offset that padding.
+    ui.allocate_ui_with_layout(
+        egui::vec2(96.0, height),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.spacing_mut().interact_size.y = height;
+            egui::ComboBox::from_id_salt(id)
+                .width(96.0)
+                .selected_text(value.map(RaidRole::label).unwrap_or("No role"))
+                .show_ui(ui, |ui| {
+                    ui.spacing_mut().interact_size.y = height;
+                    let size = egui::vec2(ui.available_width(), height);
                     if ui
-                        .selectable_label(*value == Some(role), role.label())
+                        .add_sized(size, egui::Button::selectable(value.is_none(), "No role"))
                         .clicked()
                     {
-                        *value = Some(role);
+                        *value = None;
                         ui.close();
                     }
+                    for role in [RaidRole::Dps, RaidRole::Healer, RaidRole::Tank] {
+                        let icon = egui::Image::new((
+                            role_texture(ui.ctx(), role).id(),
+                            egui::vec2(18.0, 18.0),
+                        ));
+                        if ui
+                            .add_sized(
+                                size,
+                                egui::Button::selectable(
+                                    *value == Some(role),
+                                    (icon, role.label()),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            *value = Some(role);
+                            ui.close();
+                        }
+                    }
                 });
-            }
-        });
+        },
+    );
     before != *value
 }
 
@@ -134,7 +175,6 @@ pub struct ProfileUi {
     role: Option<RaidRole>,
     pending: Option<mpsc::Receiver<Completed>>,
     last_fetch: Option<Instant>,
-    notice: Option<String>,
 }
 
 impl ProfileUi {
@@ -170,14 +210,14 @@ impl ProfileUi {
                                 }
                                 self.value = Some(profile);
                             }
-                            self.notice = completed.saved.then(|| "Profile saved.".into());
                         }
-                        Err(error) => self.notice = Some(error),
+                        // Keep the confirmed value and unsaved draft on failure.
+                        // The form remains available for another attempt without banners.
+                        Err(_) => {}
                     }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending = None;
-                    self.notice = Some("Profile request stopped unexpectedly. Try again.".into());
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -210,6 +250,9 @@ impl ProfileUi {
         ui.label(egui::RichText::new("Your profile").strong());
         let enabled = self.value.as_ref().is_some_and(|value| value.available) && !self.busy();
         ui.add_enabled_ui(enabled, |ui| {
+            // Size the row before placing labels and icons, so later padded
+            // controls cannot move its center after those widgets are painted.
+            ui.spacing_mut().interact_size.y = role_control_height(ui);
             ui.horizontal(|ui| {
                 ui.label("Name");
                 ui.add(
@@ -232,32 +275,12 @@ impl ProfileUi {
             });
         });
         ui.label(egui::RichText::new("Leave the name empty to use your Discord name.").small());
-        if self.busy() {
-            ui.label(egui::RichText::new("Updating profile…").small());
-        }
-        if self.value.as_ref().is_some_and(|value| !value.available) || !presence::configured() {
-            ui.label(egui::RichText::new("Profile settings are not available yet.").small());
-        }
-        if let Some(notice) = &self.notice {
-            ui.label(egui::RichText::new(notice).small());
-        }
-        if !self.busy()
-            && self.value.is_none()
-            && presence::configured()
-            && ui.small_button("Retry profile").clicked()
-        {
-            self.start(ui.ctx(), Operation::Load);
-        }
     }
 
     pub fn set_member_role(&mut self, ctx: &egui::Context, id: String, role: Option<RaidRole>) {
         if !self.busy() {
             self.start(ctx, Operation::Role(id, role));
         }
-    }
-
-    pub fn notice(&self) -> Option<&str> {
-        self.notice.as_deref()
     }
 
     fn dirty(&self) -> bool {
@@ -274,7 +297,6 @@ impl ProfileUi {
         let ctx = ctx.clone();
         let own_id = self.user_id.clone();
         self.last_fetch = Some(Instant::now());
-        self.notice = None;
         self.pending = Some(rx);
         thread::spawn(move || {
             let expected_user = own_id.clone();

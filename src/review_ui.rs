@@ -78,22 +78,65 @@ struct CooldownEditor {
     draft: defensives::Preferences,
     observed_names: std::collections::BTreeMap<u64, ObservedSpellName>,
     search: String,
+    group: DefensiveGroup,
+    advanced: bool,
+    remembered_groups: std::collections::BTreeMap<u64, DefensiveGroup>,
     new_id: String,
-    new_group: DefensiveGroup,
     error: Option<String>,
 }
 impl CooldownEditor {
-    fn new(draft: defensives::Preferences, events: &[RaidEvent]) -> Self {
+    fn new(draft: defensives::Preferences, events: &[RaidEvent], group: DefensiveGroup) -> Self {
         let mut editor = Self {
             draft,
             observed_names: Default::default(),
             search: String::new(),
+            group,
+            advanced: false,
+            remembered_groups: Default::default(),
             new_id: String::new(),
-            new_group: DefensiveGroup::Healing,
             error: None,
         };
         editor.refresh_names(events);
         editor
+    }
+
+    fn category(&self, id: u64) -> DefensiveGroup {
+        self.draft
+            .classify(id)
+            .or_else(|| self.remembered_groups.get(&id).copied())
+            .or_else(|| {
+                defensives::SPELLS
+                    .iter()
+                    .find(|spell| spell.id == id)
+                    .map(|spell| spell.group)
+            })
+            .unwrap_or(self.group)
+    }
+
+    fn name(&self, id: u64) -> &str {
+        self.observed_names
+            .get(&id)
+            .map(|names| names.display.as_str())
+            .or_else(|| defensives::spell_name(id))
+            .unwrap_or("Custom spell")
+    }
+
+    fn apply_rule(&mut self, id: u64, rule: defensives::Rule) {
+        let default = defensives::Preferences::default().rule(id);
+        if default == Some(rule) {
+            self.draft.overrides.remove(&id);
+        } else if self.draft.overrides.contains_key(&id)
+            || self.draft.overrides.len() < defensives::MAX_OVERRIDES
+        {
+            self.draft.overrides.insert(id, rule);
+            if let Some(group) = rule.group {
+                self.remembered_groups.insert(id, group);
+            }
+        } else {
+            self.error = Some(
+                "Up to 128 spell changes can be saved. Reset a changed spell to make room.".into(),
+            );
+        }
     }
 
     // WCL events and labels are already bounded. Index names only when opening
@@ -145,7 +188,7 @@ pub struct ReviewUi {
     cooldown_editor: Option<CooldownEditor>,
     cooldown_save: Option<defensives::Preferences>,
     cooldown_notice: Option<String>,
-    cooldown_filter: Option<DefensiveGroup>,
+    cooldown_filter: DefensiveGroup,
     selected_event: Option<(i64, String)>,
     scroll_to_event: bool,
     aligning: bool,
@@ -194,7 +237,7 @@ impl Default for ReviewUi {
             cooldown_editor: None,
             cooldown_save: None,
             cooldown_notice: None,
-            cooldown_filter: None,
+            cooldown_filter: DefensiveGroup::Healing,
             selected_event: None,
             scroll_to_event: false,
             aligning: false,
@@ -487,19 +530,26 @@ impl ReviewUi {
                                 self.last_attempt = None;
                             }
                             Ok(Data::Cooldowns(preferences)) => {
+                                let rules_changed =
+                                    self.cooldowns.overrides != preferences.overrides;
                                 self.cooldowns = preferences;
                                 self.cooldown_editor = None;
                                 self.cooldown_notice = None;
-                                self.event_notice = None;
-                                self.events
-                                    .retain(|event| event.kind != EventKind::Defensives);
-                                self.loaded_events
-                                    .retain(|kind| *kind != EventKind::Defensives);
-                                self.requested_events
-                                    .retain(|kind| *kind != EventKind::Defensives);
+                                if rules_changed {
+                                    self.event_notice = None;
+                                    self.events
+                                        .retain(|event| event.kind != EventKind::Defensives);
+                                    self.loaded_events
+                                        .retain(|kind| *kind != EventKind::Defensives);
+                                    self.requested_events
+                                        .retain(|kind| *kind != EventKind::Defensives);
+                                }
                             }
                             Ok(Data::Events(key, kind, events, preferences)) => {
-                                self.cooldowns = preferences;
+                                // A queued timeline toggle is newer than this in-flight read.
+                                if self.cooldown_save.is_none() {
+                                    self.cooldowns = preferences;
+                                }
                                 if self.pull.as_ref().is_some_and(|p| pull_key(p) == key) {
                                     self.events.retain(|event| event.kind != kind);
                                     self.events.extend(events);
@@ -936,6 +986,7 @@ impl ReviewUi {
         stream: &Stream,
         povs: &[Stream],
         state: &PlaybackState,
+        native_player_present: bool,
         player_error: Option<&str>,
         mut comparison: Option<&mut crate::review_compare_ui::Comparison>,
     ) -> WorkspaceAction {
@@ -1147,52 +1198,42 @@ impl ReviewUi {
         );
         ui.painter()
             .rect_filled(video, 5.0, Color32::from_rgb(10, 12, 16));
-        if let Some(error) = player_error {
-            ui.scope_builder(egui::UiBuilder::new().max_rect(video.shrink(24.0)), |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space((video.height() / 2.0 - 55.0).max(0.0));
-                    ui.label(error);
-                    if let Some(playback) = &self.playback {
-                        ui.hyperlink_to("Open video in browser", &playback.public_url);
-                    }
+        if !native_player_present {
+            if let Some(error) = player_error {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(video.shrink(24.0)), |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space((video.height() / 2.0 - 55.0).max(0.0));
+                        ui.label(error);
+                        if let Some(playback) = &self.playback {
+                            ui.hyperlink_to("Open video in browser", &playback.public_url);
+                        }
+                    });
                 });
-            });
-        } else {
-            ui.painter().text(
-                video.center(),
-                egui::Align2::CENTER_CENTER,
-                if self.popup_open && state.ready {
-                    if state.blocked {
-                        "Click Play in the Twitch player"
-                    } else if state.seeking.is_some() {
-                        "Seeking to the selected moment…"
-                    } else if state.buffering {
-                        "Video is buffering…"
-                    } else if state.playing {
-                        "Video keeps playing while this menu is open"
+            } else {
+                ui.painter().text(
+                    video.center(),
+                    egui::Align2::CENTER_CENTER,
+                    if self.playback.is_some() {
+                        "Opening replay…"
+                    } else if self.pending_focus.is_some() && self.review.is_some() {
+                        "This POV does not contain the selected moment"
+                    } else if self.pending_focus.is_some() {
+                        "Finding this view…"
+                    } else if self
+                        .review
+                        .as_ref()
+                        .is_some_and(|review| review.pulls.is_empty())
+                    {
+                        "No raid pulls are available for this view"
+                    } else if self.work.is_some() {
+                        "Finding raid pulls…"
                     } else {
-                        "Video paused"
-                    }
-                } else if self.playback.is_some() {
-                    "Opening replay…"
-                } else if self.pending_focus.is_some() && self.review.is_some() {
-                    "This POV does not contain the selected moment"
-                } else if self.pending_focus.is_some() {
-                    "Finding this view…"
-                } else if self
-                    .review
-                    .as_ref()
-                    .is_some_and(|review| review.pulls.is_empty())
-                {
-                    "No raid pulls are available for this view"
-                } else if self.work.is_some() {
-                    "Finding raid pulls…"
-                } else {
-                    "Choose a pull to watch"
-                },
-                egui::FontId::proportional(15.0),
-                MUTED,
-            );
+                        "Choose a pull to watch"
+                    },
+                    egui::FontId::proportional(15.0),
+                    MUTED,
+                );
+            }
         }
         action.rect = Some(video);
         let timeline =
@@ -1215,6 +1256,7 @@ impl ReviewUi {
                 }
             });
         }
+        self.draw_cooldown_editor(ui.ctx());
         if self.work.is_none() {
             if let Some(preferences) = self.cooldown_save.take() {
                 self.start(ui.ctx(), Some(stream), Action::SaveCooldowns(preferences));
@@ -1719,209 +1761,186 @@ impl ReviewUi {
         }
     }
 
-    fn draw_cooldown_editor(&mut self, ui: &mut egui::Ui, _height: f32) {
-        ui.spacing_mut().item_spacing = egui::vec2(5.0, 4.0);
-        ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
-        ui.spacing_mut().interact_size.y = 20.0;
-        let mut close = false;
-        let mut save = false;
+    fn draw_cooldown_editor(&mut self, ctx: &egui::Context) {
+        let Some(editor) = self.cooldown_editor.as_mut() else {
+            return;
+        };
+        self.popup_open = true;
         let busy = self.cooldown_save.is_some()
             || matches!(self.work_action, Some(Action::SaveCooldowns(_)));
-        let editor = self.cooldown_editor.as_mut().unwrap();
-        ui.horizontal(|ui| {
-            ui.strong("Cooldown filters");
-            close = ui
-                .add_enabled(!busy, egui::Button::new("Back").small())
-                .clicked();
-            save = ui
-                .add_enabled(!busy, egui::Button::new("Save").small())
-                .clicked();
-        });
-        if let Some(error) = &self.cooldown_notice {
-            ui.colored_label(DEATH, error);
-        }
-        if busy {
-            ui.small("Saving…");
-        }
-        ui.add_enabled_ui(!busy, |ui| {
-            ui.small("Choose rows to show and spells to track.");
-            ui.horizontal_wrapped(|ui| {
-                for group in DefensiveGroup::ALL {
-                    let mut visible = editor.draft.visible(group);
-                    if ui.checkbox(&mut visible, group.label()).changed() {
-                        editor.draft.hidden_groups.retain(|hidden| *hidden != group);
-                        if !visible {
-                            editor.draft.hidden_groups.push(group);
-                        }
-                    }
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        let screen = ctx.content_rect();
+        // A separate window leaves the player's allocation and playback intact.
+        let size = egui::vec2(
+            (screen.width() - 56.0).clamp(280.0, 640.0),
+            (screen.height() - 96.0).clamp(240.0, 540.0),
+        );
+        egui::Window::new(RichText::new(format!("Edit {}", editor.group.label())).strong().color(Color32::from_rgb(226, 230, 237)))
+            .id(egui::Id::new("cooldown-editor"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size(size)
+            .default_pos(screen.center() - size * 0.5)
+            .constrain_to(screen.shrink(12.0))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+                ui.spacing_mut().interact_size.y = 26.0;
+                ui.label("Check Track to include a spell in this category.");
+                if let Some(error) = self.cooldown_notice.as_ref().or(editor.error.as_ref()) {
+                    ui.colored_label(DEATH, error);
                 }
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut editor.new_id)
-                        .hint_text("WCL spell ID")
-                        .char_limit(7)
-                        .desired_width(95.0),
-                );
-                if ui.small_button("Add").clicked() {
-                    let result = defensives::Preferences::parse_id(&editor.new_id).and_then(|id| {
-                        if !editor.draft.overrides.contains_key(&id)
-                            && editor.draft.overrides.len() >= defensives::MAX_OVERRIDES
-                        {
-                            return Err("Up to 128 spell changes can be saved.".into());
-                        }
-                        editor.draft.overrides.insert(
-                            id,
-                            defensives::Rule {
-                                group: Some(editor.new_group),
-                                observation: defensives::Observation::Cast,
-                            },
-                        );
-                        editor.search = id.to_string();
-                        editor.new_id.clear();
-                        Ok(())
+                ui.add_enabled_ui(!busy, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut editor.search)
+                            .hint_text("Search spells…").char_limit(80)
+                            .desired_width((ui.available_width() - 105.0).max(80.0)));
+                        ui.toggle_value(&mut editor.advanced, "Advanced");
                     });
-                    editor.error = result.err();
-                }
-            });
-            let combo = egui::ComboBox::from_id_salt("new-cooldown-row")
-                .selected_text(editor.new_group.label())
-                .width(150.0)
-                .show_ui(ui, |ui| {
-                    for group in DefensiveGroup::ALL {
-                        ui.selectable_value(&mut editor.new_group, group, group.label());
+                    if editor.advanced {
+                        ui.small("Advanced: add a spell ID, change its category or include buff applications.");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut editor.new_id)
+                                .hint_text("Warcraft Logs spell ID").char_limit(7).desired_width(190.0));
+                            if ui.button("Add spell").clicked() {
+                                match defensives::Preferences::parse_id(&editor.new_id) {
+                                    Ok(id) => {
+                                        editor.error = None;
+                                        editor.apply_rule(id, defensives::Rule {
+                                            group: Some(editor.group), observation: defensives::Observation::Cast,
+                                        });
+                                        if editor.error.is_none() {
+                                            editor.search = id.to_string();
+                                            editor.new_id.clear();
+                                        }
+                                    }
+                                    Err(error) => editor.error = Some(error),
+                                }
+                            }
+                            if ui.button("Reset category").on_hover_text("Restore this category's default spells and cast tracking.").clicked() {
+                                let ids: Vec<_> = editor.draft.ids().into_iter()
+                                    .filter(|id| editor.category(*id) == editor.group
+                                        || defensives::SPELLS.iter().any(|spell| spell.id == *id && spell.group == editor.group)).collect();
+                                for id in ids { editor.draft.overrides.remove(&id); }
+                                editor.remembered_groups.clear();
+                                editor.search.clear();
+                                editor.error = None;
+                            }
+                        });
                     }
-                });
-            self.popup_open |= combo.inner.is_some();
-            if let Some(error) = &editor.error {
-                ui.colored_label(DEATH, error);
-            }
-            ui.add(
-                egui::TextEdit::singleline(&mut editor.search)
-                    .hint_text("Find spell name or ID")
-                    .char_limit(80)
-                    .desired_width(f32::INFINITY),
-            );
-            let search = editor.search.to_lowercase();
-            let ids: Vec<_> = editor
-                .draft
-                .ids()
-                .into_iter()
-                .filter(|id| {
-                    search.is_empty()
-                        || id.to_string().contains(&search)
-                        || defensives::spell_name(*id)
-                            .is_some_and(|name| name.to_lowercase().contains(&search))
-                        || editor.observed_names.get(id).is_some_and(|names| {
-                            names.search.iter().any(|name| name.contains(&search))
-                        })
-                })
-                .collect();
-            // The enabled scope starts below the header. Use its remaining
-            // viewport, so the header/error text is not counted twice.
-            let list_height = (ui.available_height() - 28.0).max(0.0);
-            egui::ScrollArea::vertical()
-                .id_salt("cooldown-rules")
-                .max_height(list_height)
-                .show_rows(ui, 84.0, ids.len(), |ui, range| {
-                    for index in range {
-                        let id = ids[index];
-                        let Some(mut rule) = editor.draft.rule(id) else {
-                            continue;
-                        };
-                        let before = rule;
-                        let name = editor
-                            .observed_names
-                            .get(&id)
-                            .map(|names| names.display.as_str())
-                            .or_else(|| defensives::spell_name(id))
-                            .unwrap_or("Custom spell");
-                        ui.push_id(id, |ui| {
-                            ui.add(
-                                egui::Label::new(RichText::new(format!("{name} · {id}")).small())
-                                    .truncate(),
-                            );
-                            ui.horizontal(|ui| {
-                                let combo = egui::ComboBox::from_id_salt("row")
-                                    .selected_text(
-                                        rule.group.map_or("Not tracked", DefensiveGroup::label),
-                                    )
-                                    .width(150.0)
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut rule.group, None, "Not tracked");
-                                        for group in DefensiveGroup::ALL {
-                                            ui.selectable_value(
-                                                &mut rule.group,
-                                                Some(group),
-                                                group.label(),
-                                            );
+                    let search = editor.search.to_lowercase();
+                    let mut ids: Vec<_> = editor.draft.ids().into_iter().filter(|id| {
+                        editor.category(*id) == editor.group && (search.is_empty()
+                            || id.to_string().contains(&search)
+                            || defensives::spell_name(*id).is_some_and(|name| name.to_lowercase().contains(&search))
+                            || editor.observed_names.get(id).is_some_and(|names| {
+                                names.search.iter().any(|name| name.contains(&search))
+                            }))
+                    }).collect();
+                    ids.sort_by(|a, b| editor.name(*a).cmp(editor.name(*b)).then(a.cmp(b)));
+                    let tracked = ids.iter().filter(|id| editor.draft.classify(**id).is_some()).count();
+                    ui.label(RichText::new(format!("{tracked} of {} spells tracked", ids.len())).color(MUTED));
+                    ui.separator();
+                    let row_height = if editor.advanced { 72.0 } else { 30.0 };
+                    let list_height = (ui.available_height() - 60.0).max(0.0);
+                    egui::ScrollArea::vertical().id_salt("cooldown-rules")
+                        .auto_shrink([false, false]).max_height(list_height)
+                        .show_rows(ui, row_height, ids.len(), |ui, range| {
+                            for index in range {
+                                let id = ids[index];
+                                let Some(mut rule) = editor.draft.rule(id) else { continue; };
+                                let before = rule;
+                                let category = editor.category(id);
+                                ui.push_id(id, |ui| {
+                                    ui.allocate_ui(egui::vec2(ui.available_width(), row_height), |ui| {
+                                        ui.horizontal(|ui| {
+                                            let mut tracked = rule.group.is_some();
+                                            if ui.checkbox(&mut tracked, "Track").changed() {
+                                                editor.remembered_groups.insert(id, category);
+                                                rule.group = tracked.then_some(category);
+                                            }
+                                            let name = editor.name(id);
+                                            ui.add(egui::Label::new(RichText::new(name).size(15.0).color(Color32::from_rgb(226, 230, 237))).truncate()).on_hover_text(name);
+                                            if defensives::SPELLS.iter().any(|spell| spell.id == id && !spell.default_enabled) {
+                                                ui.label(RichText::new("Optional").small().color(MUTED));
+                                            }
+                                        });
+                                        if editor.advanced {
+                                            ui.horizontal(|ui| {
+                                                ui.label(RichText::new(format!("ID {id}")).small().color(MUTED));
+                                                let mut group = category;
+                                                ui.add_enabled_ui(rule.group.is_some(), |ui| {
+                                                egui::ComboBox::from_id_salt("category").selected_text(group.label()).width(155.0)
+                                                    .show_ui(ui, |ui| {
+                                                        for category in DefensiveGroup::ALL {
+                                                            ui.selectable_value(&mut group, category, category.label());
+                                                        }
+                                                    });
+                                                });
+                                                if group != category {
+                                                    editor.remembered_groups.insert(id, group);
+                                                    if rule.group.is_some() { rule.group = Some(group); }
+                                                }
+                                                egui::ComboBox::from_id_salt("evidence").selected_text(rule.observation.label()).width(168.0)
+                                                    .show_ui(ui, |ui| {
+                                                        for observation in defensives::Observation::ALL {
+                                                            ui.selectable_value(&mut rule.observation, observation, observation.label());
+                                                        }
+                                                    });
+                                                if editor.draft.overrides.contains_key(&id)
+                                                    && ui.small_button("Reset").clicked() {
+                                                    editor.draft.overrides.remove(&id);
+                                                    editor.remembered_groups.remove(&id);
+                                                }
+                                            });
                                         }
                                     });
-                                self.popup_open |= combo.inner.is_some();
-                                if editor.draft.overrides.contains_key(&id)
-                                    && ui
-                                        .small_button("↶")
-                                        .on_hover_text("Restore default / remove custom spell")
-                                        .clicked()
-                                {
-                                    editor.draft.overrides.remove(&id);
-                                }
-                            });
-                            let combo = egui::ComboBox::from_id_salt("evidence")
-                                .selected_text(rule.observation.label())
-                                .width(180.0)
-                                .show_ui(ui, |ui| {
-                                    for observation in defensives::Observation::ALL {
-                                        ui.selectable_value(
-                                            &mut rule.observation,
-                                            observation,
-                                            observation.label(),
-                                        );
-                                    }
                                 });
-                            self.popup_open |= combo.inner.is_some();
-                        });
-                        if before != rule {
-                            if editor.draft.overrides.len() < defensives::MAX_OVERRIDES
-                                || editor.draft.overrides.contains_key(&id)
-                            {
-                                editor.draft.overrides.insert(id, rule);
-                            } else {
-                                editor.error = Some("Up to 128 spell changes can be saved.".into());
+                                if before != rule { editor.apply_rule(id, rule); }
                             }
-                        }
-                    }
+                        });
                 });
-            if ui.small_button("Restore all defaults").clicked() {
-                editor.draft = Default::default();
-                editor.error = None;
-                editor.search.clear();
-            }
-        });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    save = ui.add_enabled(!busy, egui::Button::new(RichText::new("Save changes").color(Color32::WHITE)).fill(ACCENT)).clicked();
+                    cancel = ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked();
+                    if busy { ui.spinner(); ui.label("Saving…"); }
+                });
+            });
         if save {
             match editor.draft.validate() {
                 Ok(()) => {
-                    self.cooldown_save = Some(editor.draft.clone());
+                    let mut preferences = editor.draft.clone();
+                    preferences.overrides.retain(|id, rule| {
+                        rule.group.is_some() || defensives::spell_name(*id).is_some()
+                    });
+                    self.cooldown_save = Some(preferences);
                     self.cooldown_notice = None;
                 }
                 Err(error) => editor.error = Some(error),
             }
         }
-        if close {
+        if (!open || cancel) && !busy {
             self.cooldown_editor = None;
             self.cooldown_notice = None;
         }
     }
 
-    fn draw_events(&mut self, ui: &mut egui::Ui, height: f32) -> Option<PlaybackCommand> {
-        if self.cooldown_editor.is_some() {
-            self.draw_cooldown_editor(ui, height);
-            return None;
-        }
+    fn draw_events(&mut self, ui: &mut egui::Ui, _height: f32) -> Option<PlaybackCommand> {
         ui.horizontal(|ui| {
             for kind in [EventKind::Deaths, EventKind::Defensives] {
-                let count = self.events.iter().filter(|e| e.kind == kind).count();
+                let count = self
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        event.kind == kind
+                            && (kind == EventKind::Deaths
+                                || event.group == Some(self.cooldown_filter))
+                    })
+                    .count();
                 if ui
                     .selectable_label(self.kind == kind, format!("{} ({count})", kind.label()))
                     .clicked()
@@ -1958,36 +1977,58 @@ impl ReviewUi {
                 }
             });
         } else {
+            let selector = egui::ComboBox::from_id_salt("cooldown-category")
+                .selected_text(self.cooldown_filter.label())
+                .width(ui.available_width() - 16.0)
+                .show_ui(ui, |ui| {
+                    for group in DefensiveGroup::ALL {
+                        ui.selectable_value(&mut self.cooldown_filter, group, group.label());
+                    }
+                });
+            self.popup_open |= selector.inner.is_some();
             ui.horizontal(|ui| {
-                let selector = egui::ComboBox::from_id_salt("cooldown-category")
-                    .selected_text(
-                        self.cooldown_filter
-                            .map_or("All rows", DefensiveGroup::label),
-                    )
-                    .width(125.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.cooldown_filter, None, "All rows");
-                        for group in DefensiveGroup::ALL {
-                            ui.selectable_value(
-                                &mut self.cooldown_filter,
-                                Some(group),
-                                group.label(),
-                            );
-                        }
-                    });
-                self.popup_open |= selector.inner.is_some();
+                let saving = matches!(self.work_action, Some(Action::SaveCooldowns(_)));
+                let mut visible = self.cooldowns.visible(self.cooldown_filter);
                 if ui
                     .add_enabled(
-                        !self.loaded_events.is_empty(),
-                        egui::Button::new("Edit").small(),
+                        !saving && self.cooldown_editor.is_none(),
+                        egui::Checkbox::new(&mut visible, "Show in timeline"),
+                    )
+                    .changed()
+                {
+                    self.cooldowns
+                        .hidden_groups
+                        .retain(|group| *group != self.cooldown_filter);
+                    if !visible {
+                        self.cooldowns.hidden_groups.push(self.cooldown_filter);
+                    }
+                    self.cooldown_save = Some(self.cooldowns.clone());
+                    self.cooldown_notice = None;
+                }
+                if ui
+                    .add_enabled(
+                        !self.loaded_events.is_empty() && !saving,
+                        egui::Button::new("Edit"),
                     )
                     .clicked()
                 {
-                    self.cooldown_editor =
-                        Some(CooldownEditor::new(self.cooldowns.clone(), &self.events));
+                    self.cooldown_editor = Some(CooldownEditor::new(
+                        self.cooldowns.clone(),
+                        &self.events,
+                        self.cooldown_filter,
+                    ));
                     self.cooldown_notice = None;
                 }
             });
+            if self.cooldown_editor.is_none() {
+                if let Some(notice) = &self.cooldown_notice {
+                    ui.label(RichText::new(notice).small().color(DEATH));
+                    if ui.small_button("Retry save").clicked() {
+                        self.cooldown_save = Some(self.cooldowns.clone());
+                        self.cooldown_notice = None;
+                    }
+                }
+            }
         }
         ui.separator();
         if let Some(notice) = &self.event_notice {
@@ -2013,11 +2054,7 @@ impl ReviewUi {
             .iter()
             .filter(|e| {
                 e.kind == self.kind
-                    && (e.kind == EventKind::Deaths
-                        || (e.group.is_some_and(|group| self.cooldowns.visible(group))
-                            && self
-                                .cooldown_filter
-                                .is_none_or(|group| e.group == Some(group))))
+                    && (e.kind == EventKind::Deaths || e.group == Some(self.cooldown_filter))
                     && (search.is_empty()
                         || e.actor.to_lowercase().contains(&search)
                         || e.ability.to_lowercase().contains(&search)
@@ -2050,7 +2087,7 @@ impl ReviewUi {
             }
             self.scroll_to_event = false;
         }
-        scroll.max_height((height - 120.0).max(50.0)).show_rows(
+        scroll.max_height(ui.available_height().max(0.0)).show_rows(
             ui,
             ROW_HEIGHT,
             events.len(),
@@ -4436,7 +4473,7 @@ mod tests {
                     },
                     |ui| {
                         std::hint::black_box(
-                            review_ui.draw_workspace(ui, &stream, &povs, &state, None, None),
+                            review_ui.draw_workspace(ui, &stream, &povs, &state, false, None, None),
                         );
                     },
                 );
@@ -4492,6 +4529,7 @@ mod tests {
                             &stream,
                             &povs,
                             &PlaybackState::default(),
+                            false,
                             None,
                             Some(&mut comparison),
                         );
@@ -4576,7 +4614,7 @@ mod tests {
         };
         let mut events = vec![event.clone(); 20_000];
         events[1].ability = "Alternate Name".into();
-        let mut editor = CooldownEditor::new(Default::default(), &events);
+        let mut editor = CooldownEditor::new(Default::default(), &events, DefensiveGroup::Healing);
         assert_eq!(editor.observed_names.len(), 1);
         let names = &editor.observed_names[&event.ability_id];
         assert_eq!(names.display, "Observed Name");
@@ -4594,62 +4632,312 @@ mod tests {
 
     #[test]
     fn cooldown_editor_is_bounded_with_a_full_custom_spell_list() {
-        for size in [egui::vec2(924.0, 548.0), egui::vec2(1384.0, 728.0)] {
+        for size in [
+            egui::vec2(664.0, 420.0),
+            egui::vec2(924.0, 548.0),
+            egui::vec2(1384.0, 728.0),
+        ] {
+            for advanced in [false, true] {
+                let (review, pull, stream) = fixture();
+                let mut review_ui = ReviewUi::default();
+                review_ui.review = Some(review);
+                review_ui.active = true;
+                review_ui.connected = true;
+                review_ui.select(pull);
+                let mut preferences = defensives::Preferences::default();
+                for id in 1..=defensives::MAX_OVERRIDES as u64 {
+                    preferences.overrides.insert(
+                        id,
+                        defensives::Rule {
+                            group: Some(DefensiveGroup::Utility),
+                            observation: defensives::Observation::Buff,
+                        },
+                    );
+                }
+                review_ui.cooldown_editor = Some(CooldownEditor::new(
+                    preferences,
+                    &review_ui.events,
+                    DefensiveGroup::Utility,
+                ));
+                review_ui.cooldown_editor.as_mut().unwrap().advanced = advanced;
+                let ctx = egui::Context::default();
+                for _ in 0..3 {
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let available = ui.available_rect_before_wrap();
+                            let action = review_ui.draw_workspace(
+                                ui,
+                                &stream,
+                                &pov_fixture(),
+                                &PlaybackState::default(),
+                                false,
+                                None,
+                                None,
+                            );
+                            assert!(available.contains_rect(action.rect.unwrap()));
+                            assert!(
+                                ui.min_rect().right() <= available.right() + 1.0,
+                                "Cooldown editor expanded beyond the rail"
+                            );
+                            assert!(
+                                ui.min_rect().bottom() <= available.bottom() + 1.0,
+                                "Cooldown editor expanded beyond the window"
+                            );
+                            assert!(
+                                action.command.is_none(),
+                                "Editing a filter must not seek or pause playback"
+                            );
+                        },
+                    );
+                    let editor_rect = ctx
+                        .memory(|memory| memory.area_rect(egui::Id::new("cooldown-editor")))
+                        .unwrap();
+                    assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(editor_rect),
+                    "Editor escaped screen: {editor_rect:?}, screen {size:?}, advanced {advanced}");
+                    assert!(
+                        output.shapes.len() < 800,
+                        "Spell editor should virtualize its rows"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn category_visibility_does_not_hide_events_or_change_tracked_spells() {
+        let (review, pull, _) = fixture();
+        let mut review_ui = ReviewUi::default();
+        review_ui.review = Some(review);
+        review_ui.select(pull.clone());
+        review_ui.kind = EventKind::Defensives;
+        review_ui.loaded_events = vec![EventKind::Defensives];
+        review_ui
+            .cooldowns
+            .hidden_groups
+            .push(DefensiveGroup::Healing);
+        review_ui.events.push(RaidEvent {
+            at_ms: pull.start_ms + 1000,
+            actor_id: 1,
+            target_actor_id: None,
+            observed_buff: false,
+            actor: "Healing officer".into(),
+            class: "Priest".into(),
+            ability: "Apotheosis".into(),
+            ability_id: 200183,
+            target: None,
+            kind: EventKind::Defensives,
+            group: Some(DefensiveGroup::Healing),
+        });
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            review_ui.draw_events(ui, 500.0);
+        });
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "Apotheosis")));
+        assert_eq!(
+            review_ui.cooldowns.filter_expression().unwrap(),
+            defensives::Preferences::default()
+                .filter_expression()
+                .unwrap()
+        );
+        assert_eq!(review_ui.cooldown_filter, DefensiveGroup::Healing);
+        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "All rows")));
+    }
+
+    #[test]
+    fn editor_tracks_optional_spells_and_restores_their_default() {
+        let mut editor = CooldownEditor::new(Default::default(), &[], DefensiveGroup::Healing);
+        assert_eq!(editor.category(120517), DefensiveGroup::Healing); // Optional Halo.
+        assert_eq!(editor.category(642), DefensiveGroup::Personal);
+        let mut rule = editor.draft.rule(120517).unwrap();
+        assert_eq!(rule.group, None);
+        rule.group = Some(editor.group);
+        editor.apply_rule(120517, rule);
+        assert_eq!(editor.draft.classify(120517), Some(DefensiveGroup::Healing));
+        rule.group = None;
+        editor.apply_rule(120517, rule);
+        assert!(!editor.draft.overrides.contains_key(&120517));
+        assert_eq!(editor.draft, defensives::Preferences::default());
+    }
+
+    #[test]
+    fn editor_save_queues_changes_and_cancel_discards_them() {
+        for save in [false, true] {
+            let mut review_ui = ReviewUi::default();
+            let mut editor = CooldownEditor::new(Default::default(), &[], DefensiveGroup::Healing);
+            editor.apply_rule(
+                120517,
+                defensives::Rule {
+                    group: Some(DefensiveGroup::Healing),
+                    observation: defensives::Observation::Cast,
+                },
+            );
+            review_ui.cooldown_editor = Some(editor);
+            let ctx = egui::Context::default();
+            let mut frame = |events: Vec<egui::Event>| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(980.0, 720.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| review_ui.draw_cooldown_editor(ui.ctx()),
+                )
+            };
+            frame(vec![]);
+            let output = frame(vec![]);
+            let button = if save { "Save changes" } else { "Cancel" };
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == button => {
+                        Some(text.pos + text.galley.rect.center().to_vec2())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            for pressed in [true, false] {
+                frame(vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]);
+            }
+            assert_eq!(review_ui.cooldowns, defensives::Preferences::default());
+            if save {
+                assert_eq!(
+                    review_ui.cooldown_save.as_ref().unwrap().classify(120517),
+                    Some(DefensiveGroup::Healing)
+                );
+            } else {
+                assert!(review_ui.cooldown_save.is_none() && review_ui.cooldown_editor.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn review_placeholder_is_only_painted_when_native_player_is_absent() {
+        for present in [false, true] {
             let (review, pull, stream) = fixture();
             let mut review_ui = ReviewUi::default();
             review_ui.review = Some(review);
-            review_ui.active = true;
             review_ui.connected = true;
+            review_ui.active = true;
             review_ui.select(pull);
-            let mut preferences = defensives::Preferences::default();
-            for id in 1..=defensives::MAX_OVERRIDES as u64 {
-                preferences.overrides.insert(
-                    id,
-                    defensives::Rule {
-                        group: Some(DefensiveGroup::Utility),
-                        observation: defensives::Observation::Buff,
-                    },
-                );
-            }
-            review_ui.cooldown_editor = Some(CooldownEditor::new(preferences, &review_ui.events));
             let ctx = egui::Context::default();
-            for _ in 0..3 {
-                let output = ctx.run_ui(
-                    egui::RawInput {
-                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-                        ..Default::default()
-                    },
-                    |ui| {
-                        let available = ui.available_rect_before_wrap();
-                        let action = review_ui.draw_workspace(
-                            ui,
-                            &stream,
-                            &pov_fixture(),
-                            &PlaybackState::default(),
-                            None,
-                            None,
-                        );
-                        assert!(available.contains_rect(action.rect.unwrap()));
-                        assert!(
-                            ui.min_rect().right() <= available.right() + 1.0,
-                            "Cooldown editor expanded beyond the rail"
-                        );
-                        assert!(
-                            ui.min_rect().bottom() <= available.bottom() + 1.0,
-                            "Cooldown editor expanded beyond the window"
-                        );
-                        assert!(
-                            action.command.is_none(),
-                            "Editing a filter must not seek or pause playback"
-                        );
-                    },
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(980.0, 720.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    review_ui.draw_workspace(
+                        ui,
+                        &stream,
+                        &pov_fixture(),
+                        &PlaybackState::default(),
+                        present,
+                        None,
+                        None,
+                    );
+                },
+            );
+            assert_eq!(
+                output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == "Opening replay…")),
+                !present
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "native visual fixture: shows basic and Advanced editor, closes after 9 seconds"]
+    fn cooldown_editor_visual_fixture() {
+        struct App {
+            review: ReviewUi,
+            stream: Stream,
+            started: Instant,
+        }
+        impl eframe::App for App {
+            fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+                let elapsed = self.started.elapsed();
+                if elapsed > Duration::from_secs(9) {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
+                if let Some(editor) = self.review.cooldown_editor.as_mut() {
+                    editor.advanced = elapsed > Duration::from_secs(5);
+                }
+                self.review.draw_workspace(
+                    ui,
+                    &self.stream,
+                    &[self.stream.clone()],
+                    &PlaybackState::default(),
+                    false,
+                    None,
+                    None,
                 );
-                assert!(
-                    output.shapes.len() < 800,
-                    "Spell editor should virtualize its rows"
-                );
+                ui.ctx().request_repaint_after(Duration::from_millis(250));
             }
         }
+        eframe::run_native(
+            "Brick cooldown editor visual fixture",
+            eframe::NativeOptions {
+                viewport: egui::ViewportBuilder::default().with_inner_size([980.0, 720.0]),
+                event_loop_builder: Some(Box::new(|builder| {
+                    #[cfg(target_os = "linux")]
+                    {
+                        use winit::platform::x11::EventLoopBuilderExtX11 as _;
+                        builder.with_x11().with_any_thread(true);
+                    }
+                    #[cfg(target_os = "windows")]
+                    {
+                        use winit::platform::windows::EventLoopBuilderExtWindows as _;
+                        builder.with_any_thread(true);
+                    }
+                })),
+                ..Default::default()
+            },
+            Box::new(|cc| {
+                cc.egui_ctx.set_visuals(egui::Visuals::dark());
+                let (review, pull, mut stream) = fixture();
+                stream.name = "Healing officer".into();
+                let mut review_ui = ReviewUi::default();
+                review_ui.review = Some(review);
+                review_ui.connected = true;
+                review_ui.active = true;
+                review_ui.select(pull);
+                review_ui.kind = EventKind::Defensives;
+                review_ui.loaded_events = vec![EventKind::Deaths, EventKind::Defensives];
+                review_ui.cooldown_editor = Some(CooldownEditor::new(
+                    Default::default(),
+                    &[],
+                    DefensiveGroup::Healing,
+                ));
+                Ok(Box::new(App {
+                    review: review_ui,
+                    stream,
+                    started: Instant::now(),
+                }))
+            }),
+        )
+        .expect("Editor visual fixture failed");
     }
 
     #[test]
@@ -4700,6 +4988,7 @@ mod tests {
                                 &stream,
                                 &pov_fixture(),
                                 &state,
+                                false,
                                 None,
                                 None,
                             );

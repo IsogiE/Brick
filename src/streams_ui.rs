@@ -577,6 +577,7 @@ impl StreamsUi {
                     &stream,
                     &self.pov_cache,
                     &state,
+                    self.player.is_some() && !self.player_switch_pending,
                     self.player_error.as_deref(),
                     self.comparison.as_mut(),
                 );
@@ -914,17 +915,19 @@ impl StreamsUi {
                     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
                     ui.painter()
                         .rect_filled(rect, 8.0, Color32::from_rgb(12, 14, 19));
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        if self.player_error.is_some() {
-                            "Player unavailable"
-                        } else {
-                            "Opening stream…"
-                        },
-                        egui::FontId::proportional(16.0),
-                        MUTED,
-                    );
+                    if self.player.is_none() {
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            if self.player_error.is_some() {
+                                "Player unavailable"
+                            } else {
+                                "Opening stream…"
+                            },
+                            egui::FontId::proportional(16.0),
+                            MUTED,
+                        );
+                    }
                     self.player_rect = Some(rect);
                     ui.add_space(if ui.ctx().content_rect().height() < 640.0 {
                         4.0
