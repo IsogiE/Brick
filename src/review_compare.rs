@@ -293,6 +293,7 @@ impl Controller {
         state.ready
             && state.is_fresh_after(since)
             && state.seconds.is_finite()
+            && !state.blocked
             && !state.buffering
             && state.seeking.is_none()
             && state.playback_intent.is_none()
@@ -373,6 +374,7 @@ impl Controller {
             let provider_gesture = state.play_intent
                 && state.ready
                 && state.playing
+                && !state.blocked
                 && !state.buffering
                 && state.is_fresh_after(since)
                 && state.playback_intent != Some(true);
@@ -410,6 +412,7 @@ impl Controller {
             (can_pause
                 && self.wants_playing
                 && state.ready
+                && !state.blocked
                 && state.pause_intent
                 && !state.playing
                 && state.is_fresh_after(self.sample_epoch)
@@ -485,6 +488,7 @@ impl Controller {
                     && states.iter().enumerate().all(|(side, state)| {
                         state.ready
                             && state.is_fresh_after(since)
+                            && !state.blocked
                             && !state.buffering
                             && state.playback_intent != Some(true)
                             && state.seeking.is_none_or(|target| {
@@ -657,6 +661,7 @@ impl Controller {
                 if let Some(blocked) = states.iter().position(|state| {
                     !state.ready
                         || !state.is_fresh_after(self.sample_epoch)
+                        || state.blocked
                         || state.buffering
                         || state.seeking.is_some()
                 }) {
@@ -854,6 +859,26 @@ mod tests {
         } else {
             matches!(values[side], Some(PlaybackCommand::Pause))
         });
+    }
+
+    #[test]
+    fn a_blocked_provider_cannot_finish_comparison_preparation() {
+        for side in 0..2 {
+            let mut c = controller(true);
+            let empty = PlaybackState::default();
+            c.tick([&empty, &empty], test_now());
+            let mut paused = [sample(112.5, false), sample(913.25, false)];
+            paused[side].blocked = true;
+            let result = c.tick([&paused[0], &paused[1]], test_now());
+            assert!(result.primary.is_none() && result.secondary.is_none());
+            assert_ne!(c.status(), Status::Paused);
+            assert_ne!(c.status(), Status::Playing);
+            assert!(c.wants_playing());
+            paused[side].blocked = false;
+            let result = c.tick([&paused[0], &paused[1]], test_now());
+            assert!(matches!(result.primary, Some(PlaybackCommand::Play)));
+            assert!(matches!(result.secondary, Some(PlaybackCommand::Play)));
+        }
     }
 
     #[test]

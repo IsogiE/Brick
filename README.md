@@ -14,6 +14,10 @@ Brick keeps the guild addon installed across your WoW clients, runs in the syste
 
 On startup and every minute while running and signed in, Brick checks the installed addon versions against the current signed release. If a managed addon's folder or TOC file is missing, or its TOC version differs, Brick reinstalls the current package automatically.
 
+Raid replay review uses ART's small Unix timestamp to calibrate YouTube and Twitch recordings. ART displays it at the top left for five seconds in normal, heroic and mythic raids; `/art unix` previews it in-game. One verified pull establishes the recording's timing, which can then align later pulls across Warcraft Logs reports. New recordings are calibrated separately. Overlapping pulls establish clock corrections between log reports; a new report without overlap may need one background check, shared by the other calibrated POVs. Manual seconds offsets are no longer used.
+
+Verified timing is saved locally and shared through the guild service. Its optional background worker reads short source-video fragments to prepare recording calibrations, with occasional checks for changes. Independent client readings can also establish a shared calibration. Passive reading during playback never seeks or changes video quality, and a newly discovered timestamp does not move the currently playing pull. Provider timing remains available when a marker cannot be read.
+
 ## Download
 
 Get the latest build from [Releases](https://github.com/IsogiE/Brick-Releases/releases/latest).
@@ -22,6 +26,8 @@ Get the latest build from [Releases](https://github.com/IsogiE/Brick-Releases/re
 | --- | --- |
 | Windows | `.exe` installer; installs for the current user |
 | Linux | AppImage, Debian `.deb`, or Arch package archive with `PKGBUILD` |
+
+Packaged Linux builds require Ubuntu 24.04 or a compatible distribution with glibc 2.39 or newer. The AppImage bundles its GTK, WebKit and media runtime.
 
 Run Brick, sign in with Discord, and select your World of Warcraft folder. You can add more than one installation. Retail, Classic, PTR, and beta clients are supported.
 
@@ -75,7 +81,7 @@ cargo test --locked
 node --test scripts/publish-addon-feed.test.mjs presence/*.test.mjs
 ```
 
-Node.js 22 is used for the service and release scripts. The desktop app itself only needs Rust and its native dependencies. CI checks Windows and Linux.
+Node.js 22.13 or newer is used for the service and release scripts. The desktop app itself only needs Rust and its native dependencies. CI checks Windows and Linux.
 
 Bug reports should include the Brick version, operating system, and steps to reproduce. For tray or startup issues, mention whether Brick was opened manually or started at login.
 

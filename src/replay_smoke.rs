@@ -105,247 +105,6 @@ mod native {
         }
     }
 
-    const MAX_HEALTH_FIXTURE_BYTES: usize = 2 * 1024 * 1024;
-
-    struct HealthFixture {
-        identity: crate::replay_observer::Identity,
-        names: Vec<crate::replay_ocr::BossName>,
-        window: Arc<crate::warcraftlogs::HealthWindow>,
-    }
-
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct HealthFixtureJson {
-        identity: HealthIdentityJson,
-        names: Vec<HealthNameJson>,
-        window: HealthWindowJson,
-    }
-
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct HealthIdentityJson {
-        provider: String,
-        video_id: String,
-        broadcast_id: String,
-        report_code: String,
-        pull_id: u64,
-        pull_start_ms: i64,
-        pull_end_ms: i64,
-    }
-
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct HealthNameJson {
-        id: u32,
-        name: String,
-    }
-
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct HealthWindowJson {
-        start_ms: i64,
-        end_ms: i64,
-        traces: Vec<HealthTraceJson>,
-    }
-
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct HealthTraceJson {
-        actor: u64,
-        instance: Option<u64>,
-        game_id: u64,
-        name: String,
-        points: Vec<HealthPointJson>,
-    }
-
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct HealthPointJson {
-        elapsed_seconds: f64,
-        hit_points: u64,
-        max_hit_points: u64,
-    }
-
-    fn parse_health_fixture(bytes: &[u8], replay: &Replay) -> Result<HealthFixture, &'static str> {
-        const INVALID: &str = "The health fixture has invalid or mismatched observation data";
-        if bytes.len() > MAX_HEALTH_FIXTURE_BYTES {
-            return Err("The health fixture exceeds its two-megabyte limit");
-        }
-        let fixture: HealthFixtureJson = serde_json::from_slice(bytes).map_err(|_| {
-            "The health fixture must contain only the documented observation fields"
-        })?;
-        let identity = fixture.identity;
-        let duration = identity
-            .pull_end_ms
-            .checked_sub(identity.pull_start_ms)
-            .ok_or(INVALID)?;
-        let valid_name = |name: &str| {
-            name.len() <= 192
-                && !name.chars().any(char::is_control)
-                && (2..=96).contains(&crate::replay_ocr::normalize_boss_name(name).chars().count())
-        };
-        if identity.provider != replay.provider.key()
-            || identity.video_id != replay.video_id
-            || identity.broadcast_id != replay.broadcast_id
-            || identity.report_code.len() != 16
-            || !identity
-                .report_code
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric())
-            || !(1..=i32::MAX as u64).contains(&identity.pull_id)
-            || identity.pull_start_ms < 0
-            || !(1..=86_400_000).contains(&duration)
-            || !(1..=32).contains(&fixture.names.len())
-            || fixture.names.iter().enumerate().any(|(i, name)| {
-                !valid_name(&name.name)
-                    || fixture.names[..i]
-                        .iter()
-                        .any(|previous| previous.id == name.id)
-            })
-            || fixture.window.start_ms < 0
-            || fixture.window.end_ms <= fixture.window.start_ms
-            || fixture.window.end_ms > duration
-            || !(1..=64).contains(&fixture.window.traces.len())
-            || fixture
-                .window
-                .traces
-                .iter()
-                .map(|trace| trace.points.len())
-                .sum::<usize>()
-                > 16_000
-        {
-            return Err(INVALID);
-        }
-        for trace in &fixture.window.traces {
-            if trace.actor == 0
-                || trace.game_id == 0
-                || trace.instance == Some(0)
-                || !valid_name(&trace.name)
-                || trace.points.is_empty()
-                || !fixture.names.iter().any(|name| {
-                    crate::replay_ocr::normalize_boss_name(&name.name)
-                        == crate::replay_ocr::normalize_boss_name(&trace.name)
-                })
-                || trace
-                    .points
-                    .windows(2)
-                    .any(|pair| pair[1].elapsed_seconds < pair[0].elapsed_seconds)
-                || trace.points.iter().any(|point| {
-                    !point.elapsed_seconds.is_finite()
-                        || point.elapsed_seconds < fixture.window.start_ms as f64 / 1000.0
-                        || point.elapsed_seconds > fixture.window.end_ms as f64 / 1000.0
-                        || point.max_hit_points == 0
-                        || point.hit_points > point.max_hit_points
-                })
-            {
-                return Err(INVALID);
-            }
-        }
-        Ok(HealthFixture {
-            identity: crate::replay_observer::Identity {
-                provider: replay.provider.key(),
-                video_id: identity.video_id,
-                broadcast_id: identity.broadcast_id,
-                report_code: identity.report_code,
-                pull_id: identity.pull_id,
-                pull_start_ms: identity.pull_start_ms,
-                pull_end_ms: identity.pull_end_ms,
-            },
-            names: fixture
-                .names
-                .into_iter()
-                .map(|name| crate::replay_ocr::BossName {
-                    id: name.id,
-                    name: name.name,
-                })
-                .collect(),
-            window: Arc::new(crate::warcraftlogs::HealthWindow {
-                start_ms: fixture.window.start_ms,
-                end_ms: fixture.window.end_ms,
-                traces: fixture
-                    .window
-                    .traces
-                    .into_iter()
-                    .map(|trace| crate::warcraftlogs::HealthTrace {
-                        actor: trace.actor,
-                        instance: trace.instance,
-                        game_id: trace.game_id,
-                        name: trace.name,
-                        points: trace
-                            .points
-                            .into_iter()
-                            .map(|point| crate::warcraftlogs::HealthPoint {
-                                elapsed_seconds: point.elapsed_seconds,
-                                hit_points: point.hit_points,
-                                max_hit_points: point.max_hit_points,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            }),
-        })
-    }
-
-    fn health_test_data() -> (Replay, serde_json::Value) {
-        let replay = Replay {
-            provider: Provider::Youtube,
-            video_id: "synthetic-video".into(),
-            broadcast_id: "synthetic-broadcast".into(),
-            started_at: "2026-01-01T00:00:00Z".into(),
-            available_seconds: 600,
-        };
-        let fixture = serde_json::json!({
-            "identity": {"provider":"youtube","video_id":replay.video_id,
-                "broadcast_id":replay.broadcast_id,"report_code":"AAAAAAAAAAAAAAAA",
-                "pull_id":1,"pull_start_ms":1000,"pull_end_ms":4000},
-            "names":[{"id":1,"name":"Amber King"}],
-            "window":{"start_ms":0,"end_ms":3000,"traces":[{
-                "actor":10,"instance":1,"game_id":20,"name":"Amber King",
-                "points":[{"elapsed_seconds":0.0,"hit_points":900,"max_hit_points":1000},
-                    {"elapsed_seconds":1.0,"hit_points":800,"max_hit_points":1000}]
-            }]}
-        });
-        (replay, fixture)
-    }
-
-    #[test]
-    fn health_fixture_preserves_same_name_actor_instances_and_checks_identity() {
-        let (replay, mut fixture) = health_test_data();
-        let mut other = fixture["window"]["traces"][0].clone();
-        other["instance"] = serde_json::json!(2);
-        fixture["window"]["traces"]
-            .as_array_mut()
-            .unwrap()
-            .push(other);
-        let parsed = parse_health_fixture(&serde_json::to_vec(&fixture).unwrap(), &replay).unwrap();
-        assert_eq!(parsed.window.traces.len(), 2);
-        assert_ne!(
-            parsed.window.traces[0].instance,
-            parsed.window.traces[1].instance
-        );
-        fixture["identity"]["video_id"] = serde_json::json!("different-video");
-        assert!(parse_health_fixture(&serde_json::to_vec(&fixture).unwrap(), &replay).is_err());
-    }
-
-    #[test]
-    fn health_fixture_rejects_credentials_invalid_resources_and_oversized_input() {
-        let (replay, fixture) = health_test_data();
-        let mut extra = fixture.clone();
-        extra["access_token"] = serde_json::json!("not-a-credential");
-        assert!(parse_health_fixture(&serde_json::to_vec(&extra).unwrap(), &replay).is_err());
-        let mut invalid = fixture.clone();
-        invalid["window"]["traces"][0]["points"][0]["hit_points"] = serde_json::json!(1001);
-        assert!(parse_health_fixture(&serde_json::to_vec(&invalid).unwrap(), &replay).is_err());
-        let mut invalid = fixture.clone();
-        invalid["window"]["traces"][0]["points"][1]["elapsed_seconds"] = serde_json::json!(-1.0);
-        assert!(parse_health_fixture(&serde_json::to_vec(&invalid).unwrap(), &replay).is_err());
-        let mut invalid = fixture;
-        let point = invalid["window"]["traces"][0]["points"][0].clone();
-        invalid["window"]["traces"][0]["points"] = serde_json::json!(vec![point; 16_001]);
-        assert!(parse_health_fixture(&serde_json::to_vec(&invalid).unwrap(), &replay).is_err());
-        assert!(parse_health_fixture(&vec![b' '; MAX_HEALTH_FIXTURE_BYTES + 1], &replay).is_err());
-    }
-
     #[derive(Clone, Copy)]
     enum Phase {
         Autoplay,
@@ -363,7 +122,6 @@ mod native {
         AlternateHolds,
         ReturnSettles,
         ReturnAdvances,
-        Observe,
     }
 
     impl Phase {
@@ -384,7 +142,6 @@ mod native {
                 Self::AlternateHolds => "alternate POV holds its requested paused frame",
                 Self::ReturnSettles => "reused player returns to the original POV",
                 Self::ReturnAdvances => "original POV resumes without replacing the native player",
-                Self::Observe => "local clock discovery and tracking while replay plays",
             }
         }
     }
@@ -403,16 +160,6 @@ mod native {
         switch_rounds: usize,
         completed_rounds: usize,
         deadline: Duration,
-        observer: Option<crate::replay_observer::Observer>,
-        observation_identity: crate::replay_observer::Identity,
-        health_fixture: Option<HealthFixture>,
-        health_observations: usize,
-        health_readings: usize,
-        health_mappings: usize,
-        observations: usize,
-        last_observation: Option<Instant>,
-        last_clock_readings: Vec<(u32, u32)>,
-        advancing_clock_samples: usize,
         player_id: Option<String>,
         capture_path: Option<std::path::PathBuf>,
         capture_requested: bool,
@@ -490,12 +237,6 @@ mod native {
                 self.last_diagnostic = Instant::now();
             }
             if self.started.elapsed() > self.deadline {
-                if self.health_fixture.is_some() && matches!(self.phase, Phase::Observe) {
-                    let stats = self.observer.as_ref().unwrap().statistics();
-                    return Err(format!("Native health estimate was not established at the default player size: observations={}, health_frames={}, readings={}, mappings={}, captures={}, discarded={}",
-                        self.observations, self.health_observations, self.health_readings,
-                        self.health_mappings, stats.captured_frames, stats.discarded_results));
-                }
                 return Err(format!(
                     "Timed out during {} (ready={}, playing={})",
                     self.phase.label(),
@@ -671,11 +412,7 @@ mod native {
                             }
                             self.next(Phase::AlternateSettles, state.seconds);
                         } else {
-                            if self.observer.is_some() {
-                                self.next(Phase::Observe, state.seconds);
-                            } else {
-                                return Ok(true);
-                            }
+                            return Ok(true);
                         }
                     }
                 }
@@ -748,92 +485,6 @@ mod native {
                         self.next(Phase::AlternateSettles, state.seconds);
                     }
                 }
-                Phase::Observe => {
-                    let observer = self.observer.as_mut().unwrap();
-                    if let Some(health) = &self.health_fixture {
-                        observer.tick_with_health(
-                            ctx,
-                            self.player.as_ref().map(Box::as_ref),
-                            Some(self.observation_identity.clone()),
-                            &health.names,
-                            Some(&health.window),
-                        );
-                    } else {
-                        observer.tick(
-                            ctx,
-                            self.player.as_ref().map(Box::as_ref),
-                            Some(self.observation_identity.clone()),
-                        );
-                    }
-                    if let Some(observation) = observer.observation() {
-                        if self.last_observation != Some(observation.observed_at) {
-                            self.last_observation = Some(observation.observed_at);
-                            self.observations += 1;
-                            if self.health_fixture.is_some() {
-                                self.health_observations +=
-                                    usize::from(!observation.health_readings.is_empty());
-                                self.health_readings += observation.health_readings.len();
-                                self.health_mappings = observation
-                                    .health_assessment
-                                    .as_ref()
-                                    .map_or(0, |assessment| assessment.mappings.len());
-                                eprintln!("Native health observation: frame={}, dimensions={}x{}, readings={}, mappings={}, processing_ms={}, sampling_ms={:.1}",
-                                    self.observations, observation.width, observation.height,
-                                    observation.health_readings.len(), self.health_mappings,
-                                    observation.processing_duration.as_millis(),
-                                    observation.sampling_uncertainty_seconds * 1000.0);
-                                if self.health_observations >= 3 {
-                                    if let Some(mapping) = observation
-                                        .health_assessment
-                                        .as_ref()
-                                        .and_then(|assessment| assessment.unique_mapping())
-                                        .filter(|mapping| mapping.observed_frames.len() >= 3)
-                                    {
-                                        eprintln!("Native health estimate: observed_frames={}, threshold_crossings={}, interval_width_seconds={:.3}; estimated visual association, not exact event timing",
-                                            mapping.observed_frames.len(), mapping.crossing_count,
-                                            mapping.start_interval.width_seconds());
-                                        return Ok(true);
-                                    }
-                                }
-                            }
-                            if observation.readings.iter().any(|reading| {
-                                self.last_clock_readings.iter().any(|(id, seconds)| {
-                                    *id == reading.region_id
-                                        && reading.elapsed_seconds > *seconds
-                                        && reading.elapsed_seconds - seconds <= 10
-                                })
-                            }) {
-                                self.advancing_clock_samples += 1;
-                            }
-                            self.last_clock_readings = observation
-                                .readings
-                                .iter()
-                                .map(|reading| (reading.region_id, reading.elapsed_seconds))
-                                .collect();
-                            eprintln!("Native clock observation: phase={:?}, readings={}, processing_ms={}, sampling_ms={:.1}",
-                                observation.phase, observation.readings.len(), observation.processing_duration.as_millis(),
-                                observation.sampling_uncertainty_seconds * 1000.0);
-                        }
-                    }
-                    if observer.status() == crate::replay_observer::Status::Unavailable {
-                        return Err("The opted-in local OCR worker is unavailable".into());
-                    }
-                    if self.health_fixture.is_none()
-                        && self.observations >= 3
-                        && self.advancing_clock_samples >= 2
-                    {
-                        let stats = observer.statistics();
-                        if stats.discoveries == 0 || stats.tracked_frames < 2 {
-                            return Err(
-                                "The native observer did not reuse learned clock regions".into()
-                            );
-                        }
-                        eprintln!("Native observer verified: captures={}, discoveries={}, tracked={}, model_load_ms={}, total_processing_ms={}",
-                            stats.captured_frames, stats.discoveries, stats.tracked_frames,
-                            stats.model_load_duration.as_millis(), stats.processing_duration.as_millis());
-                        return Ok(true);
-                    }
-                }
             }
             Ok(false)
         }
@@ -880,9 +531,7 @@ mod native {
             ui.label(self.phase.label());
             ui.label("One player instance · local fixture · no account sign-in");
             ui.add_space(12.0);
-            let size = if matches!(self.phase, Phase::Observe) {
-                egui::vec2(1280.0, 720.0)
-            } else if self.resized {
+            let size = if self.resized {
                 egui::vec2(680.0, 390.0)
             } else {
                 egui::vec2(900.0, 510.0)
@@ -1057,54 +706,13 @@ mod native {
             switch_rounds == 1 || alternate.is_some(),
             "Repeated switches need an alternate fixture"
         );
-        let health_fixture = std::env::var_os("BRICK_REPLAY_HEALTH_FIXTURE").map(|path| {
-            let mut bytes = Vec::new();
-            std::fs::File::open(path)
-                .expect("The explicit health fixture could not be opened")
-                .take(MAX_HEALTH_FIXTURE_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-                .expect("The health fixture could not be read");
-            parse_health_fixture(&bytes, &replay).unwrap_or_else(|error| panic!("{error}"))
-        });
-        let deadline = DEADLINE
-            + Duration::from_secs((switch_rounds as u64 - 1) * 45)
-            + if health_fixture.is_some() {
-                Duration::from_secs(35)
-            } else {
-                Duration::ZERO
-            };
-        let observer = std::env::var_os("BRICK_REPLAY_OCR_MODEL_DIR")
-            .map(|_| crate::replay_observer::Observer::for_native_test());
-        assert!(
-            health_fixture.is_none() || observer.is_some(),
-            "The native health gate requires explicit OCR models and RTEN_NUM_THREADS=1"
-        );
-        assert!(
-            observer.is_none() || alternate.is_none(),
-            "Run OCR observation separately from repeated POV swaps"
-        );
-        let observation_identity = health_fixture
-            .as_ref()
-            .map(|health| health.identity.clone())
-            .unwrap_or_else(|| crate::replay_observer::Identity {
-                provider: replay.provider.key(),
-                video_id: replay.video_id.clone(),
-                broadcast_id: replay.broadcast_id.clone(),
-                report_code: "local-observer-fixture".into(),
-                pull_id: 1,
-                pull_start_ms: 0,
-                pull_end_ms: 180000,
-            });
+        let deadline = DEADLINE + Duration::from_secs((switch_rounds as u64 - 1) * 45);
         let outcome = Arc::new(Mutex::new(Outcome::default()));
         let app_outcome = outcome.clone();
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("Brick · Native replay smoke")
-                .with_inner_size(if observer.is_some() {
-                    [1360.0, 820.0]
-                } else {
-                    [960.0, 660.0]
-                })
+                .with_inner_size([960.0, 660.0])
                 .with_active(true)
                 .with_position([20.0, 20.0]),
             event_loop_builder: Some(Box::new(|builder| {
@@ -1135,16 +743,6 @@ mod native {
                     switch_rounds,
                     completed_rounds: 0,
                     deadline,
-                    observer,
-                    observation_identity,
-                    health_fixture,
-                    health_observations: 0,
-                    health_readings: 0,
-                    health_mappings: 0,
-                    observations: 0,
-                    last_observation: None,
-                    last_clock_readings: Vec::new(),
-                    advancing_clock_samples: 0,
                     player_id: None,
                     capture_path: std::env::var_os("BRICK_REPLAY_CAPTURE")
                         .map(std::path::PathBuf::from),

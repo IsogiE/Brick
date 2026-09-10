@@ -1,10 +1,9 @@
 use crate::{
     defensives::DefensiveGroup,
     discord_auth,
-    replay_timing::DEFAULT_SECONDS,
     stream_player::{PlaybackCommand, PlaybackState},
     streams::{Status, Stream},
-    warcraftlogs::{while_current, Client, EventKind, Pull, RaidEvent, Replay, Review},
+    warcraftlogs::{while_current, Client, EventKind, Pull, RaidEvent, Review},
 };
 use eframe::egui::{self, Color32, RichText};
 use std::{
@@ -36,83 +35,6 @@ impl Drop for PeerMetadataPermit {
     }
 }
 
-// Shared by the primary view and its comparison peer. At most one local save
-// runs at once; repeated edits coalesce without retaining obsolete workers.
-#[derive(Clone)]
-struct TimingWrite {
-    replay: Replay,
-    pull: Pull,
-    seconds: i64,
-}
-impl TimingWrite {
-    fn same_context(&self, other: &Self) -> bool {
-        self.replay.provider == other.replay.provider
-            && self.replay.video_id == other.replay.video_id
-            && self.pull.report == other.pull.report
-    }
-}
-#[derive(Default)]
-struct TimingWrites {
-    pending: Vec<TimingWrite>,
-    running: Option<TimingWrite>,
-    latest: Vec<TimingWrite>,
-}
-impl TimingWrites {
-    fn enqueue(&mut self, write: TimingWrite) -> bool {
-        if let Some(old) = self.pending.iter_mut().find(|old| old.same_context(&write)) {
-            *old = write.clone();
-        } else if self.pending.len() < 64 {
-            self.pending.push(write.clone());
-        } else {
-            return false;
-        }
-        // A refresh captured before an edit must not restore its old mapping.
-        self.remember(write);
-        true
-    }
-    fn remember(&mut self, write: TimingWrite) {
-        if let Some(old) = self.latest.iter_mut().find(|old| old.same_context(&write)) {
-            *old = write;
-        } else {
-            if self.latest.len() == 64 {
-                self.latest.remove(0);
-            }
-            self.latest.push(write);
-        }
-    }
-    fn next(&self) -> Option<TimingWrite> {
-        self.running
-            .is_none()
-            .then(|| self.pending.first().cloned())
-            .flatten()
-    }
-    fn begin(&mut self, write: &TimingWrite) -> bool {
-        if self.running.is_some() {
-            return false;
-        }
-        let Some(index) = self
-            .pending
-            .iter()
-            .position(|queued| queued.same_context(write) && queued.seconds == write.seconds)
-        else {
-            return false;
-        };
-        self.running = Some(self.pending.remove(index));
-        true
-    }
-    fn apply_to(&self, review: &mut Review) {
-        for write in &self.latest {
-            if write.replay.provider == review.replay.provider
-                && write.replay.video_id == review.replay.video_id
-            {
-                review
-                    .timing
-                    .insert(write.pull.report.clone(), write.seconds);
-            }
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct Playback {
     pub seconds: f64,
@@ -127,21 +49,11 @@ enum Action {
     Connect,
     Disconnect,
     Events(Pull, EventKind),
-    Health(Pull, Vec<crate::warcraftlogs::HealthBand>),
-    HealthTargets(Pull),
-    Align(Replay, Pull, i64),
 }
 enum Data {
     Review(Review),
     Authentication,
-    Aligned,
     Events(String, EventKind, Vec<RaidEvent>),
-    Health(
-        String,
-        Vec<crate::warcraftlogs::HealthBand>,
-        crate::warcraftlogs::HealthWindow,
-    ),
-    HealthTargets(String, Vec<crate::warcraftlogs::HealthTarget>),
 }
 type Outcome = (u64, String, Result<Data, String>, bool);
 
@@ -157,7 +69,8 @@ pub struct WorkspaceAction {
 
 pub struct ReviewUi {
     client: Arc<Mutex<Option<Client>>>,
-    timing_writes: Arc<Mutex<TimingWrites>>,
+    marker_cache: Arc<Mutex<crate::replay_sync::Cache>>,
+    marker_sync: crate::replay_sync::Sync,
     metadata_only: bool,
     work: Option<mpsc::Receiver<Outcome>>,
     work_action: Option<Action>,
@@ -193,23 +106,14 @@ pub struct ReviewUi {
     pov_menu: PovMenuState,
     range_epoch: Instant,
     range_pause_sent: bool,
-    health_window: Option<Arc<crate::warcraftlogs::HealthWindow>>,
-    health_names: Vec<crate::replay_ocr::BossName>,
-    health_enabled: bool,
-    health_bands: Vec<crate::warcraftlogs::HealthBand>,
-    health_attempted: Vec<crate::warcraftlogs::HealthBand>,
-    health_window_bands: Vec<crate::warcraftlogs::HealthBand>,
-    health_last_query: Option<Instant>,
-    health_last_observation: Option<Instant>,
-    health_targets: Vec<crate::warcraftlogs::HealthTarget>,
-    health_targets_requested: bool,
 }
 
 impl Default for ReviewUi {
     fn default() -> Self {
         Self {
             client: Arc::new(Mutex::new(None)),
-            timing_writes: Arc::new(Mutex::new(TimingWrites::default())),
+            marker_cache: Arc::new(Mutex::new(crate::replay_sync::Cache::default())),
+            marker_sync: crate::replay_sync::Sync::default(),
             metadata_only: false,
             work: None,
             work_action: None,
@@ -245,24 +149,12 @@ impl Default for ReviewUi {
             pov_menu: PovMenuState::default(),
             range_epoch: Instant::now(),
             range_pause_sent: false,
-            health_window: None,
-            health_names: Vec::new(),
-            health_enabled: false,
-            health_bands: Vec::new(),
-            health_attempted: Vec::new(),
-            health_window_bands: Vec::new(),
-            health_last_query: None,
-            health_last_observation: None,
-            health_targets: Vec::new(),
-            health_targets_requested: false,
         }
     }
 }
 impl Drop for ReviewUi {
     fn drop(&mut self) {
-        if !matches!(self.work_action, Some(Action::Align(..))) {
-            self.cancel.store(true, Ordering::Relaxed);
-        }
+        self.cancel.store(true, Ordering::Relaxed);
     }
 }
 impl ReviewUi {
@@ -279,7 +171,7 @@ impl ReviewUi {
     pub(crate) fn metadata_peer(&self) -> Self {
         let mut peer = Self::default();
         peer.client = self.client.clone();
-        peer.timing_writes = self.timing_writes.clone();
+        peer.marker_cache = self.marker_cache.clone();
         peer.metadata_only = true;
         peer
     }
@@ -304,6 +196,9 @@ impl ReviewUi {
 
     pub(crate) fn comparison_position(&self, state: &PlaybackState) -> Option<(i64, bool)> {
         let (review, pull) = self.comparison_context()?;
+        if let Some((elapsed, playing)) = self.marker_sync.intent() {
+            return Some((pull.start_ms + (elapsed * 1000.0).round() as i64, playing));
+        }
         let seconds = self
             .confirmed_video_position(state)
             .or_else(|| {
@@ -329,6 +224,10 @@ impl ReviewUi {
                 && (pov_key(candidate) == self.key
                     || video_id == Some(review.replay.video_id.as_str()))
         });
+        if let Some(review) = known.filter(|r| r.marker_alignment(pull).is_some()) {
+            let seconds = review.pull_video_start(pull) + (at_ms - pull.start_ms) as f64 / 1000.0;
+            return seconds >= 0.0 && seconds < review.replay.available_seconds as f64;
+        }
         // RFC3339 decoding happens once when metadata arrives, never while
         // painting or filtering the candidate list.
         let range = known
@@ -337,20 +236,7 @@ impl ReviewUi {
         let Some(range) = range else {
             return false;
         };
-        let mut correction = known
-            .and_then(|review| review.timing.get(&pull.report))
-            .copied()
-            .unwrap_or(DEFAULT_SECONDS);
-        if let (Some(video_id), Ok(writes)) = (video_id, self.timing_writes.lock()) {
-            if let Some(write) = writes.latest.iter().find(|write| {
-                write.replay.provider == candidate.provider
-                    && write.replay.video_id == video_id
-                    && write.pull.report == pull.report
-            }) {
-                correction = write.seconds;
-            }
-        }
-        recording_covers_moment(range, pull.start_ms, at_ms, correction)
+        recording_covers_moment(range, pull.start_ms, at_ms)
     }
 
     pub(crate) fn pov_selection_context(&self, state: &PlaybackState) -> Option<(&Pull, i64)> {
@@ -358,74 +244,6 @@ impl ReviewUi {
             return Some((pull, *at_ms));
         }
         Some((self.pull.as_ref()?, self.comparison_position(state)?.0))
-    }
-
-    pub(crate) fn video_timing(&self, report: &str) -> i64 {
-        self.review
-            .as_ref()
-            .and_then(|review| review.timing.get(report))
-            .copied()
-            .unwrap_or(DEFAULT_SECONDS)
-    }
-
-    fn set_video_timing(&mut self, pull: &Pull, seconds: i64) -> bool {
-        if !(-600..=600).contains(&seconds) || self.video_timing(&pull.report) == seconds {
-            return false;
-        }
-        let Some(review) = self.review.as_mut() else {
-            return false;
-        };
-        if !review
-            .pulls
-            .iter()
-            .any(|item| item.report == pull.report && item.id == pull.id)
-        {
-            return false;
-        }
-        let write = TimingWrite {
-            replay: review.replay.clone(),
-            pull: pull.clone(),
-            seconds,
-        };
-        if !self
-            .timing_writes
-            .lock()
-            .is_ok_and(|mut writes| writes.enqueue(write))
-        {
-            self.notice = Some("Video timing is busy. Try again in a moment.".into());
-            return false;
-        }
-        review.timing.insert(pull.report.clone(), seconds);
-        self.notice = None;
-        true
-    }
-
-    /// A metadata peer supplies its matching pull explicitly; it need not open
-    /// another workspace or issue player commands to save its own correction.
-    pub(crate) fn draw_video_timing(&mut self, ui: &mut egui::Ui, pull: &Pull) -> bool {
-        let seconds = self.video_timing(&pull.report);
-        video_timing_control(ui, seconds, self.review.is_some())
-            .is_some_and(|seconds| self.set_video_timing(pull, seconds))
-    }
-
-    fn adjust_video_timing(
-        &mut self,
-        pull: &Pull,
-        seconds: i64,
-        at_ms: i64,
-        autoplay: bool,
-    ) -> Option<PlaybackCommand> {
-        let replay = &self.review.as_ref()?.replay;
-        let target = (at_ms - replay.start_ms().ok()?) as f64 / 1000.0 + seconds as f64;
-        if !(0.0..replay.available_seconds as f64).contains(&target) {
-            self.notice = Some("That timing would move this moment outside the VOD.".into());
-            return None;
-        }
-        self.playback.as_ref()?;
-        if !self.set_video_timing(pull, seconds) {
-            return None;
-        }
-        self.seek_absolute_with_playback(at_ms, autoplay)
     }
 
     pub(crate) fn set_recording_labels(&mut self, labels: RecordingLabels) {
@@ -438,7 +256,6 @@ impl ReviewUi {
 
     pub(crate) fn open_recording(&mut self) {
         self.cancel_read();
-        self.clear_health();
         self.review = None;
         self.replay_coverage = None;
         self.pull = None;
@@ -473,132 +290,79 @@ impl ReviewUi {
         )
     }
 
-    pub(crate) fn observation_context(&self) -> Option<(&Replay, &Pull)> {
-        if !self.active || self.pending_focus.is_some() || self.popup_open || self.aligning {
+    pub(crate) fn syncing_marker(&self) -> bool {
+        self.marker_sync.busy()
+    }
+
+    pub(crate) fn cancel_marker(&mut self, player: Option<&crate::stream_player::StreamPlayer>) {
+        self.marker_sync.cancel(player);
+    }
+
+    pub(crate) fn sync_marker(
+        &mut self,
+        ctx: &egui::Context,
+        player: &crate::stream_player::StreamPlayer,
+        selected: Option<&Pull>,
+        desired: Option<(i64, bool)>,
+    ) -> Option<PlaybackCommand> {
+        if self.popup_open || self.pending_focus.is_some() || (!self.metadata_only && !self.active)
+        {
             return None;
         }
-        let review = self.review.as_ref()?;
-        let playback = self.playback.as_ref()?;
-        (playback.broadcast_id == review.replay.broadcast_id)
-            .then_some((&review.replay, self.pull.as_ref()?))
-    }
-
-    pub(crate) fn observation_boss_names(&self) -> &[crate::replay_ocr::BossName] {
-        &self.health_names
-    }
-
-    pub(crate) fn observation_health_window(
-        &self,
-    ) -> Option<&Arc<crate::warcraftlogs::HealthWindow>> {
-        self.health_window.as_ref()
-    }
-
-    pub(crate) fn prepare_health_observation(&mut self) {
-        self.health_enabled = true;
-    }
-
-    /// Search the log using observed health, not an assumed time delay. Preserve
-    /// every recognized label/percent alternative and every same-name NPC.
-    pub(crate) fn observe_health(&mut self, observation: &crate::replay_observer::Observation) {
-        if observation.observed_at.elapsed() >= Duration::from_secs(10)
-            || self.health_last_observation == Some(observation.observed_at)
+        let pull = selected.or(self.pull.as_ref())?;
+        let review = self.review.as_mut()?;
+        let estimate = review.pull_video_start(pull);
+        let (elapsed, autoplay) = desired.map_or_else(
+            || {
+                self.playback
+                    .as_ref()
+                    .map_or((0.0, true), |p| (p.seconds - estimate, p.autoplay))
+            },
+            |(at_ms, playing)| ((at_ms - pull.start_ms) as f64 / 1000.0, playing),
+        );
+        let command = self.marker_sync.tick(
+            ctx,
+            player,
+            &review.replay,
+            pull,
+            estimate,
+            elapsed,
+            autoplay,
+            review.marker_alignment(pull).is_some(),
+            true,
+        );
+        if let Some(alignment) = self.marker_sync.take_alignment() {
+            crate::replay_library::submit(&review.replay, pull, alignment);
+            if let Ok(mut cache) = self.marker_cache.lock() {
+                cache.insert(
+                    crate::replay_sync::Key::new(&review.replay, pull),
+                    alignment,
+                );
+            }
+            // Cache for the next explicit navigation. Changing this pull's
+            // clock while it is playing would move its timeline or comparison.
+        }
+        if let Some(PlaybackCommand::Seek(seconds) | PlaybackCommand::SeekPaused(seconds)) = command
         {
-            return;
-        }
-        let Some((replay, pull)) = self.observation_context() else {
-            return;
-        };
-        if observation.identity != crate::replay_observer::Identity::new(replay, pull) {
-            return;
-        }
-        self.health_last_observation = Some(observation.observed_at);
-        let mut bands = Vec::<crate::warcraftlogs::HealthBand>::new();
-        let mut covered = self.health_window.is_some();
-        for reading in &observation.health_readings {
-            let candidate = &reading.candidate;
-            let Some(name) = self
-                .health_names
-                .iter()
-                .find(|name| name.id == candidate.boss_name_id)
-            else {
-                return;
-            };
-            let mut game_ids: Vec<_> = self
-                .health_targets
-                .iter()
-                .filter(|target| crate::replay_ocr::normalize_boss_name(&target.name) == name.name)
-                .map(|target| target.game_id)
-                .collect();
-            game_ids.sort_unstable();
-            game_ids.dedup();
-            if game_ids.is_empty()
-                || !candidate.percent.is_finite()
-                || !(0.0..=100.0).contains(&candidate.percent)
-                || candidate.decimal_places > 2
-            {
-                return;
-            }
-            let unit = 10.0_f64.powi(-i32::from(candidate.decimal_places));
-            let lower = (candidate.percent - unit).max(0.0);
-            let upper = (candidate.percent + unit).min(100.0);
-            covered &= self.health_window_bands.iter().any(|band| {
-                band.game_ids == game_ids && band.min_percent <= lower && band.max_percent >= upper
-            });
-            // This is a log search band, not a playback offset. Extra health
-            // coverage lets several subsequent frames share one bounded query.
-            let band = crate::warcraftlogs::HealthBand {
-                game_ids,
-                min_percent: (lower - 3.0).floor().max(0.0),
-                max_percent: (upper + 3.0).ceil().min(100.0),
-            };
-            if !bands.contains(&band) {
-                bands.push(band);
-            }
-            if bands.len() > 32 {
-                return;
+            // Calibration probes are temporary. Only the final restored moment
+            // becomes the workspace's playback intent.
+            if !self.marker_sync.busy() {
+                if let Some(playback) = &mut self.playback {
+                    playback.seconds = seconds;
+                    playback.public_url = review.replay.public_url(seconds as u64);
+                }
+                self.reset_playback_range();
             }
         }
-        if covered || bands.is_empty() {
-            return;
-        }
-        bands.sort_by(|a, b| {
-            a.game_ids
-                .cmp(&b.game_ids)
-                .then(a.min_percent.total_cmp(&b.min_percent))
-                .then(a.max_percent.total_cmp(&b.max_percent))
-        });
-        let mut merged = Vec::<crate::warcraftlogs::HealthBand>::new();
-        for band in bands {
-            if let Some(last) = merged.last_mut().filter(|last| {
-                last.game_ids == band.game_ids && band.min_percent <= last.max_percent
-            }) {
-                last.max_percent = last.max_percent.max(band.max_percent);
-            } else {
-                merged.push(band);
-            }
-        }
-        self.health_bands = merged;
-    }
-
-    fn clear_health(&mut self) {
-        self.health_window = None;
-        self.health_names.clear();
-        self.health_enabled = false;
-        self.health_bands.clear();
-        self.health_attempted.clear();
-        self.health_window_bands.clear();
-        self.health_last_query = None;
-        self.health_last_observation = None;
-        self.health_targets.clear();
-        self.health_targets_requested = false;
+        command
     }
 
     pub fn tick(&mut self, ctx: &egui::Context, stream: Option<&Stream>) -> bool {
         let key = stream.map(pov_key).unwrap_or_default();
         let mut changed = false;
         if self.key != key {
+            self.marker_sync.reset(None);
             self.cancel_read();
-            self.clear_health();
             self.key = key;
             self.review = None;
             self.replay_coverage = None;
@@ -618,12 +382,7 @@ impl ReviewUi {
             }
             changed = true;
         }
-        if !self.active
-            && matches!(
-                self.work_action,
-                Some(Action::Events(..) | Action::Health(..) | Action::HealthTargets(..))
-            )
-        {
+        if !self.active && matches!(self.work_action, Some(Action::Events(..))) {
             self.cancel_read();
         }
         if let Some(rx) = &self.work {
@@ -636,21 +395,17 @@ impl ReviewUi {
                         && key == self.key
                         && !self.cancel.load(Ordering::Relaxed)
                     {
-                        let local_save = matches!(action, Some(Action::Align(..)));
-                        if !local_save {
-                            self.connected = connected;
-                        }
+                        self.connected = connected;
                         match result {
                             Ok(Data::Review(review)) => {
                                 changed |= self.accept_review(review);
                                 changed |= self.restore_pov_position();
                             }
-                            Ok(Data::Aligned) => {
-                                // The visible mapping changes with the user's edit.
-                                // An older save completion must never roll it back.
-                            }
                             Ok(Data::Authentication) => {
-                                self.clear_health();
+                                self.marker_sync.reset(None);
+                                if let Ok(mut cache) = self.marker_cache.lock() {
+                                    *cache = Default::default();
+                                }
                                 self.review = None;
                                 self.replay_coverage = None;
                                 self.pull = None;
@@ -669,46 +424,8 @@ impl ReviewUi {
                                     self.loaded_events.push(kind);
                                 }
                             }
-                            Ok(Data::Health(key, bands, window)) => {
-                                if self.pull.as_ref().is_some_and(|p| pull_key(p) == key) {
-                                    self.health_window = Some(Arc::new(window));
-                                    self.health_window_bands = bands;
-                                }
-                            }
-                            Ok(Data::HealthTargets(key, targets)) => {
-                                if self.pull.as_ref().is_some_and(|p| pull_key(p) == key) {
-                                    let mut names: Vec<_> = targets
-                                        .iter()
-                                        .map(|trace| {
-                                            crate::replay_ocr::normalize_boss_name(&trace.name)
-                                        })
-                                        .filter(|name| !name.is_empty())
-                                        .collect();
-                                    names.sort();
-                                    names.dedup();
-                                    self.health_names = if names.len() <= 32 {
-                                        names
-                                            .into_iter()
-                                            .enumerate()
-                                            .map(|(index, name)| crate::replay_ocr::BossName {
-                                                id: index as u32 + 1,
-                                                name,
-                                            })
-                                            .collect()
-                                    } else {
-                                        Vec::new()
-                                    };
-                                    self.health_targets = targets;
-                                }
-                            }
                             Err(error) => {
-                                if matches!(
-                                    action,
-                                    Some(Action::Health(..) | Action::HealthTargets(..))
-                                ) {
-                                    // Optional alignment evidence remains unavailable;
-                                    // it must not replace or erase the selected pull.
-                                } else if let Some(Action::Events(pull, _)) = action {
+                                if let Some(Action::Events(pull, _)) = action {
                                     if self
                                         .pull
                                         .as_ref()
@@ -716,15 +433,12 @@ impl ReviewUi {
                                     {
                                         self.event_notice = Some(error);
                                     }
-                                } else if matches!(action, Some(Action::Align(..))) {
-                                    self.notice = Some("Video timing changed for this session, but could not be saved.".into());
                                 } else {
                                     self.notice = Some(error);
                                 }
                             }
                         }
-                        if !connected && !local_save {
-                            self.clear_health();
+                        if !connected {
                             self.review = None;
                             self.replay_coverage = None;
                             self.pull = None;
@@ -750,7 +464,7 @@ impl ReviewUi {
             }
         }
         if let Some(action) = self.next_action() {
-            if stream.is_some() || matches!(action, Action::Align(..)) {
+            if stream.is_some() {
                 self.start(ctx, stream, action);
             }
         }
@@ -760,15 +474,8 @@ impl ReviewUi {
     // Keep the worker until it finishes its bounded current request. Derive the
     // next read from the current UI selection instead of queuing obsolete pulls.
     fn cancel_read(&mut self) {
-        if !matches!(
-            self.work_action,
-            Some(
-                Action::Refresh
-                    | Action::Events(..)
-                    | Action::Health(..)
-                    | Action::HealthTargets(..)
-            )
-        ) || self.cancel.swap(true, Ordering::Relaxed)
+        if !matches!(self.work_action, Some(Action::Refresh | Action::Events(..)))
+            || self.cancel.swap(true, Ordering::Relaxed)
         {
             return;
         }
@@ -783,8 +490,6 @@ impl ReviewUi {
             {
                 self.requested_events.retain(|requested| requested != kind);
             }
-            Some(Action::Health(..)) => self.health_attempted.clear(),
-            Some(Action::HealthTargets(..)) => self.health_targets_requested = false,
             _ => (),
         }
     }
@@ -793,35 +498,11 @@ impl ReviewUi {
         if self.work.is_some() {
             return None;
         }
-        if let Some(write) = self
-            .timing_writes
-            .lock()
-            .ok()
-            .and_then(|writes| writes.next())
-        {
-            return Some(Action::Align(write.replay, write.pull, write.seconds));
-        }
         let missing = [EventKind::Deaths, EventKind::Defensives]
             .into_iter()
             .find(|kind| !self.requested_events.contains(kind));
         if let Some((pull, kind)) = self.pull.clone().zip(missing).filter(|_| self.active) {
             Some(Action::Events(pull, kind))
-        } else if let Some(pull) = self
-            .pull
-            .clone()
-            .filter(|_| self.active && self.health_enabled && !self.health_targets_requested)
-        {
-            Some(Action::HealthTargets(pull))
-        } else if let Some(pull) = self.pull.clone().filter(|_| {
-            self.active
-                && self.health_enabled
-                && !self.health_bands.is_empty()
-                && self.health_bands != self.health_attempted
-                && self
-                    .health_last_query
-                    .is_none_or(|at| at.elapsed() >= Duration::from_secs(15))
-        }) {
-            Some(Action::Health(pull, self.health_bands.clone()))
         } else if self
             .last_attempt
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(60))
@@ -833,6 +514,44 @@ impl ReviewUi {
     }
 
     fn accept_review(&mut self, mut review: Review) -> bool {
+        if let Ok(mut cache) = self.marker_cache.lock() {
+            for pull in &review.pulls {
+                if let Some(alignment) = review.marker_alignment(pull) {
+                    cache.insert(
+                        crate::replay_sync::Key::new(&review.replay, pull),
+                        alignment,
+                    );
+                }
+                if let Some(alignment) = cache.get(&review.replay, pull) {
+                    review
+                        .marker_timing
+                        .insert((pull.report.clone(), pull.id), alignment);
+                }
+            }
+        }
+        // A refresh may discover a better clock, but only explicit navigation
+        // adopts it. Keep the currently watched pull's mapping unchanged.
+        if let Some((old, selected)) = self.review.as_ref().zip(self.pull.as_ref()) {
+            if old.replay.broadcast_id == review.replay.broadcast_id
+                && old.replay.video_id == review.replay.video_id
+                && review.pulls.iter().any(|p| {
+                    p.report == selected.report
+                        && p.id == selected.id
+                        && p.start_ms == selected.start_ms
+                        && p.end_ms == selected.end_ms
+                })
+            {
+                let key = (selected.report.clone(), selected.id);
+                match old.marker_alignment(selected) {
+                    Some(alignment) => {
+                        review.marker_timing.insert(key, alignment);
+                    }
+                    None => {
+                        review.marker_timing.remove(&key);
+                    }
+                }
+            }
+        }
         self.replay_coverage = review.replay.start_ms().ok().and_then(|start| {
             start
                 .checked_add(
@@ -842,9 +561,6 @@ impl ReviewUi {
                 )
                 .map(|end| (start, end))
         });
-        if let Ok(writes) = self.timing_writes.lock() {
-            writes.apply_to(&mut review);
-        }
         let broadcast_changed = self
             .playback
             .as_ref()
@@ -857,7 +573,6 @@ impl ReviewUi {
         });
         let unavailable = self.pull.is_some() && current.is_none();
         if broadcast_changed || unavailable {
-            self.clear_health();
             self.pull = None;
             self.playback = None;
             self.events.clear();
@@ -880,7 +595,6 @@ impl ReviewUi {
                 self.loaded_events.clear();
                 self.selected_event = None;
                 self.scroll_to_event = false;
-                self.clear_health();
                 self.range_epoch = Instant::now();
                 self.range_pause_sent = false;
                 self.timeline_position = None;
@@ -913,24 +627,6 @@ impl ReviewUi {
         } else {
             None
         };
-        let local_write = if let Action::Align(replay, pull, seconds) = &action {
-            let write = TimingWrite {
-                replay: replay.clone(),
-                pull: pull.clone(),
-                seconds: *seconds,
-            };
-            if !self
-                .timing_writes
-                .lock()
-                .is_ok_and(|mut writes| writes.begin(&write))
-            {
-                return;
-            }
-            Some(write)
-        } else {
-            None
-        };
-        let timing_writes = self.timing_writes.clone();
         let client = self.client.clone();
         let stream = stream.cloned();
         let ctx = ctx.clone();
@@ -948,32 +644,11 @@ impl ReviewUi {
         if let Action::Events(_, kind) = &action {
             self.requested_events.push(*kind);
         }
-        if let Action::Health(_, bands) = &action {
-            self.health_attempted = bands.clone();
-            self.health_last_query = Some(Instant::now());
-        }
-        if matches!(action, Action::HealthTargets(..)) {
-            self.health_targets_requested = true;
-        }
         self.signing_in = matches!(action, Action::Connect);
         thread::spawn(move || {
             let _peer_permit = peer_permit;
             let mut connected = false;
             let result = (|| {
-                if let Some(write) = &local_write {
-                    // This preference is local. Saving it does not require a
-                    // network refresh and must survive closing a comparison.
-                    let mut lock = client.lock().map_err(|_| "Video timing is unavailable.")?;
-                    if lock.is_none() {
-                        *lock = Some(Client::new()?);
-                    }
-                    lock.as_mut().unwrap().align_video(
-                        &write.replay,
-                        &write.pull,
-                        write.seconds,
-                    )?;
-                    return Ok(Data::Aligned);
-                }
                 let token =
                     while_current(&cancel, discord_auth::current_or_refreshed_access_token)??
                         .ok_or("Sign in to Discord again.")?;
@@ -994,33 +669,29 @@ impl ReviewUi {
                     Action::Refresh => client
                         .review(&token, stream.as_ref().ok_or("Choose a VOD first.")?)
                         .map(Data::Review),
-                    Action::Align(replay, pull, seconds) => client
-                        .align_video(&replay, &pull, seconds)
-                        .map(|_| Data::Aligned),
                     Action::Events(pull, kind) => client
                         .events(&token, &pull, kind)
                         .map(|events| Data::Events(pull_key(&pull), kind, events)),
-                    Action::Health(pull, bands) => client
-                        .health_band_window(&token, &pull, &bands)
-                        .map(|window| Data::Health(pull_key(&pull), bands, window)),
-                    Action::HealthTargets(pull) => client
-                        .health_targets(&token, &pull)
-                        .map(|targets| Data::HealthTargets(pull_key(&pull), targets)),
                 };
                 connected = client.connected();
                 result
             })();
-            if local_write.is_some() {
-                if let Ok(mut writes) = timing_writes.lock() {
-                    writes.running = None;
-                }
-            }
             let _ = tx.send((generation, key, result, connected));
             ctx.request_repaint();
         });
     }
 
     fn select(&mut self, pull: Pull) {
+        self.marker_sync.reset(None);
+        if let Some(review) = &mut self.review {
+            if let Ok(cache) = self.marker_cache.lock() {
+                if let Some(alignment) = cache.get(&review.replay, &pull) {
+                    review
+                        .marker_timing
+                        .insert((pull.report.clone(), pull.id), alignment);
+                }
+            }
+        }
         let Some(review) = &self.review else {
             return;
         };
@@ -1032,7 +703,6 @@ impl ReviewUi {
             public_url: review.replay.public_url(seconds as u64),
         };
         self.cancel_read();
-        self.clear_health();
         self.pending_focus = None;
         self.playback = Some(playback);
         self.aligning = false;
@@ -1061,15 +731,18 @@ impl ReviewUi {
         at_ms: i64,
         autoplay: bool,
     ) -> Option<PlaybackCommand> {
+        if let Some((review, pull)) = self.review.as_mut().zip(self.pull.as_ref()) {
+            if let Ok(cache) = self.marker_cache.lock() {
+                if let Some(alignment) = cache.get(&review.replay, pull) {
+                    review
+                        .marker_timing
+                        .insert((pull.report.clone(), pull.id), alignment);
+                }
+            }
+        }
         let review = self.review.as_ref()?;
-        let start = review.replay.start_ms().ok()?;
-        let correction = self
-            .pull
-            .as_ref()
-            .and_then(|pull| review.timing.get(&pull.report))
-            .copied()
-            .unwrap_or(DEFAULT_SECONDS);
-        let seconds = (at_ms - start) as f64 / 1000.0 + correction as f64;
+        let pull = self.pull.as_ref()?;
+        let seconds = review.pull_video_start(pull) + (at_ms - pull.start_ms) as f64 / 1000.0;
         if !seconds.is_finite()
             || seconds < 0.0
             || seconds >= review.replay.available_seconds as f64
@@ -1297,7 +970,6 @@ impl ReviewUi {
             .collect();
         self.pov_menu.covered = Some(covered);
         ui.add_space(5.0);
-        let mut comparison_x = None;
         ui.scope(|ui| {
             ui.spacing_mut().interact_size.y = 32.0;
             ui.horizontal(|ui| {
@@ -1308,7 +980,6 @@ impl ReviewUi {
                 }
 
                 if let Some(comparison) = comparison.as_deref_mut() {
-                    comparison_x = Some(ui.next_widget_position().x);
                     action.close_comparison =
                         comparison.draw_inline(ui, povs, stream, &self.pov_menu.labels, &available);
                 }
@@ -1330,32 +1001,6 @@ impl ReviewUi {
                 }
             });
         });
-        if let Some(pull) = self.pull.clone() {
-            let position = comparison
-                .as_deref()
-                .map(|peer| peer.position())
-                .or_else(|| self.comparison_position(state));
-            let seconds = self.video_timing(&pull.report);
-            ui.horizontal(|ui| {
-                ui.push_id("primary-video-timing", |ui| {
-                    if let Some(seconds) = video_timing_control(ui, seconds, position.is_some()) {
-                        if let Some((at_ms, autoplay)) = position {
-                            if let Some(command) =
-                                self.adjust_video_timing(&pull, seconds, at_ms, autoplay)
-                            {
-                                action.command = Some(command);
-                            }
-                        }
-                    }
-                });
-                if let Some(comparison) = comparison.as_deref_mut() {
-                    if let Some(x) = comparison_x {
-                        ui.add_space((x - ui.next_widget_position().x).max(0.0));
-                    }
-                    comparison.draw_video_timing(ui, &pull);
-                }
-            });
-        }
         self.popup_open = egui::Popup::is_any_open(ui.ctx());
         ui.add_space(7.0);
         if let Some(notice) = &self.notice {
@@ -1401,7 +1046,9 @@ impl ReviewUi {
                 video.center(),
                 egui::Align2::CENTER_CENTER,
                 if self.popup_open && state.ready {
-                    if state.seeking.is_some() {
+                    if state.blocked {
+                        "Click Play in the Twitch player"
+                    } else if state.seeking.is_some() {
                         "Seeking to the selected moment…"
                     } else if state.buffering {
                         "Video is buffering…"
@@ -1481,6 +1128,9 @@ impl ReviewUi {
                 self.start(ui.ctx(), Some(stream), Action::Disconnect);
             }
         }
+        if action.command.is_some() {
+            self.marker_sync.cancel(None);
+        }
         if let Some(playback) = &mut self.playback {
             match action.command {
                 Some(PlaybackCommand::Play | PlaybackCommand::Seek(_)) => playback.autoplay = true,
@@ -1497,6 +1147,13 @@ impl ReviewUi {
         // While a POV is loading or cannot show the requested moment, retain
         // the existing intent for the next switch instead of inventing a time.
         if self.playback.is_none() {
+            return;
+        }
+        if let Some((elapsed, autoplay)) = self.marker_sync.intent() {
+            if let Some(pull) = self.pull.clone() {
+                let at_ms = pull.start_ms + (elapsed * 1000.0).round() as i64;
+                self.pending_focus = Some((pull, at_ms, autoplay));
+            }
             return;
         }
         if let (Some(pull), Some(review)) = (&self.pull, &self.review) {
@@ -1587,7 +1244,7 @@ impl ReviewUi {
             .unwrap_or(0.0);
         let current = elapsed.clamp(0.0, duration);
         let mut command = None;
-        let playing = playback_intent(state, self.playback.as_ref());
+        let playing = !state.blocked && playback_intent(state, self.playback.as_ref());
         let replay = confirmed_position.is_some() && elapsed >= duration && !self.aligning;
         let mut seek_range = None;
         let mut cursor_position = self.scrub.unwrap_or(current);
@@ -1884,11 +1541,15 @@ impl ReviewUi {
             && state.seconds.is_finite()
             && state.is_fresh_since(self.range_epoch)
             && state.seeking.is_none()
+            && !state.blocked
             && !state.buffering)
             .then_some(state.seconds)
     }
 
     pub(crate) fn pause_at_pull_end(&mut self, state: &PlaybackState) -> Option<PlaybackCommand> {
+        if self.marker_sync.busy() {
+            return None;
+        }
         // A prior POV's sample, pending seek or stalled frame must never pause
         // the newly selected replay. Timestamp freshness uses SDK request start.
         if !self.active
@@ -1898,6 +1559,7 @@ impl ReviewUi {
             || !state.seconds.is_finite()
             || !state.is_fresh_since(self.range_epoch)
             || state.seeking.is_some()
+            || state.blocked
             || state.buffering
             || state.playback_intent.is_some()
         {
@@ -2139,27 +1801,19 @@ fn pov_key(stream: &Stream) -> String {
 }
 
 /// Match the protected replay mapper's pull-start rule, then check the actual
-/// requested video instant after this POV's local correction. Ends are exclusive.
-pub(crate) fn recording_covers_moment(
-    range: (i64, i64),
-    pull_start_ms: i64,
-    at_ms: i64,
-    correction_seconds: i64,
-) -> bool {
+/// requested video instant using the API estimate. Ends are exclusive.
+pub(crate) fn recording_covers_moment(range: (i64, i64), pull_start_ms: i64, at_ms: i64) -> bool {
     let (start, end) = range;
     if start < 0
         || end <= start
         || end
             .checked_sub(start)
             .is_none_or(|duration| duration > 7 * 86_400_000)
-        || !(-600..=600).contains(&correction_seconds)
         || !(start..end).contains(&pull_start_ms)
     {
         return false;
     }
-    at_ms
-        .checked_add(correction_seconds * 1000)
-        .is_some_and(|video_instant| (start..end).contains(&video_instant))
+    (start..end).contains(&at_ms)
 }
 
 fn pov_unavailable(stream: &Stream, current: &Stream) -> Option<&'static str> {
@@ -2739,51 +2393,8 @@ fn event_description(event: &RaidEvent) -> String {
     }
 }
 
-fn video_timing_control(ui: &mut egui::Ui, current: i64, enabled: bool) -> Option<i64> {
-    let mut changed = None;
-    ui.allocate_ui_with_layout(egui::vec2(240.0, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        ui.spacing_mut().button_padding = egui::vec2(5.0, 3.0);
-        ui.spacing_mut().interact_size.y = 24.0;
-        ui.label(RichText::new("Video timing").small().color(MUTED));
-        ui.add_enabled_ui(enabled, |ui| {
-            let drag_id = ui.make_persistent_id("timing-drag");
-            let mut seconds = ui.ctx().data(|data| data.get_temp::<i64>(drag_id)).unwrap_or(current);
-            if ui.add_enabled(current > -600, egui::Button::new("−")).on_hover_text("Move video 1 second earlier").clicked() {
-                changed = Some(current - 1);
-            }
-            let value = ui.add(egui::DragValue::new(&mut seconds)
-                .range(-600..=600).speed(1.0).fixed_decimals(0)
-                .update_while_editing(false)
-                .custom_formatter(|value, _| format!("{value:+.0} s"))
-                .custom_parser(|text| text.trim().trim_end_matches('s').trim().parse().ok()));
-            value.clone().on_hover_text("Increase if the video is behind the log; decrease if it is ahead. Click the value to type seconds.");
-            value.widget_info(|| egui::WidgetInfo::slider(enabled, seconds as f64, "Video timing in seconds"));
-            if value.dragged() {
-                ui.ctx().data_mut(|data| data.insert_temp(drag_id, seconds));
-            } else if value.drag_stopped() || value.changed() {
-                ui.ctx().data_mut(|data| data.remove::<i64>(drag_id));
-                changed = Some(seconds);
-            }
-            if ui.add_enabled(current < 600, egui::Button::new("+")).on_hover_text("Move video 1 second later").clicked() {
-                changed = Some(current + 1);
-            }
-            if ui.add_enabled(current != DEFAULT_SECONDS, egui::Button::new("↺"))
-                .on_hover_text(format!("Reset video timing to {DEFAULT_SECONDS:+} seconds")).clicked() {
-                changed = Some(DEFAULT_SECONDS);
-            }
-        });
-    });
-    changed.filter(|seconds| *seconds != current)
-}
-
 fn pull_video_start(review: &Review, pull: &Pull) -> f64 {
-    (pull.start_ms - review.replay.start_ms().unwrap_or(pull.start_ms)) as f64 / 1000.0
-        + review
-            .timing
-            .get(&pull.report)
-            .copied()
-            .unwrap_or(DEFAULT_SECONDS) as f64
+    review.pull_video_start(pull)
 }
 
 fn encounter_moment(review: &Review, pull: &Pull, video_seconds: f64) -> i64 {
@@ -2793,7 +2404,7 @@ fn encounter_moment(review: &Review, pull: &Pull, video_seconds: f64) -> i64 {
 fn playback_intent(state: &PlaybackState, playback: Option<&Playback>) -> bool {
     if let Some(intent) = state.playback_intent {
         intent
-    } else if !state.ready || state.seeking.is_some() || state.buffering {
+    } else if !state.ready || state.seeking.is_some() || state.blocked || state.buffering {
         playback.is_none_or(|p| p.autoplay)
     } else {
         state.playing
@@ -2804,6 +2415,7 @@ fn playback_intent(state: &PlaybackState, playback: Option<&Playback>) -> bool {
 mod tests {
     use super::*;
     use crate::streams::{Provider, Status};
+    use crate::warcraftlogs::Replay;
     use std::collections::HashMap;
 
     fn fixture() -> (Review, Pull, Stream) {
@@ -2847,9 +2459,9 @@ mod tests {
         };
         (
             Review {
+                marker_timing: HashMap::new(),
                 replay,
                 pulls: vec![pull.clone()],
-                timing: HashMap::from([(pull.report.clone(), 9)]),
             },
             pull,
             stream,
@@ -2865,7 +2477,6 @@ mod tests {
             (start, end),
             pull.start_ms,
             pull.start_ms + 121_867,
-            6
         ));
         // Overlapping the same raid report is insufficient when this recording
         // starts several pulls after the selected fight.
@@ -2874,59 +2485,36 @@ mod tests {
             (later, end),
             pull.start_ms,
             pull.start_ms + 121_867,
-            6
         ));
         assert!(recording_covers_moment(
             (later, end),
             later + 60_000,
             later + 121_867,
-            6
         ));
         let short_end = pull.start_ms + 120_000;
         assert!(recording_covers_moment(
             (start, short_end),
             pull.start_ms,
             pull.start_ms + 100_000,
-            6
         ));
         assert!(!recording_covers_moment(
             (start, short_end),
             pull.start_ms,
             pull.start_ms + 121_867,
-            6
         ));
     }
 
     #[test]
-    fn recording_coverage_preserves_milliseconds_and_applies_only_the_candidate_correction() {
+    fn recording_coverage_preserves_milliseconds_without_an_offset() {
         let start = 1_700_000_000_000;
         let end = start + 240_000;
-        assert!(recording_covers_moment(
-            (start, end),
-            start,
-            start - 6000,
-            6
-        ));
-        assert!(!recording_covers_moment(
-            (start, end),
-            start,
-            start - 6001,
-            6
-        ));
-        assert!(recording_covers_moment((start, end), start, end - 6001, 6));
-        assert!(!recording_covers_moment((start, end), start, end - 6000, 6));
-        assert!(recording_covers_moment((start, end), start, end - 1, 0));
-        assert!(!recording_covers_moment(
-            (start, end),
-            start,
-            start + 2999,
-            -3
-        ));
+        assert!(recording_covers_moment((start, end), start, start));
+        assert!(recording_covers_moment((start, end), start, end - 1));
+        assert!(!recording_covers_moment((start, end), start, start - 1));
+        assert!(!recording_covers_moment((start, end), start, end));
         for range in [(start, start), (end, start), (-1, end), (0, i64::MAX)] {
-            assert!(!recording_covers_moment(range, start, start, 0));
+            assert!(!recording_covers_moment(range, start, start));
         }
-        assert!(!recording_covers_moment((start, end), start, i64::MAX, 6));
-        assert!(!recording_covers_moment((start, end), start, start, 601));
     }
 
     #[test]
@@ -2947,290 +2535,93 @@ mod tests {
         assert!(!ui.pov_covers_moment(&other, &pull, pull.start_ms + 121_867));
         other.replay_start_ms = review.replay.start_ms().ok();
         other.replay_end_ms = Some(pull.end_ms);
-        assert!(ui.pov_covers_moment(&other, &pull, pull.end_ms - 6001));
-        assert!(!ui.pov_covers_moment(&other, &pull, pull.end_ms - 6000));
-        let mut replay = review.replay;
-        replay.video_id = other.channel_id.clone();
-        ui.timing_writes.lock().unwrap().enqueue(TimingWrite {
-            replay,
-            pull: pull.clone(),
-            seconds: 0,
-        });
         assert!(ui.pov_covers_moment(&other, &pull, pull.end_ms - 1));
         assert!(!ui.pov_covers_moment(&other, &pull, pull.end_ms));
     }
 
     #[test]
-    fn video_timing_label_is_centered_with_its_buttons_and_value() {
-        let ctx = egui::Context::default();
-        let output = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(980.0, 720.0),
-                )),
-                ..Default::default()
-            },
-            |ui| {
-                ui.spacing_mut().interact_size.y = 32.0;
-                ui.horizontal(|ui| {
-                    video_timing_control(ui, 6, true);
-                });
-            },
-        );
-        let center = |label: &str| {
-            output
-                .shapes
-                .iter()
-                .find_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text) if text.galley.text() == label => {
-                        Some(text.pos.y + text.galley.rect.center().y)
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("Missing timing control text: {label}"))
-        };
-        for label in ["−", "+", "+6 s"] {
-            assert!(
-                (center("Video timing") - center(label)).abs() <= 1.0,
-                "Timing label not centered with {label}"
-            );
-        }
-    }
-
-    #[test]
-    fn video_timing_moves_video_later_without_changing_encounter_milliseconds_or_pause() {
-        let (review, pull, _) = fixture();
-        let mut ui = ReviewUi::default();
-        ui.review = Some(review);
-        ui.active = true;
-        ui.select(pull.clone());
-        let moment = pull.start_ms + 121_867;
-        ui.seek_absolute_with_playback(moment, false).unwrap();
-        let before = ui.playback().unwrap().seconds;
-        assert!(matches!(ui.adjust_video_timing(&pull, 10, moment, false),
-            Some(PlaybackCommand::SeekPaused(at)) if (at - before - 1.0).abs() < 0.0001));
-        let playback = ui.playback().unwrap();
-        assert!(!playback.autoplay);
-        assert_eq!(
-            encounter_moment(ui.review.as_ref().unwrap(), &pull, playback.seconds),
-            moment
-        );
-        assert!(matches!(ui.adjust_video_timing(&pull, -3, moment, true),
-            Some(PlaybackCommand::Seek(at)) if (at - before + 12.0).abs() < 0.0001));
-        assert_eq!(
-            encounter_moment(
-                ui.review.as_ref().unwrap(),
-                &pull,
-                ui.playback().unwrap().seconds
-            ),
-            moment
-        );
-        assert_eq!(ui.timing_writes.lock().unwrap().pending.len(), 1);
-    }
-
-    #[test]
-    fn default_timing_and_explicit_zero_use_the_same_forward_and_inverse_mapping() {
+    fn raid_marker_alignment_is_per_pull_and_preserves_event_milliseconds() {
         let (mut review, pull, _) = fixture();
-        review.timing.clear();
-        let raw = (pull.start_ms - review.replay.start_ms().unwrap()) as f64 / 1000.0;
-        assert_eq!(
-            pull_video_start(&review, &pull),
-            raw + DEFAULT_SECONDS as f64
+        review.marker_timing.insert(
+            (pull.report.clone(), pull.id),
+            crate::replay_sync::Alignment {
+                unix_seconds: pull.start_ms / 1000,
+                video_seconds: 123.456,
+                uncertainty_seconds: 0.10,
+            },
         );
+        assert_eq!(review.pull_video_start(&pull), 123.456);
+        let mut other = pull.clone();
+        other.id += 1;
+        assert_ne!(review.pull_video_start(&other), 123.456);
+        let at_ms = pull.start_ms + 137_625;
         let mut ui = ReviewUi::default();
         ui.review = Some(review);
-        ui.active = true;
         ui.select(pull.clone());
-        assert_eq!(ui.video_timing(&pull.report), DEFAULT_SECONDS);
-        let moment = pull.start_ms + 137_625;
-        assert!(matches!(ui.seek_absolute_with_playback(moment, false),
-            Some(PlaybackCommand::SeekPaused(at)) if (at - raw - 137.625 - DEFAULT_SECONDS as f64).abs() < 0.0001));
-        ui.adjust_video_timing(&pull, 0, moment, false).unwrap();
-        assert_eq!(ui.video_timing(&pull.report), 0);
-        assert_eq!(pull_video_start(ui.review.as_ref().unwrap(), &pull), raw);
-        ui.adjust_video_timing(&pull, DEFAULT_SECONDS, moment, false)
-            .unwrap();
-        assert_eq!(ui.video_timing(&pull.report), DEFAULT_SECONDS);
+        let command = ui.seek_absolute_with_playback(at_ms, false).unwrap();
+        assert!(
+            matches!(command, PlaybackCommand::SeekPaused(seconds) if (seconds - 261.081).abs() < 0.00001)
+        );
+        assert_eq!(
+            encounter_moment(ui.review.as_ref().unwrap(), &pull, 261.081),
+            at_ms
+        );
+        assert!(!ui.playback.as_ref().unwrap().autoplay);
     }
 
     #[test]
-    fn stale_provider_seek_after_timing_edit_does_not_change_the_next_edit_moment() {
+    fn discovering_a_timestamp_does_not_move_the_watched_pull_until_navigation() {
         let (review, pull, _) = fixture();
         let mut ui = ReviewUi::default();
-        ui.review = Some(review);
-        ui.active = true;
+        ui.accept_review(review.clone());
         ui.select(pull.clone());
-        let moment = pull.start_ms + 121_867;
-        ui.seek_absolute_with_playback(moment, false).unwrap();
-        let mut state = PlaybackState::default();
-        state.ready = true;
-        state.seeking = Some(ui.playback().unwrap().seconds);
-        state.mark_polled_now();
-        ui.adjust_video_timing(&pull, 10, moment, false).unwrap();
-        assert_eq!(ui.comparison_position(&state), Some((moment, false)));
-        ui.adjust_video_timing(&pull, 11, moment, false).unwrap();
-        assert_eq!(ui.comparison_position(&state), Some((moment, false)));
+        let original = ui.review.as_ref().unwrap().pull_video_start(&pull);
+        ui.marker_cache.lock().unwrap().insert(
+            crate::replay_sync::Key::new(&review.replay, &pull),
+            crate::replay_sync::Alignment {
+                unix_seconds: pull.start_ms / 1000,
+                video_seconds: original + 3.5,
+                uncertainty_seconds: 0.1,
+            },
+        );
+        ui.accept_review(review);
+        assert_eq!(
+            ui.review.as_ref().unwrap().pull_video_start(&pull),
+            original
+        );
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, original);
+        ui.select(pull.clone());
+        assert_eq!(
+            ui.review.as_ref().unwrap().pull_video_start(&pull),
+            original + 3.5
+        );
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, original + 3.5);
     }
 
     #[test]
-    fn timing_writes_survive_peer_close_and_do_not_restore_an_older_completed_value() {
-        let (review, pull, _) = fixture();
-        let mut primary = ReviewUi::default();
-        primary.review = Some(review.clone());
-        let mut peer = primary.metadata_peer();
-        peer.review = Some(review.clone());
-        assert!(peer.set_video_timing(&pull, 10));
-        let first = primary.timing_writes.lock().unwrap().next().unwrap();
-        assert!(primary.timing_writes.lock().unwrap().begin(&first));
-        assert!(peer.set_video_timing(&pull, 12));
-        drop(peer);
-        let mut writes = primary.timing_writes.lock().unwrap();
-        assert!(writes.next().is_none());
-        writes.running = None;
-        assert_eq!(writes.next().unwrap().seconds, 12);
-        let mut stale = review.clone();
-        writes.apply_to(&mut stale);
-        assert_eq!(stale.timing[&pull.report], 12);
-        writes.pending.clear();
-        writes.apply_to(&mut stale);
-        assert_eq!(stale.timing[&pull.report], 12);
-        drop(writes);
-        primary.accept_review(review);
-        assert_eq!(primary.video_timing(&pull.report), 12);
-    }
-
-    #[test]
-    fn timing_changes_reject_out_of_recording_targets_and_bound_pending_contexts() {
+    fn refreshed_metadata_reuses_only_calibration_for_identical_pull_bounds() {
         let (review, pull, _) = fixture();
         let mut ui = ReviewUi::default();
-        ui.review = Some(review.clone());
-        ui.active = true;
-        ui.select(pull.clone());
-        let before = ui.playback().unwrap().seconds;
-        let too_early = review.replay.start_ms().unwrap();
-        assert!(ui.adjust_video_timing(&pull, -1, too_early, true).is_none());
+        ui.marker_cache.lock().unwrap().insert(
+            crate::replay_sync::Key::new(&review.replay, &pull),
+            crate::replay_sync::Alignment {
+                unix_seconds: pull.start_ms / 1000,
+                video_seconds: 123.456,
+                uncertainty_seconds: 0.10,
+            },
+        );
+        ui.accept_review(review.clone());
+        assert_eq!(ui.review.as_ref().unwrap().pull_video_start(&pull), 123.456);
+        let mut changed = review;
+        changed.pulls[0].start_ms += 1;
+        let changed_pull = changed.pulls[0].clone();
+        ui.accept_review(changed);
         assert!(ui
-            .adjust_video_timing(&pull, 601, pull.start_ms, true)
+            .review
+            .as_ref()
+            .unwrap()
+            .marker_alignment(&changed_pull)
             .is_none());
-        assert_eq!(ui.video_timing(&pull.report), 9);
-        assert_eq!(ui.playback().unwrap().seconds, before);
-        let mut writes = TimingWrites::default();
-        for index in 0..64 {
-            let mut replay = review.replay.clone();
-            replay.video_id = format!("video-{index}");
-            assert!(writes.enqueue(TimingWrite {
-                replay,
-                pull: pull.clone(),
-                seconds: 6
-            }));
-        }
-        assert!(!writes.enqueue(TimingWrite {
-            replay: review.replay,
-            pull: pull.clone(),
-            seconds: 6
-        }));
-        let mut same = writes.pending[0].clone();
-        same.seconds = 0;
-        assert!(writes.enqueue(same));
-        assert_eq!(writes.pending.len(), 64);
-        assert_eq!(writes.latest.len(), 64);
-        assert_eq!(writes.pending[0].seconds, 0);
-    }
-
-    #[test]
-    fn health_observation_loads_names_before_requesting_log_samples() {
-        let (review, pull, _) = fixture();
-        let mut ui = ReviewUi::default();
-        ui.review = Some(review);
-        ui.active = true;
-        ui.select(pull);
-        ui.requested_events = vec![EventKind::Deaths, EventKind::Defensives];
-        ui.last_attempt = Some(Instant::now());
-        assert!(ui.next_action().is_none());
-        ui.prepare_health_observation();
-        assert!(matches!(ui.next_action(), Some(Action::HealthTargets(_))));
-        ui.health_targets_requested = true;
-        // Without a real observed percentage there is no bulk health request.
-        assert!(ui.next_action().is_none());
-    }
-
-    #[test]
-    fn observed_health_search_preserves_same_name_actors_and_disjoint_alternatives() {
-        use crate::replay_ocr::{BossName, ClockRegion, HealthCandidate};
-        let (review, pull, _) = fixture();
-        let identity = crate::replay_observer::Identity::new(&review.replay, &pull);
-        let mut ui = ReviewUi::default();
-        ui.review = Some(review);
-        ui.active = true;
-        ui.select(pull);
-        ui.health_names = vec![BossName {
-            id: 1,
-            name: "boss".into(),
-        }];
-        ui.health_targets = vec![
-            crate::warcraftlogs::HealthTarget {
-                actor: 1,
-                game_id: 11,
-                name: "Boss".into(),
-            },
-            crate::warcraftlogs::HealthTarget {
-                actor: 2,
-                game_id: 12,
-                name: "Boss".into(),
-            },
-            crate::warcraftlogs::HealthTarget {
-                actor: 3,
-                game_id: 13,
-                name: "Different".into(),
-            },
-        ];
-        let region = ClockRegion {
-            x: 0.1,
-            y: 0.1,
-            width: 0.1,
-            height: 0.03,
-        };
-        let mut observation = crate::replay_observer::Observation {
-            identity,
-            width: 1000,
-            height: 600,
-            observed_at: Instant::now(),
-            before_seconds: 100.0,
-            after_seconds: 100.1,
-            sampling_uncertainty_seconds: 0.1,
-            readings: Vec::new(),
-            health_readings: [0.0, 74.5]
-                .into_iter()
-                .map(|percent| crate::replay_observer::HealthReading {
-                    region_id: 1001,
-                    candidate: HealthCandidate {
-                        boss_name_id: 1,
-                        percent,
-                        decimal_places: 1,
-                        name_region: region,
-                        percent_region: region,
-                    },
-                })
-                .collect(),
-            health_assessment: None,
-            phase: crate::replay_observer::Phase::Discovery,
-            processing_duration: Duration::ZERO,
-            model_load_duration: Duration::ZERO,
-        };
-        ui.observe_health(&observation);
-        assert_eq!(ui.health_bands.len(), 2);
-        assert!(ui
-            .health_bands
-            .iter()
-            .all(|band| band.game_ids == vec![11, 12]));
-        assert!(ui.health_bands[0].max_percent < ui.health_bands[1].min_percent);
-        let original = ui.health_bands.clone();
-        observation.identity.video_id = "different-pov".into();
-        observation.observed_at = Instant::now();
-        observation.health_readings[1].candidate.percent = 40.0;
-        ui.observe_health(&observation);
-        assert_eq!(ui.health_bands, original);
     }
 
     #[test]
@@ -3293,7 +2684,14 @@ mod tests {
         let mut other = source.clone();
         other.replay.started_at = "2026-09-01T17:00:00Z".into();
         other.replay.video_id = "xyzDEF_12-3".into();
-        other.timing.insert(pull.report.clone(), -3);
+        other.marker_timing.insert(
+            (pull.report.clone(), pull.id),
+            crate::replay_sync::Alignment {
+                unix_seconds: pull.start_ms / 1000,
+                video_seconds: other.pull_video_start(&pull) - 3.0,
+                uncertainty_seconds: 0.1,
+            },
+        );
         let mut ui = ReviewUi::default();
         ui.review = Some(other.clone());
         ui.select(pull.clone());
@@ -3351,15 +2749,21 @@ mod tests {
     }
 
     #[test]
-    fn selecting_a_pull_starts_at_timeline_zero_with_its_own_video_timing() {
-        for correction in [None, Some(-3), Some(0), Some(6), Some(9)] {
+    fn selecting_a_pull_uses_unix_or_raw_metadata_without_an_offset() {
+        for alignment in [None, Some(123.456)] {
             let (mut review, pull, _) = fixture();
-            review.timing.clear();
-            if let Some(seconds) = correction {
-                review.timing.insert(pull.report.clone(), seconds);
+            if let Some(video_seconds) = alignment {
+                review.marker_timing.insert(
+                    (pull.report.clone(), pull.id),
+                    crate::replay_sync::Alignment {
+                        unix_seconds: pull.start_ms / 1000,
+                        video_seconds,
+                        uncertainty_seconds: 0.10,
+                    },
+                );
             }
-            let expected = (pull.start_ms - review.replay.start_ms().unwrap()) as f64 / 1000.0
-                + correction.unwrap_or(DEFAULT_SECONDS) as f64;
+            let expected = alignment
+                .unwrap_or((pull.start_ms - review.replay.start_ms().unwrap()) as f64 / 1000.0);
             let mut ui = ReviewUi::default();
             ui.review = Some(review.clone());
             ui.active = true;

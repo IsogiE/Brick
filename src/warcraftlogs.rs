@@ -25,13 +25,6 @@ const TOKEN: &str = "https://www.warcraftlogs.com/oauth/token";
 const DAY: i64 = 86_400_000;
 const CANCELLED: &str = "The Warcraft Logs request was cancelled.";
 
-#[path = "warcraftlogs_health.rs"]
-mod health;
-pub(crate) use health::{HealthBand, HealthTarget, HealthWindow};
-#[cfg(test)]
-pub(crate) use health::{HealthPoint, HealthTrace};
-
-/// Blocking transport has a bounded timeout, but cannot be interrupted here.
 /// Check both sides so obsolete requests cannot start another page or publish
 /// their response. Token refresh is deliberately handled separately below.
 pub(crate) fn while_current<T>(
@@ -158,7 +151,21 @@ pub struct RaidEvent {
 pub struct Review {
     pub replay: Replay,
     pub pulls: Vec<Pull>,
-    pub timing: HashMap<String, i64>,
+    pub marker_timing: HashMap<(String, u64), crate::replay_sync::Alignment>,
+}
+
+impl Review {
+    pub fn marker_alignment(&self, pull: &Pull) -> Option<crate::replay_sync::Alignment> {
+        self.marker_timing
+            .get(&(pull.report.clone(), pull.id))
+            .copied()
+    }
+    pub fn pull_video_start(&self, pull: &Pull) -> f64 {
+        self.marker_alignment(pull).map_or_else(
+            || (pull.start_ms - self.replay.start_ms().unwrap_or(pull.start_ms)) as f64 / 1000.0,
+            |alignment| alignment.video_seconds,
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -186,10 +193,6 @@ pub struct Client {
     directory: Option<ReportDirectory>,
     retry_at: Option<Instant>,
     events: HashMap<(String, u64, EventKind), (Instant, Vec<RaidEvent>)>,
-    health: HashMap<(String, u64, i64, i64), (Instant, HealthWindow)>,
-    health_targets: HashMap<(String, u64, i64, i64), (Instant, Vec<HealthTarget>)>,
-    health_bands: HashMap<(String, u64, i64, i64, String), (Instant, HealthWindow)>,
-    timing: crate::replay_timing::Store,
     cancel: Arc<AtomicBool>,
 }
 
@@ -235,10 +238,6 @@ impl Client {
             directory: None,
             retry_at: None,
             events: HashMap::new(),
-            health: HashMap::new(),
-            health_targets: HashMap::new(),
-            health_bands: HashMap::new(),
-            timing: crate::replay_timing::Store::load(),
             cancel: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -263,9 +262,6 @@ impl Client {
                 self.session = None;
                 self.reports.clear();
                 self.events.clear();
-                self.health.clear();
-                self.health_targets.clear();
-                self.health_bands.clear();
                 self.directory = None;
             }
             e.message
@@ -292,9 +288,6 @@ impl Client {
             self.session = None;
             self.reports.clear();
             self.events.clear();
-            self.health.clear();
-            self.health_targets.clear();
-            self.health_bands.clear();
             self.directory = None;
             if let Some(bytes) = if restore {
                 while_current(&self.cancel, || store(&config)?.load())??
@@ -328,9 +321,6 @@ impl Client {
         self.session = None;
         self.reports.clear();
         self.events.clear();
-        self.health.clear();
-        self.health_targets.clear();
-        self.health_bands.clear();
         self.directory = None;
         Ok(())
     }
@@ -456,9 +446,6 @@ impl Client {
                 self.session = None;
                 self.reports.clear();
                 self.events.clear();
-                self.health.clear();
-                self.health_targets.clear();
-                self.health_bands.clear();
                 self.directory = None;
                 return Err("Please reconnect Warcraft Logs.".into());
             };
@@ -474,9 +461,6 @@ impl Client {
                         self.session = None;
                         self.reports.clear();
                         self.events.clear();
-                        self.health.clear();
-                        self.health_targets.clear();
-                        self.health_bands.clear();
                         self.directory = None;
                     }
                     return Err(error);
@@ -489,26 +473,12 @@ impl Client {
     }
 
     fn query(&mut self, query: &str, variables: Value) -> Result<Value, String> {
-        self.query_before(query, variables, None, None)
-    }
-
-    fn query_before(
-        &mut self,
-        query: &str,
-        variables: Value,
-        deadline: Option<Instant>,
-        prepared_token: Option<&str>,
-    ) -> Result<Value, String> {
         check_cancelled(&self.cancel)?;
-        health::request_timeout(deadline)?;
         if self.retry_at.is_some_and(|until| Instant::now() < until) {
             return Err("Warcraft Logs is busy. Brick will retry shortly.".into());
         }
-        let token = match prepared_token {
-            Some(token) => token.to_owned(),
-            None => self.access_token()?,
-        };
-        let timeout = health::request_timeout(deadline)?;
+        let token = self.access_token()?;
+        let timeout = Duration::from_secs(15);
         let response = while_current(&self.cancel, || {
             self.http
                 .post(API)
@@ -518,7 +488,6 @@ impl Client {
                 .send()
         })?
         .map_err(|_| "Couldn't reach Warcraft Logs. Brick will retry shortly.")?;
-        health::request_timeout(deadline)?;
         let status = response.status().as_u16();
         if status == 429 {
             let delay = response
@@ -535,9 +504,6 @@ impl Client {
             self.session = None;
             self.reports.clear();
             self.events.clear();
-            self.health.clear();
-            self.health_targets.clear();
-            self.health_bands.clear();
             self.directory = None;
         }
         if status == 401 {
@@ -555,7 +521,6 @@ impl Client {
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| "Warcraft Logs returned an invalid response.")?;
         check_cancelled(&self.cancel)?;
-        health::request_timeout(deadline)?;
         if value
             .get("errors")
             .and_then(Value::as_array)
@@ -592,7 +557,11 @@ impl Client {
         {
             return Err("The replay does not match this stream.".into());
         }
-        self.review_replay(replay)
+        let mut review = self.review_replay(replay)?;
+        while_current(&self.cancel, || {
+            crate::replay_library::lookup(discord_token, &mut review)
+        })?;
+        Ok(review)
     }
 
     pub fn events(
@@ -641,20 +610,6 @@ impl Client {
         check_cancelled(&self.cancel)?;
         self.events.insert(key, (Instant::now(), result.clone()));
         Ok(result)
-    }
-
-    pub fn align_video(
-        &mut self,
-        replay: &Replay,
-        pull: &Pull,
-        seconds: i64,
-    ) -> Result<(), String> {
-        self.timing.set(
-            replay.provider.key(),
-            &replay.video_id,
-            &pull.report,
-            seconds,
-        )
     }
 
     fn review_replay(&mut self, replay: Replay) -> Result<Review, String> {
@@ -758,21 +713,11 @@ impl Client {
             }
             unique.push(pull);
         }
-        let timing = unique
-            .iter()
-            .map(|pull| {
-                (
-                    pull.report.clone(),
-                    self.timing
-                        .get(replay.provider.key(), &replay.video_id, &pull.report),
-                )
-            })
-            .collect();
         check_cancelled(&self.cancel)?;
         Ok(Review {
+            marker_timing: HashMap::new(),
             replay,
             pulls: unique,
-            timing,
         })
     }
 }

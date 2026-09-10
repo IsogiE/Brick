@@ -14,12 +14,13 @@ mod discord_auth;
 mod download;
 mod presence;
 mod recordings_ui;
-mod replay_health;
-mod replay_observer;
-mod replay_ocr;
+mod replay_digits;
+mod replay_edge;
+mod replay_library;
+mod replay_marker;
 #[cfg(test)]
 mod replay_smoke;
-mod replay_timing;
+mod replay_sync;
 mod review_compare;
 mod review_compare_ui;
 mod review_ui;
@@ -40,7 +41,6 @@ use std::{
 use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
-    replay_observer::configure_at_startup();
     let startup_mode = env::args().any(|arg| arg == "--startup");
     let _instance_guard = match single_instance::acquire() {
         Ok(guard) => Some(guard),

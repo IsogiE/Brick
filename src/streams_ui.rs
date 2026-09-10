@@ -71,11 +71,13 @@ pub struct StreamsUi {
     drafts: [String; 2],
     confirm_remove: Option<Provider>,
     review: crate::review_ui::ReviewUi,
-    observer: crate::replay_observer::Observer,
+    warmup: crate::review_ui::ReviewUi,
 }
 
 impl Default for StreamsUi {
     fn default() -> Self {
+        let review = crate::review_ui::ReviewUi::default();
+        let warmup = review.metadata_peer();
         Self {
             snapshot: None,
             received_at: None,
@@ -108,8 +110,8 @@ impl Default for StreamsUi {
             edit_open: false,
             drafts: [String::new(), String::new()],
             confirm_remove: None,
-            review: crate::review_ui::ReviewUi::default(),
-            observer: crate::replay_observer::Observer::default(),
+            review,
+            warmup,
         }
     }
 }
@@ -185,16 +187,13 @@ impl StreamsUi {
     }
 
     pub fn clear(&mut self) {
-        let mut observer = std::mem::take(&mut self.observer);
-        observer.reset();
         *self = Self::default();
-        self.observer = observer;
     }
 
     pub fn stop_player(&mut self) {
         self.comparison = None;
         self.review.set_comparing(false);
-        self.observer.reset();
+        self.review.cancel_marker(self.player.as_ref());
         self.player = None;
         self.player_switch_pending = false;
         self.player_work = None;
@@ -337,13 +336,36 @@ impl StreamsUi {
                 }
             }
         }
-        if active && presence::configured() && self.work.is_none() {
-            if (self.recordings_open || self.review.active()) && !self.recordings_attempted {
+        if presence::configured() && self.work.is_none() {
+            let refresh = if active {
+                REFRESH
+            } else {
+                Duration::from_secs(60)
+            };
+            if active
+                && (self.recordings_open || self.review.active())
+                && !self.recordings_attempted
+            {
                 self.start(ctx, Action::Recordings);
-            } else if self.last_attempt.is_none_or(|at| at.elapsed() >= REFRESH) {
+            } else if self.last_attempt.is_none_or(|at| at.elapsed() >= refresh) {
                 self.start(ctx, Action::Refresh);
             }
         }
+        // One metadata-only observer finds new raid pulls while Brick is idle.
+        // The VPS queues all covered POVs; no background video decoder is
+        // created on the client. The selected review takes over while watching.
+        let warmup_stream = self
+            .snapshot
+            .as_ref()
+            .filter(|_| !active || self.selected.is_none())
+            .and_then(|snapshot| {
+                snapshot
+                    .streams
+                    .iter()
+                    .filter(|s| s.status == Status::Live)
+                    .min_by_key(|s| (&s.user_id, s.provider.key(), &s.channel_id))
+            });
+        self.warmup.tick(ctx, warmup_stream);
         if self.review.tick(
             ctx,
             self.selected
@@ -372,6 +394,15 @@ impl StreamsUi {
         if let Some(error) = self.player.as_ref().and_then(StreamPlayer::failure) {
             self.recover_player(error);
         }
+        if active && !self.recordings_open && !self.player_switch_pending {
+            if let Some(player) = &mut self.player {
+                if let Some(command) = self.review.sync_marker(ctx, player, None, None) {
+                    if let Err(error) = player.command(command) {
+                        self.player_error = Some(error);
+                    }
+                }
+            }
+        }
         self.leave_unavailable_comparison();
         if let Some(comparison) = &mut self.comparison {
             comparison.tick(
@@ -381,25 +412,6 @@ impl StreamsUi {
             );
         }
         self.leave_unavailable_comparison();
-        if self.observer.enabled() {
-            if active && !self.recordings_open && !self.player_switch_pending {
-                self.review.prepare_health_observation();
-            }
-            let identity = (active && !self.recordings_open && !self.player_switch_pending)
-                .then(|| self.review.observation_context())
-                .flatten()
-                .map(|(replay, pull)| crate::replay_observer::Identity::new(replay, pull));
-            self.observer.tick_with_health(
-                ctx,
-                self.player.as_ref(),
-                identity,
-                self.review.observation_boss_names(),
-                self.review.observation_health_window(),
-            );
-            if let Some(observation) = self.observer.observation() {
-                self.review.observe_health(observation);
-            }
-        }
         false
     }
 
