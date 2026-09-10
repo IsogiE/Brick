@@ -71,6 +71,8 @@ pub struct Library {
     heading_rects: Vec<egui::Rect>,
     #[cfg(test)]
     viewport_rect: Option<egui::Rect>,
+    #[cfg(test)]
+    painted_scrollbars: usize,
 }
 
 impl Library {
@@ -267,7 +269,7 @@ impl Library {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     ui.set_width(sidebar);
-                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                    ui.spacing_mut().scroll = library_scroll_style();
                     ui.visuals_mut().clip_rect_margin = 0.0;
                     ui.label(RichText::new("PLAYERS").small().strong().color(MUTED));
                     ui.add_space(10.0);
@@ -287,7 +289,7 @@ impl Library {
                     egui::ScrollArea::vertical()
                         .id_salt("recording-library-members")
                         .scroll_bar_visibility(
-                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                            egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
                         )
                         .max_height(ui.available_height())
                         .show_rows(ui, MEMBER_HEIGHT, self.members.len(), |ui, rows| {
@@ -384,14 +386,16 @@ impl Library {
                     return;
                 }
                 ui.spacing_mut().item_spacing.y = ROW_SPACING;
-                // Reserve a fixed gutter: floating bars paint over the row actions
-                // and expand when hovered, while a solid bar stays outside content.
-                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                // The content margin reserves a permanent gutter. Its fixed-width
+                // scrollbar appears only when needed and never covers row actions.
+                ui.spacing_mut().scroll = library_scroll_style();
                 ui.visuals_mut().clip_rect_margin = 0.0;
                 let mut toggled_day = None;
                 let mut scroll = egui::ScrollArea::vertical()
                     .id_salt("recording-library-rows")
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
                     .auto_shrink([false, false])
                     .max_height(ui.available_height());
                 if std::mem::take(&mut self.reset_scroll) {
@@ -664,6 +668,22 @@ impl Library {
             });
         });
         action
+    }
+}
+
+fn library_scroll_style() -> egui::style::ScrollStyle {
+    egui::style::ScrollStyle {
+        floating: true,
+        floating_width: 6.0,
+        // egui draws floating scrollbars over this margin, outside row content.
+        content_margin: egui::Margin {
+            right: 10,
+            ..egui::Margin::ZERO
+        },
+        dormant_handle_opacity: 1.0,
+        active_handle_opacity: 1.0,
+        interact_handle_opacity: 1.0,
+        ..egui::style::ScrollStyle::solid()
     }
 }
 
@@ -1008,7 +1028,7 @@ mod tests {
     ) -> (egui::Rect, Option<Action>) {
         let mut bounds = egui::Rect::NOTHING;
         let mut action = None;
-        let _ = ctx.run_ui(
+        let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
                 events,
@@ -1021,6 +1041,22 @@ mod tests {
                 });
             },
         );
+        library.painted_scrollbars = output
+            .shapes
+            .iter()
+            .filter(|clipped| {
+                if let egui::Shape::Rect(shape) = &clipped.shape {
+                    library.viewport_rect.is_some_and(|viewport| {
+                        shape.rect.left() >= viewport.right() - 6.1
+                            && shape.rect.right() <= viewport.right() + 0.1
+                            && shape.rect.height() > 10.0
+                            && shape.fill.a() > 0
+                    })
+                } else {
+                    false
+                }
+            })
+            .count();
         (bounds, action)
     }
 
@@ -1082,7 +1118,7 @@ mod tests {
         }
         let width = library.row_rects[0].width();
         let viewport = library.viewport_rect.unwrap();
-        let gutter = egui::pos2(viewport.right() + 6.0, viewport.center().y);
+        let gutter = egui::pos2(viewport.right() - 3.0, viewport.center().y);
         for _ in 0..4 {
             frame_input(
                 &ctx,
@@ -1095,8 +1131,9 @@ mod tests {
             assert!(library
                 .row_rects
                 .iter()
-                .all(|rect| rect.right() <= viewport.right()));
+                .all(|rect| rect.right() <= viewport.right() - 10.0));
         }
+        assert!(library.painted_scrollbars > 0);
         assert!(click(&ctx, &mut library, &source, size, gutter).is_none());
         let id = library.scroll_id.unwrap();
         // Cancel the gutter click's animated scroll before testing header clicks.
@@ -1118,9 +1155,10 @@ mod tests {
         // No overflow after collapsing both days still reserves exactly the same gutter.
         library.toggle_day("2026-09-10".into());
         library.toggle_day("2026-09-09".into());
-        for _ in 0..4 {
+        for _ in 0..20 {
             frame(&ctx, &mut library, &source, size);
         }
+        assert_eq!(library.painted_scrollbars, 0);
         assert_eq!(library.rows.len(), 2);
         assert!(library.row_rects.is_empty());
         assert_eq!(library.heading_rects[0].width(), width);
