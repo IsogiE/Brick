@@ -334,7 +334,10 @@ mod tests {
 mod native_tests {
     use super::*;
     use std::{
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
         time::{Duration, Instant},
     };
 
@@ -354,6 +357,7 @@ mod native_tests {
     fn native_overlays_preserve_media_visibility_size_and_playback() {
         struct App {
             view: Option<WebView>,
+            loaded: Arc<AtomicBool>,
             controller: Controller,
             started: Instant,
             phase_at: Instant,
@@ -380,8 +384,17 @@ mod native_tests {
                 if self.view.is_none() {
                     #[cfg(target_os = "linux")]
                     crate::stream_player::initialize_gtk().unwrap();
+                    let loaded = self.loaded.clone();
+                    let page_ctx = ctx.clone();
                     self.view = Some(
                         wry::WebViewBuilder::new()
+                            .with_on_page_load_handler(move |event, _| {
+                                loaded.store(
+                                    matches!(event, wry::PageLoadEvent::Finished),
+                                    Ordering::Release,
+                                );
+                                page_ctx.request_repaint();
+                            })
                             .with_bounds(crate::stream_player::wry_bounds(BOUNDS))
                             .with_autoplay(true)
                             .with_html(HTML)
@@ -502,7 +515,12 @@ mod native_tests {
                     }
                     self.phase_at = Instant::now();
                 }
-                if !self.pending && self.phase_at.elapsed() > Duration::from_secs(2) {
+                // Do not submit callback-bearing scripts before Wry's initial
+                // page commit; its Linux pending-script queue drops callbacks.
+                if self.loaded.load(Ordering::Acquire)
+                    && !self.pending
+                    && self.phase_at.elapsed() > Duration::from_secs(2)
+                {
                     self.pending = true;
                     let measured = self.measured.clone();
                     view.evaluate_script_with_callback("JSON.stringify({visible:document.visibilityState,changes:window.changes,seconds:media.currentTime,paused:media.paused,width:innerWidth,height:innerHeight,scale:devicePixelRatio})", move |value| {
@@ -536,6 +554,7 @@ mod native_tests {
             Box::new(move |_| {
                 Ok(Box::new(App {
                     view: None,
+                    loaded: Arc::new(AtomicBool::new(false)),
                     controller: Controller::default(),
                     started: Instant::now(),
                     phase_at: Instant::now(),

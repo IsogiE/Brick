@@ -19,7 +19,10 @@ mod tests {
     use super::*;
     use eframe::egui;
     use std::{
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
         time::{Duration, Instant},
     };
 
@@ -28,6 +31,7 @@ mod tests {
     fn native_player_viewport_shrinks_for_compare_and_grows_for_single_view() {
         struct App {
             view: Option<WebView>,
+            loaded: Arc<AtomicBool>,
             started: Instant,
             phase: usize,
             measured: Arc<Mutex<Option<String>>>,
@@ -62,7 +66,13 @@ mod tests {
                 if self.view.is_none() {
                     #[cfg(target_os = "linux")]
                     super::super::initialize_gtk().unwrap();
+                    let loaded = self.loaded.clone();
+                    let page_ctx = ctx.clone();
                     let view=wry::WebViewBuilder::new()
+                        .with_on_page_load_handler(move |event, _| {
+                            loaded.store(matches!(event, wry::PageLoadEvent::Finished), Ordering::Release);
+                            page_ctx.request_repaint();
+                        })
                         .with_bounds(super::super::wry_bounds([20,40,width,height]))
                         .with_html("<!doctype html><style>html,body,iframe{margin:0;width:100%;height:100%;border:0;overflow:hidden}</style><iframe srcdoc=\"<style>html,body{margin:0;width:100%;height:100%}</style>Resize fixture\"></iframe>")
                         .build_as_child(frame).unwrap();
@@ -115,7 +125,10 @@ mod tests {
                     }
                     self.resizing = false;
                 }
-                if !self.waiting
+                // Wry 0.55's Linux backend queues pre-commit scripts without
+                // preserving their callback. A timer cannot establish readiness.
+                if self.loaded.load(Ordering::Acquire)
+                    && !self.waiting
                     && self.started.elapsed()
                         > Duration::from_secs(if std::env::var_os("BRICK_RESIZE_URL").is_some() {
                             8
@@ -153,6 +166,7 @@ mod tests {
             Box::new(move |_| {
                 Ok(Box::new(App {
                     view: None,
+                    loaded: Arc::new(AtomicBool::new(false)),
                     started: Instant::now(),
                     phase: 0,
                     measured: Arc::new(Mutex::new(None)),
