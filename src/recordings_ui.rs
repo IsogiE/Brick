@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     rc::{Rc, Weak},
 };
 
@@ -58,6 +58,7 @@ pub struct Library {
     filtered: Vec<usize>,
     rows: Vec<DisplayRow>,
     rows_height: f32,
+    collapsed_days: HashSet<String>,
     dirty: bool,
     reset_scroll: bool,
     #[cfg(test)]
@@ -66,6 +67,10 @@ pub struct Library {
     row_rects: Vec<egui::Rect>,
     #[cfg(test)]
     scroll_id: Option<egui::Id>,
+    #[cfg(test)]
+    heading_rects: Vec<egui::Rect>,
+    #[cfg(test)]
+    viewport_rect: Option<egui::Rect>,
 }
 
 impl Library {
@@ -134,6 +139,13 @@ impl Library {
                 vod.id.clone(),
             )
         });
+        let days: HashSet<_> = self
+            .entries
+            .iter()
+            .map(|entry| entry.day.as_str())
+            .collect();
+        self.collapsed_days
+            .retain(|day| days.contains(day.as_str()));
         self.members = members.into_values().collect();
         self.members.sort_by_cached_key(|member| {
             (
@@ -187,8 +199,21 @@ impl Library {
                     .then_some(index)
                 }),
         );
-        // Build the date separators only when the source or filters change. The
-        // per-frame path binary-searches these offsets and paints visible rows.
+        self.rebuild_rows();
+        self.dirty = false;
+        self.reset_scroll = true;
+    }
+
+    fn toggle_day(&mut self, day: String) {
+        if !self.collapsed_days.remove(&day) {
+            self.collapsed_days.insert(day);
+        }
+        self.rebuild_rows();
+    }
+
+    fn rebuild_rows(&mut self) {
+        // Prepare only on data/filter/collapse changes. Each frame binary-searches
+        // these offsets and paints visible rows without rebuilding the library.
         self.rows.clear();
         let mut previous_day = None;
         let mut top = 0.0;
@@ -203,16 +228,16 @@ impl Library {
                 top += DATE_HEIGHT + ROW_SPACING;
                 previous_day = Some(day);
             }
-            self.rows.push(DisplayRow {
-                entry,
-                top,
-                heading: false,
-            });
-            top += ROW_HEIGHT + ROW_SPACING;
+            if !self.collapsed_days.contains(day) {
+                self.rows.push(DisplayRow {
+                    entry,
+                    top,
+                    heading: false,
+                });
+                top += ROW_HEIGHT + ROW_SPACING;
+            }
         }
         self.rows_height = (top - ROW_SPACING).max(0.0);
-        self.dirty = false;
-        self.reset_scroll = true;
     }
 
     pub fn draw(
@@ -225,7 +250,10 @@ impl Library {
     ) -> Option<Action> {
         self.prepare(source);
         #[cfg(test)]
-        self.row_rects.clear();
+        {
+            self.row_rects.clear();
+            self.heading_rects.clear();
+        }
         let mut action = None;
         let height = ui.available_height().max(1.0);
         let sidebar = if ui.available_width() < 1000.0 {
@@ -239,17 +267,28 @@ impl Library {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     ui.set_width(sidebar);
+                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                    ui.visuals_mut().clip_rect_margin = 0.0;
                     ui.label(RichText::new("PLAYERS").small().strong().color(MUTED));
                     ui.add_space(10.0);
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    if member_row(ui, "All players", None, source.len(), self.member.is_none())
-                        .clicked()
+                    if member_row(
+                        ui,
+                        "All players",
+                        None,
+                        self.members.len(),
+                        self.member.is_none(),
+                    )
+                    .clicked()
                         && self.member.take().is_some()
                     {
                         self.dirty = true;
                     }
                     egui::ScrollArea::vertical()
                         .id_salt("recording-library-members")
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
                         .max_height(ui.available_height())
                         .show_rows(ui, MEMBER_HEIGHT, self.members.len(), |ui, rows| {
                             for index in rows {
@@ -344,9 +383,15 @@ impl Library {
                     }
                     return;
                 }
-                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.spacing_mut().item_spacing.y = ROW_SPACING;
+                // Reserve a fixed gutter: floating bars paint over the row actions
+                // and expand when hovered, while a solid bar stays outside content.
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                ui.visuals_mut().clip_rect_margin = 0.0;
+                let mut toggled_day = None;
                 let mut scroll = egui::ScrollArea::vertical()
                     .id_salt("recording-library-rows")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .auto_shrink([false, false])
                     .max_height(ui.available_height());
                 if std::mem::take(&mut self.reset_scroll) {
@@ -375,9 +420,62 @@ impl Library {
                             ),
                         );
                         if display.heading {
+                            #[cfg(test)]
+                            self.heading_rects.push(rect);
+                            let collapsed = self.collapsed_days.contains(&entry.day);
+                            let mut heading_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(rect)
+                                    .id_salt(("recording-date", &entry.day)),
+                            );
+                            heading_ui.set_clip_rect(ui.clip_rect().intersect(rect));
+                            let ui = &mut heading_ui;
+                            let response = ui
+                                .interact(
+                                    rect,
+                                    ui.id().with(("recording-date", &entry.day)),
+                                    egui::Sense::click(),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            response.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    ui.is_enabled(),
+                                    format!(
+                                        "{} {}",
+                                        if collapsed { "Expand" } else { "Collapse" },
+                                        entry.date
+                                    ),
+                                )
+                            });
+                            if response.clicked() {
+                                toggled_day = Some(entry.day.clone());
+                            }
                             let painter = ui.painter_at(rect);
+                            if response.hovered() || response.has_focus() {
+                                painter.rect_filled(rect, 4.0, Color32::from_rgb(36, 42, 52));
+                            }
+                            let center = egui::pos2(rect.left() + 12.0, rect.center().y);
+                            let points = if collapsed {
+                                [
+                                    egui::vec2(-2.0, -4.0),
+                                    egui::vec2(-2.0, 4.0),
+                                    egui::vec2(3.0, 0.0),
+                                ]
+                            } else {
+                                [
+                                    egui::vec2(-4.0, -2.0),
+                                    egui::vec2(4.0, -2.0),
+                                    egui::vec2(0.0, 3.0),
+                                ]
+                            };
+                            painter.add(egui::Shape::convex_polygon(
+                                points.into_iter().map(|point| center + point).collect(),
+                                MUTED,
+                                egui::Stroke::NONE,
+                            ));
                             let label = painter.text(
-                                egui::pos2(rect.left() + 8.0, rect.center().y),
+                                egui::pos2(rect.left() + 26.0, rect.center().y),
                                 egui::Align2::LEFT_CENTER,
                                 &entry.date,
                                 egui::FontId::proportional(12.0),
@@ -406,6 +504,7 @@ impl Library {
                                     vod.provider.key(),
                                     &vod.id,
                                 )));
+                            row_ui.set_clip_rect(ui.clip_rect().intersect(rect));
                             let ui = &mut row_ui;
                             let click_rect = egui::Rect::from_min_max(
                                 rect.min,
@@ -554,6 +653,11 @@ impl Library {
                 #[cfg(test)]
                 {
                     self.scroll_id = Some(output.id);
+                    self.viewport_rect = Some(output.inner_rect);
+                }
+                if let Some(day) = toggled_day {
+                    self.toggle_day(day);
+                    ui.ctx().request_repaint();
                 }
                 #[cfg(not(test))]
                 let _ = output;
@@ -892,20 +996,154 @@ mod tests {
         source: &Rc<Vec<Vod>>,
         size: egui::Vec2,
     ) -> egui::Rect {
+        frame_input(ctx, library, source, size, Vec::new()).0
+    }
+
+    fn frame_input(
+        ctx: &egui::Context,
+        library: &mut Library,
+        source: &Rc<Vec<Vod>>,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> (egui::Rect, Option<Action>) {
         let mut bounds = egui::Rect::NOTHING;
+        let mut action = None;
         let _ = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
                 ..Default::default()
             },
             |ui| {
                 egui::CentralPanel::default().show_inside(ui, |ui| {
-                    library.draw(ui, source, false, true, false);
+                    action = library.draw(ui, source, false, true, false);
                     bounds = ui.min_rect();
                 });
             },
         );
-        bounds
+        (bounds, action)
+    }
+
+    fn click(
+        ctx: &egui::Context,
+        library: &mut Library,
+        source: &Rc<Vec<Vod>>,
+        size: egui::Vec2,
+        pos: egui::Pos2,
+    ) -> Option<Action> {
+        frame_input(ctx, library, source, size, vec![egui::Event::PointerMoved(pos)]);
+        let mut action = None;
+        for pressed in [true, false] {
+            let next = frame_input(
+                ctx,
+                library,
+                source,
+                size,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            )
+            .1;
+            if next.is_some() {
+                action = next;
+            }
+        }
+        action
+    }
+
+    #[test]
+    fn day_headers_collapse_locally_and_scrollbar_has_a_fixed_separate_gutter() {
+        let mut items: Vec<_> = (0..24).map(archive).collect();
+        for (i, vod) in items.iter_mut().enumerate() {
+            vod.started_at = Some(format!(
+                "2026-09-{}T18:00:00Z",
+                if i < 12 { "10" } else { "09" }
+            ));
+        }
+        let source = Rc::new(items);
+        let ctx = egui::Context::default();
+        configure_context(&ctx);
+        let mut library = Library::default();
+        let size = egui::vec2(980.0, 600.0);
+        for _ in 0..3 {
+            frame(&ctx, &mut library, &source, size);
+        }
+        let width = library.row_rects[0].width();
+        let viewport = library.viewport_rect.unwrap();
+        let gutter = egui::pos2(viewport.right() + 6.0, viewport.center().y);
+        for _ in 0..4 {
+            frame_input(
+                &ctx,
+                &mut library,
+                &source,
+                size,
+                vec![egui::Event::PointerMoved(gutter)],
+            );
+            assert_eq!(library.row_rects[0].width(), width);
+            assert!(library
+                .row_rects
+                .iter()
+                .all(|rect| rect.right() <= viewport.right()));
+        }
+        assert!(click(&ctx, &mut library, &source, size, gutter).is_none());
+        let id = library.scroll_id.unwrap();
+        // Cancel the gutter click's animated scroll before testing header clicks.
+        egui::scroll_area::State::default().store(&ctx, id);
+        frame(&ctx, &mut library, &source, size);
+        frame(&ctx, &mut library, &source, size);
+        let header = library.heading_rects[0].center();
+        assert!(click(&ctx, &mut library, &source, size, header).is_none());
+        frame(&ctx, &mut library, &source, size);
+        assert!(library.collapsed_days.contains("2026-09-10"));
+        assert_eq!(library.rows.len(), 14);
+        assert_eq!(library.filtered.len(), 24);
+        assert_eq!(library.row_rects[0].width(), width);
+        assert_eq!(library.rows_height, 2.0 * 30.0 + 12.0 * 50.0 - 2.0);
+        assert!(click(&ctx, &mut library, &source, size, header).is_none());
+        frame(&ctx, &mut library, &source, size);
+        assert!(library.collapsed_days.is_empty());
+        assert_eq!(library.rows.len(), 26);
+        // No overflow after collapsing both days still reserves exactly the same gutter.
+        library.toggle_day("2026-09-10".into());
+        library.toggle_day("2026-09-09".into());
+        for _ in 0..4 {
+            frame(&ctx, &mut library, &source, size);
+        }
+        assert_eq!(library.rows.len(), 2);
+        assert!(library.row_rects.is_empty());
+        assert_eq!(library.heading_rects[0].width(), width);
+        assert_eq!(library.viewport_rect.unwrap().right(), viewport.right());
+        assert_eq!(library.builds, 1);
+        assert!(!library.dirty);
+    }
+
+    #[test]
+    fn collapsed_days_survive_filtering_and_refresh_but_removed_dates_are_pruned() {
+        let mut source = Rc::new(vec![archive(0), archive(3)]);
+        let mut library = Library::default();
+        library.prepare(&source);
+        library.filter(&source);
+        library.toggle_day("2026-09-04".into());
+        library.query = "Player 04".into();
+        library.dirty = true;
+        library.filter(&source);
+        assert_eq!(library.rows.len(), 1);
+        assert!(library.rows[0].heading);
+        Rc::make_mut(&mut source)[1].title = "Updated title".into();
+        library.prepare(&source);
+        library.filter(&source);
+        assert_eq!(library.rows.len(), 1);
+        assert!(library.collapsed_days.contains("2026-09-04"));
+        Rc::make_mut(&mut source).remove(1);
+        library.prepare(&source);
+        library.filter(&source);
+        assert!(library.collapsed_days.is_empty());
     }
 
     #[test]
