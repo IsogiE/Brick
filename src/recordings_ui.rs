@@ -1031,7 +1031,13 @@ mod tests {
         size: egui::Vec2,
         pos: egui::Pos2,
     ) -> Option<Action> {
-        frame_input(ctx, library, source, size, vec![egui::Event::PointerMoved(pos)]);
+        frame_input(
+            ctx,
+            library,
+            source,
+            size,
+            vec![egui::Event::PointerMoved(pos)],
+        );
         let mut action = None;
         for pressed in [true, false] {
             let next = frame_input(
