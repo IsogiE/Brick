@@ -237,8 +237,8 @@ impl StreamsUi {
     }
 
     fn finish_recording_review(&mut self) {
-        // Review can also end during tick (tab switch, hiding Brick, or loss of
-        // the Logs connection). A saved VOD is never a live-stream selection.
+        // Review can also end during tick (tab switch or hiding Brick).
+        // A saved VOD is never a live-stream selection.
         if !self.review.active()
             && self
                 .selected
@@ -1900,7 +1900,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut ui = StreamsUi::default();
         ui.snapshot = Some(Rc::new(snapshot()));
-        // This is also the state left by an asynchronous Logs disconnect.
+        // Explicitly leaving review must return a saved recording to the list.
         ui.selected = Some(recording("987", "2").as_stream());
         assert!(!ui.review.active());
         let _ = ctx.run_ui(egui::RawInput::default(), |root| ui.draw(root));
