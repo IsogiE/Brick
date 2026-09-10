@@ -79,7 +79,7 @@ export function streamPlayerPage(stream, origin, playback = null) {
   }
   const escaped = embed.href.replaceAll("&", "&amp;").replaceAll('"', "&quot;");
   const preciseStart = playback ? ` data-start="${Number(playback.seconds).toFixed(3)}"` : "";
-  const iframe = `<iframe id="media"${preciseStart} title="Guild stream" src="${escaped}" referrerpolicy="strict-origin-when-cross-origin" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen></iframe>`;
+  const iframe = `<iframe id="media"${preciseStart} title="Guild stream" src="${escaped}" referrerpolicy="strict-origin-when-cross-origin" allow="autoplay; encrypted-media; fullscreen; picture-in-picture; clipboard-write" allowfullscreen></iframe>`;
   const media = stream.provider === "twitch"
     ? `<div id="media" data-src="${escaped}"></div>${twitchControlTags}`
     : `${iframe}${stream.provider === "youtube" ? youtubeControlTags : ""}`;

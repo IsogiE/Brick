@@ -18,6 +18,10 @@ use uuid::Uuid;
 
 use crate::download;
 
+#[cfg(target_os = "windows")]
+#[path = "windows_install.rs"]
+mod windows_install;
+
 const APP_UPDATE_OWNER: &str = "IsogiE";
 const APP_UPDATE_REPO: &str = "Brick-Releases";
 const APP_UPDATE_TAG: &str = "app-feed";
@@ -224,24 +228,14 @@ fn verify_prepared_installer(update: &PreparedAppUpdate) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
 fn launch_windows_nsis_installer(update: &PreparedAppUpdate) -> Result<(), String> {
-    if !cfg!(target_os = "windows") {
-        return Err("Brick NSIS updates are only supported on Windows.".to_string());
-    }
-    let mut command = Command::new(&update.installer_path);
-    command.arg("/S").arg("/R").arg("/NS");
-    if let Some(install_dir) = current_user_windows_install_dir() {
-        command.arg(format!("/D={}", install_dir.display()));
-    }
+    windows_install::launch(&update.installer_path)
+}
 
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("Failed to start Brick installer: {error}"))?;
-
-    Ok(())
+#[cfg(not(target_os = "windows"))]
+fn launch_windows_nsis_installer(_update: &PreparedAppUpdate) -> Result<(), String> {
+    Err("Brick NSIS updates are only supported on Windows.".to_string())
 }
 
 fn launch_linux_appimage(update: &PreparedAppUpdate) -> Result<(), String> {
@@ -687,16 +681,6 @@ fn current_appimage_path() -> Option<PathBuf> {
     }
 
     Some(path)
-}
-
-#[cfg(target_os = "windows")]
-fn current_user_windows_install_dir() -> Option<PathBuf> {
-    env::var_os("LOCALAPPDATA").map(|path| PathBuf::from(path).join("Brick"))
-}
-
-#[cfg(not(target_os = "windows"))]
-fn current_user_windows_install_dir() -> Option<PathBuf> {
-    None
 }
 
 fn safe_path_part(value: &str) -> String {

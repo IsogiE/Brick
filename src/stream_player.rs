@@ -1137,8 +1137,8 @@ fn open_provider_link(ctx: &egui::Context, destination: &str) {
     {
         return;
     }
-    // Eframe opens these using the system's default browser, just like native
-    // hyperlinks. Only the public URL crosses over, never the wrapper's headers.
+    // Brick drains these alongside native hyperlinks through browser::open.
+    // Only the public URL crosses over, never the wrapper's headers.
     ctx.open_url(egui::OpenUrl::new_tab(url.as_str()));
     ctx.request_repaint();
 }
@@ -1399,6 +1399,7 @@ fn protect_linux_navigation(
         settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
     }
     let ctx = ctx.clone();
+    let provider_navigation = std::cell::RefCell::new(ProviderNavigation::default());
     // WebKit calls this for subframes too. Permit only official media frames,
     // and explicitly reject any attempted forwarding of the Brick bearer header.
     view.connect_decide_policy(move |_, decision, kind| {
@@ -1415,10 +1416,18 @@ fn protect_linux_navigation(
                     .http_headers()
                     .is_some_and(|headers| headers.one("Authorization").is_some());
                 Some({
-                    let permitted = allowed.lock().is_ok_and(|url| destination.as_str() == *url)
-                        || (!has_authorization
-                            && !action.is_user_gesture()
-                            && allowed_provider_frame(&destination));
+                    let wrapper = allowed.lock().is_ok_and(|url| destination.as_str() == *url);
+                    let permitted = if wrapper {
+                        // A new authenticated wrapper owns a new provider document.
+                        *provider_navigation.borrow_mut() = ProviderNavigation::default();
+                        true
+                    } else {
+                        provider_navigation.borrow_mut().allow(
+                            &destination,
+                            has_authorization,
+                            action.is_user_gesture(),
+                        )
+                    };
                     if !permitted && !has_authorization && action.is_user_gesture() {
                         open_provider_link(&ctx, &destination);
                     }
@@ -1551,6 +1560,44 @@ fn diagnostic_destination(value: &str) -> String {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[derive(Default)]
+struct ProviderNavigation {
+    document: Option<Url>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl ProviderNavigation {
+    fn allow(&mut self, destination: &str, has_authorization: bool, user_gesture: bool) -> bool {
+        if has_authorization || !allowed_provider_frame(destination) {
+            return false;
+        }
+        if destination == "about:blank" {
+            return !user_gesture;
+        }
+        let Ok(url) = Url::parse(destination) else {
+            return false;
+        };
+        if user_gesture {
+            let Some(previous) = &self.document else {
+                return false;
+            };
+            // YouTube's settings sheet uses #bottom-sheet and history navigation
+            // to open, change menus and close. Only the fragment may change in
+            // an already permitted iframe; ordinary links still leave Brick.
+            let mut previous_document = previous.clone();
+            previous_document.set_fragment(None);
+            let mut next_document = url.clone();
+            next_document.set_fragment(None);
+            if previous.fragment() == url.fragment() || previous_document != next_document {
+                return false;
+            }
+        }
+        self.document = Some(url);
+        true
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn allowed_provider_frame(value: &str) -> bool {
     if value == "about:blank" {
         return true;
@@ -1591,6 +1638,45 @@ pub fn pump_events() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn youtube_settings_can_open_change_and_close_with_trusted_fragment_navigation() {
+        let frame = "https://www.youtube.com/embed/abcDEF_12-3?enablejsapi=1";
+        let mut navigation = ProviderNavigation::default();
+        assert!(!navigation.allow(&format!("{frame}#bottom-sheet"), false, true));
+        assert!(navigation.allow(frame, false, false));
+        // A nested blank frame must not forget the current media document.
+        assert!(navigation.allow("about:blank", false, false));
+        for fragment in ["#bottom-sheet", "#", "#bottom-sheet", ""] {
+            assert!(navigation.allow(&format!("{frame}{fragment}"), false, true));
+        }
+        assert!(
+            !navigation.allow(frame, false, true),
+            "Reload is not a menu transition"
+        );
+        assert!(!navigation.allow("about:blank", false, true));
+    }
+
+    #[test]
+    fn provider_menu_navigation_keeps_credentials_and_other_documents_out() {
+        let mut navigation = ProviderNavigation::default();
+        let frame = "https://www.youtube.com/embed/abcDEF_12-3?enablejsapi=1";
+        assert!(navigation.allow(frame, false, false));
+        for destination in [
+            "https://www.youtube.com/watch?v=abcDEF_12-3#bottom-sheet",
+            "https://www.youtube.com/embed/another1234?enablejsapi=1#bottom-sheet",
+            "https://www.youtube.com/embed/abcDEF_12-3?enablejsapi=0#bottom-sheet",
+            "https://www.youtube.com.evil.example/embed/abcDEF_12-3#bottom-sheet",
+            "https://www.twitch.tv/guildmate#bottom-sheet",
+        ] {
+            assert!(!navigation.allow(destination, false, true), "{destination}");
+        }
+        assert!(!navigation.allow(&format!("{frame}#bottom-sheet"), true, true));
+        assert!(!navigation.allow(frame, true, false));
+        assert!(navigation.allow(&format!("{frame}#bottom-sheet"), false, true));
+        navigation = ProviderNavigation::default();
+        assert!(!navigation.allow(&format!("{frame}#"), false, true));
+    }
 
     #[test]
     fn blocked_playback_cannot_acknowledge_a_seek_or_pause() {

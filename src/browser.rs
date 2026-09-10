@@ -1,6 +1,85 @@
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::process::Command;
 
+/// Use the same desktop launcher for egui hyperlinks and embedded provider
+/// links as OAuth. Eframe's default launcher inherits the AppImage environment.
+pub fn open_pending_urls(ctx: &eframe::egui::Context) -> Result<(), String> {
+    dispatch_pending_urls(ctx, open)
+}
+
+fn dispatch_pending_urls(
+    ctx: &eframe::egui::Context,
+    mut launch: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut urls = Vec::new();
+    ctx.output_mut(|output| {
+        output.commands.retain(|command| {
+            if let eframe::egui::OutputCommand::OpenUrl(request) = command {
+                urls.push(request.url.clone());
+                false
+            } else {
+                true
+            }
+        });
+    });
+    // Launch outside egui's output lock, and consume each request exactly once.
+    let mut result = Ok(());
+    for url in urls {
+        if let Err(error) = launch(&url) {
+            result = Err(error);
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    use eframe::egui::{Context, OpenUrl, OutputCommand, RawInput};
+
+    #[test]
+    fn hyperlinks_and_provider_links_share_the_launcher_without_consuming_clipboard_output() {
+        let ctx = Context::default();
+        let mut opened = Vec::new();
+        let output = ctx.run_ui(RawInput::default(), |ui| {
+            ui.ctx().copy_text("copied text".into());
+            ui.ctx().open_url(OpenUrl::new_tab(
+                "https://www.warcraftlogs.com/reports/example",
+            ));
+            ui.ctx().open_url(OpenUrl::new_tab(
+                "https://www.youtube.com/watch?v=abcDEF_12-3&t=30",
+            ));
+            let mut launch = |url: &str| {
+                opened.push(url.to_owned());
+                Ok(())
+            };
+            dispatch_pending_urls(ui.ctx(), &mut launch).unwrap();
+            dispatch_pending_urls(ui.ctx(), &mut launch).unwrap();
+        });
+        assert_eq!(
+            opened,
+            [
+                "https://www.warcraftlogs.com/reports/example",
+                "https://www.youtube.com/watch?v=abcDEF_12-3&t=30",
+            ]
+        );
+        assert!(
+            matches!(&output.platform_output.commands[..], [OutputCommand::CopyText(text)] if text == "copied text")
+        );
+    }
+
+    #[test]
+    fn failed_launch_is_reported_and_not_retried_by_eframe() {
+        let ctx = Context::default();
+        ctx.open_url(OpenUrl::new_tab("https://www.youtube.com/"));
+        assert_eq!(
+            dispatch_pending_urls(&ctx, |_| Err("Browser unavailable".into())),
+            Err("Browser unavailable".into())
+        );
+        assert!(ctx.output(|output| output.commands.is_empty()));
+    }
+}
+
 pub fn open(url: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {

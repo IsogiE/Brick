@@ -15,6 +15,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg python3-
 WORKDIR /app
 COPY LICENSE src/assets/PTSansNarrow-LICENSE.txt ./
 COPY --from=reader /build/presence/reader/target/release/brick-timestamp-reader ./
-COPY presence/timestamp_worker.mjs presence/timestamp_scan.py presence/replay_sync.mjs presence/security.mjs ./
+COPY presence/timestamp_worker.mjs presence/timestamp_process.mjs presence/timestamp_scan.py presence/replay_sync.mjs presence/security.mjs ./
 USER node
 CMD ["node", "timestamp_worker.mjs"]
