@@ -74,7 +74,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           pkg-config --atleast-version=2.52.6 webkit2gtk-4.1
-          pkg-config --modversion webkit2gtk-4.1 gstreamer-1.0
+          pkg-config --modversion webkit2gtk-4.1
+          dpkg-query --show --showformat='${Package} ${Version}\n' libgstreamer1.0-0
 
       - name: Install Cargo Packager
         shell: bash
