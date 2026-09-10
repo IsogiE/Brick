@@ -4,7 +4,7 @@ import { runInNewContext } from "node:vm";
 import { createHash } from "node:crypto";
 import { youtubeControls, twitchControls, playerScriptPolicy } from "./player_control.mjs";
 
-function youtube({ paused = false, start = 19800.125, live = false } = {}) {
+function youtube({ viewport = null, paused = false, start = 19800.125, live = false } = {}) {
   const calls = []; const timers = []; let events; let status = paused ? 2 : 1; let seconds = start;
   const player = {
     mute: () => calls.push("mute"),
@@ -14,25 +14,25 @@ function youtube({ paused = false, start = 19800.125, live = false } = {}) {
     pauseVideo: () => { status = 2; calls.push("pause"); },
     getCurrentTime: () => seconds, getPlayerState: () => status,
   };
-  const window = {};
+  let sourceHeight=0;
+  const frame={style:{width:"",height:"",transform:"",transformOrigin:""},src:`https://www.youtube.com/embed/abcDEF_12-3?start=${Math.floor(start)}&autoplay=${paused ? 0 : 1}`,dataset:live?{}:{start:String(start)}};
+  const window = {innerWidth:viewport?.[0],innerHeight:viewport?.[1],brickReplaySourceHeight:()=>sourceHeight};
   runInNewContext(youtubeControls, {
     window, URL, Number, setTimeout: callback => timers.push(callback),
-    document: { getElementById: () => ({
-      src: `https://www.youtube.com/embed/abcDEF_12-3?start=${Math.floor(start)}&autoplay=${paused ? 0 : 1}`,
-      dataset: live ? {} : { start: String(start) },
-    }) },
+    document: {getElementById:()=>frame},
     YT: { Player: class {
       constructor(id, options) { assert.equal(id, "media"); events = options.events; return player; }
     } },
   });
   window.onYouTubeIframeAPIReady();
-  return { media: window.brickMedia, calls, ready: () => events.onReady({ target: player }),
+  return { frame, sourceHeight:value=>sourceHeight=value, media: window.brickMedia, calls, ready: () => events.onReady({ target: player }),
     timers: () => { for (const callback of timers.splice(0)) callback(); },
     status: value => { status = value; events.onStateChange({ data: value }); } };
 }
 
-function twitch({ paused = false, deferredSeek = false, deferredPause = false, pauseStatusLag = false, dropSeekInPause = false, omitPauseState = false } = {}) {
+function twitch({ viewport = null, qualities = ["auto","chunked","720p60","360p"], live = false, paused = false, deferredSeek = false, deferredPause = false, pauseStatusLag = false, dropSeekInPause = false, omitPauseState = false } = {}) {
   const calls = []; const listeners = new Map(); let options; let seconds = 95.125; let isPaused = true; let ended = false;
+  let quality="auto", height=360;
   const seeks = [];
   const pauses = [];
   let insidePause = false;
@@ -48,24 +48,28 @@ function twitch({ paused = false, deferredSeek = false, deferredPause = false, p
   const player = {
     addEventListener: (event, callback) => { listeners.set(event, [...(listeners.get(event) || []), callback]); },
     setMuted: value => calls.push(["mute", value]),
-    seek: value => { calls.push(["seek", value]); if (dropSeekInPause && insidePause) return; seconds = value; if (deferredSeek) seeks.push("seek"); else emit("seek"); },
+    seek: value => { assert.equal(live, false, "live must never seek"); calls.push(["seek", value]); if (dropSeekInPause && insidePause) return; seconds = value; if (deferredSeek) seeks.push("seek"); else emit("seek"); },
     play: () => { calls.push("play"); if (isPaused) emit("play"); },
     pause: () => { calls.push("pause"); if (!isPaused) { if (deferredPause) pauses.push("pause"); else emit("pause"); } },
-    getCurrentTime: () => seconds, isPaused: () => isPaused, getEnded: () => ended,
+    getQuality: () => quality,
+    setQuality: value => { quality=value; calls.push(["quality",value]); },
+    getQualities: () => qualities,
+    getPlaybackStats: () => ({videoResolution:`1920x${height}`,bufferSize:10,fps:60}),
+    getCurrentTime: () => { assert.equal(live, false, "live must not read VOD time"); return seconds; }, isPaused: () => isPaused, getEnded: () => ended,
   };
   class Player {
-    static READY = "ready"; static PLAY = "play"; static SEEK = "seek";
+    static PLAYBACK_BLOCKED = "blocked"; static READY = "ready"; static PLAY = "play"; static SEEK = "seek";
     static PAUSE = "pause"; static ENDED = "ended"; static PLAYING = "playing";
     constructor(id, args) { assert.equal(id, "media"); options = args; return player; }
   }
-  const window = {};
+  const container={style:{},dataset:{src:`https://player.twitch.tv/?${live ? "channel=vspeed" : "video=v123"}&parent=brick.example&time=${live ? 0 : 95.125}s&autoplay=${!paused}`}};
+  let resized;
+  const window = {innerWidth:viewport?.[0],innerHeight:viewport?.[1],addEventListener:(_,callback)=>resized=callback};
   runInNewContext(twitchControls, {
     window, URL, Number, Twitch: { Player },
-    document: { getElementById: () => ({ dataset: {
-      src: `https://player.twitch.tv/?video=v123&parent=brick.example&time=95.125s&autoplay=${!paused}`,
-    } }) },
+    document: {getElementById:()=>container},
   });
-  return { media: window.brickMedia, calls, options, emit, ready: () => emit("ready"),
+  return { container, resize:(w,h)=>{window.innerWidth=w;window.innerHeight=h;resized();}, media: window.brickMedia, calls, options, emit, qualityHeight:value=>height=value, ready: () => emit("ready"),
     deliverSeeks: () => { for (const event of seeks.splice(0)) emit(event); },
     deliverPauses: () => { for (const event of pauses.splice(0)) emit(event); },
     pausedSnapshot: () => { isPaused = true; },
@@ -129,7 +133,7 @@ test("Twitch buffers until playback starts and preserves precise paused seek tar
   assert.equal(f.options.video, "v123"); assert.equal(f.options.parent[0], "brick.example");
   f.media.seek(100.375, true); assert.equal(f.calls.length, 0);
   f.ready();
-  assert.deepEqual(f.calls, [["mute", true], ["seek", 100.375], "play"]);
+  assert.deepEqual(f.calls, [["mute", true], "play"]);
   assert.equal(f.media.state().buffering, true);
   assert.equal(f.media.state().playing, false);
   f.emit("playing"); assert.equal(f.media.state().playing, true);
@@ -382,4 +386,113 @@ test("both provider controls reject invalid seek values and resume flags before 
 test("player script policy authorizes the exact controls without arbitrary inline scripts", () => {
   for (const script of [youtubeControls, twitchControls]) assert.ok(playerScriptPolicy.includes(`'sha256-${createHash("sha256").update(script).digest("base64")}'`));
   assert.doesNotMatch(playerScriptPolicy, /unsafe-inline|unsafe-eval|https:\/\*|https:\/\/\*|script-src \*/);
+});
+
+
+test("Twitch live uses the SDK without VOD timing calls", () => {
+  const f = twitch({live:true});
+  assert.equal(f.options.channel, "vspeed");
+  assert.equal(f.options.video, undefined);
+  assert.equal(f.options.time, undefined);
+  f.ready(); f.emit("blocked");
+  assert.equal(f.media.state().blocked, true);
+  f.media.seek(100, true);
+  f.emit("playing");
+  assert.equal(f.media.state().playing, true);
+  assert.equal(f.media.state().seconds, 0);
+  f.media.pause(); f.media.play(); f.emit("playing");
+  assert.equal(f.media.state().blocked, false);
+});
+
+test("Twitch blocked startup waits for real playback and preserves a paused target", () => {
+  for (const paused of [false, true]) {
+    const f = twitch({paused, deferredPause:true});
+    f.ready(); f.emit("blocked"); f.pausedSnapshot();
+    const before = f.calls.length;
+    f.media.seek(111.625, !paused);
+    for (let n=0;n<5;n++) f.media.state();
+    assert.equal(f.calls.length, before, "no seek/play loop while provider needs interaction");
+    f.emit("pause");
+    assert.equal(f.media.state().pause_intent, false);
+    f.emit("play"); f.advance(2);
+    assert.equal(f.media.state().blocked, true);
+    assert.equal(f.media.state().playing, false);
+    f.emit("playing");
+    assert.equal(f.media.state().blocked, false);
+    if (paused) {
+      assert.equal(f.media.state().buffering, true);
+      f.deliverPauses();
+      assert.equal(f.media.state().buffering, false);
+      assert.equal(f.media.state().playing, false);
+      assert.equal(f.media.state().seconds,111.625);
+    } else assert.equal(f.media.state().playing,true);
+  }
+});
+
+
+test("Twitch marker scan waits for decoded source quality and restores the viewer quality",()=>{
+  const f=twitch();f.ready();f.emit("playing");
+  f.media.prepareSync(true);
+  assert.equal(f.media.state().sync_ready,false);
+  assert.deepEqual(f.calls.at(-1),["quality","chunked"]);
+  const count=f.calls.length;f.media.state();assert.equal(f.calls.length,count);
+  f.qualityHeight(1080);assert.equal(f.media.state().sync_ready,true);
+  f.media.prepareSync(false);assert.deepEqual(f.calls.at(-1),["quality","auto"]);
+  assert.equal(f.media.state().sync_ready,true);
+});
+
+test("Twitch startup does not seek before decoded playback, including a newer blocked target",()=>{
+  const f=twitch();f.ready();f.emit("blocked");f.media.seek(234.625,true);
+  assert.equal(f.calls.some(c=>Array.isArray(c)&&c[0]==="seek"),false);
+  f.emit("playing");assert.deepEqual(f.calls.at(-1),["seek",234.625]);
+  f.media.seek(240.0,true);f.emit("blocked");f.media.seek(250.5,false);f.emit("playing");
+  assert.equal(f.media.state().playing,false);
+  assert.equal(f.media.state().seconds,250.5);
+});
+
+
+test("Twitch source selection accepts current SDK objects and requests their group",()=>{
+  const f=twitch({qualities:[{name:"Auto",group:"auto"},{name:"480p",group:"480p30"},{name:"1080p60",group:"1080p60"}]});
+  f.ready();f.emit("playing");f.media.prepareSync(true);assert.equal(f.media.state().sync_ready,false);
+  assert.deepEqual(f.calls.at(-1),["quality","1080p60"]);
+  f.qualityHeight(1080);assert.equal(f.media.state().sync_ready,true);
+  f.media.prepareSync(false);assert.deepEqual(f.calls.at(-1),["quality","auto"]);
+});
+
+
+test("compact Twitch panes keep the entire supported provider viewport visible",()=>{
+  const f=twitch({viewport:[300,180]});
+  assert.equal(f.container.style.width,"500px");assert.equal(f.container.style.height,"300px");assert.equal(f.container.style.transform,"scale(0.6)");
+  f.resize(900,500);assert.equal(f.container.style.width,"900px");assert.equal(f.container.style.height,"500px");assert.equal(f.container.style.transform,"");
+});
+
+
+test("YouTube scan expands its internal viewport and waits for readable decoded pixels",()=>{
+  const f=youtube({viewport:[800,450]});f.ready();f.status(1);f.media.prepareSync(true);
+  assert.equal(f.frame.style.width,"1920px");assert.equal(f.frame.style.height,"1080px");
+  assert.equal(f.media.state().sync_ready,false);f.sourceHeight(1080);assert.equal(f.media.state().sync_ready,true);
+  f.media.prepareSync(false);assert.equal(f.frame.style.width,"");assert.equal(f.frame.style.transform,"");
+});
+
+test("native Play can retry a blocked provider without pretending playback resumed", () => {
+  const f = twitch(); f.ready(); f.emit("blocked");
+  const before = f.calls.length;
+  f.media.play();
+  assert.deepEqual(f.calls.slice(before), ["play"]);
+  assert.equal(f.media.state().blocked, true);
+  assert.equal(f.media.state().playing, false);
+  for (let n=0;n<10;n++) f.media.state();
+  assert.equal(f.calls.length, before+1);
+  f.emit("playing");assert.equal(f.media.state().blocked, false);
+});
+
+test("Play recovers a blocked in-flight pause and retains its requested VOD position", () => {
+  const f=twitch({deferredPause:true});f.ready();f.emit("playing");
+  f.media.seek(130.625,false);f.emit("blocked");
+  const before=f.calls.length;f.media.play();
+  assert.deepEqual(f.calls.slice(before),["play"]);
+  f.emit("playing");
+  assert.equal(f.media.state().blocked,false);
+  assert.equal(f.media.state().playing,true);
+  assert.equal(f.media.state().seconds,130.625);
 });

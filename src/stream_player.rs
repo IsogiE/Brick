@@ -20,6 +20,7 @@ use wry::{
 use crate::stream_preferences::{PreferenceBridge, Preferences};
 
 mod capture;
+mod diagnostics;
 mod fullscreen;
 mod resize;
 pub use capture::FrameCapture;
@@ -90,6 +91,10 @@ pub struct PlaybackState {
     pub seconds: f64,
     pub playing: bool,
     pub buffering: bool,
+    pub decoded: Option<bool>,
+    pub blocked: bool,
+    pub sync_ready: Option<bool>,
+    pub diagnostics: diagnostics::Stats,
     /// Provider Pause event evidence; never substitutes for settled SDK state.
     pub pause_intent: bool,
     /// Provider Play opposing the wrapper's paused intent; not a settled ACK.
@@ -276,6 +281,11 @@ impl StreamPlayer {
                     wrapper_loaded.store(true, Ordering::Relaxed);
                 }
             });
+
+        let builder = builder.with_initialization_script_for_main_only(
+            capture::clock_script(&player_url.origin().ascii_serialization()),
+            false,
+        );
 
         let builder = if let Some(preferences) = &preferences {
             let (relay, capture) = preferences.scripts(&player_url.origin().ascii_serialization());
@@ -579,7 +589,7 @@ impl StreamPlayer {
         }
         // Forward the user's native replay action when the provider is ready.
         // This also preserves a seek made while the first document is loading.
-        if self.playback_state().ready {
+        if self.playback_state().ready && !self.playback_state().blocked {
             let ready_since = self.ready_since.get_or_insert_with(Instant::now);
             // WebKit reports SDK readiness before initial media setup finishes.
             // Forward once after that setup, preserving any newer native action.
@@ -643,7 +653,7 @@ impl StreamPlayer {
         };
         if webview
             .evaluate_script_with_callback(
-                "JSON.stringify(window.brickMedia ? window.brickMedia.state() : null)",
+                "JSON.stringify(window.brickPlaybackState ? window.brickPlaybackState() : (window.brickMedia ? window.brickMedia.state() : null))",
                 move |value| {
                     let poll_finished_at = Instant::now();
                     pending.store(false, Ordering::Relaxed);
@@ -767,7 +777,8 @@ impl StreamPlayer {
             return None;
         }
         let state = self.playback_state();
-        if self.command_retried
+        if state.blocked
+            || self.command_retried
             || elapsed < COMMAND_RETRY_AFTER
             || !self.visible.get()
             || !self.loaded.load(Ordering::Relaxed)
@@ -790,6 +801,7 @@ impl StreamPlayer {
 
     /// Opt-in capture of this media child, with a fresh SDK timing bracket.
     /// Continue polling playback while it runs, then consume the result once.
+    #[cfg(test)]
     pub fn request_frame_capture(&self, ctx: &egui::Context) -> bool {
         self.webview.as_ref().is_some_and(|view| {
             self.capture.request(
@@ -797,9 +809,29 @@ impl StreamPlayer {
                 &self.playback_state(),
                 self.visible.get() && ctx.input(|input| input.viewport().visible().unwrap_or(true)),
                 self.bounds,
+                false,
                 ctx,
             )
         })
+    }
+
+    pub fn request_source_frame_capture(&self, ctx: &egui::Context) -> bool {
+        self.webview.as_ref().is_some_and(|view| {
+            self.capture.request(
+                view,
+                &self.playback_state(),
+                self.visible.get() && ctx.input(|input| input.viewport().visible().unwrap_or(true)),
+                self.bounds,
+                true,
+                ctx,
+            )
+        })
+    }
+
+    pub fn prepare_marker_quality(&self, enabled: bool) {
+        if let Some(view) = &self.webview {
+            let _ = view.evaluate_script(&format!("window.brickMedia?.prepareSync?.({enabled})"));
+        }
     }
 
     pub fn take_frame_capture(&self) -> Option<Result<FrameCapture, String>> {
@@ -966,6 +998,8 @@ fn newer_provider_pause(
     };
     !seeking
         && state.ready
+        && state.decoded != Some(false)
+        && !state.blocked
         && state.pause_intent
         && !state.playing
         && state.is_fresh_after(requested)
@@ -982,6 +1016,14 @@ fn publish_playback_state(state: &Mutex<PlaybackState>, next: PlaybackState) -> 
     if state.polled_at.is_some_and(|previous| previous > polled_at) {
         return false;
     }
+    let transition = (state.ready, state.playing, state.buffering, state.blocked)
+        != (next.ready, next.playing, next.buffering, next.blocked);
+    #[cfg(not(test))]
+    if transition {
+        diagnostics::record(&next);
+    }
+    #[cfg(test)]
+    let _ = transition;
     *state = next;
     true
 }
@@ -994,7 +1036,9 @@ fn seek_acknowledged(target: f64, resume: bool, requested: Instant, state: &Play
 
 fn seek_landed(target: f64, resume: bool, elapsed: Duration, state: &PlaybackState) -> bool {
     state.ready
+        && state.decoded != Some(false)
         && state.playing == resume
+        && !state.blocked
         && !state.buffering
         && if resume {
             // A busy provider can return its first useful sample after video
@@ -1008,7 +1052,12 @@ fn seek_landed(target: f64, resume: bool, elapsed: Duration, state: &PlaybackSta
 }
 
 fn playback_acknowledged(playing: bool, requested: Instant, state: &PlaybackState) -> bool {
-    state.is_fresh_since(requested) && state.ready && !state.buffering && state.playing == playing
+    state.is_fresh_since(requested)
+        && state.ready
+        && state.decoded != Some(false)
+        && !state.blocked
+        && !state.buffering
+        && state.playing == playing
 }
 
 impl Drop for StreamPlayer {
@@ -1542,6 +1591,22 @@ pub fn pump_events() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_playback_cannot_acknowledge_a_seek_or_pause() {
+        let requested = Instant::now();
+        let mut state = PlaybackState {
+            ready: true,
+            seconds: 120.0,
+            blocked: true,
+            ..Default::default()
+        };
+        state.mark_polled_now();
+        assert!(!seek_acknowledged(120.0, false, requested, &state));
+        assert!(!playback_acknowledged(false, requested, &state));
+        state.blocked = false;
+        assert!(seek_acknowledged(120.0, false, requested, &state));
+    }
 
     #[test]
     fn a_near_poll_deadline_does_not_request_immediate_egui_frames() {

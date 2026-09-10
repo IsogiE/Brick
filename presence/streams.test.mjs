@@ -1106,3 +1106,28 @@ test("officer removal succeeds and a designated user without guild access cannot
   assert.equal((await f.authorized(route, { method: "DELETE" }, "bob-token")).status, 200);
   assert.deepEqual((await (await f.authorized("/v1/streams/vods")).json()).vods, []);
 });
+
+test("shared raid timestamps require guild authorization and a visible VOD before storage", async t => {
+  const f = await fixture(t);
+  await seedRecording(f);
+  const key = { readerVersion: 1, provider: 'youtube', videoId, broadcastId: videoId, report: 'abcdefghABCDEFGH', pullId: 1, encounter: 3429, difficulty: 4,
+    startMs: Date.parse('2023-11-14T20:05:00Z'), endMs: Date.parse('2023-11-14T20:11:00Z'), recordingStartMs: Date.parse('2023-11-14T20:00:00Z') };
+  const alignment = { unixSeconds: key.startMs / 1000, videoSeconds: 300.12, uncertaintySeconds: 0.1 };
+  const lookup = '/v1/streams/review/sync/lookup';
+  const upload = '/v1/streams/review/sync/observations';
+  const request = body => ({ method: 'POST', body: JSON.stringify(body) });
+  assert.equal((await f.request(lookup, request({ keys: [key] }))).status, 401);
+  assert.equal((await f.request(upload, request({ key, alignment }))).status, 401);
+  assert.equal((await f.authorized(upload, request({ key, alignment }), 'removed-token')).status, 403);
+  const first = await f.authorized(upload, request({ key, alignment }));
+  assert.equal(first.status, 200); assert.equal((await first.json()).verified, false);
+  assert.equal((await (await f.authorized(upload, request({ key, alignment }))).json()).confirmations, 1);
+  assert.equal((await (await f.authorized(upload, request({ key, alignment }), 'bob-token')).json()).verified, true);
+  const result = await (await f.authorized(lookup, request({ keys: [key] }))).json();
+  assert.equal(result.results[0].alignment.verified, true);
+  assert.equal(result.results[0].alignment.videoSeconds, alignment.videoSeconds);
+  assert.equal((await f.authorized(lookup, request({ keys: [{ ...key, videoId: 'zbcDEF_12-3' }] }))).status, 404);
+  assert.equal((await f.authorized(upload, request({ key: { ...key, difficulty: 10 }, alignment }))).status, 400);
+  f.setMembers([members[1]]); await f.restart();
+  assert.equal((await f.authorized(lookup, request({ keys: [key] }), 'bob-token')).status, 404);
+});

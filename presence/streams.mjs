@@ -80,10 +80,10 @@ export function streamPlayerPage(stream, origin, playback = null) {
   const escaped = embed.href.replaceAll("&", "&amp;").replaceAll('"', "&quot;");
   const preciseStart = playback ? ` data-start="${Number(playback.seconds).toFixed(3)}"` : "";
   const iframe = `<iframe id="media"${preciseStart} title="Guild stream" src="${escaped}" referrerpolicy="strict-origin-when-cross-origin" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" allowfullscreen></iframe>`;
-  const media = stream.provider === "twitch" && playback
+  const media = stream.provider === "twitch"
     ? `<div id="media" data-src="${escaped}"></div>${twitchControlTags}`
     : `${iframe}${stream.provider === "youtube" ? youtubeControlTags : ""}`;
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Brick stream</title><style>html,body,iframe,#media{margin:0;width:100%;height:100%;border:0;background:#14161a;overflow:hidden}iframe{display:block}</style></head><body>${media}</body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Brick stream</title><style>html,body,iframe,#media{margin:0;width:100%;height:100%;border:0;background:#14161a;overflow:hidden}iframe{display:block}</style></head><body><div id="playback-notice" role="status" hidden style="position:absolute;z-index:2;bottom:48px;left:12px;right:12px;text-align:center;pointer-events:none;color:white;font:14px sans-serif;text-shadow:0 1px 3px black"></div>${media}</body></html>`;
 }
 
 export async function createStreamService({ dataDir, env, fetch, now = Date.now, firstCheckWaitMs = FIRST_CHECK_WAIT_MS }) {

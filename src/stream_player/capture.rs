@@ -1,4 +1,4 @@
-//! Opt-in snapshots of the owned media child. No desktop capture or persistence.
+//! Bounded snapshots of the owned media child. No desktop capture or persistence.
 
 use super::PlaybackState;
 use eframe::egui;
@@ -14,16 +14,23 @@ use std::{
 };
 use wry::WebView;
 
-const MAX_BYTES: usize = 12 * 1024 * 1024;
-const MAX_SIDE: u32 = 4096;
-const MAX_PIXELS: u64 = 4_194_304;
+pub(super) fn clock_script(origin: &str) -> String {
+    format!("{}\n{}", include_str!("clock.js"), include_str!("frame.js")).replace(
+        "__BRICK_WRAPPER_ORIGIN__",
+        &serde_json::to_string(origin).unwrap(),
+    )
+}
+
+const MAX_BYTES: usize = 24 * 1024 * 1024;
+const MAX_SIDE: u32 = 8192;
+const MAX_PIXELS: u64 = 8_847_360;
 const TIMEOUT: Duration = Duration::from_secs(3);
 const SAMPLE_TIMEOUT: Duration = Duration::from_millis(500);
-const MIN_INTERVAL: Duration = Duration::from_millis(500);
+const MIN_INTERVAL: Duration = Duration::from_millis(100);
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// The browser APIs provide an image, but no decoded-frame presentation time.
-/// These SDK readings bracket the capture; they are not an exact frame timestamp.
+/// These media-clock readings bracket the capture; they are not an exact frame timestamp.
 pub struct FrameCapture {
     pub generation: u64,
     pub png: Vec<u8>,
@@ -42,6 +49,7 @@ pub struct FrameCapture {
     pub sampling_uncertainty_seconds: f64,
 }
 
+#[cfg(test)]
 impl FrameCapture {
     pub fn estimated_seconds(&self) -> f64 {
         (self.before_seconds + self.after_seconds) / 2.0
@@ -85,6 +93,7 @@ enum Pixels {
 
 struct Job {
     generation: u64,
+    source_video: bool,
     started: Instant,
     before: Option<Sample>,
     native_started: Option<Instant>,
@@ -127,6 +136,7 @@ impl Controller {
         state: &PlaybackState,
         visible: bool,
         bounds: [i32; 4],
+        source_video: bool,
         ctx: &egui::Context,
     ) -> bool {
         if self.pending()
@@ -143,6 +153,7 @@ impl Controller {
         self.last_requested.set(Some(now));
         let job = Arc::new(Mutex::new(Job {
             generation: self.generation.get(),
+            source_video,
             started: now,
             before: None,
             native_started: None,
@@ -154,7 +165,14 @@ impl Controller {
             result: None,
         }));
         self.job.replace(Some(job.clone()));
-        request_clock(view, Arc::downgrade(&job), false, ctx);
+        if source_video {
+            let _ = view.evaluate_script(&format!(
+                "window.brickReplayRequestFrame?.({})",
+                self.generation.get()
+            ));
+        } else {
+            request_clock(view, Arc::downgrade(&job), false, ctx);
+        }
         true
     }
 
@@ -164,6 +182,10 @@ impl Controller {
         };
         if !eligible(state, visible) {
             self.cancel();
+            return;
+        }
+        if job.lock().is_ok_and(|job| job.source_video) {
+            poll_source_frame(view, &job, ctx);
             return;
         }
         enum Next {
@@ -245,10 +267,118 @@ impl Controller {
     }
 }
 
+fn poll_source_frame(view: &WebView, job: &Arc<Mutex<Job>>, ctx: &egui::Context) {
+    let (generation, started) = {
+        let Ok(mut current) = job.lock() else {
+            return;
+        };
+        if current.result.is_some() || current.encoding {
+            return;
+        }
+        if current.started.elapsed() > TIMEOUT {
+            current.result = Some(Err("The video frame was unavailable.".into()));
+            return;
+        }
+        current.encoding = true;
+        (current.generation, current.started)
+    };
+    let weak = Arc::downgrade(job);
+    let failed = weak.clone();
+    let ctx = ctx.clone();
+    if view
+        .evaluate_script_with_callback(
+            &format!("JSON.stringify(window.brickReplayTakeFrame?.({generation}) ?? null)"),
+            move |value| {
+                let Some(job) = weak.upgrade() else {
+                    return;
+                };
+                let Ok(mut job) = job.lock() else {
+                    return;
+                };
+                job.encoding = false;
+                if value.len() > 13 * 1024 * 1024 {
+                    job.result = Some(Err("The video frame exceeded its limit.".into()));
+                    return;
+                }
+                let decoded = serde_json::from_str::<String>(&value).unwrap_or(value);
+                if decoded == "null" {
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                    return;
+                }
+                job.result = Some(source_frame(&decoded, generation, started));
+                ctx.request_repaint();
+            },
+        )
+        .is_err()
+    {
+        complete(&failed, Err("The video frame was unavailable.".into()));
+    }
+}
+
+fn source_frame(value: &str, generation: u64, started: Instant) -> Result<FrameCapture, String> {
+    use base64::Engine;
+    #[derive(serde::Deserialize)]
+    struct Source {
+        generation: u64,
+        width: u32,
+        height: u32,
+        before: f64,
+        after: f64,
+        png: String,
+    }
+    let data: Source = serde_json::from_str(value).map_err(|_| "Invalid video frame.")?;
+    if data.generation != generation
+        || started.elapsed() > TIMEOUT
+        || data.width == 0
+        || data.width > 2048
+        || data.height == 0
+        || data.height > 1024
+        || !data.before.is_finite()
+        || !data.after.is_finite()
+        || data.before < 0.0
+        || data.after > 604800.0
+        || !(0.0..=0.15).contains(&(data.after - data.before))
+        || data.png.len() > 12 * 1024 * 1024
+    {
+        return Err("Invalid video frame.".into());
+    }
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(
+            data.png
+                .strip_prefix("data:image/png;base64,")
+                .ok_or("Invalid video frame.")?,
+        )
+        .map_err(|_| "Invalid video frame.")?;
+    let dimensions =
+        image::ImageReader::with_format(std::io::Cursor::new(&png), image::ImageFormat::Png)
+            .into_dimensions()
+            .map_err(|_| "Invalid video frame.")?;
+    if dimensions != (data.width, data.height) {
+        return Err("Invalid video frame dimensions.".into());
+    }
+    Ok(FrameCapture {
+        generation,
+        png,
+        width: data.width,
+        height: data.height,
+        before_seconds: data.before,
+        after_seconds: data.after,
+        playing: true,
+        observed_at: started,
+        #[cfg(test)]
+        bracket_duration: started.elapsed(),
+        #[cfg(test)]
+        capture_duration: started.elapsed(),
+        #[cfg(test)]
+        sampling_uncertainty_seconds: (data.after - data.before) / 2.0,
+    })
+}
+
 fn eligible(state: &PlaybackState, visible: bool) -> bool {
     visible
         && state.ready
         && state.is_fresh()
+        && !state.blocked
         && !state.buffering
         && state.seeking.is_none()
         && state.playback_intent.is_none()
@@ -273,7 +403,7 @@ fn request_clock(view: &WebView, job: Weak<Mutex<Job>>, after: bool, ctx: &egui:
     let ctx = ctx.clone();
     if view
         .evaluate_script_with_callback(
-            "JSON.stringify(window.brickMedia ? window.brickMedia.state() : null)",
+            "JSON.stringify(window.brickReplayClock ? window.brickReplayClock() : null)",
             move |value| {
                 let received = Instant::now();
                 let parsed = if value.len() <= 4096 {
@@ -284,6 +414,7 @@ fn request_clock(view: &WebView, job: Weak<Mutex<Job>>, after: bool, ctx: &egui:
                 };
                 if let Some(mut state) = parsed.filter(|state| {
                     state.ready
+                        && !state.blocked
                         && !state.buffering
                         && state.seconds.is_finite()
                         && (0.0..=604800.0).contains(&state.seconds)
@@ -592,6 +723,7 @@ mod tests {
     fn job() -> Arc<Mutex<Job>> {
         Arc::new(Mutex::new(Job {
             generation: 1,
+            source_video: false,
             started: Instant::now(),
             before: None,
             native_started: None,
@@ -618,6 +750,30 @@ mod tests {
     }
 
     #[test]
+    fn source_frame_checks_generation_timing_and_actual_png_dimensions() {
+        use base64::Engine;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(20, 10)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mut value = serde_json::json!({"generation":7,"width":20,"height":10,"before":100.0,"after":100.01,
+            "png":format!("data:image/png;base64,{}",base64::engine::general_purpose::STANDARD.encode(png.into_inner()))});
+        assert!(source_frame(&value.to_string(), 7, Instant::now()).is_ok());
+        assert!(source_frame(&value.to_string(), 8, Instant::now()).is_err());
+        assert!(source_frame(
+            &value.to_string(),
+            7,
+            Instant::now() - Duration::from_secs(4)
+        )
+        .is_err());
+        value["width"] = serde_json::json!(19);
+        assert!(source_frame(&value.to_string(), 7, Instant::now()).is_err());
+        value["width"] = serde_json::json!(20);
+        value["after"] = serde_json::json!(101.0);
+        assert!(source_frame(&value.to_string(), 7, Instant::now()).is_err());
+    }
+
+    #[test]
     fn capture_skips_hidden_stale_buffering_or_changing_playback() {
         let mut state = sample(Instant::now(), 100.0, false).state;
         assert!(eligible(&state, true));
@@ -631,6 +787,9 @@ mod tests {
         state.buffering = true;
         assert!(!eligible(&state, true));
         state.buffering = false;
+        state.blocked = true;
+        assert!(!eligible(&state, true));
+        state.blocked = false;
         state.polled_at = Some(Instant::now() - Duration::from_secs(3));
         assert!(!eligible(&state, true));
     }
@@ -638,6 +797,9 @@ mod tests {
     #[test]
     fn snapshot_limits_and_cancellation_bound_retained_data() {
         assert!(dimensions(1920, 1080).is_ok());
+        assert!(dimensions(2560, 1440).is_ok());
+        assert!(dimensions(3840, 2160).is_ok());
+        assert!(dimensions(5120, 1440).is_ok());
         assert!(dimensions(4096, 4096).is_err());
         assert!(dimensions(0, 1).is_err());
         let controller = Controller::default();

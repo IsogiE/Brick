@@ -6,6 +6,8 @@ import { pathToFileURL } from "node:url";
 import { HttpError, RateLimit, readBounded, clientAddress } from "./security.mjs";
 import { createStreamService, streamPlayerPage } from "./streams.mjs";
 import { playerScriptPolicy } from "./player_control.mjs";
+import { createReplayWarmup } from "./replay_warmup.mjs";
+import { createReplaySyncLibrary, syncKey } from "./replay_sync.mjs";
 import { createLogsHandoff } from "./stream_review.mjs";
 
 export async function createPresenceServer({ env = process.env, fetch = globalThis.fetch, now = Date.now, firstStreamCheckWaitMs = 5_000 } = {}) {
@@ -39,6 +41,9 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   const streams = await createStreamService({ dataDir, env, fetch, now, firstCheckWaitMs: firstStreamCheckWaitMs });
   const requestDeadlines = new WeakMap();
   const logsHandoff = createLogsHandoff({ now });
+  const replaySync = createReplaySyncLibrary({ dataDir, now });
+  const replayWarmup = createReplayWarmup({ streams, library: replaySync, now });
+  const syncSubmissions = new RateLimit(120, 2, 20, 0.5);
   // This is a public PKCE client ID. No WCL tokens or private logs live here.
   const logsClientId = env.WARCRAFTLOGS_CLIENT_ID?.trim() || "";
   if (logsClientId && !/^[a-zA-Z0-9_-]{1,128}$/.test(logsClientId)) throw new Error("Invalid Warcraft Logs client ID");
@@ -585,6 +590,40 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     if (!members.some(member => member.userId === requester.id)) throw new HttpError(403, "Discord user does not have the required guild role.");
     const canDeleteRecordings = requester.id === "341518802208423957"
       || members.find(member => member.userId === requester.id)?.role === "Officer";
+    if (request.method === "POST" && ["/v1/streams/review/sync/lookup", "/v1/streams/review/sync/observations"].includes(url.pathname)) {
+      const body = await readJsonBody(request);
+      const submitting = url.pathname.endsWith("/observations");
+      if (submitting) syncSubmissions.take(requester.id);
+      const keys = submitting ? [body.key] : body.keys;
+      if (!Array.isArray(keys) || !keys.length || keys.length > 64) throw new HttpError(400, "Invalid timestamp lookup.");
+      const normalized = keys.map(key => syncKey(key).key);
+      const recordings = await streams.recordings();
+      const eligible = new Set(members.map(member => member.userId));
+      if (normalized.some(key => !replayWarmup.allows(key, eligible) && !recordings.some(vod => eligible.has(vod.userId) && vod.provider === key.provider && vod.id === key.videoId))) {
+        throw new HttpError(404, "This recording is no longer available.");
+      }
+      if (!submitting && env.BRICK_TIMESTAMP_WORKER === "true") {
+        const jobs = normalized.slice(0, 4);
+        // The newest pulls also warm other eligible raid POVs from the saved
+        // broadcast metadata. A new WCL report keeps its own exact pull keys.
+        for (const pull of normalized.slice(0, 2)) {
+          for (const vod of recordings) {
+            if (!eligible.has(vod.userId) || !vod.startedAt || (vod.provider === "twitch" && !vod.broadcastId)) continue;
+            const start = Date.parse(vod.startedAt);
+            const end = Date.parse(vod.endedAt);
+            if (!Number.isFinite(start) || start > pull.startMs || pull.startMs-start > 24*3600_000
+                || (Number.isFinite(end) && pull.startMs >= end)) continue;
+            try { jobs.push(syncKey({...pull, provider: vod.provider, videoId: vod.id,
+              broadcastId: vod.broadcastId || vod.id, recordingStartMs: start}).key); } catch (_) {}
+          }
+        }
+        replaySync.enqueue([...jobs, ...normalized.slice(4)]);
+        void replayWarmup.prepare(normalized, requester, members);
+      }
+      sendJson(response, 200, submitting ? replaySync.submit(requester.id, body)
+        : { results: normalized.map(key => ({ key, alignment: replaySync.lookup(key) })) });
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/v1/streams/review/config") {
       sendJson(response, 200, { clientId: logsClientId, guildId: logsGuildId, userId: requester.id });
       return;
@@ -653,14 +692,14 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     if (replay) {
       const stream = snapshot.streams.find(entry => entry.userId === replay[1] && entry.provider === replay[2]);
       if (!stream) throw new HttpError(404, "This stream is no longer live.");
-      sendJson(response, 200, await streams.replay(stream));
+      sendJson(response, 200, replayWarmup.remember(stream, await streams.replay(stream)));
       return;
     }
     if (player) {
       const stream = snapshot.streams.find(entry => entry.userId === player[1] && (!player[2] || entry.provider === player[2]));
       if (!stream) throw new HttpError(404, "This stream is no longer live.");
       let playback = null;
-      if (requestedPlayback) playback = playbackFor(requestedPlayback, await streams.replay(stream));
+      if (requestedPlayback) playback = playbackFor(requestedPlayback, replayWarmup.remember(stream, await streams.replay(stream)));
       sendHtml(response, 200, streamPlayerPage(stream, streams.playerOrigin, playback), true);
     } else sendJson(response, 200, snapshot);
   }
@@ -796,6 +835,8 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     }
   };
   server.on("close", () => {
+    replayWarmup.close();
+    replaySync.close();
     streamPollingClosed = true;
     clearTimeout(streamTimer);
     streams.close();

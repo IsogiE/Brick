@@ -1,6 +1,6 @@
 [package]
 name = "brick"
-version = "0.4.2"
+version = "0.4.5"
 description = "Advance"
 authors = ["Advance Raid Tools"]
 license = "MIT"
@@ -14,9 +14,6 @@ ed25519-dalek = "2"
 eframe = { version = "=0.34.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
-ocrs = { version = "=0.13.0", default-features = false, features = ["rten"] }
-rten = { version = "=0.26.0", default-features = false, features = ["rten_format"] }
-rten-imageproc = "=0.26.0"
 fs2 = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "http2", "json", "rustls-tls"] }
 rfd = "0.16"
@@ -56,19 +53,3 @@ winresource = "0.1"
 codegen-units = 1
 lto = "thin"
 opt-level = "z"
-
-# Keep the app small while optimizing the opt-in OCR tensor loops for latency.
-[profile.release.package.ocrs]
-opt-level = 3
-[profile.release.package.rten]
-opt-level = 3
-[profile.release.package.rten-gemm]
-opt-level = 3
-[profile.release.package.rten-imageproc]
-opt-level = 3
-[profile.release.package.rten-simd]
-opt-level = 3
-[profile.release.package.rten-tensor]
-opt-level = 3
-[profile.release.package.rten-vecmath]
-opt-level = 3

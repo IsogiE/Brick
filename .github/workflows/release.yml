@@ -6,7 +6,7 @@ on:
       version:
         description: 'SemVer version to publish'
         required: true
-        default: '0.4.2'
+        default: '0.4.5'
       publish:
         description: 'Publish publicly after smoke testing; leave off to build unpublished candidate artifacts'
         type: boolean
@@ -28,7 +28,7 @@ jobs:
           - os: windows-latest
             formats: nsis
             cache-formats: nsis
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             formats: appimage,deb,pacman
             cache-formats: appimage-deb-pacman
     runs-on: ${{ matrix.os }}
@@ -57,10 +57,10 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/registry/index
             target
-          key: brick-${{ runner.os }}-${{ matrix.cache-formats }}-${{ hashFiles('Cargo.lock') }}
+          key: brick-${{ matrix.os }}-${{ matrix.cache-formats }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            brick-${{ runner.os }}-${{ matrix.cache-formats }}-
-            brick-${{ runner.os }}-
+            brick-${{ matrix.os }}-${{ matrix.cache-formats }}-
+            brick-${{ matrix.os }}-
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -69,6 +69,12 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/google-chrome*.sources
           sudo apt-get update
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav patchelf
+
+      - name: Verify Linux playback runtime
+        if: runner.os == 'Linux'
+        run: |
+          pkg-config --atleast-version=2.52.6 webkit2gtk-4.1
+          pkg-config --modversion webkit2gtk-4.1 gstreamer-1.0
 
       - name: Install Cargo Packager
         shell: bash

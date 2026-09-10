@@ -1,0 +1,22 @@
+services:
+  api:
+    environment:
+      BRICK_TIMESTAMP_WORKER: "true"
+  timestamps:
+    build:
+      context: ..
+      dockerfile: presence/Dockerfile.timestamp
+    restart: unless-stopped
+    init: true
+    cpus: 0.5
+    mem_limit: 512m
+    pids_limit: 64
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:size=134217728,uid=1000,gid=1000,mode=0700
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - brick-presence-data:/data
