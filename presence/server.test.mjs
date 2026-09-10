@@ -76,6 +76,39 @@ test("profiles require current guild membership; officers can set roles but cann
   assert(!encrypted.includes("officer"));
 });
 
+test("maintainer officer override uses verified identity and retains guild eligibility", async t => {
+  const maintainer = "341518802208423957";
+  let eligible = true;
+  const members = () => [
+    { user: { id: maintainer, username: "Maintainer" }, roles: eligible ? ["789"] : [] },
+    { user: { id: "222", username: "Raider" }, roles: ["789"] },
+  ];
+  const f = await fixture(t, (url, options) => {
+    const id = options.headers.authorization === "Bearer maintainer" ? maintainer : "222";
+    if (url.endsWith("/users/@me")) return json({ id, username: id });
+    if (url.endsWith("/member")) return json({ roles: ["789"] });
+    return json(members());
+  }, { PROFILE_ENCRYPTION_KEY: "be".repeat(32), ROSTER_CACHE_SECONDS: "1" });
+  const roster = await (await f.authorized("/v1/roster", "maintainer")).json();
+  assert.equal(roster.canEditRoles, true);
+  assert.equal(roster.officers[0].userId, maintainer);
+  assert.equal(roster.officers[0].role, "Officer");
+  assert.equal((await (await f.authorized("/v1/streams/vods", "maintainer")).json()).canDeleteRecordings, true);
+  assert.equal((await (await f.authorized("/v1/roster", "raider")).json()).canEditRoles, false);
+  const setRole = token => f.authorized("/v1/profiles/222/role", token, {
+    method: "PUT", body: JSON.stringify({ raidRole: "tank" }),
+  });
+  assert.equal((await setRole("raider")).status, 403);
+  assert.equal((await setRole("maintainer")).status, 200);
+  assert.equal((await f.authorized("/v1/profiles/222/role", "raider", {
+    method: "PUT", headers: { "x-brick-profile-user": maintainer },
+    body: JSON.stringify({ raidRole: "healer" }),
+  })).status, 409);
+  eligible = false;
+  await new Promise(resolve => setTimeout(resolve, 1050));
+  assert.equal((await setRole("maintainer")).status, 403);
+});
+
 test("authorized heartbeat and roster persist no credentials", async t => {
   let calls = 0;
   const f = await fixture(t, (...args) => { calls++; return discordFixture(...args); });

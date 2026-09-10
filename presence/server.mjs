@@ -174,11 +174,13 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     }
   }
 
-  function roleFromIds(roleIds) {
+  // Maintainer access is tied to the verified Discord identity and still
+  // requires one of the guild's allowed roles.
+  function roleFromIds(roleIds, userId) {
     if (!Array.isArray(roleIds)) {
       return null;
     }
-    if (roleIds.includes(officerRoleId)) {
+    if (roleIds.includes(officerRoleId) || (userId === "341518802208423957" && roleIds.includes(raiderRoleId))) {
       return "Officer";
     }
     if (roleIds.includes(raiderRoleId)) {
@@ -252,7 +254,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
       throw error;
     }
 
-    const role = roleFromIds(member?.roles);
+    const role = roleFromIds(member?.roles, user?.id);
     if (!role) {
       requesterCache.delete(cacheKey);
       throw new HttpError(403, "Discord user does not have the required guild role.");
@@ -525,7 +527,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   }
 
   function rosterRow(member, heartbeat, now) {
-    const role = roleFromIds(member.roles);
+    const role = roleFromIds(member.roles, member.user?.id);
     if (!role || member.user?.bot) {
       return null;
     }
@@ -581,7 +583,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
       onlineWindowSeconds,
       officers,
       raiders,
-      canEditRoles: profiles.available && members.some(member => member.user?.id === requester.id && roleFromIds(member.roles) === "Officer"),
+      canEditRoles: profiles.available && members.some(member => member.user?.id === requester.id && roleFromIds(member.roles, member.user?.id) === "Officer"),
     });
   }
 
@@ -622,8 +624,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     // Apply current guild eligibility to reads and writes alike, even while the
     // OAuth identity token remains in its short verification cache.
     if (!members.some(member => member.userId === requester.id)) throw new HttpError(403, "Discord user does not have the required guild role.");
-    const canDeleteRecordings = requester.id === "341518802208423957"
-      || members.find(member => member.userId === requester.id)?.role === "Officer";
+    const canDeleteRecordings = members.find(member => member.userId === requester.id)?.role === "Officer";
     if (request.method === "POST" && ["/v1/streams/review/sync/lookup", "/v1/streams/review/sync/observations"].includes(url.pathname)) {
       const body = await readJsonBody(request);
       const submitting = url.pathname.endsWith("/observations");
@@ -764,8 +765,8 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
 
   async function streamMembers() {
     return (await fetchRosterMembers({ strict: true }))
-      .filter(member => roleFromIds(member.roles) && !member.user?.bot && /^[0-9]{1,20}$/.test(member.user?.id))
-      .map(member => profiles.member({ userId: member.user.id, name: displayName(member, member.user), role: roleFromIds(member.roles) }));
+      .filter(member => roleFromIds(member.roles, member.user?.id) && !member.user?.bot && /^[0-9]{1,20}$/.test(member.user?.id))
+      .map(member => profiles.member({ userId: member.user.id, name: displayName(member, member.user), role: roleFromIds(member.roles, member.user?.id) }));
   }
 
   async function handleRequest(request, response) {
