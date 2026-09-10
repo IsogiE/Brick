@@ -94,17 +94,48 @@ jobs:
 
       - name: Test Linux keyring storage
         if: runner.os == 'Linux'
+        env:
+          RUSTFLAGS: '-D warnings'
         run: |
           test_dir="$(mktemp -d)"
+          trap 'rm -rf "$test_dir"' EXIT
+          export XDG_CONFIG_HOME="$test_dir/config"
           export XDG_DATA_HOME="$test_dir/data"
+          export XDG_CACHE_HOME="$test_dir/cache"
           export XDG_RUNTIME_DIR="$test_dir/runtime"
-          mkdir -p "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR"
-          chmod 700 "$XDG_RUNTIME_DIR"
-          dbus-run-session -- sh -ec '
-            printf "%s" "brick-test-password" | gnome-keyring-daemon --unlock --components=secrets
-            cargo test --locked linux_keyring_roundtrip -- --ignored
-          '
-          DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/brick-no-such-bus cargo test --locked linux_keyring_failure -- --ignored
+          unset GNOME_KEYRING_CONTROL GNOME_KEYRING_PID DBUS_SESSION_BUS_ADDRESS
+          mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR/keyring"
+          chmod 700 "$XDG_RUNTIME_DIR" "$XDG_RUNTIME_DIR/keyring"
+          dbus-run-session -- bash -euo pipefail <<'KEYRING_TEST'
+          # --unlock can return before the Secret Service is ready. Keep the
+          # daemon attached to this test session and wait for the unlocked store.
+          printf '%s' 'brick-test-password' | gnome-keyring-daemon --foreground --unlock --components=secrets --control-directory="$XDG_RUNTIME_DIR/keyring" >"$XDG_RUNTIME_DIR/keyring.log" 2>&1 &
+          keyring_pid=$!
+          trap 'kill "$keyring_pid" 2>/dev/null || true; wait "$keyring_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for attempt in {1..100}; do
+            if ! kill -0 "$keyring_pid" 2>/dev/null; then
+              cat "$XDG_RUNTIME_DIR/keyring.log"
+              exit 1
+            fi
+            owner="$(gdbus call --session --timeout 1 --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.NameHasOwner org.freedesktop.secrets 2>/dev/null || true)"
+            if [[ "$owner" == '(true,)' ]]; then
+              locked="$(gdbus call --session --timeout 1 --dest org.freedesktop.secrets --object-path /org/freedesktop/secrets/aliases/default --method org.freedesktop.DBus.Properties.Get org.freedesktop.Secret.Collection Locked 2>/dev/null || true)"
+              if [[ "$locked" == '(<false>,)' ]]; then
+                ready=1
+                break
+              fi
+            fi
+            sleep 0.1
+          done
+          if [[ "$ready" != 1 ]]; then
+            cat "$XDG_RUNTIME_DIR/keyring.log"
+            echo 'The isolated Secret Service did not expose an unlocked default collection.' >&2
+            exit 1
+          fi
+          cargo test --locked linux_keyring_roundtrip -- --ignored --test-threads=1
+          KEYRING_TEST
+          DBUS_SESSION_BUS_ADDRESS="unix:path=$test_dir/no-such-bus" cargo test --locked linux_keyring_failure -- --ignored --test-threads=1
 
       - name: Build release binary
         env:
