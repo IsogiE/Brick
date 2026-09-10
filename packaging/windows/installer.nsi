@@ -68,7 +68,7 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
   !uninstfinalize '${UNINSTALLERSIGNCOMMAND}'
 !else if "$%BRICK_WINDOWS_SIGNING%" == "certum"
   ; Sign the embedded uninstaller too: machine uninstalls request elevation.
-  !uninstfinalize 'powershell -NoProfile -ExecutionPolicy Bypass -File "$%GITHUB_WORKSPACE%\scripts\sign-windows-uninstaller.ps1" -Path "%1"' = 0
+  !uninstfinalize 'pwsh -NoProfile -ExecutionPolicy Bypass -File "$%GITHUB_WORKSPACE%\scripts\sign-windows-uninstaller.ps1" -Path "%1"' = 0
 !endif
 
 ; Handle install mode, `perUser`, `perMachine` or `both`

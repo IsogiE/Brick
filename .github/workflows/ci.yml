@@ -76,6 +76,9 @@ jobs:
         run: |
           ./scripts/sign-windows.test.ps1
           ./scripts/sign-windows-uninstaller.test.ps1
+          # NSIS must use the same PowerShell edition as the signing steps.
+          pwsh -NoProfile -ExecutionPolicy Bypass -Command 'Get-Item Cert:\CurrentUser | Out-Null'
+          if ($LASTEXITCODE -ne 0) { throw 'The NSIS signing shell cannot access the certificate store.' }
 
       - name: Test Linux keyring storage
         if: runner.os == 'Linux'
