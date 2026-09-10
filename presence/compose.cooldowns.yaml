@@ -1,0 +1,8 @@
+# Public spell metadata; atomically replace the JSON and increment its revision.
+# The API checks for changes on authenticated reads, at most once per minute.
+services:
+  api:
+    environment:
+      COOLDOWN_CATALOG_FILE: /config/cooldown-catalog.json
+    volumes:
+      - ./cooldown-catalog:/config:ro

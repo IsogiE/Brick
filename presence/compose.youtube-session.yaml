@@ -1,0 +1,11 @@
+services:
+  timestamps:
+    environment:
+      BRICK_YOUTUBE_COOKIES_FILE: /run/secrets/youtube_cookies
+    volumes:
+      - type: bind
+        source: ${BRICK_YOUTUBE_COOKIES_FILE:?Set the absolute path to the dedicated YouTube session file}
+        target: /run/secrets/youtube_cookies
+        read_only: true
+        bind:
+          create_host_path: false

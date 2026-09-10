@@ -86,7 +86,7 @@ export function streamPlayerPage(stream, origin, playback = null) {
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Brick stream</title><style>html,body,iframe,#media{margin:0;width:100%;height:100%;border:0;background:#14161a;overflow:hidden}iframe{display:block}</style></head><body><div id="playback-notice" role="status" hidden style="position:absolute;z-index:2;bottom:48px;left:12px;right:12px;text-align:center;pointer-events:none;color:white;font:14px sans-serif;text-shadow:0 1px 3px black"></div>${media}</body></html>`;
 }
 
-export async function createStreamService({ dataDir, env, fetch, now = Date.now, firstCheckWaitMs = FIRST_CHECK_WAIT_MS }) {
+export async function createStreamService({ dataDir, env, fetch, now = Date.now, firstCheckWaitMs = FIRST_CHECK_WAIT_MS, correctReplay = value => value }) {
   const filePath = path.join(dataDir, "streams.json");
   const credential = async (name) => env[`${name}_FILE`]
     ? (await fs.readFile(env[`${name}_FILE`], "utf8")).trim() : env[name]?.trim() || "";
@@ -509,10 +509,10 @@ export async function createStreamService({ dataDir, env, fetch, now = Date.now,
 
   return {
     snapshot, playerOrigin, poll,
-    async replay(stream) { return replay(stream, freshCache(stream)); },
+    async replay(stream) { return correctReplay(await replay(stream, freshCache(stream)), true); },
     nextPollDelayMs: () => refreshAt ? Math.max(1_000, Math.min(REFRESH_MS, refreshAt - now())) : REFRESH_MS,
     async recordings() { return vods.list(); },
-    async recordingReplay(record) { return recordingReplay(record); },
+    async recordingReplay(record) { return correctReplay(await recordingReplay(record), false); },
     async removeRecording(provider, id) { await vods.remove(provider, id); return { ok: true }; },
     close() {
       shutdown.abort();

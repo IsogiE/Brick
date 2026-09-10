@@ -414,7 +414,33 @@ pub(crate) fn recognize(image: &GrayImage, start_ms: i64, locked: Option<Marker>
             *stamp == start_ms / 1000 && [0, 4, 8, 12, 18, 26].contains(style)
         })
         .collect();
-    let mut regions: Vec<_> = candidates(image)
+    let mut proposals = candidates(image);
+    // Raid-frame names can touch the final digit and merge into its component.
+    // Propose font-sized prefixes only in ART's fixed top-left corner; every
+    // proposal still has to verify all ten digits and beat other numbers.
+    let mut origins: Vec<_> = proposals
+        .iter()
+        .filter(|r| r.x <= 32 && r.y <= 32 && r.width >= r.height * 5)
+        .map(|r| (r.x, r.y, r.height))
+        .collect();
+    origins.sort_unstable();
+    origins.dedup();
+    for (x, y, height) in origins.into_iter().take(32) {
+        for (_, _, template) in &coarse {
+            let width = (f64::from(template.width()) * f64::from(height)
+                / f64::from(template.height()))
+            .round() as u32;
+            proposals.push(Region {
+                x,
+                y,
+                width,
+                height,
+            });
+        }
+    }
+    proposals.sort_by_key(|r| (r.y, r.x, r.width, r.height));
+    proposals.dedup();
+    let mut regions: Vec<_> = proposals
         .into_iter()
         .map(|region| {
             let confidence = coarse
@@ -492,4 +518,37 @@ pub fn read(png: &[u8], start_ms: i64, locked: Option<Marker>) -> Reading {
         Luma([*p.iter().min().unwrap()])
     });
     recognize(&image, start_ms, locked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_touching_adjacent_ui_text_keeps_all_digit_checks() {
+        for unix in [1_788_950_123, 1_789_058_701, 1_800_123_456] {
+            let text = resize(&template(unix, 24), 66, 9, FilterType::Triangle);
+            let mut frame = GrayImage::new(960, 360);
+            image::imageops::replace(&mut frame, &text, 5, 4);
+            // Bright UI text connects to the final digit at its right edge.
+            // It must not enlarge the numeric crop or become another digit.
+            for x in 71..84 {
+                for y in 6..12 {
+                    if y == 8 || x % 4 < 2 {
+                        frame.put_pixel(x, y, Luma([190]));
+                    }
+                }
+            }
+            assert!(
+                matches!(recognize(&frame, unix * 1000, None),
+                Reading::Present(marker) if marker.unix_seconds == unix),
+                "{unix}"
+            );
+            assert_eq!(recognize(&frame, (unix + 60) * 1000, None), Reading::Absent);
+            assert_eq!(
+                recognize(&GrayImage::new(960, 360), unix * 1000, None),
+                Reading::Absent
+            );
+        }
+    }
 }

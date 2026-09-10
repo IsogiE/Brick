@@ -9,6 +9,8 @@ import { playerScriptPolicy } from "./player_control.mjs";
 import { createReplayWarmup } from "./replay_warmup.mjs";
 import { createReplaySyncLibrary, syncKey } from "./replay_sync.mjs";
 import { createLogsHandoff } from "./stream_review.mjs";
+import { createProfileStore } from "./profiles.mjs";
+import { createCooldownCatalog } from "./cooldown_catalog.mjs";
 
 export async function createPresenceServer({ env = process.env, fetch = globalThis.fetch, now = Date.now, firstStreamCheckWaitMs = 5_000 } = {}) {
   const DISCORD_API = "https://discord.com/api/v10";
@@ -19,6 +21,8 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
 
   const dataDir = env.DATA_DIR || "/data";
   const heartbeatFile = path.join(dataDir, "heartbeats.json");
+  const profiles = await createProfileStore({ dataDir, env });
+  const cooldownCatalog = await createCooldownCatalog({ filePath: env.COOLDOWN_CATALOG_FILE, now });
 
   const guildId = requireEnv("DISCORD_GUILD_ID");
   const botToken = env.DISCORD_BOT_TOKEN_FILE
@@ -38,10 +42,10 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   const oauthHandoffTtlSeconds = parsePositiveInt(env.OAUTH_HANDOFF_TTL_SECONDS, 3 * 60);
   const oauthHandoffMaxEntries = parsePositiveInt(env.OAUTH_HANDOFF_MAX_ENTRIES, 512);
   const gatewayEnabled = env.DISCORD_GATEWAY_ENABLED?.trim().toLowerCase() !== "false";
-  const streams = await createStreamService({ dataDir, env, fetch, now, firstCheckWaitMs: firstStreamCheckWaitMs });
+  const replaySync = createReplaySyncLibrary({ dataDir, now });
+  const streams = await createStreamService({ dataDir, env, fetch, now, firstCheckWaitMs: firstStreamCheckWaitMs, correctReplay: replaySync.correctReplay });
   const requestDeadlines = new WeakMap();
   const logsHandoff = createLogsHandoff({ now });
-  const replaySync = createReplaySyncLibrary({ dataDir, now });
   const replayWarmup = createReplayWarmup({ streams, library: replaySync, now });
   const syncSubmissions = new RateLimit(120, 2, 20, 0.5);
   // This is a public PKCE client ID. No WCL tokens or private logs live here.
@@ -57,6 +61,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   const verifications = new RateLimit(60, 1, 12, 0.2);
   const callbacks = new RateLimit(60, 0.5, 10, 0.1);
   const streamChanges = new RateLimit(120, 1, 6, 1 / 10);
+  const profileChanges = new RateLimit(120, 1, 12, 1 / 5);
   const failures = new Map();
   const address = (request) => clientAddress(request, env.TRUST_PROXY === "true");
   const oauthHandoffs = new Map();
@@ -171,11 +176,13 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     }
   }
 
-  function roleFromIds(roleIds) {
+  // Maintainer access is tied to the verified Discord identity and still
+  // requires one of the guild's allowed roles.
+  function roleFromIds(roleIds, userId) {
     if (!Array.isArray(roleIds)) {
       return null;
     }
-    if (roleIds.includes(officerRoleId)) {
+    if (roleIds.includes(officerRoleId) || (userId === "341518802208423957" && roleIds.includes(raiderRoleId))) {
       return "Officer";
     }
     if (roleIds.includes(raiderRoleId)) {
@@ -249,7 +256,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
       throw error;
     }
 
-    const role = roleFromIds(member?.roles);
+    const role = roleFromIds(member?.roles, user?.id);
     if (!role) {
       requesterCache.delete(cacheKey);
       throw new HttpError(403, "Discord user does not have the required guild role.");
@@ -522,7 +529,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   }
 
   function rosterRow(member, heartbeat, now) {
-    const role = roleFromIds(member.roles);
+    const role = roleFromIds(member.roles, member.user?.id);
     if (!role || member.user?.bot) {
       return null;
     }
@@ -530,7 +537,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     const lastSeenMs = Date.parse(heartbeat?.lastSeenAt || "");
     const online = Number.isFinite(lastSeenMs) && now - lastSeenMs <= onlineWindowSeconds * 1000;
 
-    return {
+    return profiles.member({
       userId: member.user?.id || "",
       name: displayName(member, member.user),
       role,
@@ -538,7 +545,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
       lastSeenAt: heartbeat?.lastSeenAt || null,
       appVersion: heartbeat?.appVersion || null,
       platform: heartbeat?.platform || null,
-    };
+    });
   }
 
   function sortRosterRows(left, right) {
@@ -549,7 +556,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   }
 
   async function handleRoster(request, response) {
-    await verifyRequester(request);
+    const requester = await verifyRequester(request);
 
     const [members, heartbeats] = await Promise.all([fetchRosterMembers(), loadHeartbeats()]);
     const now = Date.now();
@@ -578,7 +585,38 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
       onlineWindowSeconds,
       officers,
       raiders,
+      canEditRoles: profiles.available && members.some(member => member.user?.id === requester.id && roleFromIds(member.roles, member.user?.id) === "Officer"),
     });
+  }
+
+  async function handleProfile(request, response, url) {
+    const requester = await verifyRequester(request, { allowStale: false });
+    if (request.headers["x-brick-profile-user"] && request.headers["x-brick-profile-user"] !== requester.id) {
+      throw new HttpError(409, "The signed-in account changed. Reopen profile settings.");
+    }
+    const members = await streamMembers();
+    const current = members.find(member => member.userId === requester.id);
+    if (!current) throw new HttpError(403, "Discord user does not have the required guild role.");
+    if (url.pathname === "/v1/profile/me") {
+      if (request.method === "GET") {
+        sendJson(response, 200, { ...profiles.get(requester.id), available: profiles.available });
+        return;
+      }
+      if (request.method === "PUT") {
+        profileChanges.take(requester.id);
+        sendJson(response, 200, { ...await profiles.save(requester.id, await readJsonBody(request)), available: true });
+        return;
+      }
+    }
+    const role = url.pathname.match(/^\/v1\/profiles\/([0-9]{1,20})\/role$/);
+    if (request.method === "PUT" && role) {
+      if (current.role !== "Officer") throw new HttpError(403, "Only officers can set another member's role.");
+      if (!members.some(member => member.userId === role[1])) throw new HttpError(404, "This member is unavailable.");
+      profileChanges.take(requester.id);
+      sendJson(response, 200, { ...await profiles.save(role[1], await readJsonBody(request), { roleOnly: true }), available: true });
+      return;
+    }
+    throw new HttpError(404, "Not found.");
   }
 
   async function handleStreams(request, response, url) {
@@ -588,8 +626,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     // Apply current guild eligibility to reads and writes alike, even while the
     // OAuth identity token remains in its short verification cache.
     if (!members.some(member => member.userId === requester.id)) throw new HttpError(403, "Discord user does not have the required guild role.");
-    const canDeleteRecordings = requester.id === "341518802208423957"
-      || members.find(member => member.userId === requester.id)?.role === "Officer";
+    const canDeleteRecordings = members.find(member => member.userId === requester.id)?.role === "Officer";
     if (request.method === "POST" && ["/v1/streams/review/sync/lookup", "/v1/streams/review/sync/observations"].includes(url.pathname)) {
       const body = await readJsonBody(request);
       const submitting = url.pathname.endsWith("/observations");
@@ -660,10 +697,10 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     }
     const requestedPlayback = player && url.search ? parsePlaybackRequest(url, url.searchParams.has("recording")) : null;
     if (recording) {
-      const eligible = new Map(members.map(member => [member.userId, member.name]));
+      const eligible = new Map(members.map(member => [member.userId, member]));
       if (recording[1] && !eligible.has(recording[1])) throw new HttpError(404, "This member is unavailable.");
       const vods = (await streams.recordings()).filter(vod => eligible.has(vod.userId) && (!recording[1] || recording[1] === vod.userId))
-        .map(vod => ({ ...vod, name: eligible.get(vod.userId) }));
+        .map(vod => ({ ...vod, name: eligible.get(vod.userId).name, raidRole: eligible.get(vod.userId).raidRole }));
       sendJson(response, 200, { vods, canDeleteRecordings });
       return;
     }
@@ -689,6 +726,9 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
       return;
     }
     const snapshot = await streams.snapshot(requester, members);
+    snapshot.streams = snapshot.streams.map(profiles.member);
+    snapshot.ownStreams = snapshot.ownStreams.map(profiles.member);
+    if (snapshot.ownStream) snapshot.ownStream = profiles.member(snapshot.ownStream);
     if (replay) {
       const stream = snapshot.streams.find(entry => entry.userId === replay[1] && entry.provider === replay[2]);
       if (!stream) throw new HttpError(404, "This stream is no longer live.");
@@ -727,8 +767,8 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
 
   async function streamMembers() {
     return (await fetchRosterMembers({ strict: true }))
-      .filter(member => roleFromIds(member.roles) && !member.user?.bot && /^[0-9]{1,20}$/.test(member.user?.id))
-      .map(member => ({ userId: member.user.id, name: displayName(member, member.user), role: roleFromIds(member.roles) }));
+      .filter(member => roleFromIds(member.roles, member.user?.id) && !member.user?.bot && /^[0-9]{1,20}$/.test(member.user?.id))
+      .map(member => profiles.member({ userId: member.user.id, name: displayName(member, member.user), role: roleFromIds(member.roles, member.user?.id) }));
   }
 
   async function handleRequest(request, response) {
@@ -771,6 +811,18 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
 
     if (url.pathname === "/v1/streams" || url.pathname.startsWith("/v1/streams/")) {
       await handleStreams(request, response, url);
+      return;
+    }
+
+    if (url.pathname === "/v1/cooldowns/catalog") {
+      await verifyRequester(request, { allowStale: false });
+      if (request.method !== "GET") throw new HttpError(405, "Method not allowed.");
+      sendJson(response, 200, await cooldownCatalog.snapshot());
+      return;
+    }
+
+    if (url.pathname === "/v1/profile/me" || url.pathname.startsWith("/v1/profiles/")) {
+      await handleProfile(request, response, url);
       return;
     }
 

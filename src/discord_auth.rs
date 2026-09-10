@@ -634,14 +634,17 @@ fn authorized_user(session: &AuthSession, config: &AuthConfig) -> AuthorizedUser
             .unwrap_or_else(|| session.username.clone()),
         username: session.username.clone(),
         guild_name: config.guild_name.clone(),
-        role_label: authorized_role_label(&session.authorized_role_ids, config),
+        role_label: authorized_role_label(&session.user_id, &session.authorized_role_ids, config),
         expires_at_unix: session.expires_at_unix,
         created_at_unix: session_created_at_unix(session),
     }
 }
 
-fn authorized_role_label(role_ids: &[String], config: &AuthConfig) -> String {
-    if role_ids.iter().any(|role_id| role_id == OFFICER_ROLE_ID) {
+fn authorized_role_label(user_id: &str, role_ids: &[String], config: &AuthConfig) -> String {
+    if role_ids.iter().any(|role_id| role_id == OFFICER_ROLE_ID)
+        || (user_id == "341518802208423957"
+            && role_ids.iter().any(|role_id| role_id == RAIDER_ROLE_ID))
+    {
         "Officer".to_string()
     } else if role_ids.iter().any(|role_id| role_id == RAIDER_ROLE_ID) {
         "Raider".to_string()
@@ -1138,15 +1141,16 @@ mod tests {
         let config = test_config();
 
         assert_eq!(
-            authorized_role_label(&["1199377026168143872".to_string()], &config),
+            authorized_role_label("12345", &["1199377026168143872".to_string()], &config),
             "Raider"
         );
         assert_eq!(
-            authorized_role_label(&["1167061441023582258".to_string()], &config),
+            authorized_role_label("12345", &["1167061441023582258".to_string()], &config),
             "Officer"
         );
         assert_eq!(
             authorized_role_label(
+                "12345",
                 &[
                     "1199377026168143872".to_string(),
                     "1167061441023582258".to_string()
@@ -1154,6 +1158,23 @@ mod tests {
                 &config
             ),
             "Officer"
+        );
+    }
+
+    #[test]
+    fn maintainer_officer_label_requires_an_allowed_guild_role() {
+        let config = test_config();
+        assert_eq!(
+            authorized_role_label(
+                "341518802208423957",
+                &[super::RAIDER_ROLE_ID.to_owned()],
+                &config
+            ),
+            "Officer"
+        );
+        assert_eq!(
+            authorized_role_label("341518802208423957", &[], &config),
+            config.role_label
         );
     }
 

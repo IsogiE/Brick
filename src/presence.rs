@@ -37,6 +37,22 @@ pub struct Roster {
     pub online_window_seconds: u64,
     pub officers: Vec<RosterMember>,
     pub raiders: Vec<RosterMember>,
+    #[serde(default)]
+    pub can_edit_roles: bool,
+}
+
+impl Roster {
+    pub fn sort_members(&mut self) {
+        for members in [&mut self.officers, &mut self.raiders] {
+            members.sort_by_cached_key(|member| {
+                (
+                    crate::profile::role_order(member.raid_role),
+                    member.name.to_lowercase(),
+                    member.user_id.clone(),
+                )
+            });
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +60,8 @@ pub struct Roster {
 pub struct RosterMember {
     pub user_id: String,
     pub name: String,
+    #[serde(default)]
+    pub raid_role: Option<crate::profile::RaidRole>,
     pub role: String,
     pub online: bool,
     pub last_seen_at: Option<String>,
@@ -126,8 +144,59 @@ pub fn fetch_roster(access_token: &str) -> Result<Roster, String> {
         return Err(api_error("Roster refresh failed", status.as_u16(), &body));
     }
 
-    serde_json::from_slice(&body)
+    serde_json::from_slice::<Roster>(&body)
+        .map(|mut roster| {
+            roster.sort_members();
+            roster
+        })
         .map_err(|error| format!("Roster refresh failed: invalid server response: {error}"))
+}
+
+pub(crate) fn profile_request(
+    method: reqwest::Method,
+    path: &str,
+    access_token: &str,
+    expected_user: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<crate::profile::Profile, String> {
+    let client = http_client()?;
+    for attempt in 0..2 {
+        let mut request = client
+            .request(method.clone(), endpoint_url(path)?)
+            .bearer_auth(access_token)
+            .header("x-brick-profile-user", expected_user);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request
+            .send()
+            .map_err(|_| "Profile service could not be reached. Try again.".to_string())?;
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(5)
+            .clamp(1, 10);
+        let bytes = download::read_response(
+            response,
+            MAX_STATUS_RESPONSE_BYTES,
+            "Profile request failed",
+        )?;
+        // Officer edits share a server-side burst limit. One bounded retry runs
+        // on the existing worker so rapid choices neither vanish nor animate UI.
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt == 0 {
+            std::thread::sleep(Duration::from_secs(retry_after));
+            continue;
+        }
+        if !status.is_success() {
+            return Err(api_error("Profile request failed", status.as_u16(), &bytes));
+        }
+        return serde_json::from_slice(&bytes)
+            .map_err(|_| "Profile service returned invalid settings.".to_string());
+    }
+    unreachable!("The final profile request attempt always returns")
 }
 
 fn expect_success(response: reqwest::blocking::Response, prefix: &str) -> Result<(), String> {

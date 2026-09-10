@@ -14,6 +14,7 @@ use crate::{
     autostart,
     discord_auth::{self, AuthorizedUser, SessionStatus},
     presence::{self, Roster, RosterMember},
+    profile::{self, ProfileUi, RaidRole},
     single_instance,
     streams_ui::StreamsUi,
     tray,
@@ -37,6 +38,7 @@ pub struct BrickApp {
     auth_state: AuthUiState,
     presence_state: PresenceUiState,
     streams: StreamsUi,
+    profile: ProfileUi,
     active_tab: MainTab,
     sync_rx: Option<mpsc::Receiver<Result<SyncSummary, String>>>,
     auth_rx: Option<mpsc::Receiver<Result<AuthorizedUser, String>>>,
@@ -79,7 +81,7 @@ impl AuthUiState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MainTab {
-    Updates,
+    Home,
     Roster,
     Streams,
 }
@@ -149,7 +151,8 @@ impl BrickApp {
             auth_state,
             presence_state: initial_presence_state(),
             streams: StreamsUi::default(),
-            active_tab: MainTab::Updates,
+            profile: ProfileUi::default(),
+            active_tab: MainTab::Home,
             sync_rx: None,
             auth_rx: None,
             app_update_rx: None,
@@ -444,6 +447,7 @@ impl BrickApp {
                 self.roster_rx = None;
                 self.presence_state = initial_presence_state();
                 self.roster_notice = None;
+                self.profile = ProfileUi::default();
                 self.status = "Signed out of Discord.".to_string();
             }
             Err(error) => {
@@ -455,6 +459,24 @@ impl BrickApp {
 
     fn request_sign_out(&mut self) {
         self.confirm_logout = true;
+    }
+
+    fn apply_roster_role(&mut self, id: &str, role: Option<RaidRole>) {
+        // An older in-flight roster response must not undo the confirmed write.
+        self.roster_rx = None;
+        if let PresenceUiState::Ready(roster) = &mut self.presence_state {
+            if let Some(member) = roster
+                .officers
+                .iter_mut()
+                .chain(&mut roster.raiders)
+                .find(|member| member.user_id == id)
+            {
+                member.raid_role = role;
+                roster.sort_members();
+            }
+        }
+        self.last_roster_refresh = Instant::now();
+        self.streams.profiles_changed();
     }
 
     fn start_roster_refresh(&mut self) {
@@ -809,7 +831,7 @@ impl BrickApp {
             ui.add_space(if compact_streams { 4.0 } else { 18.0 });
         }
         match self.active_tab {
-            MainTab::Updates => self.draw_scrollable_updates_tab(ui),
+            MainTab::Home => self.draw_scrollable_updates_tab(ui),
             MainTab::Roster => self.draw_roster_tab(ui),
             MainTab::Streams => self.streams.draw(ui),
         }
@@ -841,8 +863,8 @@ impl BrickApp {
     }
 
     fn draw_tab_buttons(&mut self, ui: &mut egui::Ui) {
-        if tab_button(ui, "Updates", self.active_tab == MainTab::Updates).clicked() {
-            self.active_tab = MainTab::Updates;
+        if tab_button(ui, "Home", self.active_tab == MainTab::Home).clicked() {
+            self.active_tab = MainTab::Home;
         }
         if tab_button(ui, "Roster", self.active_tab == MainTab::Roster).clicked() {
             self.active_tab = MainTab::Roster;
@@ -918,7 +940,6 @@ impl BrickApp {
 
     fn draw_roster_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            section_title(ui, "Guild Roster");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if secondary_button(ui, "Refresh").clicked() {
                     self.start_roster_refresh();
@@ -930,7 +951,8 @@ impl BrickApp {
         });
         ui.add_space(8.0);
 
-        let state = self.presence_state.clone();
+        let state = &self.presence_state;
+        let mut role_change = None;
         panel_frame().show(ui, |ui| match state {
             PresenceUiState::Unavailable(error) => {
                 empty_panel_message(ui, "Roster unavailable", &friendly_roster_problem(&error));
@@ -966,9 +988,24 @@ impl BrickApp {
                             roster_notice(ui, notice);
                             ui.add_space(14.0);
                         }
-                        draw_roster_group(ui, "Officers", &roster.officers);
+                        let can_edit = roster.can_edit_roles;
+                        draw_roster_group(
+                            ui,
+                            "Officers",
+                            &roster.officers,
+                            can_edit,
+                            &self.profile,
+                            &mut role_change,
+                        );
                         ui.add_space(18.0);
-                        draw_roster_group(ui, "Raiders", &roster.raiders);
+                        draw_roster_group(
+                            ui,
+                            "Raiders",
+                            &roster.raiders,
+                            can_edit,
+                            &self.profile,
+                            &mut role_change,
+                        );
                         ui.add_space(12.0);
                         ui.label(
                             RichText::new(roster_refresh_label(
@@ -981,6 +1018,9 @@ impl BrickApp {
                     });
             }
         });
+        if let Some((id, role)) = role_change {
+            self.profile.set_member_role(ui.ctx(), id, role);
+        }
     }
 
     fn draw_login_screen(&mut self, ui: &mut egui::Ui) {
@@ -1324,6 +1364,8 @@ impl BrickApp {
             if let AuthUiState::Authorized(user) = self.auth_state.clone() {
                 ui.separator();
                 self.draw_discord_settings_row(ui, &user);
+                ui.separator();
+                self.profile.draw(ui, &user.display_name);
             }
         });
     }
@@ -1518,6 +1560,11 @@ impl BrickApp {
             }
         }
 
+        next = next.min(self.profile.repaint_after(
+            self.auth_state.is_authorized()
+                && self.window_visible
+                && self.active_tab == MainTab::Home,
+        ));
         next.min(self.streams.repaint_after(
             self.auth_state.is_authorized()
                 && self.window_visible
@@ -1578,6 +1625,21 @@ impl eframe::App for BrickApp {
             self.auth_state = AuthUiState::Denied("Sign in again to access guild streams.".into());
         }
         if self.auth_state.is_authorized() {
+            let user = match &self.auth_state {
+                AuthUiState::Authorized(user) => Some(user),
+                _ => None,
+            };
+            if self.profile.tick(
+                ctx,
+                user,
+                self.window_visible && self.active_tab == MainTab::Home,
+            ) {
+                self.start_roster_refresh();
+                self.streams.profiles_changed();
+            }
+            if let Some((id, role)) = self.profile.take_role_change() {
+                self.apply_roster_role(&id, role);
+            }
             self.poll_sync();
             self.poll_roster();
             self.start_roster_refresh_if_stale();
@@ -1706,6 +1768,23 @@ fn configure_style(ctx: &egui::Context) {
     style.spacing.button_padding = egui::vec2(14.0, 8.0);
     style.visuals.panel_fill = app_background();
     style.visuals.window_fill = app_background();
+    // egui computes button padding from the theme stroke before applying a
+    // Button::stroke override. Different state widths would resize our outlined
+    // buttons on hover even with expansion disabled. Keep all frame geometry
+    // constant; colors still communicate hover, focus and pressed states.
+    let widgets = &mut style.visuals.widgets;
+    let corner_radius = widgets.inactive.corner_radius;
+    for state in [
+        &mut widgets.noninteractive,
+        &mut widgets.inactive,
+        &mut widgets.hovered,
+        &mut widgets.active,
+        &mut widgets.open,
+    ] {
+        state.expansion = 0.0;
+        state.bg_stroke.width = 1.0;
+        state.corner_radius = corner_radius;
+    }
     style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(35, 39, 47);
     style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(45, 50, 60);
     style.visuals.widgets.active.bg_fill = Color32::from_rgb(55, 61, 72);
@@ -1997,7 +2076,14 @@ fn roster_notice(ui: &mut egui::Ui, detail: &str) {
         });
 }
 
-fn draw_roster_group(ui: &mut egui::Ui, title: &str, members: &[RosterMember]) {
+fn draw_roster_group(
+    ui: &mut egui::Ui,
+    title: &str,
+    members: &[RosterMember],
+    can_edit: bool,
+    profile: &ProfileUi,
+    change: &mut Option<(String, Option<RaidRole>)>,
+) {
     let online_count = members.iter().filter(|member| member.online).count();
     ui.horizontal(|ui| {
         ui.label(
@@ -2026,15 +2112,26 @@ fn draw_roster_group(ui: &mut egui::Ui, title: &str, members: &[RosterMember]) {
         if index > 0 {
             ui.separator();
         }
-        draw_roster_member_row(ui, member);
+        ui.push_id(&member.user_id, |ui| {
+            draw_roster_member_row(ui, member, can_edit, profile, change);
+        });
     }
 }
 
-fn draw_roster_member_row(ui: &mut egui::Ui, member: &RosterMember) {
+fn draw_roster_member_row(
+    ui: &mut egui::Ui,
+    member: &RosterMember,
+    can_edit: bool,
+    profile: &ProfileUi,
+    change: &mut Option<(String, Option<RaidRole>)>,
+) {
     let row_height = 36.0;
     let row_width = ui.available_width().max(260.0);
     let (row_rect, _) =
         ui.allocate_exact_size(egui::vec2(row_width, row_height), egui::Sense::hover());
+    if !ui.is_rect_visible(row_rect) {
+        return;
+    }
 
     let dot_color = if member.online {
         success_accent()
@@ -2056,10 +2153,11 @@ fn draw_roster_member_row(ui: &mut egui::Ui, member: &RosterMember) {
     }
 
     let name_left = row_rect.left() + 34.0;
+    let role_width = if can_edit { 106.0 } else { 0.0 };
     let status_width = if row_width < 520.0 { 148.0 } else { 220.0 };
     let status_rect = egui::Rect::from_min_max(
-        egui::pos2(row_rect.right() - status_width, row_rect.top()),
-        row_rect.right_bottom(),
+        egui::pos2(row_rect.right() - status_width - role_width, row_rect.top()),
+        row_rect.right_bottom() - egui::vec2(role_width, 0.0),
     );
     let name_rect = egui::Rect::from_min_max(
         egui::pos2(name_left, row_rect.top()),
@@ -2075,6 +2173,7 @@ fn draw_roster_member_row(ui: &mut egui::Ui, member: &RosterMember) {
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
         |ui| {
             ui.shrink_clip_rect(name_rect);
+            profile::role_icon(ui, member.raid_role);
             ui.add(
                 egui::Label::new(
                     RichText::new(member.name.as_str())
@@ -2109,6 +2208,23 @@ fn draw_roster_member_row(ui: &mut egui::Ui, member: &RosterMember) {
             .on_hover_text(status);
         },
     );
+    if can_edit {
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(row_rect.right() - role_width + 6.0, row_rect.top()),
+            row_rect.right_bottom(),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                let mut role = profile.role_for_member(&member.user_id, member.raid_role);
+                if profile::role_picker(ui, ("roster-role", &member.user_id), &mut role) {
+                    *change = Some((member.user_id.clone(), role));
+                }
+            },
+        );
+    }
 }
 
 fn roster_member_status(member: &RosterMember) -> String {
@@ -2374,7 +2490,7 @@ fn info_accent() -> Color32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use eframe::App as _;
 
@@ -2398,7 +2514,8 @@ mod tests {
             }),
             presence_state: PresenceUiState::Idle,
             streams: StreamsUi::default(),
-            active_tab: MainTab::Updates,
+            profile: ProfileUi::default(),
+            active_tab: MainTab::Home,
             sync_rx: None,
             auth_rx: None,
             app_update_rx: None,
@@ -2421,6 +2538,145 @@ mod tests {
             last_app_update_check: now,
             last_roster_refresh: now,
             roster_notice: None,
+        }
+    }
+
+    // Inspect both allocated rows and painted frames/text after the previous-frame
+    // WidgetState has caught up. A single hover frame misses egui's ButtonStyle path.
+    pub(crate) fn assert_static_button_hover(labels: &[&str], mut draw: impl FnMut(&mut egui::Ui)) {
+        #[derive(Debug, PartialEq)]
+        enum Geometry {
+            Rect(egui::Rect, egui::CornerRadius, f32),
+            Text(String, egui::Pos2, egui::Vec2),
+        }
+        fn collect(shape: &egui::Shape, out: &mut Vec<Geometry>) {
+            match shape {
+                egui::Shape::Rect(rect) => out.push(Geometry::Rect(
+                    rect.rect,
+                    rect.corner_radius,
+                    rect.stroke.width,
+                )),
+                egui::Shape::Text(text) => out.push(Geometry::Text(
+                    text.galley.text().into(),
+                    text.pos,
+                    text.galley.size(),
+                )),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            configure_style(&ctx);
+            ctx.set_pixels_per_point(scale);
+            let mut frame = |events| {
+                let mut bounds = egui::Rect::NOTHING;
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(980.0, 720.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        draw(ui);
+                        bounds = ui.min_rect();
+                    },
+                );
+                let mut geometry = Vec::new();
+                for shape in output.shapes {
+                    collect(&shape.shape, &mut geometry);
+                }
+                (bounds, geometry)
+            };
+            frame(vec![]);
+            frame(vec![]);
+            let baseline = frame(vec![]);
+            for label in labels {
+                let center = baseline
+                    .1
+                    .iter()
+                    .find_map(|part| match part {
+                        Geometry::Text(text, pos, size) if text == label => {
+                            Some(*pos + *size * 0.5)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("Missing button {label}"));
+                // The first frame discovers hover; later frames allocate with it.
+                for n in 0..4 {
+                    assert_eq!(
+                        baseline,
+                        frame(vec![egui::Event::PointerMoved(center)]),
+                        "Button {label}, hover frame {n}, scale {scale} changed geometry",
+                    );
+                }
+                for n in 0..4 {
+                    assert_eq!(
+                        baseline,
+                        frame(vec![egui::Event::PointerGone]),
+                        "Button {label}, exit frame {n}, scale {scale} changed geometry",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn common_buttons_keep_painted_geometry_on_hover() {
+        assert_static_button_hover(
+            &[
+                "Refresh",
+                "Choose Folder",
+                "Log out",
+                "Save profile",
+                "Advanced",
+            ],
+            |ui| {
+                ui.horizontal(|ui| {
+                    secondary_button(ui, "Refresh");
+                    primary_button(ui, "Choose Folder");
+                    danger_button(ui, "Log out");
+                    let _ = ui.button("Save profile");
+                    ui.add_sized(
+                        [80.0, 28.0],
+                        egui::Button::new("Advanced").stroke(Stroke::new(1.0_f32, panel_stroke())),
+                    );
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn both_update_headers_keep_painted_geometry_on_hover() {
+        for available in [false, true] {
+            for review in [false, true] {
+                let mut app = app();
+                if available {
+                    app.app_update_state = AppUpdateUiState::Available("0.4.7".into());
+                }
+                let label = if available {
+                    "Update now"
+                } else if review {
+                    "Check updates"
+                } else {
+                    "Check for updates"
+                };
+                assert_static_button_hover(&["Home", "Roster", "Streams", label], |ui| {
+                    if review {
+                        app.draw_review_header(ui);
+                    } else {
+                        app.draw_header(ui);
+                        app.draw_tab_bar(ui);
+                    }
+                });
+            }
         }
     }
 
@@ -2516,6 +2772,38 @@ mod tests {
         app.status = "Failed to verify addon signature".into();
         app.apply_view_refresh(Ok(AppView::default()));
         assert_eq!(app.status, "Failed to verify addon signature");
+    }
+
+    #[test]
+    fn confirmed_roster_role_keeps_sections_and_discards_older_refresh() {
+        let mut app = app();
+        app.presence_state = PresenceUiState::Ready(serde_json::from_value(serde_json::json!({
+            "generatedAt":"2026-09-10", "onlineWindowSeconds":60, "canEditRoles":true,
+            "officers":[{"userId":"1","name":"Officer","role":"Officer","online":true,"raidRole":"dps"}],
+            "raiders":[
+                {"userId":"2","name":"Zulu","role":"Raider","online":true,"raidRole":"healer"},
+                {"userId":"3","name":"Alpha","role":"Raider","online":true,"raidRole":"tank"}
+            ]
+        })).unwrap());
+        let (tx, rx) = mpsc::channel();
+        app.roster_rx = Some(rx);
+        app.apply_roster_role("2", Some(RaidRole::Tank));
+        let PresenceUiState::Ready(roster) = &app.presence_state else {
+            panic!("roster was cleared");
+        };
+        assert_eq!(roster.officers[0].user_id, "1");
+        assert_eq!(
+            roster
+                .raiders
+                .iter()
+                .map(|member| member.user_id.as_str())
+                .collect::<Vec<_>>(),
+            ["3", "2"]
+        );
+        assert_eq!(roster.raiders[1].raid_role, Some(RaidRole::Tank));
+        assert!(app.roster_rx.is_none());
+        assert!(tx.send(Ok(roster.clone())).is_err());
+        assert!(app.last_roster_refresh.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

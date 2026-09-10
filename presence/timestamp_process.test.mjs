@@ -117,3 +117,17 @@ test('startup recovers only owned jobs and never follows their symlinks', async 
   await symlink(outside, linkedRoot);
   await assert.rejects(createScanner({ root: linkedRoot }), /Invalid timestamp scratch directory/);
 });
+
+test('configured disk scratch root owns and cleans job files', { skip: process.platform === 'win32' }, async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'brick-disk-scratch-test-'));
+  const previous = process.env.BRICK_TIMESTAMP_SCRATCH_DIR;
+  process.env.BRICK_TIMESTAMP_SCRATCH_DIR = path.join(directory, 'jobs');
+  t.after(async () => {
+    if (previous === undefined) delete process.env.BRICK_TIMESTAMP_SCRATCH_DIR;
+    else process.env.BRICK_TIMESTAMP_SCRATCH_DIR = previous;
+    await rm(directory, { recursive: true, force: true });
+  });
+  const scan = await createScanner({ command: process.execPath, args: ['-e', fixture] });
+  assert.equal(await scan({ key: { mode: 'success' }, attempt: 0 }), 12345);
+  assert.deepEqual(await readdir(process.env.BRICK_TIMESTAMP_SCRATCH_DIR), []);
+});

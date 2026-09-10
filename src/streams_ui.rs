@@ -117,6 +117,11 @@ impl Default for StreamsUi {
 }
 
 impl StreamsUi {
+    pub fn profiles_changed(&mut self) {
+        self.last_attempt = None;
+        self.recordings_attempted = false;
+    }
+
     pub fn reviewing(&self) -> bool {
         self.review.active() && !self.recordings_open
     }
@@ -282,7 +287,16 @@ impl StreamsUi {
             if let Some(result) = result {
                 self.work = None;
                 match result {
-                    Ok(ResultData::Snapshot(snapshot)) => {
+                    Ok(ResultData::Snapshot(mut snapshot)) => {
+                        snapshot.streams.sort_by_cached_key(|stream| {
+                            (
+                                crate::profile::role_order(stream.raid_role),
+                                stream.name.to_lowercase(),
+                                stream.user_id.clone(),
+                                stream.provider.key(),
+                                stream.channel_id.clone(),
+                            )
+                        });
                         self.pov_revision = self.pov_revision.wrapping_add(1);
                         self.saved_provider = None;
                         if let Some(selected) =
@@ -572,6 +586,7 @@ impl StreamsUi {
                     &stream,
                     &self.pov_cache,
                     &state,
+                    self.player.is_some() && !self.player_switch_pending,
                     self.player_error.as_deref(),
                     self.comparison.as_mut(),
                 );
@@ -703,7 +718,6 @@ impl StreamsUi {
                     }
                     self.confirm_remove = None;
                     self.edit_open = true;
-                    self.stop_player();
                 }
                 let refresh_button = action_button("Refresh");
                 let refresh_button = if self.notice.is_some() && self.notice_provider.is_none() {
@@ -823,7 +837,16 @@ impl StreamsUi {
                                     .focused
                                     .as_ref()
                                     .is_some_and(|(id, _)| id == &stream.user_id);
-                                if member_row(ui, &stream.name, None, selected, true).clicked() {
+                                if member_row(
+                                    ui,
+                                    &stream.name,
+                                    stream.raid_role,
+                                    None,
+                                    selected,
+                                    true,
+                                )
+                                .clicked()
+                                {
                                     self.stop_player();
                                     self.player_error = None;
                                     self.focused =
@@ -901,17 +924,19 @@ impl StreamsUi {
                     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
                     ui.painter()
                         .rect_filled(rect, 8.0, Color32::from_rgb(12, 14, 19));
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        if self.player_error.is_some() {
-                            "Player unavailable"
-                        } else {
-                            "Opening stream…"
-                        },
-                        egui::FontId::proportional(16.0),
-                        MUTED,
-                    );
+                    if self.player.is_none() {
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            if self.player_error.is_some() {
+                                "Player unavailable"
+                            } else {
+                                "Opening stream…"
+                            },
+                            egui::FontId::proportional(16.0),
+                            MUTED,
+                        );
+                    }
                     self.player_rect = Some(rect);
                     ui.add_space(if ui.ctx().content_rect().height() < 640.0 {
                         4.0
@@ -1189,10 +1214,6 @@ impl StreamsUi {
         ctx: &egui::Context,
         allowed: bool,
     ) -> bool {
-        let obscured = self
-            .comparison
-            .as_ref()
-            .is_some_and(|comparison| comparison.obscures_player());
         let secondary_fullscreen = self
             .comparison
             .as_ref()
@@ -1203,7 +1224,7 @@ impl StreamsUi {
             }
             false
         } else {
-            self.update_primary_player(frame, ctx, allowed, obscured)
+            self.update_primary_player(frame, ctx, allowed)
         };
         let primary_fullscreen = self
             .player
@@ -1215,11 +1236,14 @@ impl StreamsUi {
                 ctx,
                 &self.review,
                 self.preferences.clone(),
-                allowed
-                    && !denied
-                    && !primary_fullscreen
-                    && (secondary_fullscreen || (!self.review.obscures_player() && !obscured)),
+                allowed && !denied && !primary_fullscreen,
             );
+        }
+        if let Some(player) = &self.player {
+            player.update_overlays(ctx);
+        }
+        if let Some(comparison) = &self.comparison {
+            comparison.update_overlays(ctx);
         }
         denied
     }
@@ -1229,9 +1253,8 @@ impl StreamsUi {
         frame: &eframe::Frame,
         ctx: &egui::Context,
         allowed: bool,
-        comparison_popup: bool,
     ) -> bool {
-        if !allowed || self.edit_open || self.recordings_open {
+        if !allowed || self.recordings_open {
             self.stop_player();
             return false;
         }
@@ -1250,12 +1273,7 @@ impl StreamsUi {
             return false;
         }
         if let Some(player) = &self.player {
-            player.set_visible(
-                !self.review.obscures_player() && !self.player_switch_pending && !comparison_popup,
-            );
-        }
-        if self.review.obscures_player() || comparison_popup {
-            return false;
+            player.set_visible(!self.player_switch_pending);
         }
         let Some(rect) = self.player_rect else {
             self.stop_player();
@@ -1389,6 +1407,7 @@ fn empty_view(ui: &mut egui::Ui, message: &str) {
 fn member_row(
     ui: &mut egui::Ui,
     name: &str,
+    role: Option<crate::profile::RaidRole>,
     recordings: Option<usize>,
     selected: bool,
     live: bool,
@@ -1443,7 +1462,18 @@ fn member_row(
                     + 12.0
             })
             .unwrap_or(0.0);
-        let inset = if live { 22.0 } else { 10.0 };
+        let mut inset = if live { 22.0 } else { 10.0 };
+        if role.is_some() {
+            crate::profile::paint_role_icon(
+                ui,
+                role,
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + inset, rect.center().y - 9.0),
+                    egui::vec2(18.0, 18.0),
+                ),
+            );
+            inset += 23.0;
+        }
         let color = if selected {
             Color32::from_rgb(239, 242, 247)
         } else {
@@ -1726,6 +1756,20 @@ pub(crate) fn player_url_for_playback(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn stream_actions_keep_painted_geometry_on_hover() {
+        crate::ui::tests::assert_static_button_hover(
+            &["Twitch", "VODs", "Refresh", "Your streams"],
+            |ui| {
+                ui.horizontal(|ui| {
+                    for label in ["Twitch", "VODs", "Refresh", "Your streams"] {
+                        ui.add(super::action_button(label));
+                    }
+                });
+            },
+        );
+    }
+
+    #[test]
     fn native_wrapper_recovery_is_automatic_bounded_and_resets_on_new_selection() {
         let mut streams = super::StreamsUi::default();
         streams.recover_player("Temporary loading failure".into());
@@ -1750,6 +1794,7 @@ mod tests {
     fn comparison_is_disposed_on_exit_inactive_view_and_authorization_loss() {
         let selected = crate::streams::Stream {
             user_id: "101".into(),
+            raid_role: None,
             name: "Example player".into(),
             provider: crate::streams::Provider::Youtube,
             channel_id: "test-channel".into(),
@@ -2656,7 +2701,6 @@ mod tests {
                                 self.next(2);
                             } else {
                                 self.streams.edit_open = true;
-                                self.streams.stop_player();
                                 self.next(4);
                             }
                         }
@@ -2675,8 +2719,16 @@ mod tests {
                         self.next(3);
                     }
                     4 if elapsed > Duration::from_secs(2) => {
-                        self.assert_media_gone(window)?;
-                        self.save_capture(window, "dialog-cleanup")?;
+                        let children = mapped_children(window)?;
+                        if self.streams.player.is_none()
+                            || !self
+                                .media_children
+                                .iter()
+                                .all(|child| children.contains(child))
+                        {
+                            return Err("Opening settings replaced or hid the media child".into());
+                        }
+                        self.save_capture(window, "dialog-over-player")?;
                         resource_sample("after-dialog-open");
                         self.streams.tick(ctx, false, false);
                         if self.streams.snapshot.is_some()

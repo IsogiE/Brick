@@ -22,6 +22,7 @@ use crate::stream_preferences::{PreferenceBridge, Preferences};
 mod capture;
 mod diagnostics;
 mod fullscreen;
+mod occlusion;
 mod resize;
 pub use capture::FrameCapture;
 
@@ -160,6 +161,7 @@ pub enum PlaybackCommand {
 }
 
 pub struct StreamPlayer {
+    _cache_usage: crate::cache_maintenance::PlayerLease,
     webview: Option<WebView>,
     allowed_url: Arc<Mutex<String>>,
     bounds: [i32; 4],
@@ -178,6 +180,7 @@ pub struct StreamPlayer {
     command_retried: bool,
     capture: capture::Controller,
     fullscreen: fullscreen::Controller,
+    occlusion: occlusion::Controller,
     #[cfg(target_os = "linux")]
     preference_handler: Option<(webkit2gtk::UserContentManager, gtk::glib::SignalHandlerId)>,
 }
@@ -192,6 +195,7 @@ impl StreamPlayer {
         pixels_per_point: f32,
         preferences: Option<Preferences>,
     ) -> Result<Self, String> {
+        let cache_usage = crate::cache_maintenance::PlayerLease::new();
         let created = Instant::now();
         let player_url = validated_player_url(url)?;
         let paused = player_url
@@ -308,7 +312,11 @@ impl StreamPlayer {
                 builder
             };
             // Override Wry's default flags so WebView2 keeps SmartScreen enabled.
-            builder.with_additional_browser_args("--autoplay-policy=no-user-gesture-required")
+            // Keep reusable HTTP/media caches bounded without disabling caching.
+            // InPrivate mode still protects provider state; never clear its UDF.
+            builder.with_additional_browser_args(
+                "--autoplay-policy=no-user-gesture-required --disk-cache-size=134217728 --media-cache-size=134217728",
+            )
         };
 
         // WebView2 invokes this for top-level navigations; provider iframe requests
@@ -349,10 +357,12 @@ impl StreamPlayer {
                 .to_string()
         })?;
         let player = Self {
+            _cache_usage: cache_usage,
             webview: Some(webview),
             allowed_url,
             bounds,
             visible: Cell::new(true),
+            occlusion: occlusion::Controller::default(),
             loaded,
             created,
             failure,
@@ -524,6 +534,12 @@ impl StreamPlayer {
         webview
             .load_url_with_headers(url.as_str(), headers)
             .map_err(|_| "The player could not change recording.".into())
+    }
+
+    pub fn update_overlays(&self, ctx: &egui::Context) {
+        if let Some(view) = &self.webview {
+            self.occlusion.update(view, ctx, self.bounds);
+        }
     }
 
     pub fn set_visible(&self, visible: bool) {
@@ -2207,10 +2223,12 @@ mod tests {
             let weak_context = view.context().unwrap().downgrade();
             assert!(view.context().unwrap().is_sandbox_enabled());
             let player = StreamPlayer {
+                _cache_usage: crate::cache_maintenance::PlayerLease::new(),
                 webview: Some(webview),
                 allowed_url: Arc::new(Mutex::new(wrapper.clone())),
                 bounds: [0; 4],
                 visible: Cell::new(true),
+                occlusion: occlusion::Controller::default(),
                 loaded: Arc::new(AtomicBool::new(true)),
                 created: Instant::now(),
                 failure: Arc::new(Mutex::new(None)),
@@ -2289,6 +2307,7 @@ mod tests {
     #[test]
     fn load_timeout_does_not_interrupt_a_loaded_player() {
         let mut player = StreamPlayer {
+            _cache_usage: crate::cache_maintenance::PlayerLease::new(),
             webview: None,
             allowed_url: Arc::new(Mutex::new(String::new())),
             preferences: None,
@@ -2306,6 +2325,7 @@ mod tests {
             preference_handler: None,
             bounds: [0; 4],
             visible: Cell::new(true),
+            occlusion: occlusion::Controller::default(),
             loaded: Arc::new(AtomicBool::new(false)),
             created: Instant::now() - WRAPPER_LOAD_TIMEOUT,
             failure: Arc::new(Mutex::new(None)),

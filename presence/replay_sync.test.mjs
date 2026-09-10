@@ -90,6 +90,31 @@ test('one timestamp calibrates later pulls and new reports without rescanning', 
   }
 });
 
+test('new pulls and changed bounds preserve failed recording backoff across restarts', async t => {
+  const f = await fixture(t);
+  f.library.enqueue([key]);
+  assert.equal(f.library.finish(f.library.claim(), null), false);
+  const later = { ...key, pullId: 60, startMs: key.startMs + 600_000, endMs: key.endMs + 600_000 };
+  f.library.enqueue([later]);
+  assert.equal(f.library.claim(), null);
+  const changed = { ...later, endMs: later.endMs + 1 };
+  f.library.enqueue([changed]);
+  f.restart();
+  assert.equal(f.library.claim(), null);
+  // A different recording remains eligible while this one backs off.
+  f.library.enqueue([{ ...key, videoId: '123' }]);
+  const other = f.library.claim();
+  assert.equal(other.key.videoId, '123');
+  assert.equal(f.library.finish(other, alignment), true);
+  f.advance(599_999);
+  assert.equal(f.library.claim(), null);
+  f.advance(2);
+  const retry = f.library.claim();
+  assert.deepEqual(retry.key, changed);
+  assert.equal(f.library.finish(retry, { ...alignment, unixSeconds: alignment.unixSeconds + 600,
+    videoSeconds: alignment.videoSeconds + 600 }), true);
+});
+
 test('one non-overlapping report check corrects the clock for other calibrated POVs', async t => {
   const f=await fixture(t);
   const other={...key,videoId:'12345',broadcastId:'other'};
@@ -145,4 +170,54 @@ test('expired leases recover and queues are bounded across metadata refreshes', 
   for(let i=0;i<5;i++)f.library.enqueue(Array.from({length:64},(_,n)=>({...key,pullId:100+i*64+n})));
   let count=0;while(f.library.claim())count++;
   assert.ok(count<=255);
+});
+
+test('verified YouTube media clocks correct replay metadata and work with existing client bounds', async t => {
+  const f=await fixture(t);
+  const original={...key,provider:'youtube',videoId:'904VO_G5QoQ',broadcastId:'904VO_G5QoQ'};
+  const estimate=(original.startMs-original.recordingStartMs)/1000;
+  const measured={...alignment,videoSeconds:estimate-270.818};
+  const replay={provider:'youtube',videoId:original.videoId,broadcastId:original.broadcastId,
+    startedAt:new Date(original.recordingStartMs).toISOString(),availableSeconds:20000};
+  assert.deepEqual(f.library.correctReplay(replay,true),replay);
+  assert.throws(()=>f.library.submit('11',{key:original,alignment:measured}),/Invalid/);
+  f.library.enqueue([original]);assert.equal(f.library.finish(f.library.claim(),measured),true);
+  const corrected=f.library.correctReplay(replay,true);
+  const adjusted={...original,recordingStartMs:Date.parse(corrected.startedAt)};
+  assert.equal(adjusted.recordingStartMs,original.recordingStartMs+270818);
+  assert.equal(corrected.availableSeconds,19729);
+  assert.deepEqual(f.library.correctReplay(corrected,true),corrected);
+  assert.equal(f.library.correctReplay(replay,false).availableSeconds,replay.availableSeconds);
+  for(const pull of [adjusted,{...adjusted,pullId:60,startMs:adjusted.startMs+600000,endMs:adjusted.endMs+600000}]){
+    const result=f.library.lookup(pull);
+    assert.equal(result.verified,true);
+    assert.ok(Math.abs(result.videoSeconds-(pull.startMs-pull.recordingStartMs)/1000)<0.001);
+    assert.ok(Math.abs(result.unixSeconds-Math.floor(pull.startMs/1000))<=3);
+    assert.ok(result.uncertaintySeconds<=0.35);
+  }
+  assert.equal(f.library.lookup({...adjusted,endMs:adjusted.endMs+1}),null);
+  assert.equal(f.library.lookup({...adjusted,recordingStartMs:adjusted.recordingStartMs+1}),null);
+  assert.deepEqual(f.library.correctReplay({...replay,broadcastId:'other'},true),{...replay,broadcastId:'other'});
+  f.restart();assert.deepEqual(f.library.correctReplay(replay,true),corrected);
+  // A later independent reading must update the original model, not create an
+  // unrelated model merely because clients now use the corrected media origin.
+  const later={...adjusted,pullId:70,startMs:adjusted.startMs+3601000,endMs:adjusted.endMs+3601000};
+  f.library.enqueue([later]);assert.equal(f.library.finish(f.library.claim(),{...measured,unixSeconds:measured.unixSeconds+3601,videoSeconds:measured.videoSeconds+3601}),true);
+  assert.equal(f.library.lookup(later).verified,true);
+  assert.deepEqual(f.library.correctReplay(replay,true),corrected);
+});
+
+test('large clock corrections remain exclusive to precise, leased YouTube worker observations', async t => {
+  const f=await fixture(t);
+  f.library.enqueue([key]);const job=f.library.claim();
+  assert.equal(f.library.finish(job,{...alignment,videoSeconds:alignment.videoSeconds-270}),false);
+  const youtube={...key,provider:'youtube',videoId:'904VO_G5QoQ',broadcastId:'904VO_G5QoQ'};
+  for(const change of [{videoSeconds:alignment.videoSeconds-4000},{unixSeconds:alignment.unixSeconds+10},{uncertaintySeconds:.3}]){
+    f.library.enqueue([youtube]);
+    const next=f.library.claim();assert.ok(next);
+    assert.equal(f.library.finish(next,{...alignment,...change}),false);
+    f.advance(600001);
+  }
+  const replay={provider:'youtube',videoId:youtube.videoId,broadcastId:youtube.broadcastId,startedAt:new Date(key.recordingStartMs).toISOString(),availableSeconds:20000};
+  assert.deepEqual(f.library.correctReplay(replay,true),replay);
 });
