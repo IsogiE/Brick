@@ -287,7 +287,16 @@ impl StreamsUi {
             if let Some(result) = result {
                 self.work = None;
                 match result {
-                    Ok(ResultData::Snapshot(snapshot)) => {
+                    Ok(ResultData::Snapshot(mut snapshot)) => {
+                        snapshot.streams.sort_by_cached_key(|stream| {
+                            (
+                                crate::profile::role_order(stream.raid_role),
+                                stream.name.to_lowercase(),
+                                stream.user_id.clone(),
+                                stream.provider.key(),
+                                stream.channel_id.clone(),
+                            )
+                        });
                         self.pov_revision = self.pov_revision.wrapping_add(1);
                         self.saved_provider = None;
                         if let Some(selected) =

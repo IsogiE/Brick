@@ -8,6 +8,8 @@ use wry::WebView;
 #[derive(Default)]
 pub(super) struct Controller {
     applied: RefCell<Option<([i32; 4], Vec<[i32; 4]>)>>,
+    #[cfg(test)]
+    updates: std::cell::Cell<usize>,
 }
 
 impl Controller {
@@ -22,6 +24,8 @@ impl Controller {
         }
         if apply(view, bounds, &cuts).is_ok() {
             *applied = Some((bounds, cuts));
+            #[cfg(test)]
+            self.updates.set(self.updates.get() + 1);
             // Area visibility also includes the previous frame. One settled
             // frame clears a closed tooltip; stable regions never animate.
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -370,6 +374,9 @@ mod native_tests {
             phase_at: Instant,
             phase: usize,
             previous: f64,
+            cycles: usize,
+            completed_cycles: usize,
+            frames: usize,
             measured: Arc<Mutex<Option<String>>>,
             pending: bool,
             result: Arc<Mutex<Result<bool, String>>>,
@@ -379,7 +386,9 @@ mod native_tests {
             fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
                 crate::stream_player::pump_events();
                 let ctx = ui.ctx();
-                if self.started.elapsed() > Duration::from_secs(25) {
+                self.frames += 1;
+                if self.started.elapsed() > Duration::from_secs(25 + 12 * (self.cycles as u64 - 1))
+                {
                     *self.result.lock().unwrap() =
                         Err(format!("Media overlay phase {} timed out", self.phase));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -465,10 +474,25 @@ mod native_tests {
                         return;
                     }
                     eprintln!("Overlay phase {}: {actual}", self.phase);
+                    if std::env::var_os("BRICK_NATIVE_OVERLAY_DIAGNOSTICS").is_some() {
+                        eprintln!(
+                            "Overlay scheduling rendered={} passes={} causes={:?}",
+                            ctx.cumulative_frame_nr(),
+                            ctx.cumulative_pass_nr(),
+                            ctx.repaint_causes()
+                        );
+                    }
                     if actual["visible"] != "visible"
                         || actual["changes"] != 0
                         || actual["paused"] != false
-                        || seconds <= self.previous + 0.2
+                        || {
+                            let delta = if seconds >= self.previous {
+                                seconds - self.previous
+                            } else {
+                                seconds + actual["duration"].as_f64().unwrap_or(0.0) - self.previous
+                            };
+                            delta <= 0.2
+                        }
                         || (actual["width"].as_f64().unwrap_or(0.0)
                             * actual["scale"].as_f64().unwrap_or(1.0)
                             - BOUNDS[2] as f64)
@@ -516,9 +540,20 @@ mod native_tests {
                     self.previous = seconds;
                     self.phase += 1;
                     if self.phase == 5 {
-                        *self.result.lock().unwrap() = Ok(true);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        return;
+                        self.completed_cycles += 1;
+                        if self.completed_cycles == self.cycles {
+                            let elapsed = self.started.elapsed().as_secs_f64();
+                            eprintln!("Overlay stress cycles={} passes={} seconds={elapsed:.2} region_updates={}",
+                                self.cycles, self.frames, self.controller.updates.get());
+                            assert!(
+                                self.controller.updates.get() <= 16 * self.cycles,
+                                "Stable overlay regions were reapplied repeatedly"
+                            );
+                            *self.result.lock().unwrap() = Ok(true);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            return;
+                        }
+                        self.phase = 0;
                     }
                     self.phase_at = Instant::now();
                 }
@@ -530,7 +565,7 @@ mod native_tests {
                 {
                     self.pending = true;
                     let measured = self.measured.clone();
-                    view.evaluate_script_with_callback("JSON.stringify({visible:document.visibilityState,changes:window.changes,seconds:media.currentTime,paused:media.paused,width:innerWidth,height:innerHeight,scale:devicePixelRatio})", move |value| {
+                    view.evaluate_script_with_callback("JSON.stringify({visible:document.visibilityState,changes:window.changes,seconds:media.currentTime,duration:media.duration,paused:media.paused,width:innerWidth,height:innerHeight,scale:devicePixelRatio})", move |value| {
                         let value = serde_json::from_str::<String>(&value).unwrap_or(value);
                         *measured.lock().unwrap() = Some(value);
                     }).unwrap();
@@ -567,6 +602,13 @@ mod native_tests {
                     phase_at: Instant::now(),
                     phase: 0,
                     previous: 0.0,
+                    cycles: std::env::var("BRICK_NATIVE_OVERLAY_CYCLES")
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .clamp(1, 12),
+                    completed_cycles: 0,
+                    frames: 0,
                     measured: Arc::new(Mutex::new(None)),
                     pending: false,
                     result,

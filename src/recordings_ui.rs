@@ -109,15 +109,23 @@ impl Library {
                     .or_insert_with(|| month_label(&month));
             }
         }
-        self.entries.sort_by(|a, b| {
-            timestamp(&source[b.index])
-                .cmp(timestamp(&source[a.index]))
-                .then_with(|| source[a.index].name.cmp(&source[b.index].name))
-                .then_with(|| source[a.index].id.cmp(&source[b.index].id))
+        self.entries.sort_by_cached_key(|entry| {
+            let vod = &source[entry.index];
+            (
+                profile::role_order(vod.raid_role),
+                vod.name.to_lowercase(),
+                std::cmp::Reverse(timestamp(vod).to_owned()),
+                vod.id.clone(),
+            )
         });
         self.members = members.into_values().collect();
-        self.members
-            .sort_by_cached_key(|member| (member.name.to_lowercase(), member.id.clone()));
+        self.members.sort_by_cached_key(|member| {
+            (
+                profile::role_order(member.raid_role),
+                member.name.to_lowercase(),
+                member.id.clone(),
+            )
+        });
         self.months = months.into_iter().collect();
         self.months.sort_by(|a, b| b.0.cmp(&a.0));
         if self
@@ -645,6 +653,40 @@ mod tests {
         library.filter(&source);
         assert!(library.filtered.is_empty());
         assert_eq!(library.builds, 1);
+    }
+
+    #[test]
+    fn library_players_and_vods_use_role_then_case_insensitive_name_order() {
+        let mut items = vec![archive(0), archive(1), archive(2), archive(3), archive(4)];
+        for (vod, (name, role)) in items.iter_mut().zip([
+            ("Alpha", None),
+            ("zulu", Some(RaidRole::Tank)),
+            ("Bravo", Some(RaidRole::Dps)),
+            ("alpha", Some(RaidRole::Tank)),
+            ("Healer", Some(RaidRole::Healer)),
+        ]) {
+            vod.name = name.into();
+            vod.raid_role = role;
+        }
+        let source = Rc::new(items);
+        let mut library = Library::default();
+        library.prepare(&source);
+        assert_eq!(
+            library
+                .members
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "zulu", "Healer", "Bravo", "Alpha"]
+        );
+        assert_eq!(
+            library
+                .entries
+                .iter()
+                .map(|entry| source[entry.index].name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "zulu", "Healer", "Bravo", "Alpha"]
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -35,6 +36,15 @@ impl RaidRole {
             Self::Healer => include_bytes!("assets/roles/healer.png"),
             Self::Tank => include_bytes!("assets/roles/tank.png"),
         }
+    }
+}
+
+pub fn role_order(role: Option<RaidRole>) -> u8 {
+    match role {
+        Some(RaidRole::Tank) => 0,
+        Some(RaidRole::Healer) => 1,
+        Some(RaidRole::Dps) => 2,
+        None => 3,
     }
 }
 
@@ -174,6 +184,9 @@ pub struct ProfileUi {
     name: String,
     role: Option<RaidRole>,
     pending: Option<mpsc::Receiver<Completed>>,
+    pending_role: Option<(String, Option<RaidRole>)>,
+    queued_roles: VecDeque<(String, Option<RaidRole>)>,
+    completed_role: Option<(String, Option<RaidRole>)>,
     last_fetch: Option<Instant>,
 }
 
@@ -200,12 +213,19 @@ impl ProfileUi {
             match rx.try_recv() {
                 Ok(completed) => {
                     self.pending = None;
+                    let role_only = self.pending_role.take().is_some();
                     match completed.result {
                         Ok(profile) => {
-                            changed = completed.saved;
+                            changed = completed.saved && !role_only;
+                            if role_only {
+                                self.completed_role =
+                                    Some((completed.target.clone(), profile.raid_role));
+                            }
                             if completed.target == self.user_id {
-                                if completed.saved || !self.dirty() {
+                                if (completed.saved && !role_only) || !self.dirty() {
                                     self.name = profile.custom_name.clone().unwrap_or_default();
+                                    self.role = profile.raid_role;
+                                } else if role_only {
                                     self.role = profile.raid_role;
                                 }
                                 self.value = Some(profile);
@@ -218,8 +238,14 @@ impl ProfileUi {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending = None;
+                    self.pending_role = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if !id.is_empty() && self.pending.is_none() {
+            if let Some((id, role)) = self.queued_roles.pop_front() {
+                self.start(ctx, Operation::Role(id, role));
             }
         }
         if !id.is_empty()
@@ -249,38 +275,56 @@ impl ProfileUi {
     pub fn draw(&mut self, ui: &mut egui::Ui, discord_name: &str) {
         ui.label(egui::RichText::new("Your profile").strong());
         let enabled = self.value.as_ref().is_some_and(|value| value.available) && !self.busy();
+        let mut save = false;
         ui.add_enabled_ui(enabled, |ui| {
             // Size the row before placing labels and icons, so later padded
             // controls cannot move its center after those widgets are painted.
             ui.spacing_mut().interact_size.y = role_control_height(ui);
             ui.horizontal(|ui| {
                 ui.label("Name");
-                ui.add(
+                let name = ui.add(
                     egui::TextEdit::singleline(&mut self.name)
                         .hint_text(discord_name)
                         .char_limit(64)
                         .desired_width(190.0),
                 );
+                save |= name.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             });
             ui.horizontal(|ui| {
                 ui.label("Raid role");
                 role_icon(ui, self.role);
                 role_picker(ui, "own-raid-role", &mut self.role);
-                if ui
+                save |= ui
                     .add_enabled(self.dirty(), egui::Button::new("Save profile"))
-                    .clicked()
-                {
-                    self.start(ui.ctx(), Operation::Save(self.name.clone(), self.role));
-                }
+                    .clicked();
             });
         });
+        if enabled && self.dirty() && save {
+            self.start(ui.ctx(), Operation::Save(self.name.clone(), self.role));
+        }
         ui.label(egui::RichText::new("Leave the name empty to use your Discord name.").small());
     }
 
     pub fn set_member_role(&mut self, ctx: &egui::Context, id: String, role: Option<RaidRole>) {
         if !self.busy() {
             self.start(ctx, Operation::Role(id, role));
+        } else if let Some(queued) = self.queued_roles.iter_mut().find(|queued| queued.0 == id) {
+            queued.1 = role;
+        } else if self.queued_roles.len() < 32 {
+            self.queued_roles.push_back((id, role));
         }
+    }
+
+    pub fn role_for_member(&self, id: &str, confirmed: Option<RaidRole>) -> Option<RaidRole> {
+        self.queued_roles
+            .iter()
+            .find(|queued| queued.0 == id)
+            .or_else(|| self.pending_role.as_ref().filter(|pending| pending.0 == id))
+            .map_or(confirmed, |pending| pending.1)
+    }
+
+    pub fn take_role_change(&mut self) -> Option<(String, Option<RaidRole>)> {
+        self.completed_role.take()
     }
 
     fn dirty(&self) -> bool {
@@ -297,6 +341,10 @@ impl ProfileUi {
         let ctx = ctx.clone();
         let own_id = self.user_id.clone();
         self.last_fetch = Some(Instant::now());
+        self.pending_role = match &operation {
+            Operation::Role(id, role) => Some((id.clone(), *role)),
+            _ => None,
+        };
         self.pending = Some(rx);
         thread::spawn(move || {
             let expected_user = own_id.clone();
@@ -412,6 +460,67 @@ mod tests {
             assert_eq!(image::load_from_memory(role.bytes()).unwrap().width(), 64);
         }
         assert!(serde_json::from_str::<RaidRole>("\"officer\"").is_err());
+    }
+
+    #[test]
+    fn confirmed_role_save_updates_only_its_member_without_a_full_refresh() {
+        let (tx, rx) = mpsc::channel();
+        let mut profile = ProfileUi {
+            user_id: "123".into(),
+            pending: Some(rx),
+            pending_role: Some(("456".into(), Some(RaidRole::Tank))),
+            last_fetch: Some(Instant::now()),
+            ..Default::default()
+        };
+        assert_eq!(
+            profile.role_for_member("456", Some(RaidRole::Dps)),
+            Some(RaidRole::Tank)
+        );
+        assert_eq!(
+            profile.role_for_member("789", Some(RaidRole::Healer)),
+            Some(RaidRole::Healer)
+        );
+        tx.send(Completed {
+            target: "456".into(),
+            saved: true,
+            result: Ok(Profile {
+                raid_role: Some(RaidRole::Tank),
+                available: true,
+                ..Default::default()
+            }),
+        })
+        .unwrap();
+        assert!(!profile.tick(&egui::Context::default(), Some(&user()), false));
+        assert_eq!(
+            profile.take_role_change(),
+            Some(("456".into(), Some(RaidRole::Tank)))
+        );
+        assert!(profile.take_role_change().is_none());
+        assert!(!profile.busy());
+    }
+
+    #[test]
+    fn rapid_role_choices_are_coalesced_bounded_and_cleared_on_account_change() {
+        let (_tx, rx) = mpsc::channel();
+        let mut profile = ProfileUi {
+            user_id: "123".into(),
+            pending: Some(rx),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        for id in 1000..1100 {
+            profile.set_member_role(&ctx, id.to_string(), Some(RaidRole::Tank));
+        }
+        assert_eq!(profile.queued_roles.len(), 32);
+        profile.set_member_role(&ctx, "1000".into(), Some(RaidRole::Healer));
+        assert_eq!(profile.queued_roles.len(), 32);
+        assert_eq!(
+            profile.role_for_member("1000", None),
+            Some(RaidRole::Healer)
+        );
+        profile.tick(&ctx, None, false);
+        assert!(profile.queued_roles.is_empty() && profile.pending.is_none());
+        assert!(profile.role_for_member("1000", None).is_none());
     }
 
     #[test]

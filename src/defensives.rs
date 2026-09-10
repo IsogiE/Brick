@@ -3,7 +3,11 @@
 //! https://github.com/Tercioo/Open-Raid-Library/blob/main/ThingsToMantain_Midnight.lua
 //! Healing/DR/utility grouping is Brick's editable review policy, not a WCL tag.
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -195,6 +199,147 @@ spells! {
     ],
 }
 
+pub const MAX_CATALOG_BYTES: u64 = 256 * 1024;
+const MAX_CATALOG_SPELLS: usize = 512;
+const CATALOG_REFRESH: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogSpell {
+    pub id: u64,
+    pub name: String,
+    #[serde(rename = "category")]
+    pub group: DefensiveGroup,
+    pub default_enabled: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogResponse {
+    schema_version: u8,
+    revision: String,
+    spells: Vec<CatalogSpell>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Catalog {
+    revision: String,
+    spells: BTreeMap<u64, CatalogSpell>,
+}
+impl Catalog {
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        let invalid = || "The cooldown catalogue is invalid.".to_string();
+        if bytes.len() as u64 > MAX_CATALOG_BYTES {
+            return Err(invalid());
+        }
+        let response: CatalogResponse = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        if response.schema_version != 1
+            || response.revision.is_empty()
+            || response.revision.len() > 64
+            || !response
+                .revision
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            || response.spells.is_empty()
+            || response.spells.len() > MAX_CATALOG_SPELLS
+        {
+            return Err(invalid());
+        }
+        let mut spells = BTreeMap::new();
+        for spell in response.spells {
+            if !(1..=MAX_SPELL_ID).contains(&spell.id) || spell.name.trim() != spell.name
+                || spell.name.is_empty() || spell.name.chars().count() > 100
+                || spell.name.chars().any(|c| c.is_control() || matches!(c,
+                    '\u{ad}' | '\u{600}'..='\u{605}' | '\u{61c}' | '\u{6dd}' | '\u{70f}' | '\u{890}'..='\u{891}' | '\u{8e2}' |
+                    '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}' |
+                    '\u{fff9}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}' | '\u{13430}'..='\u{13455}' |
+                    '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}' | '\u{e0001}' | '\u{e0020}'..='\u{e007f}'))
+                || spells.contains_key(&spell.id) { return Err(invalid()); }
+            spells.insert(spell.id, spell);
+        }
+        Ok(Self {
+            revision: response.revision,
+            spells,
+        })
+    }
+    pub fn spell(&self, id: u64) -> Option<&CatalogSpell> {
+        self.spells.get(&id)
+    }
+    pub fn spells(&self) -> impl Iterator<Item = &CatalogSpell> {
+        self.spells.values()
+    }
+    pub fn rule(&self, id: u64) -> Option<Rule> {
+        self.spell(id).map(|spell| Rule {
+            group: spell.default_enabled.then_some(spell.group),
+            observation: Observation::Cast,
+        })
+    }
+}
+fn builtin_catalog() -> Arc<Catalog> {
+    static BUILTIN: OnceLock<Arc<Catalog>> = OnceLock::new();
+    BUILTIN
+        .get_or_init(|| {
+            Arc::new(Catalog {
+                revision: "builtin-midnight-2026-09-10".into(),
+                spells: SPELLS
+                    .iter()
+                    .map(|spell| {
+                        (
+                            spell.id,
+                            CatalogSpell {
+                                id: spell.id,
+                                name: spell.name.into(),
+                                group: spell.group,
+                                default_enabled: spell.default_enabled,
+                            },
+                        )
+                    })
+                    .collect(),
+            })
+        })
+        .clone()
+}
+
+// RAM-only last-good snapshot. Neither the service token nor this shared catalogue
+// is written to disk; only personal overrides use protected per-account storage.
+pub struct CatalogCache {
+    snapshot: Arc<Catalog>,
+    checked_at: Option<Instant>,
+}
+impl Default for CatalogCache {
+    fn default() -> Self {
+        Self {
+            snapshot: builtin_catalog(),
+            checked_at: None,
+        }
+    }
+}
+impl CatalogCache {
+    pub fn snapshot(&self) -> Arc<Catalog> {
+        self.snapshot.clone()
+    }
+    pub fn refresh(
+        &mut self,
+        now: Instant,
+        fetch: impl FnOnce() -> Result<Catalog, String>,
+    ) -> bool {
+        if self
+            .checked_at
+            .is_some_and(|checked| now.saturating_duration_since(checked) < CATALOG_REFRESH)
+        {
+            return false;
+        }
+        // Failed requests also get a cooldown: an outage must not cause hot retries.
+        self.checked_at = Some(now);
+        let Ok(catalog) = fetch() else {
+            return false;
+        };
+        if *self.snapshot == catalog {
+            return false;
+        }
+        self.snapshot = Arc::new(catalog);
+        true
+    }
+}
+
 pub const MAX_OVERRIDES: usize = 128;
 const MAX_SPELL_ID: u64 = 9_999_999;
 
@@ -204,15 +349,29 @@ pub struct Rule {
     pub group: Option<DefensiveGroup>,
     pub observation: Observation,
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preferences {
+    #[serde(skip, default = "builtin_catalog")]
+    pub catalog: Arc<Catalog>,
     #[serde(default)]
     pub overrides: BTreeMap<u64, Rule>,
     #[serde(default)]
     pub hidden_groups: Vec<DefensiveGroup>,
 }
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            catalog: builtin_catalog(),
+            overrides: BTreeMap::new(),
+            hidden_groups: Vec::new(),
+        }
+    }
+}
 impl Preferences {
+    pub fn spell_name(&self, id: u64) -> Option<&str> {
+        self.catalog.spell(id).map(|spell| spell.name.as_str())
+    }
     pub fn validate(&self) -> Result<(), String> {
         if self.overrides.len() > MAX_OVERRIDES
             || self
@@ -237,15 +396,10 @@ impl Preferences {
             .ok_or_else(|| "Enter a numeric spell ID from 1 to 9999999.".into())
     }
     pub fn rule(&self, id: u64) -> Option<Rule> {
-        self.overrides.get(&id).copied().or_else(|| {
-            SPELLS
-                .iter()
-                .find(|spell| spell.id == id)
-                .map(|spell| Rule {
-                    group: spell.default_enabled.then_some(spell.group),
-                    observation: Observation::Cast,
-                })
-        })
+        self.overrides
+            .get(&id)
+            .copied()
+            .or_else(|| self.catalog.rule(id))
     }
     pub fn classify(&self, id: u64) -> Option<DefensiveGroup> {
         self.rule(id).and_then(|rule| rule.group)
@@ -257,15 +411,16 @@ impl Preferences {
         self.overrides
             .values()
             .any(|rule| rule.group == Some(group))
-            || SPELLS.iter().any(|spell| {
+            || self.catalog.spells().any(|spell| {
                 spell.default_enabled
                     && spell.group == group
                     && !self.overrides.contains_key(&spell.id)
             })
     }
     pub fn ids(&self) -> Vec<u64> {
-        let mut ids: Vec<_> = SPELLS
-            .iter()
+        let mut ids: Vec<_> = self
+            .catalog
+            .spells()
             .map(|spell| spell.id)
             .chain(self.overrides.keys().copied())
             .collect();
@@ -329,16 +484,129 @@ fn preference_store(account: &str) -> Result<crate::credential_store::Store, Str
     }
     crate::credential_store::Store::new(&format!("cooldown-preferences-v1:{account}"))
 }
-pub fn spell_name(id: u64) -> Option<&'static str> {
-    SPELLS
-        .iter()
-        .find(|spell| spell.id == id)
-        .map(|spell| spell.name)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn catalog_json() -> serde_json::Value {
+        serde_json::json!({"schemaVersion":1,"revision":"policy.2","spells":[
+            {"id":200183,"name":"Apotheosis","category":"healing","defaultEnabled":true},
+            {"id":1234567,"name":"Future cooldown","category":"damageReduction","defaultEnabled":true}
+        ]})
+    }
+    #[test]
+    fn remote_catalogue_is_strict_bounded_and_replaces_bootstrap_defaults() {
+        let value = catalog_json();
+        let catalog = Catalog::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let mut preferences = Preferences::default();
+        preferences.catalog = Arc::new(catalog);
+        assert_eq!(preferences.ids(), vec![200183, 1234567]);
+        assert_eq!(
+            preferences.classify(642),
+            None,
+            "Server defaults replace rather than broaden the fallback"
+        );
+        assert!(preferences.filter_expression().unwrap().contains("1234567"));
+        for (field, invalid) in [
+            ("id", serde_json::json!(0)),
+            ("id", serde_json::json!(10000000)),
+            ("name", serde_json::json!(" leading")),
+            ("name", serde_json::json!("bad\nname")),
+            ("name", serde_json::json!("bad\u{202e}name")),
+            ("name", serde_json::json!("x".repeat(101))),
+            ("category", serde_json::json!("injected")),
+            ("defaultEnabled", serde_json::json!("true")),
+        ] {
+            let mut bad = value.clone();
+            bad["spells"][0][field] = invalid;
+            assert!(
+                Catalog::parse(&serde_json::to_vec(&bad).unwrap()).is_err(),
+                "Accepted invalid {field}"
+            );
+        }
+        let mut bad = value.clone();
+        bad["schemaVersion"] = serde_json::json!(2);
+        assert!(Catalog::parse(&serde_json::to_vec(&bad).unwrap()).is_err());
+        let mut bad = value.clone();
+        bad["spells"][1]["id"] = bad["spells"][0]["id"].clone();
+        assert!(Catalog::parse(&serde_json::to_vec(&bad).unwrap()).is_err());
+        let mut bad = value.clone();
+        bad["spells"] = serde_json::json!([]);
+        assert!(Catalog::parse(&serde_json::to_vec(&bad).unwrap()).is_err());
+        let mut bad = value.clone();
+        bad["spells"] = serde_json::json!(vec![value["spells"][0].clone(); 513]);
+        assert!(Catalog::parse(&serde_json::to_vec(&bad).unwrap()).is_err());
+        for revision in ["", "contains spaces", &"x".repeat(65)] {
+            let mut bad = value.clone();
+            bad["revision"] = serde_json::json!(revision);
+            assert!(Catalog::parse(&serde_json::to_vec(&bad).unwrap()).is_err());
+        }
+        assert!(Catalog::parse(&vec![b' '; MAX_CATALOG_BYTES as usize + 1]).is_err());
+    }
+    #[test]
+    fn catalogue_cache_throttles_failures_and_keeps_last_valid_snapshot() {
+        let mut cache = CatalogCache::default();
+        let now = Instant::now();
+        assert!(!cache.refresh(now, || Err("offline".into())));
+        assert_eq!(
+            cache
+                .snapshot()
+                .spells()
+                .filter(|spell| spell.default_enabled)
+                .count(),
+            71
+        );
+        assert!(!cache.refresh(now + Duration::from_secs(599), || panic!(
+            "Must not retry early"
+        )));
+        let parsed = || Catalog::parse(&serde_json::to_vec(&catalog_json()).unwrap());
+        assert!(cache.refresh(now + CATALOG_REFRESH, parsed));
+        let good = cache.snapshot();
+        assert!(!cache.refresh(now + CATALOG_REFRESH * 2, || Err("offline".into())));
+        assert!(Arc::ptr_eq(&good, &cache.snapshot()));
+        assert!(!cache.refresh(now + CATALOG_REFRESH * 3, parsed));
+        assert!(
+            Arc::ptr_eq(&good, &cache.snapshot()),
+            "Unchanged data should not rebuild snapshots"
+        );
+    }
+    #[test]
+    fn shared_catalogue_updates_preserve_serialized_account_overrides_and_visibility() {
+        let mut preferences = Preferences::default();
+        preferences.overrides.insert(
+            200183,
+            Rule {
+                group: None,
+                observation: Observation::Cast,
+            },
+        );
+        preferences.overrides.insert(
+            1234567,
+            Rule {
+                group: Some(DefensiveGroup::External),
+                observation: Observation::Buff,
+            },
+        );
+        preferences.hidden_groups.push(DefensiveGroup::Healing);
+        let before = serde_json::to_vec(&preferences).unwrap();
+        preferences.catalog =
+            Arc::new(Catalog::parse(&serde_json::to_vec(&catalog_json()).unwrap()).unwrap());
+        assert_eq!(
+            serde_json::to_vec(&preferences).unwrap(),
+            before,
+            "Shared defaults must not become per-account overrides"
+        );
+        assert_eq!(preferences.classify(200183), None);
+        assert_eq!(
+            preferences.classify(1234567),
+            Some(DefensiveGroup::External)
+        );
+        assert!(!preferences.visible(DefensiveGroup::Healing));
+        assert_eq!(
+            preferences.rule(1234567).unwrap().observation,
+            Observation::Buff
+        );
+    }
     #[test]
     fn midnight_healing_and_damage_reduction_have_separate_rows() {
         let prefs = Preferences::default();
@@ -404,7 +672,7 @@ mod tests {
         ] {
             assert_eq!(preferences.rule(id).unwrap().group, None);
             assert!(
-                spell_name(id).is_some(),
+                preferences.spell_name(id).is_some(),
                 "Opt-in spells remain discoverable by name"
             );
         }

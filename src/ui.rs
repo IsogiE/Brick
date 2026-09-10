@@ -461,6 +461,24 @@ impl BrickApp {
         self.confirm_logout = true;
     }
 
+    fn apply_roster_role(&mut self, id: &str, role: Option<RaidRole>) {
+        // An older in-flight roster response must not undo the confirmed write.
+        self.roster_rx = None;
+        if let PresenceUiState::Ready(roster) = &mut self.presence_state {
+            if let Some(member) = roster
+                .officers
+                .iter_mut()
+                .chain(&mut roster.raiders)
+                .find(|member| member.user_id == id)
+            {
+                member.raid_role = role;
+                roster.sort_members();
+            }
+        }
+        self.last_roster_refresh = Instant::now();
+        self.streams.profiles_changed();
+    }
+
     fn start_roster_refresh(&mut self) {
         if self.roster_rx.is_some() || !self.auth_state.is_authorized() {
             return;
@@ -933,7 +951,7 @@ impl BrickApp {
         });
         ui.add_space(8.0);
 
-        let state = self.presence_state.clone();
+        let state = &self.presence_state;
         let mut role_change = None;
         panel_frame().show(ui, |ui| match state {
             PresenceUiState::Unavailable(error) => {
@@ -971,13 +989,12 @@ impl BrickApp {
                             ui.add_space(14.0);
                         }
                         let can_edit = roster.can_edit_roles;
-                        let roles_enabled = !self.profile.busy();
                         draw_roster_group(
                             ui,
                             "Officers",
                             &roster.officers,
                             can_edit,
-                            roles_enabled,
+                            &self.profile,
                             &mut role_change,
                         );
                         ui.add_space(18.0);
@@ -986,7 +1003,7 @@ impl BrickApp {
                             "Raiders",
                             &roster.raiders,
                             can_edit,
-                            roles_enabled,
+                            &self.profile,
                             &mut role_change,
                         );
                         ui.add_space(12.0);
@@ -1620,6 +1637,9 @@ impl eframe::App for BrickApp {
                 self.start_roster_refresh();
                 self.streams.profiles_changed();
             }
+            if let Some((id, role)) = self.profile.take_role_change() {
+                self.apply_roster_role(&id, role);
+            }
             self.poll_sync();
             self.poll_roster();
             self.start_roster_refresh_if_stale();
@@ -2044,7 +2064,7 @@ fn draw_roster_group(
     title: &str,
     members: &[RosterMember],
     can_edit: bool,
-    roles_enabled: bool,
+    profile: &ProfileUi,
     change: &mut Option<(String, Option<RaidRole>)>,
 ) {
     let online_count = members.iter().filter(|member| member.online).count();
@@ -2075,7 +2095,9 @@ fn draw_roster_group(
         if index > 0 {
             ui.separator();
         }
-        draw_roster_member_row(ui, member, can_edit, roles_enabled, change);
+        ui.push_id(&member.user_id, |ui| {
+            draw_roster_member_row(ui, member, can_edit, profile, change);
+        });
     }
 }
 
@@ -2083,13 +2105,16 @@ fn draw_roster_member_row(
     ui: &mut egui::Ui,
     member: &RosterMember,
     can_edit: bool,
-    roles_enabled: bool,
+    profile: &ProfileUi,
     change: &mut Option<(String, Option<RaidRole>)>,
 ) {
     let row_height = 36.0;
     let row_width = ui.available_width().max(260.0);
     let (row_rect, _) =
         ui.allocate_exact_size(egui::vec2(row_width, row_height), egui::Sense::hover());
+    if !ui.is_rect_visible(row_rect) {
+        return;
+    }
 
     let dot_color = if member.online {
         success_accent()
@@ -2176,13 +2201,10 @@ fn draw_roster_member_row(
                 .max_rect(rect)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
             |ui| {
-                // Keep the picker and its reserved space while a save is pending.
-                ui.add_enabled_ui(roles_enabled, |ui| {
-                    let mut role = member.raid_role;
-                    if profile::role_picker(ui, ("roster-role", &member.user_id), &mut role) {
-                        *change = Some((member.user_id.clone(), role));
-                    }
-                });
+                let mut role = profile.role_for_member(&member.user_id, member.raid_role);
+                if profile::role_picker(ui, ("roster-role", &member.user_id), &mut role) {
+                    *change = Some((member.user_id.clone(), role));
+                }
             },
         );
     }
@@ -2594,6 +2616,38 @@ mod tests {
         app.status = "Failed to verify addon signature".into();
         app.apply_view_refresh(Ok(AppView::default()));
         assert_eq!(app.status, "Failed to verify addon signature");
+    }
+
+    #[test]
+    fn confirmed_roster_role_keeps_sections_and_discards_older_refresh() {
+        let mut app = app();
+        app.presence_state = PresenceUiState::Ready(serde_json::from_value(serde_json::json!({
+            "generatedAt":"2026-09-10", "onlineWindowSeconds":60, "canEditRoles":true,
+            "officers":[{"userId":"1","name":"Officer","role":"Officer","online":true,"raidRole":"dps"}],
+            "raiders":[
+                {"userId":"2","name":"Zulu","role":"Raider","online":true,"raidRole":"healer"},
+                {"userId":"3","name":"Alpha","role":"Raider","online":true,"raidRole":"tank"}
+            ]
+        })).unwrap());
+        let (tx, rx) = mpsc::channel();
+        app.roster_rx = Some(rx);
+        app.apply_roster_role("2", Some(RaidRole::Tank));
+        let PresenceUiState::Ready(roster) = &app.presence_state else {
+            panic!("roster was cleared");
+        };
+        assert_eq!(roster.officers[0].user_id, "1");
+        assert_eq!(
+            roster
+                .raiders
+                .iter()
+                .map(|member| member.user_id.as_str())
+                .collect::<Vec<_>>(),
+            ["3", "2"]
+        );
+        assert_eq!(roster.raiders[1].raid_role, Some(RaidRole::Tank));
+        assert!(app.roster_rx.is_none());
+        assert!(tx.send(Ok(roster.clone())).is_err());
+        assert!(app.last_roster_refresh.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

@@ -195,6 +195,7 @@ pub struct Client {
     config: Option<Config>,
     session: Option<Session>,
     cooldowns: Option<defensives::Preferences>,
+    cooldown_catalog: defensives::CatalogCache,
     http: HttpClient,
     reports: HashMap<String, (Instant, Value)>,
     directory: Option<ReportDirectory>,
@@ -241,6 +242,7 @@ impl Client {
             config: None,
             session: None,
             cooldowns: None,
+            cooldown_catalog: Default::default(),
             http,
             reports: HashMap::new(),
             directory: None,
@@ -549,6 +551,7 @@ impl Client {
 
     pub fn review(&mut self, discord_token: &str, stream: &Stream) -> Result<Review, String> {
         self.configure(discord_token, true)?;
+        self.load_cooldown_preferences(discord_token)?;
         self.access_token()?;
         let path = streams::review_path(stream).map_err(|error| error.message)?;
         let bytes = while_current(&self.cancel, || {
@@ -574,15 +577,63 @@ impl Client {
     }
 
     pub fn cooldown_preferences(&self) -> defensives::Preferences {
-        self.cooldowns.clone().unwrap_or_default()
+        let mut preferences = self.cooldowns.clone().unwrap_or_default();
+        preferences.catalog = self.cooldown_catalog.snapshot();
+        preferences
+    }
+
+    fn load_cooldown_preferences(&mut self, discord_token: &str) -> Result<(), String> {
+        check_cancelled(&self.cancel)?;
+        let http = &self.http;
+        let cancel = &self.cancel;
+        let changed = self.cooldown_catalog.refresh(Instant::now(), || {
+            let endpoint = presence::endpoint_url("/v1/cooldowns/catalog")?;
+            let response = while_current(cancel, || {
+                http.get(endpoint)
+                    .bearer_auth(discord_token)
+                    .timeout(Duration::from_secs(5))
+                    .send()
+            })?
+            .map_err(|_| "The cooldown catalogue is unavailable.")?;
+            if !response.status().is_success() {
+                return Err("The cooldown catalogue is unavailable.".into());
+            }
+            let bytes = while_current(cancel, || {
+                download::read_response(
+                    response,
+                    defensives::MAX_CATALOG_BYTES,
+                    "Cooldown catalogue",
+                )
+            })??;
+            defensives::Catalog::parse(&bytes)
+        });
+        check_cancelled(&self.cancel)?;
+        if changed {
+            self.events
+                .retain(|(_, _, kind), _| *kind != EventKind::Defensives);
+        }
+        if self.cooldowns.is_none() {
+            let account = &self
+                .config
+                .as_ref()
+                .ok_or("Sign in to load cooldown filters.")?
+                .user_id;
+            self.cooldowns = Some(while_current(&self.cancel, || {
+                defensives::Preferences::load(account)
+            })??);
+        }
+        self.cooldowns.as_mut().unwrap().catalog = self.cooldown_catalog.snapshot();
+        Ok(())
     }
 
     pub fn save_cooldown_preferences(
         &mut self,
         discord_token: &str,
-        preferences: defensives::Preferences,
+        mut preferences: defensives::Preferences,
     ) -> Result<defensives::Preferences, String> {
         self.configure(discord_token, true)?;
+        self.load_cooldown_preferences(discord_token)?;
+        preferences.catalog = self.cooldown_catalog.snapshot();
         let account = &self
             .config
             .as_ref()
@@ -603,16 +654,7 @@ impl Client {
     ) -> Result<Vec<RaidEvent>, String> {
         self.configure(discord_token, true)?;
         self.access_token()?;
-        if self.cooldowns.is_none() {
-            let account = &self
-                .config
-                .as_ref()
-                .ok_or("Sign in to load cooldown filters.")?
-                .user_id;
-            self.cooldowns = Some(while_current(&self.cancel, || {
-                defensives::Preferences::load(account)
-            })??);
-        }
+        self.load_cooldown_preferences(discord_token)?;
         let preferences = self.cooldown_preferences();
         let filter = (kind == EventKind::Defensives)
             .then(|| preferences.filter_expression())
@@ -917,7 +959,8 @@ fn map_events(
                 .map(clean_label)
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| {
-                    defensives::spell_name(ability_id)
+                    preferences
+                        .spell_name(ability_id)
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Spell {ability_id}"))
                 });
@@ -1410,6 +1453,46 @@ mod tests {
         assert_eq!(events[2].ability, "Spell 1234567");
         assert!(events[2].observed_buff);
         assert_eq!(events[2].target.as_deref(), Some("SameName"));
+    }
+
+    #[test]
+    fn server_catalogue_classifies_new_log_ids_and_personal_rules_take_precedence() {
+        let video = replay();
+        let report = json!({"code":"abcdefghABCDEFGH","startTime":video.start_ms().unwrap(),"fights":[
+            {"id":1,"encounterID":123,"difficulty":5,"name":"Boss","kill":false,"startTime":0,"endTime":120000}
+        ]});
+        let pull = map_pulls(&report, &video).unwrap().remove(0);
+        let master = json!({"actors":[{"id":1,"type":"Player","name":"Healer","subType":"Priest"}],"abilities":[]});
+        let events = json!([{"type":"cast","timestamp":6000,"sourceID":1,"abilityGameID":1234567}]);
+        let mut preferences = defensives::Preferences::default();
+        assert!(
+            map_events(&events, &master, &pull, EventKind::Defensives, &preferences)
+                .unwrap()
+                .is_empty()
+        );
+        preferences.catalog = Arc::new(defensives::Catalog::parse(br#"{"schemaVersion":1,"revision":"new-id","spells":[{"id":1234567,"name":"Server healing cooldown","category":"healing","defaultEnabled":true}]}"#).unwrap());
+        let mapped =
+            map_events(&events, &master, &pull, EventKind::Defensives, &preferences).unwrap();
+        assert_eq!(mapped[0].group, Some(DefensiveGroup::Healing));
+        assert_eq!(mapped[0].ability, "Server healing cooldown");
+        preferences.overrides.insert(
+            1234567,
+            defensives::Rule {
+                group: Some(DefensiveGroup::External),
+                observation: defensives::Observation::Cast,
+            },
+        );
+        assert_eq!(
+            map_events(&events, &master, &pull, EventKind::Defensives, &preferences).unwrap()[0]
+                .group,
+            Some(DefensiveGroup::External)
+        );
+        preferences.overrides.get_mut(&1234567).unwrap().group = None;
+        assert!(
+            map_events(&events, &master, &pull, EventKind::Defensives, &preferences)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
