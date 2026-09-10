@@ -231,6 +231,23 @@ impl StreamsUi {
         }
     }
 
+    fn finish_recording_review(&mut self) {
+        // Review can also end during tick (tab switch, hiding Brick, or loss of
+        // the Logs connection). A saved VOD is never a live-stream selection.
+        if !self.review.active()
+            && self
+                .selected
+                .as_ref()
+                .is_some_and(|stream| stream.recording_id.is_some())
+        {
+            self.recordings_open = true;
+            self.selected = None;
+            self.focused = None;
+            self.player_error = None;
+            self.stop_player();
+        }
+    }
+
     pub fn tick(&mut self, ctx: &egui::Context, authorized: bool, active: bool) -> bool {
         if !authorized {
             self.clear();
@@ -385,6 +402,7 @@ impl StreamsUi {
                 self.stop_player();
             }
         }
+        self.finish_recording_review();
         if let Some(player) = &mut self.player {
             if self.review.active() {
                 player.poll_playback(ctx);
@@ -494,6 +512,7 @@ impl StreamsUi {
     }
 
     pub fn draw(&mut self, ui: &mut egui::Ui) {
+        self.finish_recording_review();
         self.player_rect = None;
         if self.review.active() && !self.recordings_open {
             if let Some(stream) = self.selected.clone() {
@@ -648,11 +667,7 @@ impl StreamsUi {
                     self.focused = Some((stream.user_id.clone(), stream.name.clone()));
                     self.selected = Some(stream);
                 }
-                if !self.review.active() && stream.recording_id.is_some() {
-                    self.recordings_open = true;
-                    self.selected = None;
-                    self.stop_player();
-                }
+                self.finish_recording_review();
                 return;
             }
         }
@@ -1794,11 +1809,59 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         ui.work = Some(rx);
         tx.send(Ok(ResultData::Snapshot(live))).unwrap();
-        ui.tick(&ctx, true, false);
+        ui.tick(&ctx, true, true);
         assert_eq!(
             ui.selected.as_ref().unwrap().recording_id.as_deref(),
             Some("987")
         );
+    }
+
+    #[test]
+    fn leaving_streams_during_a_vod_returns_to_the_library_and_discards_player_work() {
+        let ctx = egui::Context::default();
+        let mut ui = StreamsUi::default();
+        ui.snapshot = Some(Rc::new(snapshot()));
+        ui.received_at = Some(Instant::now());
+        let (_tx, rx) = mpsc::channel();
+        ui.work = Some(rx);
+        // The recording's owner need not appear in the current live directory.
+        ui.open_recording(&recording("987", "2"));
+        ui.tick(&ctx, true, true);
+        assert!(ui.review.active());
+        let (prepare, rx) = mpsc::channel();
+        ui.player_work = Some(rx);
+        ui.player_switch_pending = true;
+
+        ui.tick(&ctx, true, false);
+        assert!(!ui.review.active());
+        assert!(ui.recordings_open);
+        assert!(ui.selected.is_none());
+        assert!(ui.focused.is_none());
+        assert!(ui.player_work.is_none());
+        assert!(!ui.player_switch_pending);
+        assert!(prepare
+            .send(Err("Late preparation".to_string().into()))
+            .is_err());
+
+        ui.tick(&ctx, true, true);
+        assert!(ui.recordings_open);
+        assert!(ui.selected.is_none());
+        assert!(ui.player_error.is_none());
+        assert_eq!(live_people(&ui.snapshot.as_ref().unwrap().streams).len(), 1);
+    }
+
+    #[test]
+    fn an_ended_review_cannot_draw_a_saved_recording_as_a_live_stream() {
+        let ctx = egui::Context::default();
+        let mut ui = StreamsUi::default();
+        ui.snapshot = Some(Rc::new(snapshot()));
+        // This is also the state left by an asynchronous Logs disconnect.
+        ui.selected = Some(recording("987", "2").as_stream());
+        assert!(!ui.review.active());
+        let _ = ctx.run_ui(egui::RawInput::default(), |root| ui.draw(root));
+        assert!(ui.recordings_open);
+        assert!(ui.selected.is_none());
+        assert!(ui.player_rect.is_none());
     }
 
     #[test]

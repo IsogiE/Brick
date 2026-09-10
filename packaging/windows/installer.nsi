@@ -1,6 +1,6 @@
 ; Vendored from cargo-packager 0.11.8.
-; Brick keeps this template so Windows installs cannot be redirected into
-; multiple side-by-side locations by the directory page or /D=.
+; Brick keeps one location per installation scope. Administrator installations
+; use Program Files; current-user installations use Local AppData.
 
 ; Set the compression algorithm.
 !if "{{compression}}" == ""
@@ -49,6 +49,9 @@ Name "${PRODUCTNAME}"
 BrandingText "${COPYRIGHT}"
 OutFile "${OUTFILE}"
 
+Var RequestedInstallScope
+Var InstallScopeConflict
+
 VIProductVersion "${VERSIONWITHBUILD}"
 VIAddVersionKey "ProductName" "${PRODUCTNAME}"
 VIAddVersionKey "FileDescription" "${SHORTDESCRIPTION}"
@@ -63,6 +66,9 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 
 !if "${UNINSTALLERSIGNCOMMAND}" != ""
   !uninstfinalize '${UNINSTALLERSIGNCOMMAND}'
+!else if "$%BRICK_WINDOWS_SIGNING%" == "certum"
+  ; Sign the embedded uninstaller too: machine uninstalls request elevation.
+  !uninstfinalize 'powershell -NoProfile -ExecutionPolicy Bypass -File "$%GITHUB_WORKSPACE%\scripts\sign-windows.ps1" -Path "%1"' = 0
 !endif
 
 ; Handle install mode, `perUser`, `perMachine` or `both`
@@ -84,11 +90,14 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
     !define MULTIUSER_USE_PROGRAMFILES64
   !endif
   !define MULTIUSER_INSTALLMODE_DEFAULT_REGISTRY_KEY "${UNINSTKEY}"
-  !define MULTIUSER_INSTALLMODE_DEFAULT_REGISTRY_VALUENAME "CurrentUser"
+  !define MULTIUSER_INSTALLMODE_DEFAULT_REGISTRY_VALUENAME "InstallLocation"
   !define MULTIUSER_INSTALLMODEPAGE_SHOWUSERNAME
   !define MULTIUSER_INSTALLMODE_FUNCTION RestorePreviousInstallLocation
   !define MULTIUSER_EXECUTIONLEVEL Highest
   !include MultiUser.nsh
+  ; 0.4.5 starts updates with CreateProcess, which rejects an installer whose
+  ; manifest requires elevation. Obtain elevation explicitly for AllUsers.
+  RequestExecutionLevel user
 !endif
 
 ; installer icon
@@ -125,8 +134,56 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 
 ; 3. Install mode (if it is set to `both`)
 !if "${INSTALLMODE}" == "both"
-  !define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
-  !insertmacro MULTIUSER_PAGE_INSTALLMODE
+  !include nsDialogs.nsh
+  Var InstallScopeAllUsers
+  Var InstallScopeCurrentUser
+  Page custom InstallScopePage InstallScopeLeave
+  Function InstallScopePage
+    Call SkipIfPassive
+    !insertmacro MUI_HEADER_TEXT "Install ${PRODUCTNAME}" "Choose who can use ${PRODUCTNAME}."
+    nsDialogs::Create 1018
+    Pop $0
+    ${NSD_CreateRadioButton} 15u 30u -15u 20u "Only for me"
+    Pop $InstallScopeCurrentUser
+    ${NSD_CreateRadioButton} 15u 60u -15u 20u "For everyone on this computer (administrator access)"
+    Pop $InstallScopeAllUsers
+    Call FindExistingInstallLocations
+    ${If} ${FileExists} "$R2\${MAINBINARYNAME}.exe"
+    ${AndIfNot} ${FileExists} "$R1\${MAINBINARYNAME}.exe"
+      ${NSD_Check} $InstallScopeAllUsers
+    ${ElseIf} $MultiUser.InstallMode == "AllUsers"
+      ${NSD_Check} $InstallScopeAllUsers
+    ${Else}
+      ${NSD_Check} $InstallScopeCurrentUser
+    ${EndIf}
+    nsDialogs::Show
+  FunctionEnd
+  Function InstallScopeLeave
+    ${NSD_GetState} $InstallScopeAllUsers $0
+    StrCpy $RequestedInstallScope "CurrentUser"
+    ${If} $0 == ${BST_CHECKED}
+      StrCpy $RequestedInstallScope "AllUsers"
+    ${EndIf}
+    Call CheckInstallScope
+    ${If} $InstallScopeConflict == 1
+      Abort
+    ${EndIf}
+    ${NSD_GetState} $InstallScopeAllUsers $0
+    ${If} $0 == ${BST_CHECKED}
+      ${If} $MultiUser.Privileges != "Admin"
+      ${AndIf} $MultiUser.Privileges != "Power"
+        ClearErrors
+        ; Keep the launching wizard alive until the elevated wizard finishes.
+        ExecShellWait "runas" "$EXEPATH" "/AllUsers" SW_SHOWNORMAL
+        IfErrors 0 +2
+          Abort
+        Quit
+      ${EndIf}
+      Call MultiUser.InstallMode.AllUsers
+    ${Else}
+      Call MultiUser.InstallMode.CurrentUser
+    ${EndIf}
+  FunctionEnd
 !endif
 
 
@@ -376,7 +433,48 @@ FunctionEnd
 !macroend
 
 Var PassiveMode
+Function FindExistingInstallLocations
+  ReadRegStr $R1 HKCU "${UNINSTKEY}" "InstallLocation"
+  ReadRegStr $R2 HKLM "${UNINSTKEY}" "InstallLocation"
+  StrCpy $0 $R1 1
+  ${IfThen} $0 == '"' ${|} StrCpy $R1 $R1 -1 1 ${|}
+  StrCpy $0 $R2 1
+  ${IfThen} $0 == '"' ${|} StrCpy $R2 $R2 -1 1 ${|}
+FunctionEnd
+
+Function CheckInstallScope
+  ; Existing copies may always update. A new copy must not duplicate an
+  ; installation in the other scope, including during silent installation.
+  StrCpy $InstallScopeConflict 0
+  Call FindExistingInstallLocations
+  ${If} $RequestedInstallScope == "AllUsers"
+    IfFileExists "$R2\${MAINBINARYNAME}.exe" scope_check_done
+    IfFileExists "$R1\${MAINBINARYNAME}.exe" 0 scope_check_done
+    StrCpy $R3 "${PRODUCTNAME} is already installed for your account. Update that installation, or uninstall it before installing for everyone."
+  ${Else}
+    IfFileExists "$R1\${MAINBINARYNAME}.exe" scope_check_done
+    IfFileExists "$R2\${MAINBINARYNAME}.exe" 0 scope_check_done
+    StrCpy $R3 "${PRODUCTNAME} is already installed for everyone. Use that installation, or uninstall it before installing only for your account."
+  ${EndIf}
+  StrCpy $InstallScopeConflict 1
+  IfSilent scope_check_done
+  MessageBox MB_OK|MB_ICONEXCLAMATION "$R3"
+  scope_check_done:
+FunctionEnd
+
+Var LegacyCurrentUserUpdate
 Function .onInit
+  ; Old clients pass their Local AppData folder through /D= without a scope.
+  ; Preserve it even when an elevated old client sees both registrations.
+  StrCpy $LegacyCurrentUserUpdate 0
+  IfSilent 0 legacy_scope_done
+    ${If} $INSTDIR == "$LOCALAPPDATA\${PRODUCTNAME}"
+      ${GetOptions} $CMDLINE "/AllUsers" $0
+      ${If} ${Errors}
+        StrCpy $LegacyCurrentUserUpdate 1
+      ${EndIf}
+    ${EndIf}
+  legacy_scope_done:
   ${GetOptions} $CMDLINE "/P" $PassiveMode
   IfErrors +2 0
     StrCpy $PassiveMode 1
@@ -411,6 +509,9 @@ Function .onInit
 
   !if "${INSTALLMODE}" == "both"
     !insertmacro MULTIUSER_INIT
+    ${If} $LegacyCurrentUserUpdate == 1
+      Call MultiUser.InstallMode.CurrentUser
+    ${EndIf}
   !endif
 FunctionEnd
 
@@ -566,11 +667,38 @@ Function .onInstSuccess
   run_done:
 FunctionEnd
 
+Var UninstallAllUsers
 Function un.onInit
   !insertmacro SetContext
 
   !if "${INSTALLMODE}" == "both"
+    ; Infer scope from this uninstaller's directory, even when both scopes exist.
+    ; A machine uninstall needs elevation regardless of how it was launched.
+    StrCpy $UninstallAllUsers 0
+    ReadRegStr $0 HKLM "${UNINSTKEY}" "InstallLocation"
+    ${If} $0 == '$\"$INSTDIR$\"'
+    ${OrIf} $0 == $INSTDIR
+      StrCpy $UninstallAllUsers 1
+      UserInfo::GetAccountType
+      Pop $0
+      ${If} $0 != "Admin"
+      ${AndIf} $0 != "Power"
+        StrCpy $1 "/AllUsers"
+        IfSilent 0 +2
+          StrCpy $1 "/S /AllUsers"
+        ClearErrors
+        ExecShellWait "runas" "$INSTDIR\uninstall.exe" "$1" SW_SHOWNORMAL
+        IfErrors 0 +2
+          Abort
+        Quit
+      ${EndIf}
+    ${EndIf}
     !insertmacro MULTIUSER_UNINIT
+    ${If} $UninstallAllUsers == 1
+      Call un.MultiUser.InstallMode.AllUsers
+    ${Else}
+      Call un.MultiUser.InstallMode.CurrentUser
+    ${EndIf}
   !endif
 
   !insertmacro MUI_UNGETLANGUAGE

@@ -1635,6 +1635,10 @@ impl eframe::App for BrickApp {
             self.auth_state = AuthUiState::Denied("Sign in again to access guild streams.".into());
         }
 
+        if let Err(error) = crate::browser::open_pending_urls(&ctx) {
+            let _ = addon::record_log(LogLevel::Error, error.clone());
+            self.status = error;
+        }
         ctx.request_repaint_after(self.next_repaint_after());
     }
 }

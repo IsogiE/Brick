@@ -891,6 +891,10 @@ test("authenticated players use only official iframes, trusted parent and safe r
     assert(response.headers.get("content-security-policy").includes("frame-ancestors 'none'"));
     const html = await response.text();
     assert(html.includes(provider));
+    if (provider.includes("youtube")) {
+      assert.match(html, /<iframe[^>]+allow="[^"]*; clipboard-write"/);
+      assert(!html.includes("clipboard-read"));
+    }
     assert(html.includes("brick.example.com"));
     for (const secret of ["alice-token", "test-bot", "test-secret", "test-app-token", "test-key", "evil.example", '<script>alert("x")</script>']) assert(!html.includes(secret));
   }

@@ -14,6 +14,11 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options:
+        max-size: "2m"
+        max-file: "2"
     tmpfs:
       - /tmp:size=134217728,uid=1000,gid=1000,mode=0700
     environment:

@@ -6,7 +6,7 @@ on:
       version:
         description: 'SemVer version to publish'
         required: true
-        default: '0.4.5'
+        default: '0.4.6'
       publish:
         description: 'Publish publicly after smoke testing; leave off to build unpublished candidate artifacts'
         type: boolean
@@ -224,6 +224,7 @@ jobs:
       - name: Build signed Windows package
         if: runner.os == 'Windows'
         env:
+          BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
           BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
           BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
           BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
