@@ -581,7 +581,8 @@ impl ReviewUi {
                             self.event_failures.clear();
                             self.selected_event = None;
                             self.playback = None;
-                            self.active = false;
+                            // Keep the selected VOD open so connection recovery
+                            // remains visible. Only navigation closes a review.
                             changed = true;
                         }
                     }
@@ -1088,17 +1089,8 @@ impl ReviewUi {
                     }
                 });
                 self.popup_open = menu.inner.is_some();
-            } else if self.signing_in {
-                ui.small("Finish signing in in your browser…");
-            } else if ui
-                .add_enabled(
-                    self.work.is_none(),
-                    egui::Button::new("Connect Warcraft Logs"),
-                )
-                .clicked()
-            {
-                self.notice = None;
-                self.start(ui.ctx(), Some(stream), Action::Connect);
+            } else {
+                self.draw_connection_control(ui, stream);
             }
         });
         if let Some(notice) = &self.notice {
@@ -1106,6 +1098,36 @@ impl ReviewUi {
                 .on_hover_text(notice);
         }
         changed
+    }
+
+    fn draw_connection_control(&mut self, ui: &mut egui::Ui, stream: &Stream) {
+        if self.signing_in {
+            ui.small("Finish signing in in your browser…");
+        } else if ui
+            .add_enabled(
+                self.work.is_none(),
+                egui::Button::new("Connect Warcraft Logs"),
+            )
+            .clicked()
+        {
+            self.notice = None;
+            self.start(ui.ctx(), Some(stream), Action::Connect);
+        }
+    }
+
+    fn close_review(&mut self) {
+        self.cancel_read();
+        self.active = false;
+        self.open_first_pull = false;
+        self.playback = None;
+        self.pull = None;
+        self.events.clear();
+        self.requested_events.clear();
+        self.loaded_events.clear();
+        self.event_failures.clear();
+        self.selected_event = None;
+        self.pending_focus = None;
+        self.popup_open = false;
     }
 
     pub fn draw_workspace(
@@ -1125,9 +1147,39 @@ impl ReviewUi {
         ui.visuals_mut().widgets.inactive.bg_fill = Color32::from_rgb(30, 34, 42);
 
         if !self.connected {
-            ui.label("Connect Warcraft Logs to find this VOD's raid pulls.");
-            self.draw(ui, stream);
-            ui.add_space(8.0);
+            // A saved recording can be the first thing someone opens. Keep sign-in
+            // available here without allocating a player or an empty timeline.
+            self.popup_open = false;
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 32.0),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    if ui
+                        .button(if stream.recording_id.is_some() {
+                            "Back to VODs"
+                        } else {
+                            "Back to streams"
+                        })
+                        .clicked()
+                    {
+                        self.close_review();
+                        action.reload = true;
+                    }
+                },
+            );
+            ui.add_space((ui.available_height() * 0.2).min(100.0));
+            ui.vertical_centered(|ui| {
+                ui.heading("Connect your Warcraft Logs account");
+                ui.add_space(8.0);
+                ui.label("Sign in to load this VOD's raid pulls and timeline.");
+                ui.add_space(16.0);
+                self.draw_connection_control(ui, stream);
+                if let Some(notice) = &self.notice {
+                    ui.add_space(8.0);
+                    ui.add(egui::Label::new(RichText::new(notice).small().color(MUTED)).wrap());
+                }
+            });
+            return action;
         }
 
         let pulls = self
@@ -1404,18 +1456,7 @@ impl ReviewUi {
             self.selected_event = None;
         }
         if leave || disconnect {
-            self.cancel_read();
-            self.active = false;
-            self.open_first_pull = false;
-            self.playback = None;
-            self.pull = None;
-            self.events.clear();
-            self.requested_events.clear();
-            self.loaded_events.clear();
-            self.event_failures.clear();
-            self.selected_event = None;
-            self.pending_focus = None;
-            self.popup_open = false;
+            self.close_review();
             action.reload = true;
             if disconnect {
                 self.start(ui.ctx(), Some(stream), Action::Disconnect);
@@ -3341,6 +3382,82 @@ mod tests {
         assert_eq!(ui.playback().unwrap().seconds, seconds);
         assert!(!ui.playback().unwrap().autoplay);
         assert_eq!(ui.report_span(), Some((pull.start_ms, pull.end_ms)));
+    }
+
+    #[test]
+    fn recording_review_keeps_connection_recovery_visible_after_loading_fails() {
+        for previously_connected in [false, true] {
+            let (review, _, mut stream) = fixture();
+            stream.status = Status::Offline;
+            stream.recording_id = Some(review.replay.video_id.clone());
+            let ctx = egui::Context::default();
+            let mut ui = ReviewUi::default();
+            ui.key = pov_key(&stream);
+            ui.connected = previously_connected;
+            ui.open_recording();
+
+            // A new account or an expired session completes the metadata request
+            // without a Logs connection. The host returns to the VOD list as soon
+            // as active becomes false, hiding the connection button and notice.
+            let (tx, rx) = mpsc::channel();
+            ui.work = Some(rx);
+            ui.work_action = Some(Action::Refresh);
+            tx.send((
+                ui.generation,
+                ui.key.clone(),
+                Err("Connect Warcraft Logs to see this raid's pulls.".into()),
+                false,
+            ))
+            .unwrap();
+            ui.tick(&ctx, Some(&stream));
+            assert!(ui.active(), "A failed read must not close the selected VOD");
+            assert!(!ui.connected);
+            assert!(ui.open_first_pull);
+            assert!(ui.playback().is_none());
+
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(980.0, 720.0),
+                    )),
+                    ..Default::default()
+                },
+                |root| {
+                    let action = ui.draw_workspace(
+                        root,
+                        &stream,
+                        &[],
+                        &PlaybackState::default(),
+                        false,
+                        None,
+                        None,
+                    );
+                    assert!(action.rect.is_none());
+                    assert!(!action.reload);
+                },
+            );
+            for label in ["Connect Warcraft Logs", "Back to VODs"] {
+                assert!(
+                    output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Text(text) if text.galley.text() == label)),
+                    "Missing recovery control: {label}"
+                );
+            }
+            assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == "Opening replay…")));
+            // Remaining in the workspace must not turn a failed request into a
+            // retry on every UI frame or start a player without a selected pull.
+            for _ in 0..5 {
+                ui.tick(&ctx, Some(&stream));
+                assert!(ui.work.is_none());
+                assert!(ui.playback().is_none());
+                assert!(ui.active());
+            }
+            assert!(ui.accept_review(review));
+            assert!(ui.playback().is_some());
+            assert!(!ui.open_first_pull);
+        }
     }
 
     #[test]
@@ -5465,6 +5582,7 @@ mod tests {
                 let (review, pull, stream) = fixture();
                 let mut review_ui = ReviewUi::default();
                 review_ui.review = Some(review);
+                review_ui.connected = true;
                 review_ui.active = true;
                 review_ui.select(pull.clone());
                 review_ui.aligning = aligning;
