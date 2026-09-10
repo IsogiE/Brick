@@ -73,7 +73,9 @@ jobs:
       - name: Test Windows signature verification
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/sign-windows.test.ps1
+        run: |
+          ./scripts/sign-windows.test.ps1
+          ./scripts/sign-windows-uninstaller.test.ps1
 
       - name: Test Linux keyring storage
         if: runner.os == 'Linux'
