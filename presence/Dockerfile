@@ -5,7 +5,7 @@ WORKDIR /app
 
 RUN mkdir -p /data && chown node:node /data
 
-COPY server.mjs security.mjs profiles.mjs streams.mjs stream_vods.mjs stream_review.mjs player_control.mjs replay_sync.mjs replay_warmup.mjs ./
+COPY server.mjs security.mjs profiles.mjs cooldown_catalog.mjs cooldown-catalog.json streams.mjs stream_vods.mjs stream_review.mjs player_control.mjs replay_sync.mjs replay_warmup.mjs ./
 
 USER node
 EXPOSE 8080

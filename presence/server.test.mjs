@@ -38,6 +38,30 @@ function discordFixture(url, options) {
   return json([{ user: { id: "12345", username: "Tester" }, roles: ["789"] }]);
 }
 
+test("cooldown catalogue requires guild authorization and exposes only a read-only bounded versioned policy", async t => {
+  let calls = 0;
+  const f = await fixture(t, (...args) => { calls++; return discordFixture(...args); });
+  assert.equal((await f.request("/v1/cooldowns/catalog")).status, 401);
+  assert.equal(calls, 0);
+  const response = await f.authorized("/v1/cooldowns/catalog");
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  const text = await response.text();
+  assert(Buffer.byteLength(text) <= 256 * 1024);
+  const value = JSON.parse(text);
+  assert.equal(value.schemaVersion, 1);
+  assert.equal(value.spells.length, 99);
+  assert.equal(value.spells.filter(spell => spell.defaultEnabled).length, 71);
+  assert(!text.includes("test-token"));
+  assert(!text.includes("test-only"));
+  for (const method of ["POST", "PUT", "DELETE"]) {
+    assert.equal((await f.authorized("/v1/cooldowns/catalog", "test-token", { method })).status, 405);
+  }
+  const denied = await fixture(t, url => url.endsWith("/users/@me")
+    ? json({ id: "12345", username: "Outside" }) : json({ roles: [] }));
+  assert.equal((await denied.authorized("/v1/cooldowns/catalog")).status, 403);
+});
+
 test("profiles require current guild membership; officers can set roles but cannot rename others", async t => {
   let officer = true;
   const members = () => [

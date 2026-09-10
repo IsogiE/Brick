@@ -10,6 +10,7 @@ import { createReplayWarmup } from "./replay_warmup.mjs";
 import { createReplaySyncLibrary, syncKey } from "./replay_sync.mjs";
 import { createLogsHandoff } from "./stream_review.mjs";
 import { createProfileStore } from "./profiles.mjs";
+import { createCooldownCatalog } from "./cooldown_catalog.mjs";
 
 export async function createPresenceServer({ env = process.env, fetch = globalThis.fetch, now = Date.now, firstStreamCheckWaitMs = 5_000 } = {}) {
   const DISCORD_API = "https://discord.com/api/v10";
@@ -21,6 +22,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   const dataDir = env.DATA_DIR || "/data";
   const heartbeatFile = path.join(dataDir, "heartbeats.json");
   const profiles = await createProfileStore({ dataDir, env });
+  const cooldownCatalog = await createCooldownCatalog({ filePath: env.COOLDOWN_CATALOG_FILE, now });
 
   const guildId = requireEnv("DISCORD_GUILD_ID");
   const botToken = env.DISCORD_BOT_TOKEN_FILE
@@ -809,6 +811,13 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
 
     if (url.pathname === "/v1/streams" || url.pathname.startsWith("/v1/streams/")) {
       await handleStreams(request, response, url);
+      return;
+    }
+
+    if (url.pathname === "/v1/cooldowns/catalog") {
+      await verifyRequester(request, { allowStale: false });
+      if (request.method !== "GET") throw new HttpError(405, "Method not allowed.");
+      sendJson(response, 200, await cooldownCatalog.snapshot());
       return;
     }
 
