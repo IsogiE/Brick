@@ -428,6 +428,7 @@ impl Preferences {
         ids.dedup();
         ids
     }
+    #[cfg(test)]
     pub fn filter_expression(&self) -> Result<String, String> {
         self.validate()?;
         let ids = self.ids();

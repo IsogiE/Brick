@@ -161,6 +161,7 @@ pub enum PlaybackCommand {
 }
 
 pub struct StreamPlayer {
+    _cache_usage: crate::cache_maintenance::PlayerLease,
     webview: Option<WebView>,
     allowed_url: Arc<Mutex<String>>,
     bounds: [i32; 4],
@@ -194,6 +195,7 @@ impl StreamPlayer {
         pixels_per_point: f32,
         preferences: Option<Preferences>,
     ) -> Result<Self, String> {
+        let cache_usage = crate::cache_maintenance::PlayerLease::new();
         let created = Instant::now();
         let player_url = validated_player_url(url)?;
         let paused = player_url
@@ -310,7 +312,11 @@ impl StreamPlayer {
                 builder
             };
             // Override Wry's default flags so WebView2 keeps SmartScreen enabled.
-            builder.with_additional_browser_args("--autoplay-policy=no-user-gesture-required")
+            // Keep reusable HTTP/media caches bounded without disabling caching.
+            // InPrivate mode still protects provider state; never clear its UDF.
+            builder.with_additional_browser_args(
+                "--autoplay-policy=no-user-gesture-required --disk-cache-size=134217728 --media-cache-size=134217728",
+            )
         };
 
         // WebView2 invokes this for top-level navigations; provider iframe requests
@@ -351,6 +357,7 @@ impl StreamPlayer {
                 .to_string()
         })?;
         let player = Self {
+            _cache_usage: cache_usage,
             webview: Some(webview),
             allowed_url,
             bounds,
@@ -2216,6 +2223,7 @@ mod tests {
             let weak_context = view.context().unwrap().downgrade();
             assert!(view.context().unwrap().is_sandbox_enabled());
             let player = StreamPlayer {
+                _cache_usage: crate::cache_maintenance::PlayerLease::new(),
                 webview: Some(webview),
                 allowed_url: Arc::new(Mutex::new(wrapper.clone())),
                 bounds: [0; 4],
@@ -2299,6 +2307,7 @@ mod tests {
     #[test]
     fn load_timeout_does_not_interrupt_a_loaded_player() {
         let mut player = StreamPlayer {
+            _cache_usage: crate::cache_maintenance::PlayerLease::new(),
             webview: None,
             allowed_url: Arc::new(Mutex::new(String::new())),
             preferences: None,

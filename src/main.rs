@@ -8,6 +8,7 @@ mod app_update;
 mod atomic_file;
 mod autostart;
 mod browser;
+mod cache_maintenance;
 mod credential_store;
 mod defensives;
 mod discord_auth;
@@ -56,6 +57,8 @@ fn main() -> Result<(), eframe::Error> {
             return Ok(());
         }
     };
+
+    cache_maintenance::start();
 
     let start_hidden = startup_mode && addon::startup_minimized_enabled();
 

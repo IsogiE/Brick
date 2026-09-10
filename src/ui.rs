@@ -1768,6 +1768,10 @@ fn configure_style(ctx: &egui::Context) {
     style.spacing.button_padding = egui::vec2(14.0, 8.0);
     style.visuals.panel_fill = app_background();
     style.visuals.window_fill = app_background();
+    // Hover changes color, never the footprint of controls or their containing rows.
+    style.visuals.widgets.inactive.expansion = 0.0;
+    style.visuals.widgets.hovered.expansion = 0.0;
+    style.visuals.widgets.active.expansion = 0.0;
     style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(35, 39, 47);
     style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(45, 50, 60);
     style.visuals.widgets.active.bg_fill = Color32::from_rgb(55, 61, 72);

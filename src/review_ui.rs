@@ -59,6 +59,13 @@ enum Data {
 }
 type Outcome = (u64, String, Result<Data, String>, bool);
 
+struct EventFailure {
+    kind: EventKind,
+    message: String,
+    attempts: u8,
+    retry_at: Instant,
+}
+
 #[derive(Default)]
 pub struct WorkspaceAction {
     pub compare: bool,
@@ -187,7 +194,7 @@ pub struct ReviewUi {
     selected_event: Option<(i64, String)>,
     scroll_to_event: bool,
     aligning: bool,
-    event_notice: Option<String>,
+    event_failures: Vec<EventFailure>,
     search: String,
     scrub: Option<f64>,
     timeline_position: Option<f64>,
@@ -236,7 +243,7 @@ impl Default for ReviewUi {
             selected_event: None,
             scroll_to_event: false,
             aligning: false,
-            event_notice: None,
+            event_failures: Vec::new(),
             search: String::new(),
             scrub: None,
             timeline_position: None,
@@ -357,6 +364,7 @@ impl ReviewUi {
         self.events.clear();
         self.requested_events.clear();
         self.loaded_events.clear();
+        self.event_failures.clear();
         self.selected_event = None;
         self.notice = None;
         self.last_attempt = None;
@@ -478,6 +486,7 @@ impl ReviewUi {
             self.events.clear();
             self.requested_events.clear();
             self.loaded_events.clear();
+            self.event_failures.clear();
             self.selected_event = None;
             self.popup_open = false;
             if stream.is_none() {
@@ -506,7 +515,7 @@ impl ReviewUi {
                         self.connected = connected;
                         match result {
                             Ok(Data::Review(review, preferences)) => {
-                                changed |= self.accept_cooldown_preferences(preferences);
+                                self.accept_cooldown_preferences(preferences);
                                 changed |= self.accept_review(review);
                                 changed |= self.restore_pov_position();
                             }
@@ -521,17 +530,18 @@ impl ReviewUi {
                                 self.events.clear();
                                 self.requested_events.clear();
                                 self.loaded_events.clear();
+                                self.event_failures.clear();
                                 self.selected_event = None;
                                 self.notice = None;
                                 self.last_attempt = None;
                             }
                             Ok(Data::Cooldowns(preferences)) => {
-                                changed |= self.accept_cooldown_preferences(preferences);
+                                self.accept_cooldown_preferences(preferences);
                                 self.cooldown_editor = None;
                                 self.cooldown_notice = None;
                             }
                             Ok(Data::Events(key, kind, events, preferences)) => {
-                                changed |= self.accept_cooldown_preferences(preferences);
+                                self.accept_cooldown_preferences(preferences);
                                 if self.pull.as_ref().is_some_and(|p| pull_key(p) == key) {
                                     self.events.retain(|event| event.kind != kind);
                                     self.events.extend(events);
@@ -539,17 +549,20 @@ impl ReviewUi {
                                     if let Some(editor) = &mut self.cooldown_editor {
                                         editor.refresh_names(&self.events);
                                     }
-                                    self.loaded_events.push(kind);
+                                    self.event_failures.retain(|failure| failure.kind != kind);
+                                    if !self.loaded_events.contains(&kind) {
+                                        self.loaded_events.push(kind);
+                                    }
                                 }
                             }
                             Err(error) => {
-                                if let Some(Action::Events(pull, _)) = action {
+                                if let Some(Action::Events(pull, kind)) = action {
                                     if self
                                         .pull
                                         .as_ref()
                                         .is_some_and(|p| pull_key(p) == pull_key(&pull))
                                     {
-                                        self.event_notice = Some(error);
+                                        self.record_event_failure(kind, error);
                                     }
                                 } else if matches!(action, Some(Action::SaveCooldowns(_))) {
                                     self.cooldown_notice = Some(error);
@@ -565,6 +578,7 @@ impl ReviewUi {
                             self.events.clear();
                             self.requested_events.clear();
                             self.loaded_events.clear();
+                            self.event_failures.clear();
                             self.selected_event = None;
                             self.playback = None;
                             self.active = false;
@@ -574,13 +588,31 @@ impl ReviewUi {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.work = None;
-                    self.work_action = None;
+                    let action = self.work_action.take();
                     self.signing_in = false;
                     if !self.cancel.load(Ordering::Relaxed) {
-                        self.notice = Some("Warcraft Logs stopped loading. Try again.".into());
+                        let message = "Warcraft Logs stopped loading. Brick will retry shortly.";
+                        if let Some(Action::Events(pull, kind)) = action {
+                            if self
+                                .pull
+                                .as_ref()
+                                .is_some_and(|current| pull_key(current) == pull_key(&pull))
+                            {
+                                self.record_event_failure(kind, message.into());
+                            }
+                        } else {
+                            self.notice = Some(message.into());
+                        }
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => (),
+            }
+        }
+        // Explicit local preference saves take priority over polling/retries and
+        // still finish if the user has left this workspace while a read completed.
+        if self.work.is_none() {
+            if let Some(preferences) = self.cooldown_save.take() {
+                self.start(ctx, stream, Action::SaveCooldowns(preferences));
             }
         }
         if let Some(action) = self.next_action() {
@@ -596,9 +628,47 @@ impl ReviewUi {
                     .saturating_sub(at.elapsed())
                     .max(Duration::from_millis(250))
             });
-            ctx.request_repaint_after(wait);
+            let retry = self.event_retry_after();
+            ctx.request_repaint_after(retry.map_or(wait, |retry| wait.min(retry)));
         }
         changed
+    }
+
+    fn record_event_failure(&mut self, kind: EventKind, message: String) {
+        let attempts = self
+            .event_failures
+            .iter()
+            .find(|failure| failure.kind == kind)
+            .map_or(1, |failure| failure.attempts.saturating_add(1));
+        let seconds = match attempts {
+            1 => 5,
+            2 => 15,
+            3 => 30,
+            _ => 60,
+        };
+        self.event_failures.retain(|failure| failure.kind != kind);
+        self.event_failures.push(EventFailure {
+            kind,
+            message,
+            attempts,
+            retry_at: Instant::now() + Duration::from_secs(seconds),
+        });
+    }
+
+    fn event_retry_after(&self) -> Option<Duration> {
+        if !self.active || self.pull.is_none() || self.work.is_some() {
+            return None;
+        }
+        self.event_failures
+            .iter()
+            .filter(|failure| !self.loaded_events.contains(&failure.kind))
+            .map(|failure| {
+                failure
+                    .retry_at
+                    .saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(250))
+            })
+            .min()
     }
 
     fn refresh_interval(&self) -> Duration {
@@ -638,7 +708,13 @@ impl ReviewUi {
         }
         let missing = [EventKind::Deaths, EventKind::Defensives]
             .into_iter()
-            .find(|kind| !self.requested_events.contains(kind));
+            .find(|kind| {
+                !self.loaded_events.contains(kind)
+                    && (!self.requested_events.contains(kind)
+                        || self.event_failures.iter().any(|failure| {
+                            failure.kind == *kind && Instant::now() >= failure.retry_at
+                        }))
+            });
         if let Some((pull, kind)) = self.pull.clone().zip(missing).filter(|_| self.active) {
             Some(Action::Events(pull, kind))
         } else if self
@@ -716,12 +792,12 @@ impl ReviewUi {
             self.events.clear();
             self.requested_events.clear();
             self.loaded_events.clear();
+            self.event_failures.clear();
             self.selected_event = None;
             self.scroll_to_event = false;
             self.scrub = None;
             self.timeline_position = None;
             self.aligning = false;
-            self.event_notice = None;
         } else if let Some(current) = current {
             if self
                 .pull
@@ -731,6 +807,7 @@ impl ReviewUi {
                 self.events.clear();
                 self.requested_events.clear();
                 self.loaded_events.clear();
+                self.event_failures.clear();
                 self.selected_event = None;
                 self.scroll_to_event = false;
                 self.range_epoch = Instant::now();
@@ -780,7 +857,9 @@ impl ReviewUi {
             self.last_attempt = Some(Instant::now());
         }
         if let Action::Events(_, kind) = &action {
-            self.requested_events.push(*kind);
+            if !self.requested_events.contains(kind) {
+                self.requested_events.push(*kind);
+            }
         }
         self.signing_in = matches!(action, Action::Connect);
         thread::spawn(move || {
@@ -842,15 +921,46 @@ impl ReviewUi {
         if let Some(editor) = self.cooldown_editor.as_mut() {
             editor.draft.catalog = preferences.catalog.clone();
         }
+        let needs_more_events = changed
+            && preferences.ids().into_iter().any(|id| {
+                let Some(rule) = preferences.rule(id).filter(|rule| rule.group.is_some()) else {
+                    return false;
+                };
+                self.cooldowns.rule(id).is_none_or(|previous| {
+                    previous.group.is_none() || previous.observation != rule.observation
+                })
+            });
         self.cooldowns = preferences;
         if changed {
-            self.events
-                .retain(|event| event.kind != EventKind::Defensives);
-            self.loaded_events
-                .retain(|kind| *kind != EventKind::Defensives);
-            self.requested_events
-                .retain(|kind| *kind != EventKind::Defensives);
-            self.event_notice = None;
+            // Recategorization and removal are local operations. Keep still-relevant
+            // rows while additional tracking loads; never blank the pull or restart media.
+            self.events.retain_mut(|event| {
+                if event.kind != EventKind::Defensives {
+                    return true;
+                }
+                let observation = if event.observed_buff {
+                    "applybuff"
+                } else {
+                    "cast"
+                };
+                let Some(rule) = self
+                    .cooldowns
+                    .rule(event.ability_id)
+                    .filter(|rule| rule.group.is_some() && rule.observation.accepts(observation))
+                else {
+                    return false;
+                };
+                event.group = rule.group;
+                true
+            });
+            if needs_more_events {
+                self.loaded_events
+                    .retain(|kind| *kind != EventKind::Defensives);
+                self.requested_events
+                    .retain(|kind| *kind != EventKind::Defensives);
+                self.event_failures
+                    .retain(|failure| failure.kind != EventKind::Defensives);
+            }
         }
         changed
     }
@@ -894,8 +1004,8 @@ impl ReviewUi {
         self.events.clear();
         self.requested_events.clear();
         self.loaded_events.clear();
+        self.event_failures.clear();
         self.selected_event = None;
-        self.event_notice = None;
         self.scroll_to_event = false;
         self.scrub = None;
         self.reset_playback_range();
@@ -1290,6 +1400,7 @@ impl ReviewUi {
             self.events.clear();
             self.requested_events.clear();
             self.loaded_events.clear();
+            self.event_failures.clear();
             self.selected_event = None;
         }
         if leave || disconnect {
@@ -1301,6 +1412,7 @@ impl ReviewUi {
             self.events.clear();
             self.requested_events.clear();
             self.loaded_events.clear();
+            self.event_failures.clear();
             self.selected_event = None;
             self.pending_focus = None;
             self.popup_open = false;
@@ -1816,11 +1928,18 @@ impl ReviewUi {
                         ui.add(egui::TextEdit::singleline(&mut editor.search)
                             .hint_text("Search spells…").char_limit(80)
                             .desired_width((ui.available_width() - 105.0).max(80.0)));
-                        if ui.add(egui::Button::new("Advanced")
-                            .fill(if editor.advanced { Color32::from_rgb(113, 52, 33) } else { Color32::from_rgb(43, 48, 58) })
-                            .stroke(egui::Stroke::new(1.0_f32, if editor.advanced { ACCENT } else { Color32::from_rgb(85, 94, 111) }))).clicked() {
-                            editor.advanced = !editor.advanced;
-                        }
+                        let advanced = ui.scope(|ui| {
+                            // Egui's default hover expansion changes the painted frame.
+                            // Keep this compact search-row control the same size in every state.
+                            let widgets = &mut ui.visuals_mut().widgets;
+                            widgets.inactive.expansion = 0.0;
+                            widgets.hovered.expansion = 0.0;
+                            widgets.active.expansion = 0.0;
+                            ui.add_sized([80.0, 28.0], egui::Button::new("Advanced")
+                                .fill(if editor.advanced { Color32::from_rgb(113, 52, 33) } else { Color32::from_rgb(43, 48, 58) })
+                                .stroke(egui::Stroke::new(1.0_f32, if editor.advanced { ACCENT } else { Color32::from_rgb(85, 94, 111) })))
+                        }).inner;
+                        if advanced.clicked() { editor.advanced = !editor.advanced; }
                     });
                     if editor.advanced {
                         ui.small("Advanced: add a spell ID, change its category or include buff applications.");
@@ -2055,12 +2174,19 @@ impl ReviewUi {
             }
         }
         ui.separator();
-        if let Some(notice) = &self.event_notice {
-            ui.label(RichText::new(notice).small().color(MUTED));
-            if ui.button("Retry").clicked() {
-                self.requested_events
-                    .retain(|kind| self.loaded_events.contains(kind));
-                self.event_notice = None;
+        if let Some(failure) = self
+            .event_failures
+            .iter()
+            .find(|failure| failure.kind == self.kind)
+        {
+            ui.label(RichText::new(&failure.message).small().color(MUTED));
+            if ui
+                .add_enabled(self.work.is_none(), egui::Button::new("Retry"))
+                .clicked()
+            {
+                self.requested_events.retain(|kind| *kind != self.kind);
+                self.event_failures
+                    .retain(|failure| failure.kind != self.kind);
             }
         } else if !self.loaded_events.contains(&self.kind) {
             ui.spinner();
@@ -3365,6 +3491,241 @@ mod tests {
     }
 
     #[test]
+    fn event_failures_retry_with_backoff_without_blocking_the_other_row() {
+        let (review, pull, _) = fixture();
+        let mut ui = ReviewUi::default();
+        ui.review = Some(review);
+        ui.active = true;
+        ui.select(pull.clone());
+        ui.last_attempt = Some(Instant::now());
+        ui.requested_events.push(EventKind::Deaths);
+        let (tx, rx) = mpsc::channel();
+        ui.work = Some(rx);
+        ui.work_action = Some(Action::Events(pull, EventKind::Deaths));
+        tx.send((
+            ui.generation,
+            String::new(),
+            Err("Temporary failure".into()),
+            true,
+        ))
+        .unwrap();
+        assert!(!ui.tick(&egui::Context::default(), None));
+        assert!(matches!(
+            ui.next_action(),
+            Some(Action::Events(_, EventKind::Defensives))
+        ));
+        assert!(ui.event_retry_after().unwrap() <= Duration::from_secs(5));
+        ui.requested_events.push(EventKind::Defensives);
+        ui.loaded_events.push(EventKind::Defensives);
+        assert!(ui.next_action().is_none());
+        ui.event_failures[0].retry_at = Instant::now() - Duration::from_millis(1);
+        assert!(matches!(
+            ui.next_action(),
+            Some(Action::Events(_, EventKind::Deaths))
+        ));
+        let (_tx, rx) = mpsc::channel();
+        ui.work = Some(rx);
+        assert!(ui.next_action().is_none());
+        assert!(ui.event_retry_after().is_none());
+        ui.work = None;
+        for _ in 0..100 {
+            ui.record_event_failure(EventKind::Deaths, "Still offline".into());
+        }
+        assert_eq!(ui.event_failures.len(), 1);
+        assert_eq!(ui.requested_events.len(), 2);
+        let retry = ui.event_retry_after().unwrap();
+        assert!(retry > Duration::from_secs(59) && retry <= Duration::from_secs(60));
+        ui.select(ui.pull.clone().unwrap());
+        assert!(ui.event_failures.is_empty());
+    }
+
+    #[test]
+    fn cooldown_saves_do_not_restart_media_or_clear_existing_timeline_rows() {
+        let (review, pull, _) = fixture();
+        let mut ui = ReviewUi::default();
+        ui.review = Some(review);
+        ui.active = true;
+        ui.select(pull.clone());
+        ui.last_attempt = Some(Instant::now());
+        ui.loaded_events = vec![EventKind::Deaths, EventKind::Defensives];
+        ui.requested_events = ui.loaded_events.clone();
+        ui.events = vec![RaidEvent {
+            at_ms: pull.start_ms + 1000,
+            actor_id: 1,
+            observed_buff: false,
+            actor: "Priest".into(),
+            class: "Priest".into(),
+            ability: "Apotheosis".into(),
+            ability_id: 200183,
+            target: None,
+            target_actor_id: None,
+            kind: EventKind::Defensives,
+            group: Some(DefensiveGroup::Healing),
+        }];
+        let position = ui.playback.as_ref().unwrap().seconds;
+        for (rule, expect_fetch, count) in [
+            (
+                defensives::Rule {
+                    group: Some(DefensiveGroup::Utility),
+                    observation: defensives::Observation::Cast,
+                },
+                false,
+                1,
+            ),
+            (
+                defensives::Rule {
+                    group: None,
+                    observation: defensives::Observation::Cast,
+                },
+                false,
+                0,
+            ),
+            (
+                defensives::Rule {
+                    group: Some(DefensiveGroup::Healing),
+                    observation: defensives::Observation::Cast,
+                },
+                true,
+                0,
+            ),
+        ] {
+            let mut preferences = ui.cooldowns.clone();
+            preferences.overrides.insert(200183, rule);
+            let (tx, rx) = mpsc::channel();
+            ui.work = Some(rx);
+            ui.work_action = Some(Action::SaveCooldowns(preferences.clone()));
+            tx.send((
+                ui.generation,
+                String::new(),
+                Ok(Data::Cooldowns(preferences)),
+                true,
+            ))
+            .unwrap();
+            assert!(
+                !ui.tick(&egui::Context::default(), None),
+                "Preference saves must not request a player reload"
+            );
+            assert_eq!(ui.playback.as_ref().unwrap().seconds, position);
+            assert!(ui.active && ui.pull.is_some() && ui.review.is_some());
+            assert_eq!(ui.events.len(), count);
+            if count > 0 {
+                assert_eq!(ui.events[0].group, rule.group);
+            }
+            assert_eq!(
+                matches!(
+                    ui.next_action(),
+                    Some(Action::Events(_, EventKind::Defensives))
+                ),
+                expect_fetch
+            );
+            assert!(ui.loaded_events.contains(&EventKind::Deaths));
+        }
+    }
+
+    #[test]
+    fn expanding_tracking_keeps_previous_events_and_row_visibility_needs_no_fetch() {
+        let (review, pull, _) = fixture();
+        let mut ui = ReviewUi::default();
+        ui.review = Some(review);
+        ui.active = true;
+        ui.select(pull.clone());
+        ui.last_attempt = Some(Instant::now());
+        ui.loaded_events = vec![EventKind::Deaths, EventKind::Defensives];
+        ui.requested_events = ui.loaded_events.clone();
+        ui.events.push(RaidEvent {
+            at_ms: pull.start_ms + 1000,
+            actor_id: 1,
+            observed_buff: false,
+            actor: "Priest".into(),
+            class: "Priest".into(),
+            ability: "Apotheosis".into(),
+            ability_id: 200183,
+            target: None,
+            target_actor_id: None,
+            kind: EventKind::Defensives,
+            group: Some(DefensiveGroup::Healing),
+        });
+        let mut preferences = ui.cooldowns.clone();
+        preferences.hidden_groups.push(DefensiveGroup::Healing);
+        assert!(!ui.accept_cooldown_preferences(preferences.clone()));
+        assert!(ui.next_action().is_none());
+        assert_eq!(ui.events.len(), 1);
+        preferences.overrides.insert(
+            1234567,
+            defensives::Rule {
+                group: Some(DefensiveGroup::Utility),
+                observation: defensives::Observation::Cast,
+            },
+        );
+        assert!(ui.accept_cooldown_preferences(preferences));
+        assert_eq!(ui.events.len(), 1);
+        assert_eq!(ui.events[0].ability_id, 200183);
+        assert!(matches!(
+            ui.next_action(),
+            Some(Action::Events(_, EventKind::Defensives))
+        ));
+        ui.record_event_failure(EventKind::Defensives, "Slow provider".into());
+        assert_eq!(ui.events.len(), 1);
+    }
+
+    #[test]
+    fn advanced_hover_keeps_its_background_and_editor_geometry_fixed() {
+        let mut review = ReviewUi::default();
+        review.cooldown_editor = Some(CooldownEditor::new(
+            Default::default(),
+            &[],
+            DefensiveGroup::Healing,
+        ));
+        let ctx = egui::Context::default();
+        let mut style = (*ctx.global_style()).clone();
+        style.animation_time = 0.0;
+        style.visuals.widgets.hovered.expansion = 3.0;
+        ctx.set_global_style(style);
+        let mut frame = |events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(980.0, 720.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| review.draw_cooldown_editor(ui.ctx()),
+            )
+        };
+        frame(vec![]);
+        frame(vec![]);
+        let geometry = |output: &egui::FullOutput| {
+            let rect = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect) if rect.fill == Color32::from_rgb(43, 48, 58) => {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let save = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "Save changes" => {
+                        Some(text.pos)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            (rect, save)
+        };
+        let before = geometry(&frame(vec![]));
+        let after = geometry(&frame(vec![egui::Event::PointerMoved(before.0.center())]));
+        assert_eq!(before, after);
+        assert_eq!(geometry(&frame(vec![egui::Event::PointerGone])), before);
+    }
+
+    #[test]
     fn late_events_from_previous_pull_do_not_replace_current_selection() {
         let (mut review, pull, _) = fixture();
         let mut next = pull.clone();
@@ -3439,7 +3800,7 @@ mod tests {
         .unwrap();
         ui.tick(&egui::Context::default(), None);
         assert!(ui.notice.is_none());
-        assert!(ui.event_notice.is_none());
+        assert!(ui.event_failures.is_empty());
         assert!(
             matches!(ui.next_action(), Some(Action::Events(pull, EventKind::Deaths)) if pull.id == 31)
         );
