@@ -5,16 +5,36 @@ use eframe::egui;
 use std::cell::RefCell;
 use wry::WebView;
 
+#[cfg(target_os = "windows")]
+mod windows_focus;
+
 #[derive(Default)]
 pub(super) struct Controller {
     applied: RefCell<Option<([i32; 4], Vec<[i32; 4]>)>>,
+    fullscreen_cover: std::cell::Cell<bool>,
     #[cfg(test)]
     updates: std::cell::Cell<usize>,
 }
 
 impl Controller {
+    pub fn cover_for_fullscreen(&self, covered: bool) {
+        self.fullscreen_cover.set(covered);
+    }
+
+    fn cuts(&self, ctx: &egui::Context, bounds: [i32; 4]) -> Vec<[i32; 4]> {
+        if self.fullscreen_cover.get() {
+            // The existing comparison peer keeps its document and media clock
+            // visible to the provider, while none of its pixels accept input.
+            vec![[0, 0, bounds[2], bounds[3]]]
+        } else {
+            overlay_rects(ctx, bounds)
+        }
+    }
+
     pub fn update(&self, view: &WebView, ctx: &egui::Context, bounds: [i32; 4]) {
-        let cuts = overlay_rects(ctx, bounds);
+        #[cfg(target_os = "windows")]
+        windows_focus::update(view, ctx);
+        let cuts = self.cuts(ctx, bounds);
         let mut applied = self.applied.borrow_mut();
         if applied
             .as_ref()
@@ -394,7 +414,7 @@ mod native_tests {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     return;
                 }
-                if self.phase == 5 {
+                if self.phase == 6 {
                     return;
                 }
                 if self.view.is_none() {
@@ -460,6 +480,7 @@ mod native_tests {
                     _ => {}
                 }
                 let view = self.view.as_ref().unwrap();
+                self.controller.cover_for_fullscreen(self.phase == 4);
                 self.controller.update(view, ctx, BOUNDS);
                 if let Some(value) = self.measured.lock().unwrap().take() {
                     self.pending = false;
@@ -511,10 +532,10 @@ mod native_tests {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         return;
                     }
-                    let cuts = overlay_rects(ctx, BOUNDS);
+                    let cuts = self.controller.cuts(ctx, BOUNDS);
                     assert_eq!(
                         cuts.is_empty(),
-                        self.phase == 0 || self.phase == 4,
+                        self.phase == 0 || self.phase == 5,
                         "Native player must only be cut beneath floating UI areas"
                     );
                     #[cfg(target_os = "linux")]
@@ -539,7 +560,7 @@ mod native_tests {
                     }
                     self.previous = seconds;
                     self.phase += 1;
-                    if self.phase == 5 {
+                    if self.phase == 6 {
                         self.completed_cycles += 1;
                         if self.completed_cycles == self.cycles {
                             let elapsed = self.started.elapsed().as_secs_f64();

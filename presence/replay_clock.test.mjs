@@ -31,7 +31,7 @@ test('provider clock rejects seeking, paused and ambiguous video and foreign par
  let listener, sent, now=1000;
  const parent={postMessage:(data,origin)=>sent={data,origin}};
  const window={parent,top:parent,addEventListener:(t,f)=>listener=f};
- const video={getBoundingClientRect:()=>({width:1920,height:1080}),videoWidth:1920,videoHeight:1080,currentTime:42.123,playbackRate:1,paused:false,ended:false,seeking:false,readyState:4};
+ const video={addEventListener:()=>{},removeEventListener:()=>{},getBoundingClientRect:()=>({width:1920,height:1080}),videoWidth:1920,videoHeight:1080,currentTime:42.123,playbackRate:1,paused:false,ended:false,seeking:false,readyState:4};
  const videos=[video];
  runInNewContext(source,{window,performance:{now:()=>now},location:{origin:'https://player.twitch.tv'},document:{querySelectorAll:()=>videos}});
  const request=(origin='https://brick.example',from=parent)=>listener({source:from,origin,data:{type:'brick-replay-clock-request',serial:4}});

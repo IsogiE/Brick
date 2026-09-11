@@ -17,6 +17,7 @@
         && typeof data.playing === 'boolean' && data.rate === 1
         ? { seconds: data.seconds, height: data.height, playing: data.playing,
           paused: data.paused === true, seeking: data.seeking === true,
+          seekGeneration: Number.isSafeInteger(data.seekGeneration) && data.seekGeneration >= 0 && data.seekGeneration <= 0xffffffff ? data.seekGeneration : null,
           decoded: data.decoded === true, ended: data.ended === true,
           readyState: data.readyState, frames: data.frames, at: now, elapsed } : null;
       pending = null;
@@ -41,6 +42,7 @@
       const media = window.brickReplayMedia();
       if (!media) return { ...state, playing: false, buffering: state.ready && !state.blocked, decoded: false };
       return { ...state, seconds: media.seconds, decoded: media.decoded,
+        provider_seek_generation: media.seekGeneration,
         playing: state.playing && media.playing && !media.seeking,
         buffering: !state.blocked && (state.buffering || media.seeking || !media.decoded || (!media.paused && !media.ended && !media.playing)),
         diagnostics: { ...state.diagnostics, media_seconds: media.seconds, ready_state: media.readyState,
@@ -59,7 +61,10 @@
     return;
   }
   if (window.parent !== window.top || !providers.has(location.origin)) return;
-  let previousVideo = null, previousSeconds = null, progressed = -Infinity;
+  let previousVideo = null, previousSeconds = null, progressed = -Infinity, seekGeneration = 0;
+  // One listener on the current media element preserves even seeks that finish
+  // between samples. Replaced videos release their listener; no extra polling.
+  const onSeeking = () => { seekGeneration = (seekGeneration + 1) >>> 0; };
   window.addEventListener('message', event => {
     if (event.source !== window.parent || event.origin !== wrapperOrigin) return;
     const data = event.data;
@@ -70,14 +75,18 @@
     });
     const video = videos.length === 1 ? videos[0] : null;
     const now = performance.now();
-    if (video !== previousVideo) { previousSeconds = null; progressed = -Infinity; previousVideo = video; }
+    if (video !== previousVideo) {
+      previousVideo?.removeEventListener('seeking', onSeeking);
+      previousSeconds = null; progressed = -Infinity; previousVideo = video;
+      video?.addEventListener('seeking', onSeeking);
+    }
     if (video && previousSeconds !== null && video.currentTime > previousSeconds && !video.seeking) progressed = now;
     previousSeconds = video?.currentTime ?? null;
     const frames = video?.getVideoPlaybackQuality?.().totalVideoFrames;
     const decoded = !!video && video.videoWidth > 0 && video.videoHeight > 0 && video.readyState >= 2
       && (frames === undefined || frames > 0);
     window.parent.postMessage({ type: replyType, serial: data.serial,
-      seconds: video?.currentTime, height: video?.videoHeight, rate: video?.playbackRate,
+      seconds: video?.currentTime, height: video?.videoHeight, rate: video?.playbackRate, seekGeneration,
       decoded, frames, readyState: video?.readyState, paused: video?.paused, ended: video?.ended, seeking: video?.seeking,
       playing: decoded && !video.paused && !video.ended && !video.seeking && video.readyState >= 3 && now-progressed <= 1000,
     }, wrapperOrigin);

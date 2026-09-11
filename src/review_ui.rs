@@ -174,6 +174,7 @@ pub struct ReviewUi {
     replay_coverage: Option<(i64, i64)>,
     notice: Option<String>,
     connected: bool,
+    connection_checked: bool,
     active: bool,
     comparing: bool,
     open_first_pull: bool,
@@ -203,6 +204,9 @@ pub struct ReviewUi {
     pov_menu: PovMenuState,
     range_epoch: Instant,
     range_pause_sent: bool,
+    provider_observation: Option<(Instant, f64)>,
+    provider_seek_generation: Option<u64>,
+    provider_seek_pending: bool,
 }
 
 impl Default for ReviewUi {
@@ -223,6 +227,7 @@ impl Default for ReviewUi {
             replay_coverage: None,
             notice: None,
             connected: false,
+            connection_checked: false,
             active: false,
             comparing: false,
             open_first_pull: false,
@@ -252,6 +257,9 @@ impl Default for ReviewUi {
             pov_menu: PovMenuState::default(),
             range_epoch: Instant::now(),
             range_pause_sent: false,
+            provider_observation: None,
+            provider_seek_generation: None,
+            provider_seek_pending: false,
         }
     }
 }
@@ -292,6 +300,38 @@ impl ReviewUi {
         let playback = self.playback.as_ref()?;
         (playback.broadcast_id == review.replay.broadcast_id)
             .then_some((review, self.pull.as_ref()?))
+    }
+
+    /// The comparison has mapped a provider gesture into this recording. Keep
+    /// its native child and use the existing event worker for a newly found pull.
+    pub(crate) fn follow_comparison_position(
+        &mut self,
+        selected: Option<Pull>,
+        seconds: f64,
+        playing: bool,
+    ) {
+        if !self.active || !self.comparing || !seconds.is_finite() {
+            return;
+        }
+        if self.pull.as_ref().map(pull_key) != selected.as_ref().map(pull_key) {
+            self.cancel_read();
+            self.marker_sync.reset(None);
+            self.pull = selected;
+            self.events.clear();
+            self.requested_events.clear();
+            self.loaded_events.clear();
+            self.event_failures.clear();
+            self.scroll_to_event = false;
+        }
+        self.selected_event = None;
+        self.scrub = None;
+        self.range_pause_sent = false;
+        self.timeline_position = Some(seconds);
+        if let Some((review, playback)) = self.review.as_ref().zip(self.playback.as_mut()) {
+            playback.seconds = seconds;
+            playback.autoplay = playing;
+            playback.public_url = review.replay.public_url(seconds as u64);
+        }
     }
 
     pub(crate) fn comparison_position(&self, state: &PlaybackState) -> Option<(i64, bool)> {
@@ -513,6 +553,7 @@ impl ReviewUi {
                             self.last_attempt = Some(Instant::now());
                         }
                         self.connected = connected;
+                        self.connection_checked = true;
                         match result {
                             Ok(Data::Review(review, preferences)) => {
                                 self.accept_cooldown_preferences(preferences);
@@ -592,6 +633,7 @@ impl ReviewUi {
                     let action = self.work_action.take();
                     self.signing_in = false;
                     if !self.cancel.load(Ordering::Relaxed) {
+                        self.connection_checked = true;
                         let message = "Warcraft Logs stopped loading. Brick will retry shortly.";
                         if let Some(Action::Events(pull, kind)) = action {
                             if self
@@ -1103,6 +1145,8 @@ impl ReviewUi {
     fn draw_connection_control(&mut self, ui: &mut egui::Ui, stream: &Stream) {
         if self.signing_in {
             ui.small("Finish signing in in your browser…");
+        } else if !self.connection_checked {
+            ui.small("Loading raid review…");
         } else if ui
             .add_enabled(
                 self.work.is_none(),
@@ -1130,6 +1174,69 @@ impl ReviewUi {
         self.popup_open = false;
     }
 
+    /// Fullscreen uses the same pull selection and native seek as the workspace.
+    /// This returns a command without closing or rebuilding either video child.
+    pub(crate) fn draw_fullscreen_navigation(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> Option<PlaybackCommand> {
+        let pulls = self
+            .review
+            .as_ref()
+            .map(|review| review.pulls.as_slice())
+            .unwrap_or_default();
+        let current = self.pull.as_ref().and_then(|selected| {
+            pulls
+                .iter()
+                .position(|pull| pull.report == selected.report && pull.id == selected.id)
+        });
+        let mut chosen = None;
+        let button_width =
+            (ui.available_width() - 56.0 - 2.0 * ui.spacing().item_spacing.x).max(80.0);
+        if ui
+            .add_enabled_ui(current.is_some_and(|index| index > 0), |ui| {
+                ui.add_sized(egui::vec2(28.0, 32.0), egui::Button::new("‹"))
+            })
+            .inner
+            .on_hover_text("Previous pull")
+            .clicked()
+        {
+            chosen = current.map(|index| index - 1);
+        }
+        chosen = draw_pull_selector_sized(
+            ui,
+            pulls,
+            current,
+            &mut self.pull_menu_cursor,
+            None,
+            button_width,
+        )
+        .or(chosen);
+        if ui
+            .add_enabled_ui(current.is_some_and(|index| index + 1 < pulls.len()), |ui| {
+                ui.add_sized(egui::vec2(28.0, 32.0), egui::Button::new("›"))
+            })
+            .inner
+            .on_hover_text("Next pull")
+            .clicked()
+        {
+            chosen = current.map(|index| index + 1);
+        }
+        self.popup_open = egui::Popup::is_any_open(ui.ctx());
+        let selected = chosen
+            .filter(|index| Some(*index) != current)
+            .and_then(|index| pulls.get(index))
+            .cloned()?;
+        self.navigate_pull(selected)
+    }
+
+    fn navigate_pull(&mut self, pull: Pull) -> Option<PlaybackCommand> {
+        self.select(pull);
+        self.playback
+            .as_ref()
+            .map(|playback| PlaybackCommand::Seek(playback.seconds))
+    }
+
     pub fn draw_workspace(
         &mut self,
         ui: &mut egui::Ui,
@@ -1144,11 +1251,13 @@ impl ReviewUi {
         ui.visuals_mut().selection.bg_fill = Color32::from_rgb(113, 52, 33);
         ui.visuals_mut().selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
         ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::from_rgb(30, 34, 42);
+        self.observe_provider_playback(state);
         ui.visuals_mut().widgets.inactive.bg_fill = Color32::from_rgb(30, 34, 42);
 
         if !self.connected {
-            // A saved recording can be the first thing someone opens. Keep sign-in
-            // available here without allocating a player or an empty timeline.
+            // A saved recording can be the first thing someone opens. An unset
+            // connection is still unknown until its existing background read finishes.
+            // Keep this state static and leave navigation available.
             self.popup_open = false;
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), 32.0),
@@ -1169,11 +1278,15 @@ impl ReviewUi {
             );
             ui.add_space((ui.available_height() * 0.2).min(100.0));
             ui.vertical_centered(|ui| {
-                ui.heading("Connect your Warcraft Logs account");
-                ui.add_space(8.0);
-                ui.label("Sign in to load this VOD's raid pulls and timeline.");
-                ui.add_space(16.0);
-                self.draw_connection_control(ui, stream);
+                if self.connection_checked {
+                    ui.heading("Connect your Warcraft Logs account");
+                    ui.add_space(8.0);
+                    ui.label("Sign in to load this VOD's raid pulls and timeline.");
+                    ui.add_space(16.0);
+                    self.draw_connection_control(ui, stream);
+                } else {
+                    ui.heading("Loading raid review…");
+                }
                 if let Some(notice) = &self.notice {
                     ui.add_space(8.0);
                     ui.add(egui::Label::new(RichText::new(notice).small().color(MUTED)).wrap());
@@ -1286,11 +1399,7 @@ impl ReviewUi {
         // a popup closes; use its actual state for marker synchronization.
         self.popup_open = egui::Popup::is_any_open(ui.ctx());
         if let Some(i) = selected.filter(|i| Some(*i) != index) {
-            self.select(pulls[i].clone());
-            action.command = self
-                .playback
-                .as_ref()
-                .map(|p| PlaybackCommand::Seek(p.seconds));
+            action.command = self.navigate_pull(pulls[i].clone());
         }
         let coverage_context = self.pov_selection_context(state).map(|(pull, at_ms)| {
             let at_ms = if action.command.is_some() {
@@ -1556,7 +1665,12 @@ impl ReviewUi {
         ui: &mut egui::Ui,
         state: &PlaybackState,
     ) -> Option<PlaybackCommand> {
-        let pull = self.pull.clone()?;
+        let Some(pull) = self.pull.clone() else {
+            if self.playback.is_some() {
+                ui.label(RichText::new("Between raid pulls").color(MUTED));
+            }
+            return None;
+        };
         let duration = (pull.end_ms - pull.start_ms) as f64 / 1000.0;
         let video_start = pull_video_start(self.review.as_ref()?, &pull);
         let confirmed_position = self.confirmed_video_position(state);
@@ -1886,6 +2000,112 @@ impl ReviewUi {
         self.range_epoch = Instant::now();
         self.range_pause_sent = false;
         self.timeline_position = None;
+        self.provider_observation = None;
+        self.provider_seek_generation = None;
+        self.provider_seek_pending = false;
+    }
+
+    /// Follow provider controls without issuing playback commands. This runs in
+    /// the ordinary player tick, including while the review UI is fullscreen.
+    pub(crate) fn observe_provider_playback(&mut self, state: &PlaybackState) {
+        if !self.active
+            || self.comparing
+            || self.aligning
+            || self.marker_sync.busy()
+            || self.pending_focus.is_some()
+            || !state.is_fresh_since(self.range_epoch)
+            || !state.seconds.is_finite()
+            || !(0.0..=604800.0).contains(&state.seconds)
+            || self
+                .review
+                .as_ref()
+                .zip(self.playback.as_ref())
+                .is_none_or(|(review, playback)| {
+                    review.replay.broadcast_id != playback.broadcast_id
+                })
+        {
+            return;
+        }
+        let Some([observed_at, _]) = state.observation_window() else {
+            return;
+        };
+        if self
+            .provider_observation
+            .is_some_and(|(previous, _)| observed_at <= previous)
+        {
+            return;
+        }
+        // Initial navigation and Brick's own commands establish a new baseline.
+        // A provider media seek caused by those commands is not a user gesture.
+        if state.seeking.is_some() || state.playback_intent.is_some() || !state.ready {
+            self.provider_observation = None;
+            self.provider_seek_generation = state.provider_seek_generation;
+            self.provider_seek_pending = false;
+            return;
+        }
+        let generation_changed = self
+            .provider_seek_generation
+            .zip(state.provider_seek_generation)
+            .is_some_and(|(previous, current)| previous != current);
+        let jumped = self
+            .provider_observation
+            .is_some_and(|(previous, seconds)| {
+                let elapsed = observed_at
+                    .saturating_duration_since(previous)
+                    .as_secs_f64();
+                // Backwards playback or advancement beyond the observed wall time
+                // covers older wrappers and a gesture whose media event was missed.
+                state.seconds < seconds - 1.0 || state.seconds > seconds + elapsed * 2.0 + 1.0
+            });
+        self.provider_seek_pending |= self.provider_observation.is_some()
+            && (generation_changed || jumped || state.diagnostics.media_seeking == Some(true));
+        self.provider_seek_generation = state.provider_seek_generation;
+        self.provider_observation = Some((observed_at, state.seconds));
+        if state.blocked || state.buffering || state.diagnostics.media_seeking == Some(true) {
+            return;
+        }
+        self.timeline_position = Some(state.seconds);
+        if let Some(playback) = &mut self.playback {
+            playback.seconds = state.seconds;
+            playback.autoplay = state.playing;
+        }
+        if !self.provider_seek_pending && self.pull.is_some() {
+            return;
+        }
+        self.provider_seek_pending = false;
+        let review = self.review.as_ref().unwrap();
+        let contains = |pull: &Pull| {
+            let start = pull_video_start(review, pull);
+            state.seconds >= start
+                && state.seconds < start + (pull.end_ms - pull.start_ms) as f64 / 1000.0
+        };
+        // Prefer the current pull when metadata ranges overlap. Scan only on a
+        // seek or while between pulls; ordinary playback does no catalogue scan.
+        let selected = self
+            .pull
+            .as_ref()
+            .filter(|pull| contains(pull))
+            .or_else(|| review.pulls.iter().find(|pull| contains(pull)))
+            .cloned();
+        let changed = self.pull.as_ref().map(pull_key) != selected.as_ref().map(pull_key);
+        if changed {
+            self.cancel_read();
+            self.marker_sync.reset(None);
+            self.pull = selected;
+            self.events.clear();
+            self.requested_events.clear();
+            self.loaded_events.clear();
+            self.event_failures.clear();
+            self.scroll_to_event = false;
+        }
+        self.selected_event = None;
+        self.scrub = None;
+        self.range_pause_sent = false;
+        // Keep the observation's epoch, position and play intent. Calling
+        // select() here would turn the user's seek into a seek to pull start.
+        if let Some((review, playback)) = self.review.as_ref().zip(self.playback.as_mut()) {
+            playback.public_url = review.replay.public_url(state.seconds as u64);
+        }
     }
 
     fn confirmed_video_position(&self, state: &PlaybackState) -> Option<f64> {
@@ -1899,7 +2119,7 @@ impl ReviewUi {
     }
 
     pub(crate) fn pause_at_pull_end(&mut self, state: &PlaybackState) -> Option<PlaybackCommand> {
-        if self.marker_sync.busy() {
+        if self.comparing || self.marker_sync.busy() || self.provider_seek_pending {
             return None;
         }
         // A prior POV's sample, pending seek or stalled frame must never pause
@@ -2105,6 +2325,14 @@ impl ReviewUi {
     }
 
     fn draw_events(&mut self, ui: &mut egui::Ui, _height: f32) -> Option<PlaybackCommand> {
+        if self.pull.is_none() && self.playback.is_some() {
+            ui.label(
+                RichText::new("No raid events at this video position.")
+                    .small()
+                    .color(MUTED),
+            );
+            return None;
+        }
         ui.horizontal(|ui| {
             for kind in [EventKind::Deaths, EventKind::Defensives] {
                 let count = self
@@ -2810,6 +3038,17 @@ fn draw_pull_selector(
     cursor: &mut Option<usize>,
     pending_label: Option<&str>,
 ) -> Option<usize> {
+    draw_pull_selector_sized(ui, pulls, current, cursor, pending_label, 352.0)
+}
+
+fn draw_pull_selector_sized(
+    ui: &mut egui::Ui,
+    pulls: &[Pull],
+    current: Option<usize>,
+    cursor: &mut Option<usize>,
+    pending_label: Option<&str>,
+    button_width: f32,
+) -> Option<usize> {
     let popup_id = ui.make_persistent_id("review-pull-menu");
     let was_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
     if pulls.is_empty() && was_open {
@@ -2873,7 +3112,7 @@ fn draw_pull_selector(
     let button = ui
         .add_enabled_ui(!pulls.is_empty(), |ui| {
             ui.add_sized(
-                egui::vec2(352.0, ui.spacing().interact_size.y),
+                egui::vec2(button_width, ui.spacing().interact_size.y),
                 egui::Button::new(&primary_label)
                     .right_text(
                         outcome
@@ -3385,6 +3624,115 @@ mod tests {
     }
 
     #[test]
+    fn initial_saved_connection_check_shows_static_loading_then_the_review() {
+        let (mut review, _, mut stream) = fixture();
+        stream.status = Status::Offline;
+        stream.recording_id = Some(review.replay.video_id.clone());
+        // No pulls avoids starting an unrelated event request in this UI test.
+        review.pulls.clear();
+        let ctx = egui::Context::default();
+        let mut review_ui = ReviewUi::default();
+        review_ui.key = pov_key(&stream);
+        review_ui.open_recording();
+        let (tx, rx) = mpsc::channel();
+        review_ui.work = Some(rx);
+        review_ui.work_action = Some(Action::Refresh);
+        let has_label = |output: &egui::FullOutput, label: &str| {
+            output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)
+        })
+        };
+        for frame in 0..3 {
+            review_ui.tick(&ctx, Some(&stream));
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(980.0, 720.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let action = review_ui.draw_workspace(
+                        ui,
+                        &stream,
+                        &[],
+                        &PlaybackState::default(),
+                        false,
+                        None,
+                        None,
+                    );
+                    assert!(action.rect.is_none() && !action.reload && action.command.is_none());
+                },
+            );
+            assert!(has_label(&output, "Loading raid review…"));
+            assert!(has_label(&output, "Back to VODs"));
+            assert!(!has_label(&output, "Connect your Warcraft Logs account"));
+            assert!(!has_label(&output, "Connect Warcraft Logs"));
+            assert!(!review_ui.connection_checked);
+            assert!(review_ui.work.is_some());
+            if frame == 2 {
+                assert!(
+                    output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                        > Duration::from_secs(1),
+                    "Waiting for saved sign-in must not request animation frames"
+                );
+            }
+        }
+        tx.send((
+            review_ui.generation,
+            review_ui.key.clone(),
+            Ok(Data::Review(review, Default::default())),
+            true,
+        ))
+        .unwrap();
+        review_ui.tick(&ctx, Some(&stream));
+        assert!(review_ui.connected && review_ui.connection_checked && review_ui.active());
+        assert!(review_ui.work.is_none());
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(980.0, 720.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let action = review_ui.draw_workspace(
+                    ui,
+                    &stream,
+                    &[],
+                    &PlaybackState::default(),
+                    false,
+                    None,
+                    None,
+                );
+                assert!(action.rect.is_some());
+            },
+        );
+        assert!(!has_label(&output, "Loading raid review…"));
+        assert!(!has_label(&output, "Connect Warcraft Logs"));
+    }
+
+    #[test]
+    fn obsolete_connection_result_does_not_expose_sign_in_during_the_initial_check() {
+        let (_, _, stream) = fixture();
+        let ctx = egui::Context::default();
+        let mut review_ui = ReviewUi::default();
+        review_ui.key = pov_key(&stream);
+        review_ui.generation = 2;
+        review_ui.last_attempt = Some(Instant::now());
+        let (tx, rx) = mpsc::channel();
+        review_ui.work = Some(rx);
+        review_ui.work_action = Some(Action::Refresh);
+        tx.send((1, review_ui.key.clone(), Ok(Data::Authentication), false))
+            .unwrap();
+        review_ui.tick(&ctx, Some(&stream));
+        assert!(!review_ui.connected && !review_ui.connection_checked);
+        assert!(review_ui.work.is_none());
+    }
+
+    #[test]
     fn recording_review_keeps_connection_recovery_visible_after_loading_fails() {
         for previously_connected in [false, true] {
             let (review, _, mut stream) = fixture();
@@ -3412,6 +3760,7 @@ mod tests {
             ui.tick(&ctx, Some(&stream));
             assert!(ui.active(), "A failed read must not close the selected VOD");
             assert!(!ui.connected);
+            assert!(ui.connection_checked);
             assert!(ui.open_first_pull);
             assert!(ui.playback().is_none());
 
@@ -3966,6 +4315,617 @@ mod tests {
         ui.work_action = Some(Action::Connect);
         drop(ui);
         assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    thread_local! {
+        static PROVIDER_TEST_CLOCK: std::cell::Cell<Instant> = std::cell::Cell::new(
+            Instant::now() - Duration::from_secs(1)
+        );
+    }
+
+    fn provider_test_now() -> Instant {
+        PROVIDER_TEST_CLOCK.with(|clock| {
+            let next = clock.get() + Duration::from_millis(1);
+            clock.set(next);
+            next
+        })
+    }
+
+    fn provider_review_fixture() -> (ReviewUi, Stream, Pull, Pull) {
+        // Keep test samples recent but strictly ordered even when Windows gives
+        // several back-to-back Instant::now() calls the same clock tick.
+        PROVIDER_TEST_CLOCK.with(|clock| clock.set(Instant::now() - Duration::from_secs(1)));
+        let (mut review, first, stream) = fixture();
+        let mut second = first.clone();
+        second.id = 2;
+        second.start_ms += 300_000;
+        second.end_ms += 300_000;
+        second.seconds += 300;
+        review.pulls.push(second.clone());
+        let mut ui = ReviewUi::default();
+        ui.review = Some(review);
+        ui.connected = true;
+        ui.active = true;
+        ui.last_attempt = Some(Instant::now());
+        ui.select(first.clone());
+        ui.range_epoch = provider_test_now();
+        ui.loaded_events = vec![EventKind::Deaths, EventKind::Defensives];
+        (ui, stream, first, second)
+    }
+
+    fn provider_sample(seconds: f64, playing: bool, generation: u64) -> PlaybackState {
+        let mut state = PlaybackState::default();
+        state.ready = true;
+        state.seconds = seconds;
+        state.playing = playing;
+        state.provider_seek_generation = Some(generation);
+        state.mark_polled_at(provider_test_now());
+        state
+    }
+
+    #[test]
+    fn direct_provider_seek_inside_pull_preserves_events_and_play_intent() {
+        for playing in [false, true] {
+            let (mut ui, _, first, _) = provider_review_fixture();
+            let start = pull_video_start(ui.review.as_ref().unwrap(), &first);
+            ui.observe_provider_playback(&provider_sample(start + 10.0, playing, 0));
+            ui.selected_event = Some((first.start_ms, "Actor".into()));
+            let state = provider_sample(start + 127.625, playing, 1);
+            ui.observe_provider_playback(&state);
+            assert_eq!(ui.pull.as_ref().map(pull_key), Some(pull_key(&first)));
+            assert_eq!(ui.timeline_position, Some(state.seconds));
+            assert_eq!(ui.playback.as_ref().unwrap().seconds, state.seconds);
+            assert_eq!(ui.playback.as_ref().unwrap().autoplay, playing);
+            assert!(ui.selected_event.is_none());
+            assert_eq!(ui.loaded_events.len(), 2);
+            assert!(
+                ui.next_action().is_none(),
+                "Within-pull seeking uses loaded events"
+            );
+            assert!(ui.pause_at_pull_end(&state).is_none());
+        }
+    }
+
+    #[test]
+    fn provider_seek_across_pulls_waits_for_settled_video_and_never_pauses_old_pull() {
+        for playing in [false, true] {
+            let (mut ui, _, first, second) = provider_review_fixture();
+            let start = pull_video_start(ui.review.as_ref().unwrap(), &first);
+            let target = pull_video_start(ui.review.as_ref().unwrap(), &second) + 17.375;
+            ui.observe_provider_playback(&provider_sample(start + 209.0, playing, 0));
+            let mut moving = provider_sample(target, playing, 1);
+            moving.buffering = true;
+            moving.diagnostics.media_seeking = Some(true);
+            ui.observe_provider_playback(&moving);
+            assert_eq!(ui.pull.as_ref().map(pull_key), Some(pull_key(&first)));
+            assert!(ui.provider_seek_pending);
+            assert!(ui.pause_at_pull_end(&moving).is_none());
+            let settled = provider_sample(target, playing, 1);
+            ui.observe_provider_playback(&settled);
+            assert_eq!(ui.pull.as_ref().map(pull_key), Some(pull_key(&second)));
+            assert_eq!(ui.playback.as_ref().unwrap().seconds, target);
+            assert_eq!(ui.playback.as_ref().unwrap().autoplay, playing);
+            assert!(ui.pause_at_pull_end(&settled).is_none());
+            assert!(
+                matches!(ui.next_action(), Some(Action::Events(p, EventKind::Deaths)) if p.id == second.id)
+            );
+            ui.loaded_events = vec![EventKind::Deaths, EventKind::Defensives];
+            ui.observe_provider_playback(&settled);
+            assert_eq!(
+                ui.loaded_events.len(),
+                2,
+                "The same sample cannot invalidate events twice"
+            );
+            let backwards = provider_sample(start + 75.5, playing, 2);
+            ui.observe_provider_playback(&backwards);
+            assert_eq!(ui.pull.as_ref().unwrap().id, first.id);
+            assert_eq!(ui.timeline_position, Some(backwards.seconds));
+        }
+    }
+
+    #[test]
+    fn seeking_between_pulls_keeps_video_and_resumes_timeline_at_the_next_pull() {
+        let (mut ui, stream, first, second) = provider_review_fixture();
+        let start = pull_video_start(ui.review.as_ref().unwrap(), &first);
+        ui.observe_provider_playback(&provider_sample(start + 100.0, true, 0));
+        let state = provider_sample(start + 299.75, true, 1);
+        ui.observe_provider_playback(&state);
+        assert!(ui.pull.is_none() && ui.playback.is_some());
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, state.seconds);
+        assert!(ui.pause_at_pull_end(&state).is_none());
+        assert!(
+            ui.next_action().is_none(),
+            "Gaps must not request unrelated pull events"
+        );
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(egui::RawInput::default(), |egui_ui| {
+            let action = ui.draw_workspace(egui_ui, &stream, &[], &state, true, None, None);
+            assert!(action.rect.is_some() && !action.reload && action.command.is_none());
+        });
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"Between raid pulls"));
+        assert!(!labels.contains(&"Loading this pull's events…"));
+        let entering = provider_sample(start + 300.0, true, 1);
+        ui.observe_provider_playback(&entering);
+        assert_eq!(ui.pull.as_ref().unwrap().id, second.id);
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, entering.seconds);
+        assert!(ui.pause_at_pull_end(&entering).is_none());
+    }
+
+    #[test]
+    fn workspace_after_fullscreen_uses_current_provider_position_without_navigation() {
+        let (mut ui, stream, first, second) = provider_review_fixture();
+        let start = pull_video_start(ui.review.as_ref().unwrap(), &first);
+        ui.observe_provider_playback(&provider_sample(start + 60.0, true, 0));
+        // No workspace is drawn while the native provider is fullscreen. Its
+        // latest sample must win immediately when the review is painted again.
+        let state = provider_sample(start + 342.25, false, 1);
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |egui_ui| {
+            let action = ui.draw_workspace(egui_ui, &stream, &[], &state, true, None, None);
+            assert!(action.rect.is_some() && !action.reload && action.command.is_none());
+        });
+        assert_eq!(ui.pull.as_ref().unwrap().id, second.id);
+        assert_eq!(ui.timeline_position, Some(state.seconds));
+        assert!(!ui.playback.as_ref().unwrap().autoplay);
+        assert_eq!(
+            ui.comparison_position(&state).unwrap(),
+            (second.start_ms + 42_250, false)
+        );
+    }
+
+    #[test]
+    fn ordinary_playback_still_pauses_at_selected_pull_end_with_provider_observation() {
+        let (mut ui, _, first, _) = provider_review_fixture();
+        let end = pull_video_start(ui.review.as_ref().unwrap(), &first) + 210.0;
+        ui.observe_provider_playback(&provider_sample(end - 0.001, true, 0));
+        let state = provider_sample(end, true, 0);
+        ui.observe_provider_playback(&state);
+        assert_eq!(ui.pull.as_ref().unwrap().id, first.id);
+        assert!(matches!(
+            ui.pause_at_pull_end(&state),
+            Some(PlaybackCommand::Pause)
+        ));
+        assert!(ui.pause_at_pull_end(&state).is_none());
+    }
+
+    #[test]
+    fn brief_provider_seek_past_boundary_uses_durable_seek_generation() {
+        let (mut ui, _, first, _) = provider_review_fixture();
+        let end = pull_video_start(ui.review.as_ref().unwrap(), &first) + 210.0;
+        ui.observe_provider_playback(&provider_sample(end - 0.1, true, 10));
+        // This tiny seek completed between SDK polls; position discontinuity
+        // alone cannot distinguish it from reaching the end naturally.
+        let state = provider_sample(end + 0.1, true, 11);
+        ui.observe_provider_playback(&state);
+        assert!(ui.pull.is_none());
+        assert!(ui.playback.as_ref().unwrap().autoplay);
+        assert!(ui.pause_at_pull_end(&state).is_none());
+    }
+
+    #[test]
+    fn native_commands_and_stale_provider_samples_cannot_change_selected_pull() {
+        let (mut ui, _, first, second) = provider_review_fixture();
+        let start = pull_video_start(ui.review.as_ref().unwrap(), &first);
+        ui.observe_provider_playback(&provider_sample(start + 60.0, true, 0));
+        let stale = provider_sample(start + 340.0, true, 1);
+        ui.seek_absolute(first.start_ms + 80_000).unwrap();
+        ui.range_epoch = provider_test_now();
+        ui.observe_provider_playback(&stale);
+        assert_eq!(ui.pull.as_ref().unwrap().id, first.id);
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, start + 80.0);
+        let mut pending = provider_sample(start + 340.0, true, 1);
+        pending.seeking = Some(start + 80.0);
+        pending.playback_intent = Some(true);
+        ui.observe_provider_playback(&pending);
+        assert_eq!(ui.pull.as_ref().unwrap().id, first.id);
+        ui.observe_provider_playback(&provider_sample(start + 80.0, true, 2));
+        assert!(!ui.provider_seek_pending);
+        ui.observe_provider_playback(&provider_sample(start + 340.0, true, 3));
+        assert_eq!(ui.pull.as_ref().unwrap().id, second.id);
+    }
+
+    fn provider_comparison_fixture() -> (ReviewUi, crate::review_compare_ui::Comparison, Pull, Pull)
+    {
+        let (mut primary, mut stream, first, second) = provider_review_fixture();
+        primary.set_comparing(true);
+        let mut secondary = primary.review.clone().unwrap();
+        secondary.replay.video_id = "different12".into();
+        secondary.replay.broadcast_id = "different12".into();
+        secondary.replay.provider = Provider::Twitch;
+        for pull in [&first, &second] {
+            secondary.marker_timing.insert(
+                (pull.report.clone(), pull.id),
+                crate::replay_sync::Alignment {
+                    unix_seconds: pull.start_ms / 1000,
+                    video_seconds: primary.review.as_ref().unwrap().pull_video_start(pull)
+                        + 600.625,
+                    uncertainty_seconds: 0.1,
+                },
+            );
+        }
+        stream.provider = Provider::Twitch;
+        stream.recording_id = Some(secondary.replay.video_id.clone());
+        let mut comparison = crate::review_compare_ui::Comparison::new(
+            &primary,
+            stream,
+            first.start_ms + 10_000,
+            true,
+        );
+        comparison.set_provider_epoch_for_test(provider_test_now());
+        comparison.metadata_for_test().review = Some(secondary);
+        (primary, comparison, first, second)
+    }
+
+    #[test]
+    fn either_fullscreen_comparison_pov_can_seek_across_pulls_without_reseeking_itself() {
+        for leader in 0..2 {
+            for playing in [false, true] {
+                let (mut primary, mut comparison, first, second) = provider_comparison_fixture();
+                let starts = [
+                    primary.review.as_ref().unwrap().pull_video_start(&first),
+                    comparison
+                        .metadata_for_test()
+                        .review
+                        .as_ref()
+                        .unwrap()
+                        .pull_video_start(&first),
+                ];
+                let baseline = starts.map(|start| provider_sample(start + 10.0, playing, 0));
+                assert!(comparison
+                    .follow_provider_controls(
+                        &mut primary,
+                        [&baseline[0], &baseline[1]],
+                        provider_test_now()
+                    )
+                    .is_none());
+                let mut seeking = baseline.clone();
+                seeking[leader] = provider_sample(starts[leader] + 342.375, playing, 1);
+                let commands = comparison
+                    .follow_provider_controls(
+                        &mut primary,
+                        [&seeking[0], &seeking[1]],
+                        provider_test_now(),
+                    )
+                    .unwrap();
+                let commands = [commands.primary, commands.secondary];
+                assert!(commands[leader].is_none());
+                let peer_seconds = match commands[1 - leader] {
+                    Some(PlaybackCommand::Seek(seconds)) if playing => seconds,
+                    Some(PlaybackCommand::SeekPaused(seconds)) if !playing => seconds,
+                    _ => panic!("Only the other POV should follow the seek"),
+                };
+                assert_eq!(peer_seconds, starts[1 - leader] + 342.375);
+                assert_eq!(primary.pull.as_ref().unwrap().id, second.id);
+                assert_eq!(
+                    primary.playback.as_ref().unwrap().seconds,
+                    starts[0] + 342.375
+                );
+                assert_eq!(comparison.position(), (second.start_ms + 42_375, playing));
+                assert!(
+                    primary.pause_at_pull_end(&seeking[0]).is_none(),
+                    "Comparison owns its boundary"
+                );
+                if leader == 1 {
+                    let controls = comparison.state_for_controls(seeking[0].clone());
+                    assert_eq!(
+                        controls.seconds, seeking[0].seconds,
+                        "Keep real primary evidence"
+                    );
+                    assert_eq!(controls.seeking, Some(starts[0] + 342.375));
+                    assert_eq!(
+                        primary.comparison_position(&controls),
+                        Some((second.start_ms + 42_375, playing))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn comparison_seek_inside_pull_reuses_loaded_timeline_events() {
+        for leader in 0..2 {
+            let (mut primary, mut comparison, first, _) = provider_comparison_fixture();
+            let starts = [
+                primary.review.as_ref().unwrap().pull_video_start(&first),
+                comparison
+                    .metadata_for_test()
+                    .review
+                    .as_ref()
+                    .unwrap()
+                    .pull_video_start(&first),
+            ];
+            let mut states = starts.map(|start| provider_sample(start + 10.0, true, 0));
+            comparison.follow_provider_controls(
+                &mut primary,
+                [&states[0], &states[1]],
+                provider_test_now(),
+            );
+            states[leader] = provider_sample(starts[leader] + 99.875, false, 1);
+            let commands = comparison
+                .follow_provider_controls(
+                    &mut primary,
+                    [&states[0], &states[1]],
+                    provider_test_now(),
+                )
+                .unwrap();
+            assert!([commands.primary, commands.secondary][leader].is_none());
+            assert!(matches!(
+                [commands.primary, commands.secondary][1 - leader],
+                Some(PlaybackCommand::SeekPaused(_))
+            ));
+            assert_eq!(primary.pull.as_ref().unwrap().id, first.id);
+            assert_eq!(primary.loaded_events.len(), 2);
+            assert!(
+                primary.next_action().is_none(),
+                "A same-pull seek keeps its cached event data"
+            );
+            assert_eq!(comparison.position(), (first.start_ms + 99_875, false));
+        }
+    }
+
+    #[test]
+    fn comparison_gap_holds_only_peer_once_and_follows_next_shared_pull() {
+        for leader in 0..2 {
+            let (mut primary, mut comparison, first, second) = provider_comparison_fixture();
+            let starts = [
+                primary.review.as_ref().unwrap().pull_video_start(&first),
+                comparison
+                    .metadata_for_test()
+                    .review
+                    .as_ref()
+                    .unwrap()
+                    .pull_video_start(&first),
+            ];
+            let baseline = starts.map(|start| provider_sample(start + 10.0, true, 0));
+            comparison.follow_provider_controls(
+                &mut primary,
+                [&baseline[0], &baseline[1]],
+                provider_test_now(),
+            );
+            let mut gap = baseline.clone();
+            gap[leader] = provider_sample(starts[leader] + 299.75, true, 1);
+            for iteration in 0..3 {
+                let commands = comparison
+                    .follow_provider_controls(&mut primary, [&gap[0], &gap[1]], provider_test_now())
+                    .unwrap();
+                let commands = [commands.primary, commands.secondary];
+                assert!(commands[leader].is_none());
+                assert_eq!(
+                    matches!(commands[1 - leader], Some(PlaybackCommand::Pause)),
+                    iteration == 0
+                );
+            }
+            assert!(primary.pull.is_none() && primary.playback.is_some());
+            assert!(
+                primary.next_action().is_none(),
+                "Gap polling must not start WCL event requests"
+            );
+            assert!(!comparison.unavailable_for_review(&primary));
+            gap[leader] = provider_sample(starts[leader] + 300.1, true, 1);
+            let commands = comparison
+                .follow_provider_controls(&mut primary, [&gap[0], &gap[1]], provider_test_now())
+                .unwrap();
+            assert!([commands.primary, commands.secondary][leader].is_none());
+            assert!(matches!(
+                [commands.primary, commands.secondary][1 - leader],
+                Some(PlaybackCommand::Seek(_))
+            ));
+            assert_eq!(primary.pull.as_ref().unwrap().id, second.id);
+            assert_eq!(comparison.position(), (second.start_ms + 100, true));
+        }
+    }
+
+    #[test]
+    fn unavailable_comparison_peer_cannot_rewind_or_stop_seeking_pov() {
+        let (mut primary, mut comparison, first, _) = provider_comparison_fixture();
+        comparison
+            .metadata_for_test()
+            .review
+            .as_mut()
+            .unwrap()
+            .pulls
+            .truncate(1);
+        let start = primary.review.as_ref().unwrap().pull_video_start(&first);
+        let baseline = [
+            provider_sample(start + 10.0, true, 0),
+            provider_sample(start + 610.625, true, 0),
+        ];
+        comparison.follow_provider_controls(
+            &mut primary,
+            [&baseline[0], &baseline[1]],
+            provider_test_now(),
+        );
+        let target = provider_sample(start + 340.0, true, 1);
+        let commands = comparison
+            .follow_provider_controls(&mut primary, [&target, &baseline[1]], provider_test_now())
+            .unwrap();
+        assert!(commands.primary.is_none());
+        assert!(matches!(commands.secondary, Some(PlaybackCommand::Pause)));
+        assert!(
+            !comparison.unavailable_for_review(&primary),
+            "Keep the user's controlling VOD open"
+        );
+        assert!(primary.playback.as_ref().unwrap().autoplay);
+    }
+
+    struct FullscreenPullHarness {
+        ctx: egui::Context,
+        review: ReviewUi,
+        width: f32,
+        navigation: egui::Rect,
+        popup: egui::Id,
+    }
+    impl FullscreenPullHarness {
+        fn new(review: ReviewUi, width: f32) -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                review,
+                width,
+                navigation: egui::Rect::NOTHING,
+                popup: egui::Id::NULL,
+            }
+        }
+        fn frame(&mut self, events: Vec<egui::Event>) -> Option<PlaybackCommand> {
+            let mut command = None;
+            let _ = self.ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(self.width, 560.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.spacing_mut().interact_size.y = 32.0;
+                    ui.horizontal(|ui| {
+                        ui.add_space(144.0);
+                        let response = ui.allocate_ui_with_layout(
+                            egui::vec2(420.0, 32.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                self.popup = ui.make_persistent_id("review-pull-menu");
+                                command = self.review.draw_fullscreen_navigation(ui);
+                            },
+                        );
+                        self.navigation = response.response.rect;
+                    });
+                    // The video is drawn after the toolbar; the pull popup must
+                    // remain in a higher egui layer over its native-player region.
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(0.0, 44.0),
+                            egui::pos2(self.width, 560.0),
+                        ),
+                        0.0,
+                        Color32::BLACK,
+                    );
+                },
+            );
+            command
+        }
+        fn click(&mut self, pos: egui::Pos2) -> Option<PlaybackCommand> {
+            self.frame(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            self.frame(vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }])
+        }
+        fn key(&mut self, key: egui::Key) -> Option<PlaybackCommand> {
+            let command = self.frame(vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            self.frame(vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            command
+        }
+    }
+
+    #[test]
+    fn fullscreen_pull_controls_navigate_without_reload_and_keep_popup_above_video() {
+        for width in [720.0, 980.0, 1920.0] {
+            let (review, _, first, second) = provider_review_fixture();
+            let mut fullscreen = FullscreenPullHarness::new(review, width);
+            fullscreen.frame(vec![]);
+            let initial = fullscreen.navigation;
+            assert!((initial.width() - 420.0).abs() < 1.0 && initial.height() <= 32.0);
+            assert!(initial.right() <= width && initial.left() >= 144.0);
+            let next = fullscreen.click(egui::pos2(initial.right() - 14.0, initial.center().y));
+            let expected = fullscreen
+                .review
+                .review
+                .as_ref()
+                .unwrap()
+                .pull_video_start(&second);
+            assert!(matches!(next, Some(PlaybackCommand::Seek(seconds)) if seconds == expected));
+            assert_eq!(fullscreen.review.pull.as_ref().unwrap().id, second.id);
+            assert!(fullscreen.review.active() && fullscreen.review.playback().is_some());
+            assert_eq!(fullscreen.navigation, initial);
+            assert!(
+                fullscreen
+                    .click(egui::pos2(initial.right() - 14.0, initial.center().y))
+                    .is_none(),
+                "Last pull disables Next"
+            );
+            let previous = fullscreen.click(egui::pos2(initial.left() + 14.0, initial.center().y));
+            assert!(matches!(previous, Some(PlaybackCommand::Seek(_))));
+            assert_eq!(fullscreen.review.pull.as_ref().unwrap().id, first.id);
+            fullscreen.click(initial.center());
+            fullscreen.frame(vec![]);
+            assert!(fullscreen.review.popup_open);
+            let popup = fullscreen.ctx.read_response(fullscreen.popup).unwrap().rect;
+            assert!(popup.top() >= initial.bottom() && popup.bottom() <= 560.0);
+            assert!(popup.left() >= 0.0 && popup.right() <= width);
+            assert_eq!(
+                fullscreen.ctx.layer_id_at(popup.center()).unwrap().order,
+                egui::Order::Foreground
+            );
+            assert_eq!(
+                fullscreen.navigation, initial,
+                "Opening the menu cannot resize the video toolbar"
+            );
+            fullscreen.key(egui::Key::End);
+            let chosen = fullscreen.key(egui::Key::Enter);
+            assert!(matches!(chosen, Some(PlaybackCommand::Seek(seconds)) if seconds == expected));
+            assert_eq!(fullscreen.review.pull.as_ref().unwrap().id, second.id);
+            assert!(!egui::Popup::is_id_open(&fullscreen.ctx, fullscreen.popup));
+        }
+    }
+
+    #[test]
+    fn fullscreen_pull_selection_uses_existing_comparison_clock_mapping() {
+        let (review, mut comparison, first, second) = provider_comparison_fixture();
+        let mut fullscreen = FullscreenPullHarness::new(review, 980.0);
+        fullscreen.frame(vec![]);
+        let bar = fullscreen.navigation;
+        let command = fullscreen
+            .click(egui::pos2(bar.right() - 14.0, bar.center().y))
+            .unwrap();
+        comparison.command(command, &fullscreen.review);
+        assert_eq!(comparison.position(), (second.start_ms, true));
+        let at_ms = comparison.position().0;
+        let peer = comparison.metadata_for_test().review.as_ref().unwrap();
+        assert_eq!(
+            crate::review_compare_ui::recording_clock(peer, &second)
+                .unwrap()
+                .video_seconds(at_ms),
+            Some(peer.pull_video_start(&second))
+        );
+        assert!(fullscreen.review.comparing && fullscreen.review.active());
+        fullscreen.frame(vec![]); // Paint the newly enabled Previous button.
+        let command = fullscreen
+            .click(egui::pos2(bar.left() + 14.0, bar.center().y))
+            .unwrap();
+        comparison.command(command, &fullscreen.review);
+        assert_eq!(comparison.position(), (first.start_ms, true));
+        assert!(fullscreen.review.playback().is_some());
     }
 
     #[test]
@@ -4588,7 +5548,10 @@ mod tests {
                         "Thumb {thumb:?} and cursor {cursor} differ at {fraction}"
                     );
                     assert!((thumb.x - egui::lerp(grid.x_range(), fraction as f32)).abs() < 0.1);
-                    assert!(grid.left() >= 132.0 && grid.right() < width, "Timeline {grid:?} escaped width={width}, scale={scale}, position={fraction}");
+                    assert!(
+                        grid.left() >= 132.0 && grid.right() < width,
+                        "Timeline {grid:?} escaped width={width}, scale={scale}, position={fraction}"
+                    );
                 }
             }
         }
@@ -5323,8 +6286,11 @@ mod tests {
                     let editor_rect = ctx
                         .memory(|memory| memory.area_rect(egui::Id::new("cooldown-editor")))
                         .unwrap();
-                    assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(editor_rect),
-                    "Editor escaped screen: {editor_rect:?}, screen {size:?}, advanced {advanced}");
+                    assert!(
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, size)
+                            .contains_rect(editor_rect),
+                        "Editor escaped screen: {editor_rect:?}, screen {size:?}, advanced {advanced}"
+                    );
                     assert!(
                         output.shapes.len() < 800,
                         "Spell editor should virtualize its rows"

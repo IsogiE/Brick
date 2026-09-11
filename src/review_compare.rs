@@ -128,6 +128,11 @@ enum Phase {
         since: Instant,
         held_at: Option<(i64, Instant)>,
     },
+    Following {
+        leader: usize,
+        issued: Option<Instant>,
+        attempts: u8,
+    },
     Running,
     Paused,
     Failed {
@@ -149,6 +154,7 @@ pub struct Controller {
     sample_epoch: Instant,
     recovery_started: Option<Instant>,
     recovered_from_ms: Option<i64>,
+    provider_leader: Option<usize>,
 }
 
 impl Controller {
@@ -173,6 +179,7 @@ impl Controller {
             sample_epoch: now,
             recovery_started: None,
             recovered_from_ms: None,
+            provider_leader: None,
         };
         controller.seek(at_ms, playing, now)?;
         Ok(controller)
@@ -207,6 +214,7 @@ impl Controller {
         {
             return Err(Error::Unavailable);
         }
+        self.provider_leader = None;
         self.at_ms = at_ms;
         self.wants_playing = playing;
         self.phase = Phase::Prepare;
@@ -216,6 +224,36 @@ impl Controller {
         self.recovery_started = None;
         self.recovered_from_ms = None;
         Ok(())
+    }
+
+    /// A provider seek already positioned one video. Synchronize only its peer;
+    /// never send the controlling player back through paused preparation.
+    pub fn follow_provider(
+        &mut self,
+        side: usize,
+        at_ms: i64,
+        playing: bool,
+        now: Instant,
+    ) -> Result<(), Error> {
+        if side >= PLAYER_COUNT {
+            return Err(Error::InvalidClock);
+        }
+        self.seek(at_ms, playing, now)?;
+        self.provider_leader = Some(side);
+        self.phase = Phase::Following {
+            leader: side,
+            issued: None,
+            attempts: 0,
+        };
+        Ok(())
+    }
+
+    pub fn provider_leader(&self) -> Option<usize> {
+        self.provider_leader
+    }
+
+    pub fn primary_seconds(&self) -> Option<f64> {
+        self.clocks[0].video_seconds(self.at_ms)
     }
 
     /// Replace one selected POV after its metadata is ready. Caller must supply
@@ -242,12 +280,22 @@ impl Controller {
 
     /// Native Play/Pause intent wins over any automatic buffering recovery.
     pub fn set_playing(&mut self, playing: bool, now: Instant) {
+        let had_provider_leader = self.provider_leader.take().is_some();
+        if had_provider_leader && matches!(self.phase, Phase::Following { .. }) {
+            self.phase = Phase::Prepare;
+            self.operation_started = now;
+            self.sample_epoch = now;
+        }
         self.recovery_started = None;
         self.recovered_from_ms = None;
         let resume_pending_seek =
             playing && !self.wants_playing && matches!(self.phase, Phase::Seeking(_));
         self.wants_playing = playing;
-        if playing {
+        if !playing && had_provider_leader && matches!(self.phase, Phase::Failed { .. }) {
+            // Peer timeout deliberately leaves its controlling VOD running.
+            // An explicit Brick Pause must still stop both once, without seeking.
+            self.hold(now, Status::Preparing);
+        } else if playing {
             if matches!(self.phase, Phase::Paused) || resume_pending_seek {
                 // A user's Pause then Play supersedes an unfinished seek.
                 // Reissue its target once; old acknowledgments cannot release
@@ -403,10 +451,24 @@ impl Controller {
     /// Call after polling both native players. Apply each returned command once.
     /// State snapshots from before a seek/POV change cannot release the barrier.
     pub fn tick(&mut self, states: [&PlaybackState; PLAYER_COUNT], now: Instant) -> Commands {
+        if matches!(self.phase, Phase::Failed { .. }) {
+            if let Some(leader) = self.provider_leader {
+                let state = states[leader];
+                if Self::settled(state, self.sample_epoch, state.playing) {
+                    if let Some(position) = self.clocks[leader].encounter_ms(state.seconds) {
+                        // A failed peer stays held. Its controlling VOD and the
+                        // timeline keep following real samples without retries.
+                        self.at_ms = position.clamp(self.range[0], self.range[1]);
+                        self.wants_playing = state.playing;
+                    }
+                }
+            }
+        }
         let user_pause = states.iter().enumerate().find_map(|(side, state)| {
             let can_pause = match self.phase {
                 Phase::Running | Phase::Starting(_) => true,
                 Phase::CatchingUp { ahead, .. } => side != ahead,
+                Phase::Following { leader, .. } => side != leader,
                 _ => false,
             };
             (can_pause
@@ -421,6 +483,7 @@ impl Controller {
             .then_some(side)
         });
         if let Some(side) = user_pause {
+            self.provider_leader = None;
             // A provider's Pause event can precede its cached paused state.
             // Honor the intent now, then wait for real settlement as usual.
             self.at_ms = self.position(side, states[side]).unwrap_or(self.at_ms);
@@ -445,9 +508,87 @@ impl Controller {
                 };
                 if notified {
                     Commands::default()
+                } else if let Some(leader) = self.provider_leader {
+                    Commands::one(1 - leader, PlaybackCommand::Pause)
                 } else {
                     Commands::both(PlaybackCommand::Pause)
                 }
+            }
+            Phase::Following {
+                leader,
+                issued,
+                attempts,
+            } => {
+                let follower = 1 - leader;
+                if Self::settled(states[leader], self.sample_epoch, states[leader].playing) {
+                    if let Some(position) = self.clocks[leader].encounter_ms(states[leader].seconds)
+                    {
+                        self.at_ms = position.clamp(self.range[0], self.range[1]);
+                    }
+                    if self.wants_playing != states[leader].playing {
+                        self.wants_playing = states[leader].playing;
+                        self.phase = Phase::Following {
+                            leader,
+                            issued: None,
+                            attempts: 0,
+                        };
+                        return self.tick(states, now);
+                    }
+                }
+                let Some(since) = issued else {
+                    let Some(seconds) = self.clocks[follower].video_seconds(self.at_ms) else {
+                        self.phase = Phase::Failed {
+                            error: Error::Unavailable,
+                            notified: true,
+                        };
+                        return Commands::one(follower, PlaybackCommand::Pause);
+                    };
+                    self.phase = Phase::Following {
+                        leader,
+                        issued: Some(now),
+                        attempts: attempts + 1,
+                    };
+                    return Commands::one(
+                        follower,
+                        if self.wants_playing {
+                            PlaybackCommand::Seek(seconds)
+                        } else {
+                            PlaybackCommand::SeekPaused(seconds)
+                        },
+                    );
+                };
+                if !states
+                    .iter()
+                    .all(|state| Self::settled(state, since, self.wants_playing))
+                {
+                    return Commands::default();
+                }
+                let aligned = if self.wants_playing {
+                    self.playback_drift(states).is_some_and(|[min, max]| {
+                        min <= DRIFT_TOLERANCE_MS as f64 && max >= -(DRIFT_TOLERANCE_MS as f64)
+                    })
+                } else {
+                    self.aligned_paused_position(states, since).is_some()
+                };
+                if aligned {
+                    self.phase = if self.wants_playing {
+                        Phase::Running
+                    } else {
+                        Phase::Paused
+                    };
+                    self.provider_leader = None;
+                    self.recovery_started = None;
+                } else if attempts < 3 {
+                    // A playing leader can advance while its peer buffers. At
+                    // most two corrections follow that live observed position.
+                    self.phase = Phase::Following {
+                        leader,
+                        issued: None,
+                        attempts,
+                    };
+                    return self.tick(states, now);
+                }
+                Commands::default()
             }
             Phase::Prepare => {
                 let [Some(primary), Some(secondary)] =
@@ -859,6 +1000,154 @@ mod tests {
         } else {
             matches!(values[side], Some(PlaybackCommand::Pause))
         });
+    }
+
+    #[test]
+    fn provider_follow_only_seeks_peer_and_does_not_restart_settled_leader() {
+        for leader in 0..2 {
+            for playing in [false, true] {
+                let mut c = controller(playing);
+                let target = START + 72_345;
+                c.follow_provider(leader, target, playing, test_now())
+                    .unwrap();
+                let mut states =
+                    clocks().map(|clock| sample(clock.video_seconds(target).unwrap(), playing));
+                let command = c.tick([&states[0], &states[1]], test_now());
+                let commands = [command.primary, command.secondary];
+                assert!(
+                    commands[leader].is_none(),
+                    "A native seek must never rewind its source"
+                );
+                assert!(matches!(commands[1 - leader], Some(PlaybackCommand::Seek(_))) == playing);
+                assert!(
+                    matches!(commands[1 - leader], Some(PlaybackCommand::SeekPaused(_))) != playing
+                );
+                assert_eq!(c.provider_leader(), Some(leader));
+                let waiting = c.tick([&states[0], &states[1]], test_now());
+                assert!(waiting.primary.is_none() && waiting.secondary.is_none());
+                let current = target + if playing { 300 } else { 0 };
+                states =
+                    clocks().map(|clock| sample(clock.video_seconds(current).unwrap(), playing));
+                let settled = c.tick([&states[0], &states[1]], test_now());
+                assert!(settled.primary.is_none() && settled.secondary.is_none());
+                assert_eq!(
+                    c.status(),
+                    if playing {
+                        Status::Playing
+                    } else {
+                        Status::Paused
+                    }
+                );
+                assert_eq!(c.position_ms(), current);
+                let repeated = c.tick([&states[0], &states[1]], test_now());
+                assert!(
+                    repeated.primary.is_none() && repeated.secondary.is_none(),
+                    "No new command barrier after alignment"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_follow_has_three_peer_seeks_and_one_deadline_without_stopping_leader() {
+        for leader in 0..2 {
+            let mut c = controller(true);
+            let target = START + 22_375;
+            let started = test_now();
+            c.follow_provider(leader, target, true, started).unwrap();
+            let mut seeks = 0;
+            for step in 0..12 {
+                let mut states =
+                    clocks().map(|clock| sample(clock.video_seconds(target).unwrap(), true));
+                states[leader].seconds += 5.0 + step as f64;
+                let command = c.tick([&states[0], &states[1]], test_now());
+                let commands = [command.primary, command.secondary];
+                assert!(commands[leader].is_none());
+                seeks += usize::from(matches!(
+                    commands[1 - leader],
+                    Some(PlaybackCommand::Seek(_))
+                ));
+            }
+            assert_eq!(seeks, 3);
+            let empty = PlaybackState::default();
+            let timeout = c.tick([&empty, &empty], started + Duration::from_secs(31));
+            assert_one(&timeout, 1 - leader, false);
+            assert_eq!(c.status(), Status::Failed(Error::TimedOut));
+            assert!(
+                c.wants_playing(),
+                "Timeout may hold the peer but must not reverse user playback intent"
+            );
+            let repeated = c.tick([&empty, &empty], started + Duration::from_secs(32));
+            assert!(repeated.primary.is_none() && repeated.secondary.is_none());
+        }
+    }
+
+    #[test]
+    fn pausing_the_provider_leader_changes_only_the_following_peer() {
+        for leader in 0..2 {
+            let mut c = controller(true);
+            let target = START + 22_375;
+            c.follow_provider(leader, target, true, test_now()).unwrap();
+            let states = clocks().map(|clock| sample(clock.video_seconds(target).unwrap(), true));
+            c.tick([&states[0], &states[1]], test_now());
+            let mut paused =
+                clocks().map(|clock| sample(clock.video_seconds(target + 400).unwrap(), true));
+            paused[leader].playing = false;
+            let commands = c.tick([&paused[0], &paused[1]], test_now());
+            let commands = [commands.primary, commands.secondary];
+            assert!(commands[leader].is_none());
+            assert!(matches!(
+                commands[1 - leader],
+                Some(PlaybackCommand::SeekPaused(_))
+            ));
+            assert!(!c.wants_playing());
+            assert_eq!(c.position_ms(), target + 400);
+        }
+    }
+
+    #[test]
+    fn failed_follow_keeps_live_position_and_explicit_peer_pause_remains_shared() {
+        for leader in 0..2 {
+            let target = START + 22_375;
+            let mut failed = controller(true);
+            let started = test_now();
+            failed
+                .follow_provider(leader, target, true, started)
+                .unwrap();
+            let empty = PlaybackState::default();
+            failed.tick([&empty, &empty], started + Duration::from_secs(31));
+            let current = target + 13_625;
+            let states = clocks().map(|clock| sample(clock.video_seconds(current).unwrap(), true));
+            let commands = failed.tick([&states[0], &states[1]], started + Duration::from_secs(32));
+            assert!(commands.primary.is_none() && commands.secondary.is_none());
+            assert_eq!(failed.position_ms(), current);
+            assert_eq!(failed.primary_seconds(), clocks()[0].video_seconds(current));
+            assert_eq!(failed.status(), Status::Failed(Error::TimedOut));
+
+            let mut following = controller(true);
+            following
+                .follow_provider(leader, target, true, test_now())
+                .unwrap();
+            let states = clocks().map(|clock| sample(clock.video_seconds(target).unwrap(), true));
+            following.tick([&states[0], &states[1]], test_now());
+            let mut paused =
+                clocks().map(|clock| sample(clock.video_seconds(target).unwrap(), true));
+            paused[1 - leader].playing = false;
+            paused[1 - leader].pause_intent = true;
+            paused[1 - leader].playback_intent = Some(false);
+            let waiting = following.tick([&paused[0], &paused[1]], test_now());
+            assert!(
+                waiting.primary.is_none() && waiting.secondary.is_none(),
+                "A pending native pause remains internal"
+            );
+            paused[1 - leader].playback_intent = None;
+            paused[1 - leader].mark_polled_at(test_now());
+            let shared = following.tick([&paused[0], &paused[1]], test_now());
+            assert!(matches!(shared.primary, Some(PlaybackCommand::Pause)));
+            assert!(matches!(shared.secondary, Some(PlaybackCommand::Pause)));
+            assert!(!following.wants_playing());
+            assert_eq!(following.provider_leader(), None);
+        }
     }
 
     #[test]
