@@ -4247,7 +4247,24 @@ mod tests {
         assert!(cancel.load(Ordering::Relaxed));
     }
 
+    thread_local! {
+        static PROVIDER_TEST_CLOCK: std::cell::Cell<Instant> = std::cell::Cell::new(
+            Instant::now() - Duration::from_secs(1)
+        );
+    }
+
+    fn provider_test_now() -> Instant {
+        PROVIDER_TEST_CLOCK.with(|clock| {
+            let next = clock.get() + Duration::from_millis(1);
+            clock.set(next);
+            next
+        })
+    }
+
     fn provider_review_fixture() -> (ReviewUi, Stream, Pull, Pull) {
+        // Keep test samples recent but strictly ordered even when Windows gives
+        // several back-to-back Instant::now() calls the same clock tick.
+        PROVIDER_TEST_CLOCK.with(|clock| clock.set(Instant::now() - Duration::from_secs(1)));
         let (mut review, first, stream) = fixture();
         let mut second = first.clone();
         second.id = 2;
@@ -4261,6 +4278,7 @@ mod tests {
         ui.active = true;
         ui.last_attempt = Some(Instant::now());
         ui.select(first.clone());
+        ui.range_epoch = provider_test_now();
         ui.loaded_events = vec![EventKind::Deaths, EventKind::Defensives];
         (ui, stream, first, second)
     }
@@ -4271,7 +4289,7 @@ mod tests {
         state.seconds = seconds;
         state.playing = playing;
         state.provider_seek_generation = Some(generation);
-        state.mark_polled_now();
+        state.mark_polled_at(provider_test_now());
         state
     }
 
@@ -4429,6 +4447,7 @@ mod tests {
         ui.observe_provider_playback(&provider_sample(start + 60.0, true, 0));
         let stale = provider_sample(start + 340.0, true, 1);
         ui.seek_absolute(first.start_ms + 80_000).unwrap();
+        ui.range_epoch = provider_test_now();
         ui.observe_provider_playback(&stale);
         assert_eq!(ui.pull.as_ref().unwrap().id, first.id);
         assert_eq!(ui.playback.as_ref().unwrap().seconds, start + 80.0);
@@ -4470,6 +4489,7 @@ mod tests {
             first.start_ms + 10_000,
             true,
         );
+        comparison.set_provider_epoch_for_test(provider_test_now());
         comparison.metadata_for_test().review = Some(secondary);
         (primary, comparison, first, second)
     }
@@ -4493,7 +4513,7 @@ mod tests {
                     .follow_provider_controls(
                         &mut primary,
                         [&baseline[0], &baseline[1]],
-                        Instant::now()
+                        provider_test_now()
                     )
                     .is_none());
                 let mut seeking = baseline.clone();
@@ -4502,7 +4522,7 @@ mod tests {
                     .follow_provider_controls(
                         &mut primary,
                         [&seeking[0], &seeking[1]],
-                        Instant::now(),
+                        provider_test_now(),
                     )
                     .unwrap();
                 let commands = [commands.primary, commands.secondary];
@@ -4556,11 +4576,15 @@ mod tests {
             comparison.follow_provider_controls(
                 &mut primary,
                 [&states[0], &states[1]],
-                Instant::now(),
+                provider_test_now(),
             );
             states[leader] = provider_sample(starts[leader] + 99.875, false, 1);
             let commands = comparison
-                .follow_provider_controls(&mut primary, [&states[0], &states[1]], Instant::now())
+                .follow_provider_controls(
+                    &mut primary,
+                    [&states[0], &states[1]],
+                    provider_test_now(),
+                )
                 .unwrap();
             assert!([commands.primary, commands.secondary][leader].is_none());
             assert!(matches!(
@@ -4594,13 +4618,13 @@ mod tests {
             comparison.follow_provider_controls(
                 &mut primary,
                 [&baseline[0], &baseline[1]],
-                Instant::now(),
+                provider_test_now(),
             );
             let mut gap = baseline.clone();
             gap[leader] = provider_sample(starts[leader] + 299.75, true, 1);
             for iteration in 0..3 {
                 let commands = comparison
-                    .follow_provider_controls(&mut primary, [&gap[0], &gap[1]], Instant::now())
+                    .follow_provider_controls(&mut primary, [&gap[0], &gap[1]], provider_test_now())
                     .unwrap();
                 let commands = [commands.primary, commands.secondary];
                 assert!(commands[leader].is_none());
@@ -4617,7 +4641,7 @@ mod tests {
             assert!(!comparison.unavailable_for_review(&primary));
             gap[leader] = provider_sample(starts[leader] + 300.1, true, 1);
             let commands = comparison
-                .follow_provider_controls(&mut primary, [&gap[0], &gap[1]], Instant::now())
+                .follow_provider_controls(&mut primary, [&gap[0], &gap[1]], provider_test_now())
                 .unwrap();
             assert!([commands.primary, commands.secondary][leader].is_none());
             assert!(matches!(
@@ -4647,11 +4671,11 @@ mod tests {
         comparison.follow_provider_controls(
             &mut primary,
             [&baseline[0], &baseline[1]],
-            Instant::now(),
+            provider_test_now(),
         );
         let target = provider_sample(start + 340.0, true, 1);
         let commands = comparison
-            .follow_provider_controls(&mut primary, [&target, &baseline[1]], Instant::now())
+            .follow_provider_controls(&mut primary, [&target, &baseline[1]], provider_test_now())
             .unwrap();
         assert!(commands.primary.is_none());
         assert!(matches!(commands.secondary, Some(PlaybackCommand::Pause)));

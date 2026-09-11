@@ -114,6 +114,11 @@ impl Drop for Comparison {
 
 impl Comparison {
     #[cfg(test)]
+    pub(crate) fn set_provider_epoch_for_test(&mut self, epoch: Instant) {
+        self.provider_seeks = std::array::from_fn(|_| ProviderSeekTracker::new(epoch));
+    }
+
+    #[cfg(test)]
     pub(crate) fn metadata_for_test(&mut self) -> &mut ReviewUi {
         &mut self.metadata
     }
