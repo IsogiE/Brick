@@ -558,8 +558,14 @@ impl StreamPlayer {
         }
     }
 
+    /// Conceal an existing comparison peer without unmapping its media document.
+    pub fn cover_for_fullscreen(&self, covered: bool) {
+        self.occlusion.cover_for_fullscreen(covered);
+    }
+
     pub fn set_visible(&self, visible: bool) {
         if !visible {
+            self.occlusion.cover_for_fullscreen(false);
             self.capture.cancel();
             self.exit_fullscreen();
         }

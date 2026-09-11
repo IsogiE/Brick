@@ -137,22 +137,40 @@ impl StreamsUi {
     }
 
     pub fn draw_fullscreen(&mut self, ui: &mut egui::Ui) {
-        let mut exit = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        // Let a fullscreen pull menu consume Escape before closing the video.
+        let mut exit = !egui::Popup::is_any_open(ui.ctx())
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let mut command = None;
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(12, 4))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                ui.spacing_mut().interact_size.y = 32.0;
                 ui.horizontal(|ui| {
-                    exit |= ui.button("Exit fullscreen").clicked();
-                    ui.label(RichText::new("Esc").small().color(MUTED));
+                    exit |= ui
+                        .add_sized(
+                            egui::vec2(128.0, 32.0),
+                            egui::Button::new("Exit fullscreen"),
+                        )
+                        .clicked();
+                    if self.review.active() {
+                        let width = ui.available_width().min(420.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(width, 32.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                command = self.review.draw_fullscreen_navigation(ui);
+                            },
+                        );
+                    }
                     let expanded = self
                         .comparison
                         .as_ref()
                         .and_then(|comparison| comparison.expanded_stream())
                         .or(self.selected.as_ref());
                     if let Some(stream) = expanded {
-                        ui.add_space(12.0);
-                        ui.add(
+                        ui.add_sized(
+                            egui::vec2(ui.available_width().max(0.0), 32.0),
                             egui::Label::new(format!(
                                 "{} · {}",
                                 stream.name,
@@ -163,6 +181,17 @@ impl StreamsUi {
                     }
                 });
             });
+        // Dispatch before either fullscreen branch: comparison maps the primary
+        // pull into both recordings, including when its secondary is expanded.
+        if let Some(command) = command {
+            if let Some(comparison) = &mut self.comparison {
+                comparison.command(command, &self.review);
+            } else if let Some(player) = &mut self.player {
+                if let Err(error) = player.command(command) {
+                    self.player_error = Some(error);
+                }
+            }
+        }
         let rect = ui.available_rect_before_wrap();
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
         if let Some(comparison) = self
@@ -170,8 +199,7 @@ impl StreamsUi {
             .as_mut()
             .filter(|comparison| comparison.fullscreen())
         {
-            comparison.fullscreen_rect(rect, exit);
-            self.player_rect = None;
+            self.player_rect = comparison.fullscreen_rect(rect, exit);
             return;
         }
         self.player_rect = Some(rect);
@@ -1228,7 +1256,11 @@ impl StreamsUi {
             .is_some_and(|comparison| comparison.fullscreen());
         let denied = if secondary_fullscreen && allowed {
             if let Some(player) = &self.player {
-                player.set_visible(false);
+                // Keep only the selected POV expanded if provider requests race.
+                player.exit_fullscreen();
+                // Keep the comparison decoder mapped beneath its expanded peer.
+                // Unmapping can make providers pause or buffer on fullscreen.
+                player.set_visible(!self.player_switch_pending);
             }
             false
         } else {
@@ -1244,10 +1276,12 @@ impl StreamsUi {
                 ctx,
                 &self.review,
                 self.preferences.clone(),
-                allowed && !denied && !primary_fullscreen,
+                allowed && !denied,
             );
+            comparison.cover_for_fullscreen(allowed && !denied && primary_fullscreen);
         }
         if let Some(player) = &self.player {
+            player.cover_for_fullscreen(allowed && !denied && secondary_fullscreen);
             player.update_overlays(ctx);
         }
         if let Some(comparison) = &self.comparison {
@@ -1775,6 +1809,40 @@ mod tests {
                 });
             },
         );
+    }
+
+    #[test]
+    fn fullscreen_toolbar_keeps_video_bounds_stable_with_long_pov_name() {
+        for width in [720.0, 980.0, 1920.0] {
+            let mut host = super::StreamsUi::default();
+            let mut stream = recording("987", "1").as_stream();
+            stream.name =
+                "A player with a very long display name that must fit the fullscreen toolbar"
+                    .into();
+            host.selected = Some(stream);
+            host.review.open_recording();
+            let ctx = egui::Context::default();
+            let mut previous = None;
+            for _ in 0..3 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 560.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| host.draw_fullscreen(ui),
+                );
+                let video = host.player_rect.unwrap();
+                assert!(video.top() <= 56.0 && video.left() >= 0.0 && video.right() <= width);
+                if let Some(previous) = previous {
+                    assert_eq!(video, previous);
+                }
+                previous = Some(video);
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "Choose a pull")));
+            }
+        }
     }
 
     #[test]

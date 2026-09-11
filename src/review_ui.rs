@@ -1174,6 +1174,69 @@ impl ReviewUi {
         self.popup_open = false;
     }
 
+    /// Fullscreen uses the same pull selection and native seek as the workspace.
+    /// This returns a command without closing or rebuilding either video child.
+    pub(crate) fn draw_fullscreen_navigation(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> Option<PlaybackCommand> {
+        let pulls = self
+            .review
+            .as_ref()
+            .map(|review| review.pulls.as_slice())
+            .unwrap_or_default();
+        let current = self.pull.as_ref().and_then(|selected| {
+            pulls
+                .iter()
+                .position(|pull| pull.report == selected.report && pull.id == selected.id)
+        });
+        let mut chosen = None;
+        let button_width =
+            (ui.available_width() - 56.0 - 2.0 * ui.spacing().item_spacing.x).max(80.0);
+        if ui
+            .add_enabled_ui(current.is_some_and(|index| index > 0), |ui| {
+                ui.add_sized(egui::vec2(28.0, 32.0), egui::Button::new("‹"))
+            })
+            .inner
+            .on_hover_text("Previous pull")
+            .clicked()
+        {
+            chosen = current.map(|index| index - 1);
+        }
+        chosen = draw_pull_selector_sized(
+            ui,
+            pulls,
+            current,
+            &mut self.pull_menu_cursor,
+            None,
+            button_width,
+        )
+        .or(chosen);
+        if ui
+            .add_enabled_ui(current.is_some_and(|index| index + 1 < pulls.len()), |ui| {
+                ui.add_sized(egui::vec2(28.0, 32.0), egui::Button::new("›"))
+            })
+            .inner
+            .on_hover_text("Next pull")
+            .clicked()
+        {
+            chosen = current.map(|index| index + 1);
+        }
+        self.popup_open = egui::Popup::is_any_open(ui.ctx());
+        let selected = chosen
+            .filter(|index| Some(*index) != current)
+            .and_then(|index| pulls.get(index))
+            .cloned()?;
+        self.navigate_pull(selected)
+    }
+
+    fn navigate_pull(&mut self, pull: Pull) -> Option<PlaybackCommand> {
+        self.select(pull);
+        self.playback
+            .as_ref()
+            .map(|playback| PlaybackCommand::Seek(playback.seconds))
+    }
+
     pub fn draw_workspace(
         &mut self,
         ui: &mut egui::Ui,
@@ -1336,11 +1399,7 @@ impl ReviewUi {
         // a popup closes; use its actual state for marker synchronization.
         self.popup_open = egui::Popup::is_any_open(ui.ctx());
         if let Some(i) = selected.filter(|i| Some(*i) != index) {
-            self.select(pulls[i].clone());
-            action.command = self
-                .playback
-                .as_ref()
-                .map(|p| PlaybackCommand::Seek(p.seconds));
+            action.command = self.navigate_pull(pulls[i].clone());
         }
         let coverage_context = self.pov_selection_context(state).map(|(pull, at_ms)| {
             let at_ms = if action.command.is_some() {
@@ -2979,6 +3038,17 @@ fn draw_pull_selector(
     cursor: &mut Option<usize>,
     pending_label: Option<&str>,
 ) -> Option<usize> {
+    draw_pull_selector_sized(ui, pulls, current, cursor, pending_label, 352.0)
+}
+
+fn draw_pull_selector_sized(
+    ui: &mut egui::Ui,
+    pulls: &[Pull],
+    current: Option<usize>,
+    cursor: &mut Option<usize>,
+    pending_label: Option<&str>,
+    button_width: f32,
+) -> Option<usize> {
     let popup_id = ui.make_persistent_id("review-pull-menu");
     let was_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
     if pulls.is_empty() && was_open {
@@ -3042,7 +3112,7 @@ fn draw_pull_selector(
     let button = ui
         .add_enabled_ui(!pulls.is_empty(), |ui| {
             ui.add_sized(
-                egui::vec2(352.0, ui.spacing().interact_size.y),
+                egui::vec2(button_width, ui.spacing().interact_size.y),
                 egui::Button::new(&primary_label)
                     .right_text(
                         outcome
@@ -4684,6 +4754,178 @@ mod tests {
             "Keep the user's controlling VOD open"
         );
         assert!(primary.playback.as_ref().unwrap().autoplay);
+    }
+
+    struct FullscreenPullHarness {
+        ctx: egui::Context,
+        review: ReviewUi,
+        width: f32,
+        navigation: egui::Rect,
+        popup: egui::Id,
+    }
+    impl FullscreenPullHarness {
+        fn new(review: ReviewUi, width: f32) -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                review,
+                width,
+                navigation: egui::Rect::NOTHING,
+                popup: egui::Id::NULL,
+            }
+        }
+        fn frame(&mut self, events: Vec<egui::Event>) -> Option<PlaybackCommand> {
+            let mut command = None;
+            let _ = self.ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(self.width, 560.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.spacing_mut().interact_size.y = 32.0;
+                    ui.horizontal(|ui| {
+                        ui.add_space(144.0);
+                        let response = ui.allocate_ui_with_layout(
+                            egui::vec2(420.0, 32.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                self.popup = ui.make_persistent_id("review-pull-menu");
+                                command = self.review.draw_fullscreen_navigation(ui);
+                            },
+                        );
+                        self.navigation = response.response.rect;
+                    });
+                    // The video is drawn after the toolbar; the pull popup must
+                    // remain in a higher egui layer over its native-player region.
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(0.0, 44.0),
+                            egui::pos2(self.width, 560.0),
+                        ),
+                        0.0,
+                        Color32::BLACK,
+                    );
+                },
+            );
+            command
+        }
+        fn click(&mut self, pos: egui::Pos2) -> Option<PlaybackCommand> {
+            self.frame(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            self.frame(vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }])
+        }
+        fn key(&mut self, key: egui::Key) -> Option<PlaybackCommand> {
+            let command = self.frame(vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            self.frame(vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            command
+        }
+    }
+
+    #[test]
+    fn fullscreen_pull_controls_navigate_without_reload_and_keep_popup_above_video() {
+        for width in [720.0, 980.0, 1920.0] {
+            let (review, _, first, second) = provider_review_fixture();
+            let mut fullscreen = FullscreenPullHarness::new(review, width);
+            fullscreen.frame(vec![]);
+            let initial = fullscreen.navigation;
+            assert!((initial.width() - 420.0).abs() < 1.0 && initial.height() <= 32.0);
+            assert!(initial.right() <= width && initial.left() >= 144.0);
+            let next = fullscreen.click(egui::pos2(initial.right() - 14.0, initial.center().y));
+            let expected = fullscreen
+                .review
+                .review
+                .as_ref()
+                .unwrap()
+                .pull_video_start(&second);
+            assert!(matches!(next, Some(PlaybackCommand::Seek(seconds)) if seconds == expected));
+            assert_eq!(fullscreen.review.pull.as_ref().unwrap().id, second.id);
+            assert!(fullscreen.review.active() && fullscreen.review.playback().is_some());
+            assert_eq!(fullscreen.navigation, initial);
+            assert!(
+                fullscreen
+                    .click(egui::pos2(initial.right() - 14.0, initial.center().y))
+                    .is_none(),
+                "Last pull disables Next"
+            );
+            let previous = fullscreen.click(egui::pos2(initial.left() + 14.0, initial.center().y));
+            assert!(matches!(previous, Some(PlaybackCommand::Seek(_))));
+            assert_eq!(fullscreen.review.pull.as_ref().unwrap().id, first.id);
+            fullscreen.click(initial.center());
+            fullscreen.frame(vec![]);
+            assert!(fullscreen.review.popup_open);
+            let popup = fullscreen.ctx.read_response(fullscreen.popup).unwrap().rect;
+            assert!(popup.top() >= initial.bottom() && popup.bottom() <= 560.0);
+            assert!(popup.left() >= 0.0 && popup.right() <= width);
+            assert_eq!(
+                fullscreen.ctx.layer_id_at(popup.center()).unwrap().order,
+                egui::Order::Foreground
+            );
+            assert_eq!(
+                fullscreen.navigation, initial,
+                "Opening the menu cannot resize the video toolbar"
+            );
+            fullscreen.key(egui::Key::End);
+            let chosen = fullscreen.key(egui::Key::Enter);
+            assert!(matches!(chosen, Some(PlaybackCommand::Seek(seconds)) if seconds == expected));
+            assert_eq!(fullscreen.review.pull.as_ref().unwrap().id, second.id);
+            assert!(!egui::Popup::is_id_open(&fullscreen.ctx, fullscreen.popup));
+        }
+    }
+
+    #[test]
+    fn fullscreen_pull_selection_uses_existing_comparison_clock_mapping() {
+        let (review, mut comparison, first, second) = provider_comparison_fixture();
+        let mut fullscreen = FullscreenPullHarness::new(review, 980.0);
+        fullscreen.frame(vec![]);
+        let bar = fullscreen.navigation;
+        let command = fullscreen
+            .click(egui::pos2(bar.right() - 14.0, bar.center().y))
+            .unwrap();
+        comparison.command(command, &fullscreen.review);
+        assert_eq!(comparison.position(), (second.start_ms, true));
+        let at_ms = comparison.position().0;
+        let peer = comparison.metadata_for_test().review.as_ref().unwrap();
+        assert_eq!(
+            crate::review_compare_ui::recording_clock(peer, &second)
+                .unwrap()
+                .video_seconds(at_ms),
+            Some(peer.pull_video_start(&second))
+        );
+        assert!(fullscreen.review.comparing && fullscreen.review.active());
+        fullscreen.frame(vec![]); // Paint the newly enabled Previous button.
+        let command = fullscreen
+            .click(egui::pos2(bar.left() + 14.0, bar.center().y))
+            .unwrap();
+        comparison.command(command, &fullscreen.review);
+        assert_eq!(comparison.position(), (first.start_ms, true));
+        assert!(fullscreen.review.playback().is_some());
     }
 
     #[test]

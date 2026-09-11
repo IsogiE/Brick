@@ -156,12 +156,17 @@ impl Comparison {
             .is_some_and(StreamPlayer::is_fullscreen)
     }
 
-    pub fn fullscreen_rect(&mut self, rect: egui::Rect, exit: bool) {
-        self.rect = Some(rect);
+    pub fn fullscreen_rect(&mut self, rect: egui::Rect, exit: bool) -> Option<egui::Rect> {
         if exit {
             if let Some(player) = &self.player {
                 player.exit_fullscreen();
             }
+            // The native flag changes before this frame's player update. Give
+            // both panes valid bounds now so the host cannot discard the pair.
+            self.split_video(Some(rect))
+        } else {
+            self.rect = Some(rect);
+            None
         }
     }
 
@@ -220,6 +225,12 @@ impl Comparison {
             player.set_visible(false);
         }
         self.metadata.tick(ctx, Some(&self.selected));
+    }
+
+    pub fn cover_for_fullscreen(&self, covered: bool) {
+        if let Some(player) = &self.player {
+            player.cover_for_fullscreen(covered);
+        }
     }
 
     pub fn update_overlays(&self, ctx: &egui::Context) {
@@ -1373,6 +1384,37 @@ mod tests {
             assert_eq!(primary.width(), secondary.width());
             assert_eq!(secondary.left() - primary.right(), 10.0);
             assert!(!primary.intersects(secondary));
+        }
+    }
+
+    #[test]
+    fn secondary_fullscreen_exit_restores_both_bounds_in_the_same_frame() {
+        for playing in [false, true] {
+            let mut comparison = Comparison::new(&ReviewUi::default(), stream(), 137_625, playing);
+            for width in [720.0, 980.0, 1920.0] {
+                let video =
+                    egui::Rect::from_min_max(egui::pos2(0.0, 48.0), egui::pos2(width, 720.0));
+                let normal = comparison.split_video(Some(video)).unwrap();
+                let controller = comparison.controller.as_ref().map(Controller::position_ms);
+                assert!(comparison.fullscreen_rect(video, false).is_none());
+                assert_eq!(comparison.rect, Some(video));
+                // StreamsUi stores this result before returning from its
+                // fullscreen draw and immediately updating native players.
+                let primary = comparison
+                    .fullscreen_rect(video, true)
+                    .expect("Exiting must not leave the host's primary player rectangle empty");
+                assert_eq!(primary, normal);
+                let secondary = comparison.rect.unwrap();
+                assert!(video.contains_rect(primary) && video.contains_rect(secondary));
+                assert!(primary.is_positive() && secondary.is_positive());
+                assert!(!primary.intersects(secondary));
+                assert_eq!(comparison.position(), (137_625, playing));
+                assert_eq!(
+                    comparison.controller.as_ref().map(Controller::position_ms),
+                    controller
+                );
+                assert!(!comparison.cancelled.load(Ordering::Relaxed));
+            }
         }
     }
 
