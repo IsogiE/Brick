@@ -180,7 +180,9 @@ impl StreamsUi {
                 player.exit_fullscreen();
             }
             if self.review.active() {
-                if let Some(command) = self.review.pause_at_pull_end(&player.playback_state()) {
+                let state = player.playback_state();
+                self.review.observe_provider_playback(&state);
+                if let Some(command) = self.review.pause_at_pull_end(&state) {
                     if let Some(comparison) = &mut self.comparison {
                         comparison.command(command, &self.review);
                     } else if let Err(error) = player.command(command) {
@@ -420,6 +422,12 @@ impl StreamsUi {
         if let Some(player) = &mut self.player {
             if self.review.active() {
                 player.poll_playback(ctx);
+                if !self.player_switch_pending {
+                    // Follow native VOD controls before any pull-boundary check,
+                    // including fullscreen frames where the timeline is hidden.
+                    self.review
+                        .observe_provider_playback(&player.playback_state());
+                }
             }
             crate::stream_player::pump_events();
         }
@@ -440,7 +448,7 @@ impl StreamsUi {
             comparison.tick(
                 ctx,
                 self.player.as_mut().filter(|_| !self.player_switch_pending),
-                &self.review,
+                &mut self.review,
             );
         }
         self.leave_unavailable_comparison();

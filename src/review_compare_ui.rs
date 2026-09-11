@@ -54,6 +54,56 @@ pub(crate) struct Comparison {
     error: Option<String>,
     search: String,
     popup: bool,
+    provider_seeks: [ProviderSeekTracker; 2],
+    provider_navigation: Option<ProviderNavigation>,
+}
+
+struct ProviderNavigation {
+    side: usize,
+    processed: Option<Instant>,
+    peer_held: bool,
+}
+
+struct ProviderSeekTracker {
+    epoch: Instant,
+    observed: Option<(Instant, f64, Option<u64>, bool)>,
+}
+impl ProviderSeekTracker {
+    fn new(epoch: Instant) -> Self {
+        Self {
+            epoch,
+            observed: None,
+        }
+    }
+    fn observe(&mut self, state: &PlaybackState) -> bool {
+        if !state.is_fresh_after(self.epoch) || !state.seconds.is_finite() {
+            return false;
+        }
+        let Some([at, _]) = state.observation_window() else {
+            return false;
+        };
+        if self.observed.is_some_and(|(previous, ..)| at <= previous) {
+            return false;
+        }
+        if !state.ready || state.seeking.is_some() || state.playback_intent.is_some() {
+            self.observed = None;
+            return false;
+        }
+        let seeking = state.diagnostics.media_seeking == Some(true);
+        let gesture = self
+            .observed
+            .is_some_and(|(previous, seconds, generation, was_seeking)| {
+                generation
+                    .zip(state.provider_seek_generation)
+                    .is_some_and(|(old, new)| old != new)
+                    || (seeking && !was_seeking)
+                    || state.seconds < seconds - 1.0
+                    || state.seconds
+                        > seconds + at.saturating_duration_since(previous).as_secs_f64() * 2.0 + 1.0
+            });
+        self.observed = Some((at, state.seconds, state.provider_seek_generation, seeking));
+        gesture
+    }
 }
 
 impl Drop for Comparison {
@@ -86,6 +136,8 @@ impl Comparison {
             error: None,
             search: String::new(),
             popup: false,
+            provider_seeks: std::array::from_fn(|_| ProviderSeekTracker::new(Instant::now())),
+            provider_navigation: None,
         }
     }
 
@@ -149,6 +201,7 @@ impl Comparison {
 
     fn choose_secondary(&mut self, ctx: &egui::Context, stream: Stream) {
         self.save_position();
+        self.reset_provider_navigation();
         self.selected = stream;
         self.controller = None;
         self.clock_versions = None;
@@ -177,6 +230,15 @@ impl Comparison {
             .map_or(self.desired.1, Controller::wants_playing);
         // The barrier's temporary pauses must not look like a user Pause.
         state.playback_intent = Some(intent);
+        if let Some(controller) = self
+            .controller
+            .as_ref()
+            .filter(|c| c.provider_leader() == Some(1))
+        {
+            // The leader's selected instant is pending in the primary footage,
+            // not a fabricated settled SDK sample.
+            state.seeking = controller.primary_seconds();
+        }
         // Preserve the primary's actual SDK position and buffering state.
         // Marking it buffering because only its peer is catching up made the
         // timeline discard that position and fall back to the initial target.
@@ -190,6 +252,14 @@ impl Comparison {
     }
 
     pub fn unavailable_for_review(&self, primary: &ReviewUi) -> bool {
+        if self.provider_navigation.is_some()
+            || self
+                .controller
+                .as_ref()
+                .is_some_and(|c| c.provider_leader().is_some())
+        {
+            return false;
+        }
         let Some((_, pull)) = primary.comparison_context() else {
             return false;
         };
@@ -292,6 +362,7 @@ impl Comparison {
 
     pub fn primary_changed(&mut self) {
         self.save_position();
+        self.reset_provider_navigation();
         self.controller = None;
         self.clock_versions = None;
         self.primary_key.clear();
@@ -302,6 +373,7 @@ impl Comparison {
     }
 
     pub fn command(&mut self, command: PlaybackCommand, review: &ReviewUi) {
+        self.reset_provider_navigation();
         self.metadata.cancel_marker(self.player.as_ref());
         let now = Instant::now();
         if let Some((metadata, pull)) = review.comparison_context() {
@@ -350,7 +422,7 @@ impl Comparison {
         &mut self,
         ctx: &egui::Context,
         primary: Option<&mut StreamPlayer>,
-        review: &ReviewUi,
+        review: &mut ReviewUi,
     ) {
         self.metadata.tick(ctx, Some(&self.selected));
         if self.metadata.comparison_metadata().is_none() {
@@ -372,6 +444,23 @@ impl Comparison {
             }
             return;
         };
+        if !self.navigating {
+            if let Some(secondary) = &self.player {
+                let states = [primary.playback_state(), secondary.playback_state()];
+                let now = Instant::now();
+                if let Some(commands) =
+                    self.follow_provider_controls(review, [&states[0], &states[1]], now)
+                {
+                    self.consume_native_commands(&commands, now);
+                    if let Some(secondary) = &mut self.player {
+                        if let Err(error) = apply_commands(commands, primary, secondary) {
+                            self.error = Some(error);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
         let Some((primary_review, pull)) = review.comparison_context() else {
             pause_if_needed(primary);
             if let Some(secondary) = &mut self.player {
@@ -458,18 +547,156 @@ impl Comparison {
             [&primary.playback_state(), &secondary.playback_state()],
             Instant::now(),
         );
-        if matches!(controller.status(), Status::Failed(_)) {
+        if matches!(controller.status(), Status::Failed(_))
+            && controller.provider_leader().is_none()
+        {
             // Native commands already have their own bounded retry. A failed
             // pair holds its current frames; the ordinary Play/Seek controls
             // can start a fresh barrier without a second recovery loop.
             controller.set_playing(false, Instant::now());
         }
         self.desired = (controller.position_ms(), controller.wants_playing());
+        for (side, command) in [commands.primary, commands.secondary]
+            .into_iter()
+            .enumerate()
+        {
+            if matches!(
+                command,
+                Some(PlaybackCommand::Seek(_) | PlaybackCommand::SeekPaused(_))
+            ) {
+                self.provider_seeks[side] = ProviderSeekTracker::new(Instant::now());
+            }
+        }
         if let Err(error) = apply_commands(commands, primary, secondary) {
             self.error = Some(error);
             pause_if_needed(primary);
             pause_if_needed(secondary);
         }
+    }
+
+    fn reset_provider_navigation(&mut self) {
+        self.provider_navigation = None;
+        self.provider_seeks = std::array::from_fn(|_| ProviderSeekTracker::new(Instant::now()));
+    }
+
+    fn consume_native_commands(&mut self, commands: &Commands, now: Instant) {
+        for (side, command) in [commands.primary, commands.secondary]
+            .into_iter()
+            .enumerate()
+        {
+            if matches!(
+                command,
+                Some(PlaybackCommand::Seek(_) | PlaybackCommand::SeekPaused(_))
+            ) {
+                self.provider_seeks[side] = ProviderSeekTracker::new(now);
+            }
+        }
+    }
+
+    /// Observe real provider controls before the normal drift/barrier policy.
+    /// Returns commands only while handling a gesture, gap or unavailable peer.
+    pub(crate) fn follow_provider_controls(
+        &mut self,
+        review: &mut ReviewUi,
+        states: [&PlaybackState; 2],
+        now: Instant,
+    ) -> Option<Commands> {
+        let mut latest = None;
+        for side in 0..2 {
+            if self.provider_seeks[side].observe(states[side]) {
+                let at = states[side].observation_window().unwrap()[0];
+                if latest.is_none_or(|(_, previous)| at > previous) {
+                    latest = Some((side, at));
+                }
+            }
+        }
+        if let Some((side, _)) = latest {
+            self.provider_navigation = Some(ProviderNavigation {
+                side,
+                processed: None,
+                peer_held: false,
+            });
+        }
+        let pending = self.provider_navigation.as_mut()?;
+        let side = pending.side;
+        let state = states[side];
+        let hold_peer = |pending: &mut ProviderNavigation| {
+            if pending.peer_held {
+                return Commands::default();
+            }
+            pending.peer_held = true;
+            if side == 0 {
+                Commands {
+                    primary: None,
+                    secondary: Some(PlaybackCommand::Pause),
+                }
+            } else {
+                Commands {
+                    primary: Some(PlaybackCommand::Pause),
+                    secondary: None,
+                }
+            }
+        };
+        if !state.ready
+            || !state.is_fresh()
+            || state.buffering
+            || state.blocked
+            || state.seeking.is_some()
+            || state.playback_intent.is_some()
+            || state.diagnostics.media_seeking == Some(true)
+        {
+            return Some(hold_peer(pending));
+        }
+        let at = state.observation_window()?[0];
+        if pending.processed.is_some_and(|previous| at <= previous) {
+            return Some(Commands::default());
+        }
+        pending.processed = Some(at);
+        let target = review
+            .comparison_metadata()
+            .zip(self.metadata.comparison_metadata())
+            .and_then(|(primary, secondary)| {
+                provider_target([primary, secondary], side, state.seconds)
+            });
+        let Some((selected, clocks, at_ms)) = target else {
+            self.controller = None;
+            self.error = None;
+            // No shared pull exists at this footage. Keep the controlling VOD
+            // playing and wait for its next known shared pull without a worker.
+            review.follow_comparison_position(None, states[0].seconds, state.playing);
+            return Some(hold_peer(pending));
+        };
+        let playing = state.playing;
+        let primary_seconds = clocks[0].video_seconds(at_ms)?;
+        review.follow_comparison_position(Some(selected.clone()), primary_seconds, playing);
+        self.desired = (at_ms, playing);
+        self.error = None;
+        if let Some((metadata, pull)) = review.comparison_context() {
+            if self.refresh_clocks(metadata, pull, now).is_err() {
+                return Some(Commands::default());
+            }
+        }
+        if self.controller.is_none() {
+            self.controller = Controller::new(
+                clocks,
+                [selected.start_ms, selected.end_ms],
+                at_ms,
+                playing,
+                now,
+            )
+            .ok();
+        }
+        let controller = self.controller.as_mut()?;
+        if controller
+            .follow_provider(side, at_ms, playing, now)
+            .is_err()
+        {
+            return Some(Commands::default());
+        }
+        self.provider_navigation = None;
+        let commands = controller.tick(states, now);
+        self.desired = (controller.position_ms(), controller.wants_playing());
+        Some(commands)
     }
 
     fn refresh_clocks(
@@ -712,6 +939,34 @@ pub(crate) fn recording_clock(review: &Review, pull: &Pull) -> Result<RecordingC
         review.replay.available_seconds as f64,
     )
     .map_err(|e| e.to_string())
+}
+
+fn provider_target(
+    reviews: [&Review; 2],
+    side: usize,
+    seconds: f64,
+) -> Option<(Pull, [RecordingClock; 2], i64)> {
+    let source = *reviews.get(side)?;
+    let source_pull = source.pulls.iter().find(|pull| {
+        let start = source.pull_video_start(pull);
+        seconds >= start && seconds < start + (pull.end_ms - pull.start_ms) as f64 / 1000.0
+    })?;
+    let selected = matching_pull(reviews[0], source_pull)?;
+    let secondary = matching_pull(reviews[1], source_pull)?;
+    let clocks = [
+        recording_clock(reviews[0], selected).ok()?,
+        recording_clock(reviews[1], secondary).ok()?,
+    ];
+    let at_ms = clocks[side].encounter_ms(seconds)?;
+    if at_ms < selected.start_ms
+        || at_ms >= selected.end_ms
+        || clocks
+            .iter()
+            .any(|clock| clock.video_seconds(at_ms).is_none())
+    {
+        return None;
+    }
+    Some((selected.clone(), clocks, at_ms))
 }
 
 fn matching_pull<'a>(review: &'a Review, selected: &Pull) -> Option<&'a Pull> {
@@ -968,6 +1223,39 @@ mod tests {
     }
 
     #[test]
+    fn brick_pause_after_provider_follow_timeout_stops_both_once_without_seeking() {
+        for leader in 0..2 {
+            let (reviews, pull) = timing_reviews();
+            let clocks =
+                std::array::from_fn(|side| recording_clock(&reviews[side], &pull).unwrap());
+            let at_ms = pull.start_ms + 12_375;
+            let now = test_now();
+            let mut controller =
+                Controller::new(clocks, [pull.start_ms, pull.end_ms], at_ms, true, now).unwrap();
+            controller
+                .follow_provider(leader, at_ms, true, now)
+                .unwrap();
+            let empty = PlaybackState::default();
+            let timeout = now + std::time::Duration::from_secs(31);
+            let commands = controller.tick([&empty, &empty], timeout);
+            assert!([commands.primary, commands.secondary][leader].is_none());
+            assert_eq!(controller.provider_leader(), Some(leader));
+            assert!(matches!(controller.status(), Status::Failed(_)));
+            let mut comparison = Comparison::new(&ReviewUi::default(), stream(), at_ms, true);
+            comparison.controller = Some(controller);
+            comparison.command(PlaybackCommand::Pause, &ReviewUi::default());
+            assert_eq!(comparison.position(), (at_ms, false));
+            let controller = comparison.controller.as_mut().unwrap();
+            assert_eq!(controller.provider_leader(), None);
+            let commands = controller.tick([&empty, &empty], test_now());
+            assert!(matches!(commands.primary, Some(PlaybackCommand::Pause)));
+            assert!(matches!(commands.secondary, Some(PlaybackCommand::Pause)));
+            let repeated = controller.tick([&empty, &empty], test_now());
+            assert!(repeated.primary.is_none() && repeated.secondary.is_none());
+        }
+    }
+
+    #[test]
     fn ordinary_play_rearms_failed_pair_at_its_existing_canonical_moment() {
         let (reviews, pull) = timing_reviews();
         let clocks = std::array::from_fn(|i| recording_clock(&reviews[i], &pull).unwrap());
@@ -1015,6 +1303,45 @@ mod tests {
             status: streams::Status::Offline,
             broadcast_state: None,
         }
+    }
+
+    #[test]
+    fn provider_seek_tracker_retains_short_gestures_and_consumes_native_acknowledgements() {
+        let mut tracker = ProviderSeekTracker::new(test_now());
+        let sample = |seconds, generation, seeking| {
+            let mut state = PlaybackState::default();
+            state.ready = true;
+            state.seconds = seconds;
+            state.provider_seek_generation = Some(generation);
+            state.diagnostics.media_seeking = Some(seeking);
+            state.mark_polled_at(test_now());
+            state
+        };
+        assert!(!tracker.observe(&sample(100.0, 0, false)));
+        let moving = sample(101.0, 1, true);
+        assert!(tracker.observe(&moving));
+        assert!(!tracker.observe(&moving), "The same poll is observed once");
+        assert!(
+            !tracker.observe(&sample(101.0, 1, true)),
+            "Seeking state does not repeat the gesture"
+        );
+        assert!(!tracker.observe(&sample(101.0, 1, false)));
+        assert!(
+            tracker.observe(&sample(101.1, 2, false)),
+            "Short completed seeks survive between polls"
+        );
+        let stale = sample(300.0, 3, false);
+        tracker = ProviderSeekTracker::new(test_now());
+        assert!(!tracker.observe(&stale));
+        let mut native = sample(300.0, 3, true);
+        native.seeking = Some(300.0);
+        native.playback_intent = Some(true);
+        assert!(!tracker.observe(&native));
+        assert!(
+            !tracker.observe(&sample(300.0, 4, false)),
+            "A native seek ACK establishes the new baseline"
+        );
+        assert!(tracker.observe(&sample(301.0, 5, false)));
     }
 
     #[test]

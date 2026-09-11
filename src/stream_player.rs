@@ -24,6 +24,8 @@ mod diagnostics;
 mod fullscreen;
 mod occlusion;
 mod resize;
+#[cfg(target_os = "windows")]
+pub(crate) mod windows_profile;
 pub use capture::FrameCapture;
 
 const WRAPPER_LOAD_TIMEOUT: Duration = Duration::from_secs(25);
@@ -93,6 +95,8 @@ pub struct PlaybackState {
     pub playing: bool,
     pub buffering: bool,
     pub decoded: Option<bool>,
+    /// Monotonic (wrapping) media seek evidence, sampled by the existing clock relay.
+    pub provider_seek_generation: Option<u64>,
     pub blocked: bool,
     pub sync_ready: Option<bool>,
     pub diagnostics: diagnostics::Stats,
@@ -163,6 +167,8 @@ pub enum PlaybackCommand {
 pub struct StreamPlayer {
     _cache_usage: crate::cache_maintenance::PlayerLease,
     webview: Option<WebView>,
+    #[cfg(target_os = "windows")]
+    _web_context: wry::WebContext,
     allowed_url: Arc<Mutex<String>>,
     bounds: [i32; 4],
     visible: Cell<bool>,
@@ -253,7 +259,15 @@ impl StreamPlayer {
             player_url.as_str(),
             preferences.unwrap_or_else(Preferences::in_memory),
         ));
-        let builder = WebViewBuilder::new()
+        // Never let a machine-wide install put browser data in Program Files.
+        // Keep this context alive with its child, including in private mode.
+        #[cfg(target_os = "windows")]
+        let mut web_context = windows_profile::context()?;
+        #[cfg(target_os = "windows")]
+        let builder = WebViewBuilder::new_with_web_context(&mut web_context);
+        #[cfg(not(target_os = "windows"))]
+        let builder = WebViewBuilder::new();
+        let builder = builder
             .with_bounds(wry_bounds(bounds))
             .with_incognito(true)
             .with_autoplay(true)
@@ -359,6 +373,8 @@ impl StreamPlayer {
         let player = Self {
             _cache_usage: cache_usage,
             webview: Some(webview),
+            #[cfg(target_os = "windows")]
+            _web_context: web_context,
             allowed_url,
             bounds,
             visible: Cell::new(true),
@@ -2309,6 +2325,8 @@ mod tests {
         let mut player = StreamPlayer {
             _cache_usage: crate::cache_maintenance::PlayerLease::new(),
             webview: None,
+            #[cfg(target_os = "windows")]
+            _web_context: wry::WebContext::default(),
             allowed_url: Arc::new(Mutex::new(String::new())),
             preferences: None,
             playback_state: Arc::new(Mutex::new(PlaybackState::default())),

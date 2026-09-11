@@ -532,6 +532,8 @@ mod tests {
                         view.focus_parent().unwrap();
                         let player = super::super::StreamPlayer {
                             _cache_usage: crate::cache_maintenance::PlayerLease::new(),
+                            #[cfg(target_os = "windows")]
+                            _web_context: wry::WebContext::default(),
                             webview: Some(view), allowed_url: Arc::new(Mutex::new(String::new())), bounds: super::super::physical_bounds(rect, ctx.pixels_per_point()).unwrap(), visible: Cell::new(true), loaded: Arc::new(std::sync::atomic::AtomicBool::new(true)), created: Instant::now(), failure: Arc::new(Mutex::new(None)), preferences: None, playback_state: Arc::new(Mutex::new(super::super::PlaybackState::default())), last_state_poll: None, state_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)), queued_command: None, ready_since: None, pending_seek: None, pending_playback: None, command_retried: false, capture: super::super::capture::Controller::default(), fullscreen, occlusion: super::super::occlusion::Controller::default(),
                             #[cfg(target_os = "linux")]
                             preference_handler: None,

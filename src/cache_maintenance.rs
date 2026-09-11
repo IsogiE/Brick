@@ -69,13 +69,11 @@ pub(crate) fn start() {
 #[cfg(target_os = "windows")]
 fn cache_roots() -> Vec<PathBuf> {
     let mut profiles = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(name) = exe.file_name() {
-            let mut name = name.to_os_string();
-            name.push(".WebView2");
-            profiles.push(exe.with_file_name(name).join("EBWebView"));
-        }
+    if let Ok(path) = crate::stream_player::windows_profile::data_directory() {
+        profiles.push(path.join("EBWebView"));
     }
+    // Older current-user installs used this location. Never clean caches in a
+    // shared Program Files install, where another Windows user may be active.
     if let Some(local) = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -328,6 +326,18 @@ mod tests {
             entries: 100,
             budget: Duration::from_secs(5),
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_cache_roots_cover_the_explicit_profile_and_stay_per_user() {
+        let profile = crate::stream_player::windows_profile::data_directory().unwrap();
+        let roots = cache_roots();
+        let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+        assert!(roots.contains(&profile.join("EBWebView/Default/Cache")));
+        assert!(roots.iter().all(|root| root.starts_with(&local)));
+        assert!(!roots.contains(&profile));
+        assert!(!roots.contains(&profile.join("EBWebView/Default")));
     }
 
     #[test]

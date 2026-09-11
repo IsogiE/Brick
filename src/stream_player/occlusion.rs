@@ -5,6 +5,9 @@ use eframe::egui;
 use std::cell::RefCell;
 use wry::WebView;
 
+#[cfg(target_os = "windows")]
+mod windows_focus;
+
 #[derive(Default)]
 pub(super) struct Controller {
     applied: RefCell<Option<([i32; 4], Vec<[i32; 4]>)>>,
@@ -14,6 +17,8 @@ pub(super) struct Controller {
 
 impl Controller {
     pub fn update(&self, view: &WebView, ctx: &egui::Context, bounds: [i32; 4]) {
+        #[cfg(target_os = "windows")]
+        windows_focus::update(view, ctx);
         let cuts = overlay_rects(ctx, bounds);
         let mut applied = self.applied.borrow_mut();
         if applied
