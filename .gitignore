@@ -3,8 +3,10 @@ node_modules/
 target/
 .release/
 *.log
-presence/.env
-presence/secrets/
+**/.env
+**/secrets/
+.local-docs/
+windows-smoke/
 
 # Keep investigation notes local; retain the public project documents below.
 *.[mM][dD]
@@ -16,3 +18,9 @@ presence/secrets/
 [Rr][Ee][Aa][Dd][Mm][Ee]*
 !/README.md
 !/SECURITY.md
+
+# Public third-party source must retain upstream licensing and package metadata.
+!/vendor/glib-0.18.5/*.md
+*.pk8
+*.key.pem
+__pycache__/

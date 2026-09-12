@@ -1,0 +1,20 @@
+GLib 0.18.5 security backport
+
+GTK3/WebKit currently requires the 0.18 API. Upgrading Wry alone does not remove
+this dependency. vendor/glib-0.18.5 is the complete MIT-licensed crates.io package
+with the two-line upstream fix for GHSA-wrw7-89jp-8q8g / RUSTSEC-2024-0429:
+https://github.com/gtk-rs/gtk-rs-core/commit/b5a4071e439bef2b5eea76c3aa25e5ae84839e34
+
+Original package SHA-256:
+233daaf6e83ae6a12a52055f568f9d7cf4671dabb78ff9560ab6da230ce00ee5
+
+scripts/verify-glib-backport.py verifies that every vendored file is identical to
+that authenticated package except the exact upstream change and two explicit
+style-lint allowances (mismatched_lifetime_syntaxes and unused_parens) for modern
+Rust warning-as-error builds. No safety or correctness lint is disabled. CI exercises the
+string iterator with the GLib dependency optimized, since the unpatched code can
+appear to work without optimization. Keep the upstream license files intact.
+
+The advisory gate rejects unsoundness in indirect registry dependencies too.
+The patched local source is verified separately. Retire the patch when the entire GTK/WebKit dependency stack can
+use a maintained compatible GLib release containing the fix.

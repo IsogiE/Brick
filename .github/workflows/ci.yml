@@ -54,9 +54,9 @@ jobs:
           node-version: 22.23.2
           package-manager-cache: false
 
-      - name: Test presence API and player scripts
+      - name: Test player scripts
         if: runner.os == 'Linux'
-        run: node --test presence/*.test.mjs tests/*.test.mjs
+        run: node --test tests/*.test.mjs
 
       - name: Test AppImage sandbox relocation
         if: runner.os == 'Linux'
@@ -70,6 +70,10 @@ jobs:
         env:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo test --locked
+
+      - name: Test GLib pointer backport with optimization
+        if: runner.os == 'Linux'
+        run: cargo test --locked --config 'profile.dev.package.glib.opt-level=3' --test glib_backport
 
       - name: Test native player resizing
         if: runner.os == 'Linux'
@@ -160,3 +164,13 @@ jobs:
         env:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo build --release --locked
+
+      - name: Retain Windows native test binaries
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: brick-windows-native-tests
+          path: |
+            target/debug/deps/brick-*.exe
+          if-no-files-found: error
+          retention-days: 7

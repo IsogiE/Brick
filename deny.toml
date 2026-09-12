@@ -1,4 +1,5 @@
 [advisories]
+unsound = "all"
 # GTK3/WebKit's build-time macro stack requires this crate. This advisory is
 # maintenance status, not a reported vulnerability; no compatible fix exists.
 # Revisit when Wry/WebKit can migrate off gtk-rs 0.18. Other advisories stay fatal.
