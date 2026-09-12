@@ -1,7 +1,4 @@
-node_modules
-npm-debug.log
 .env
-data
-*.log
 secrets
-*.test.mjs
+*.log
+reader/target

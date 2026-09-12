@@ -1,320 +1,234 @@
+# Release candidates only; final update signing and publication run locally.
 name: Release
-
-on:
+'on':
   workflow_dispatch:
     inputs:
       version:
-        description: 'SemVer version to publish'
+        description: Version of the unpublished release candidate
         required: true
-        default: '0.5.2'
-      publish:
-        description: 'Publish publicly after smoke testing; leave off to build unpublished candidate artifacts'
-        type: boolean
-        required: false
-        default: false
+        default: 0.5.3
   push:
     tags:
-      - 'v*'
-
+    - v*
 env:
-  BRICK_WINDOWS_SIGNING: ${{ vars.BRICK_WINDOWS_SIGNING || 'certum' }}
-
+  BRICK_WINDOWS_SIGNING: certum
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            formats: nsis
-            cache-formats: nsis
-          - os: ubuntu-24.04
-            formats: appimage,deb,pacman
-            cache-formats: appimage-deb-pacman
-    runs-on: ${{ matrix.os }}
-    environment: release
+  build-linux:
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
-
+      attestations: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      with:
+        node-version: 22.23.2
+        package-manager-cache: false
+    - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      with:
+        toolchain: 1.98.1
+    - name: Cache checked Cargo registry downloads
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ~/.cargo/registry/cache
+        key: cargo-registry-linux-${{ hashFiles('Cargo.lock') }}
+    - name: Install Linux dependencies
+      run: |
+        # Brick does not use the runner's optional Chrome package repository.
+        sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/google-chrome*.sources
+        sudo apt-get update
+        sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav patchelf
+    - name: Verify Linux playback runtime
+      run: |
+        pkg-config --atleast-version=2.52.6 webkit2gtk-4.1
+        pkg-config --modversion webkit2gtk-4.1
+        dpkg-query --show --showformat='${Package} ${Version}\n' libgstreamer1.0-0
+    - name: Install Cargo Packager
+      shell: bash
+      run: cargo install cargo-packager --version 0.11.8 --locked
+    - name: Download AppImage runtime
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/appimage-runtime"
+        curl -L --fail --retry 3 \
+          -o "$RUNNER_TEMP/appimage-runtime/runtime-x86_64" \
+          https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
+        echo "LDAI_RUNTIME_FILE=$RUNNER_TEMP/appimage-runtime/runtime-x86_64" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust builds
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/bin/cargo-packager
-            ~/.cargo/bin/cargo-packager.exe
-            ~/.cargo/git/db
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            target
-          key: brick-${{ matrix.os }}-${{ matrix.cache-formats }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            brick-${{ matrix.os }}-${{ matrix.cache-formats }}-
-            brick-${{ matrix.os }}-
-
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          # Brick does not use the runner's optional Chrome package repository.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/google-chrome*.sources
-          sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav patchelf
-
-      - name: Verify Linux playback runtime
-        if: runner.os == 'Linux'
-        run: |
-          pkg-config --atleast-version=2.52.6 webkit2gtk-4.1
-          pkg-config --modversion webkit2gtk-4.1
-          dpkg-query --show --showformat='${Package} ${Version}\n' libgstreamer1.0-0
-
-      - name: Install Cargo Packager
-        shell: bash
-        run: |
-          if command -v cargo-packager >/dev/null 2>&1; then
-            cargo-packager --version
-          else
-            cargo install cargo-packager --locked
-          fi
-
-      - name: Download AppImage runtime
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/appimage-runtime"
-          curl -L --fail --retry 3 \
-            -o "$RUNNER_TEMP/appimage-runtime/runtime-x86_64" \
-            https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
-          echo "LDAI_RUNTIME_FILE=$RUNNER_TEMP/appimage-runtime/runtime-x86_64" >> "$GITHUB_ENV"
-
-      - name: Configure version
-        env:
-          BRICK_APP_VERSION: ${{ inputs.version }}
-        run: node scripts/set-app-version.mjs
-
-      - name: Verify release keys
-        env:
-          BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
-        run: node -e "if (!process.env.BRICK_ADDON_PUBLIC_KEY_B64) throw new Error('BRICK_ADDON_PUBLIC_KEY_B64 is required.');"
-
-      - name: Verify Discord login config
-        env:
-          BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
-        run: node -e "if (!/^[0-9]+$/.test(process.env.BRICK_DISCORD_CLIENT_ID || '')) throw new Error('BRICK_DISCORD_CLIENT_ID repository variable is required.');"
-
-      - name: Verify presence API config
-        env:
-          BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
-        run: node -e "const url = process.env.BRICK_PRESENCE_API_URL || ''; const parsed = new URL(url); if (parsed.protocol !== 'https:') throw new Error('BRICK_PRESENCE_API_URL repository variable must be an https URL.');"
-
-      - name: Verify Windows signing configuration
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          BRICK_CERTUM_USERNAME: ${{ secrets.BRICK_CERTUM_USERNAME }}
-          BRICK_CERTUM_OTP_URI: ${{ secrets.BRICK_CERTUM_OTP_URI }}
-          BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
-        run: |
-          if ($env:BRICK_WINDOWS_SIGNING -notin @('certum', 'artifact-signing')) {
-            throw 'BRICK_WINDOWS_SIGNING must be certum or artifact-signing. Windows releases require signing.'
-          }
-          if ($env:BRICK_WINDOWS_SIGNING -eq 'certum') {
-            if (-not $env:BRICK_CERTUM_USERNAME -or -not $env:BRICK_CERTUM_OTP_URI) {
-              throw 'Certum signing requires BRICK_CERTUM_USERNAME and BRICK_CERTUM_OTP_URI secrets.'
-            }
-            if ($env:BRICK_CERTUM_THUMBPRINT -notmatch '^[0-9A-Fa-f]{40}$') {
-              throw 'BRICK_CERTUM_THUMBPRINT must be the 40-character certificate thumbprint.'
-            }
-          }
-
-      - name: Build Windows binary for signing
-        if: runner.os == 'Windows'
-        env:
-          BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
-          BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
-          BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
-          BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
-          RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
-        run: cargo build --release
-
-      - name: Download and verify SimplySign Desktop
-        if: runner.os == 'Windows' && env.BRICK_WINDOWS_SIGNING == 'certum'
-        shell: pwsh
-        run: |
-          $url = 'https://files.certum.eu/software/SimplySignDesktop/Windows/9.4.4.92/SimplySignDesktop-9.4.4.92-64-bit-en.msi'
-          Invoke-WebRequest -Uri $url -OutFile SimplySignDesktop.msi
-          if ((Get-FileHash SimplySignDesktop.msi -Algorithm SHA256).Hash -ne '8ec420fc27798b86078b7bd02fe7152097e1b3005bab51820eaca8e57df84da3') {
-            throw 'SimplySign Desktop installer checksum mismatch.'
-          }
-          if ((Get-AuthenticodeSignature SimplySignDesktop.msi).Status -ne 'Valid') {
-            throw 'SimplySign Desktop installer signature is invalid.'
-          }
-
-      - name: Connect Certum SimplySign
-        if: runner.os == 'Windows' && env.BRICK_WINDOWS_SIGNING == 'certum'
-        timeout-minutes: 12
-        uses: dismine/windows-app-signing-setup-action@89ae3b032d4bc7a5b98d1a42a34e61ecb6faad64
-        with:
-          certum-username: ${{ secrets.BRICK_CERTUM_USERNAME }}
-          certum-otp-uri: ${{ secrets.BRICK_CERTUM_OTP_URI }}
-          certum-key-id: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
-          capture-diagnostics: 'false'
-
-      - name: Sign Windows binary with Certum
-        if: runner.os == 'Windows' && env.BRICK_WINDOWS_SIGNING == 'certum'
-        timeout-minutes: 5
-        shell: pwsh
-        env:
-          BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
-        run: ./scripts/sign-windows.ps1 -Path target/release/brick.exe
-
-      - name: Azure login for Windows signing
-        if: runner.os == 'Windows' && env.BRICK_WINDOWS_SIGNING == 'artifact-signing'
-        uses: azure/login@v3
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Sign Windows binary
-        if: runner.os == 'Windows' && env.BRICK_WINDOWS_SIGNING == 'artifact-signing'
-        uses: azure/artifact-signing-action@v2
-        with:
-          endpoint: ${{ secrets.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ secrets.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
-          certificate-profile-name: ${{ secrets.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
-          files: ${{ github.workspace }}\target\release\brick.exe
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-
-      - name: Prepare signed Windows package config
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Get-Content Packager.toml |
-            Where-Object { $_ -notmatch '^before-packaging-command\s*=' } |
-            Set-Content Packager.signed.toml
-
-      - name: Build package
-        if: runner.os != 'Windows'
-        env:
-          BRICK_ADDON_PUBLIC_KEY_B64: ${{ secrets.BRICK_ADDON_PUBLIC_KEY_B64 }}
-          BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
-          BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
-          BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
-          NO_STRIP: 1
-          RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
-        run: cargo packager --release --formats ${{ matrix.formats }}
-
-      - name: Verify bundled Linux runtime and updater size limit
-        if: runner.os == 'Linux'
-        run: node packaging/linux/verify-appimage.mjs
-
-      - name: Build signed Windows package
-        if: runner.os == 'Windows'
-        env:
-          BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
-          BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
-          BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
-          BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
-          NO_STRIP: 1
-          RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
-        run: cargo packager --config Packager.signed.toml --formats ${{ matrix.formats }}
-
-      - name: Sign Windows NSIS installer
-        if: runner.os == 'Windows' && env.BRICK_WINDOWS_SIGNING == 'artifact-signing'
-        uses: azure/artifact-signing-action@v2
-        with:
-          endpoint: ${{ secrets.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ secrets.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
-          certificate-profile-name: ${{ secrets.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
-          files-folder: ${{ github.workspace }}\dist\packages
-          files-folder-filter: '*.exe'
-          files-folder-recurse: false
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-
-      - name: Sign Windows NSIS installer with Certum
-        if: runner.os == 'Windows' && env.BRICK_WINDOWS_SIGNING == 'certum'
-        timeout-minutes: 5
-        shell: pwsh
-        env:
-          BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
-        run: ./scripts/sign-windows.ps1 -Path 'dist/packages/*-setup.exe'
-
-      - name: Verify signed Windows artifacts and installer policy
-        if: runner.os == 'Windows'
-        timeout-minutes: 10
-        shell: pwsh
-        env:
-          BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
-        run: |
-          $thumbprint = if ($env:BRICK_WINDOWS_SIGNING -eq 'certum') { $env:BRICK_CERTUM_THUMBPRINT } else { '' }
-          ./scripts/sign-windows.ps1 -Path 'target/release/brick.exe', 'dist/packages/*-setup.exe' -Thumbprint $thumbprint -VerifyOnly
-          ./scripts/verify-windows-installer.ps1 -RunInstallSmoke -RequireSignature -ExpectedSigner $thumbprint
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: brick-${{ runner.os }}
-          path: dist/packages/**
-
-  publish:
-    needs: build
-    if: github.event_name == 'push' || inputs.publish == true
-    runs-on: ubuntu-22.04
+        echo "1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf  $RUNNER_TEMP/appimage-runtime/runtime-x86_64" | sha256sum -c -
+    - name: Configure version
+      env:
+        BRICK_APP_VERSION: ${{ inputs.version }}
+      run: node scripts/set-app-version.mjs
+    - name: Verify Discord login config
+      env:
+        BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+      run: node -e "if (!/^[0-9]+$/.test(process.env.BRICK_DISCORD_CLIENT_ID || '')) throw new Error('BRICK_DISCORD_CLIENT_ID repository variable
+        is required.');"
+    - name: Verify presence API config
+      env:
+        BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
+      run: node -e "const url = process.env.BRICK_PRESENCE_API_URL || ''; const parsed = new URL(url); if (parsed.protocol !== 'https:') throw
+        new Error('BRICK_PRESENCE_API_URL repository variable must be an https URL.');"
+    - name: Build package
+      env:
+        BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+        BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
+        BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
+        NO_STRIP: 1
+        RUSTFLAGS: -D warnings
+      run: cargo packager --release --formats appimage,deb,pacman
+    - name: Verify bundled Linux runtime and updater size limit
+      run: node packaging/linux/verify-appimage.mjs
+    - name: Attest release candidates
+      uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+      with:
+        subject-path: |-
+          dist/packages/*.AppImage
+          dist/packages/*.deb
+          dist/packages/*.tar.gz
+          dist/packages/PKGBUILD
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: brick-Linux
+        path: |-
+          dist/packages/*.AppImage
+          dist/packages/*.deb
+          dist/packages/*.tar.gz
+          dist/packages/PKGBUILD
+        if-no-files-found: error
+        retention-days: 14
+  build-windows:
+    runs-on: windows-latest
     permissions:
       contents: read
-
+      id-token: write
+      attestations: write
+    environment: release
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: release-assets
-
-      - name: Verify app feed signing key
-        env:
-          BRICK_ADDON_PRIVATE_KEY_B64: ${{ secrets.BRICK_ADDON_PRIVATE_KEY_B64 }}
-        run: node -e "if (!process.env.BRICK_ADDON_PRIVATE_KEY_B64) throw new Error('BRICK_ADDON_PRIVATE_KEY_B64 is required.');"
-
-      - name: Publish release assets
-        env:
-          GH_TOKEN: ${{ secrets.BRICK_RELEASE_TOKEN }}
-          BRICK_APP_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          repo="IsogiE/Brick-Releases"
-          if [[ -n "${BRICK_APP_VERSION:-}" ]]; then
-            tag="v${BRICK_APP_VERSION#v}"
-          else
-            tag="${GITHUB_REF_NAME}"
-          fi
-          gh release view "$tag" --repo "$repo" >/dev/null 2>&1 || gh release create "$tag" --repo "$repo" --title "Brick $tag" --notes ""
-          while IFS= read -r -d '' file; do
-            gh release upload "$tag" "$file" --repo "$repo" --clobber
-          done < <(find release-assets -type f -print0)
-
-      - name: Publish app update feed
-        env:
-          GH_TOKEN: ${{ secrets.BRICK_RELEASE_TOKEN }}
-          BRICK_APP_VERSION: ${{ inputs.version }}
-          BRICK_ADDON_PRIVATE_KEY_B64: ${{ secrets.BRICK_ADDON_PRIVATE_KEY_B64 }}
-          BRICK_RELEASE_ASSETS_DIR: release-assets
-        run: node scripts/publish-app-feed.mjs
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      with:
+        node-version: 22.23.2
+        package-manager-cache: false
+    - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      with:
+        toolchain: 1.98.1
+    - name: Cache checked Cargo registry downloads
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ~/.cargo/registry/cache
+        key: cargo-registry-windows-${{ hashFiles('Cargo.lock') }}
+    - name: Install Cargo Packager
+      shell: bash
+      run: cargo install cargo-packager --version 0.11.8 --locked
+    - name: Configure version
+      env:
+        BRICK_APP_VERSION: ${{ inputs.version }}
+      run: node scripts/set-app-version.mjs
+    - name: Verify Discord login config
+      env:
+        BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+      run: node -e "if (!/^[0-9]+$/.test(process.env.BRICK_DISCORD_CLIENT_ID || '')) throw new Error('BRICK_DISCORD_CLIENT_ID repository variable
+        is required.');"
+    - name: Verify presence API config
+      env:
+        BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
+      run: node -e "const url = process.env.BRICK_PRESENCE_API_URL || ''; const parsed = new URL(url); if (parsed.protocol !== 'https:') throw
+        new Error('BRICK_PRESENCE_API_URL repository variable must be an https URL.');"
+    - name: Verify Windows signing configuration
+      shell: pwsh
+      env:
+        BRICK_CERTUM_USERNAME: ${{ secrets.BRICK_CERTUM_USERNAME }}
+        BRICK_CERTUM_OTP_URI: ${{ secrets.BRICK_CERTUM_OTP_URI }}
+        BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
+      run: |
+        if ($env:BRICK_WINDOWS_SIGNING -ne 'certum') {
+          throw 'BRICK_WINDOWS_SIGNING must be certum. Windows releases require signing.'
+        }
+        if ($env:BRICK_WINDOWS_SIGNING -eq 'certum') {
+          if (-not $env:BRICK_CERTUM_USERNAME -or -not $env:BRICK_CERTUM_OTP_URI) {
+            throw 'Certum signing requires BRICK_CERTUM_USERNAME and BRICK_CERTUM_OTP_URI secrets.'
+          }
+          if ($env:BRICK_CERTUM_THUMBPRINT -notmatch '^[0-9A-Fa-f]{40}$') {
+            throw 'BRICK_CERTUM_THUMBPRINT must be the 40-character certificate thumbprint.'
+          }
+        }
+    - name: Build Windows binary for signing
+      env:
+        BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+        BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
+        BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
+        RUSTFLAGS: -D warnings -C target-feature=+crt-static
+      run: cargo build --release --locked
+    - name: Download and verify SimplySign Desktop
+      shell: pwsh
+      run: |
+        $url = 'https://files.certum.eu/software/SimplySignDesktop/Windows/9.4.4.92/SimplySignDesktop-9.4.4.92-64-bit-en.msi'
+        Invoke-WebRequest -Uri $url -OutFile SimplySignDesktop.msi
+        if ((Get-FileHash SimplySignDesktop.msi -Algorithm SHA256).Hash -ne '8ec420fc27798b86078b7bd02fe7152097e1b3005bab51820eaca8e57df84da3') {
+          throw 'SimplySign Desktop installer checksum mismatch.'
+        }
+        if ((Get-AuthenticodeSignature SimplySignDesktop.msi).Status -ne 'Valid') {
+          throw 'SimplySign Desktop installer signature is invalid.'
+        }
+    - name: Connect Certum SimplySign
+      timeout-minutes: 12
+      uses: dismine/windows-app-signing-setup-action@89ae3b032d4bc7a5b98d1a42a34e61ecb6faad64
+      with:
+        certum-username: ${{ secrets.BRICK_CERTUM_USERNAME }}
+        certum-otp-uri: ${{ secrets.BRICK_CERTUM_OTP_URI }}
+        certum-key-id: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
+        capture-diagnostics: 'false'
+    - name: Sign Windows binary with Certum
+      timeout-minutes: 5
+      shell: pwsh
+      env:
+        BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
+      run: ./scripts/sign-windows.ps1 -Path target/release/brick.exe
+    - name: Prepare signed Windows package config
+      shell: pwsh
+      run: |
+        Get-Content Packager.toml |
+          Where-Object { $_ -notmatch '^before-packaging-command\s*=' } |
+          Set-Content Packager.signed.toml
+    - name: Build signed Windows package
+      env:
+        BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
+        BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+        BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
+        BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
+        NO_STRIP: 1
+        RUSTFLAGS: -D warnings -C target-feature=+crt-static
+      run: cargo packager --config Packager.signed.toml --formats nsis
+    - name: Sign Windows NSIS installer with Certum
+      timeout-minutes: 5
+      shell: pwsh
+      env:
+        BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
+      run: ./scripts/sign-windows.ps1 -Path 'dist/packages/*-setup.exe'
+    - name: Verify signed Windows artifacts and installer policy
+      timeout-minutes: 10
+      shell: pwsh
+      env:
+        BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
+      run: |
+        $thumbprint = if ($env:BRICK_WINDOWS_SIGNING -eq 'certum') { $env:BRICK_CERTUM_THUMBPRINT } else { '' }
+        ./scripts/sign-windows.ps1 -Path 'target/release/brick.exe', 'dist/packages/*-setup.exe' -Thumbprint $thumbprint -VerifyOnly
+        ./scripts/verify-windows-installer.ps1 -RunInstallSmoke -RequireSignature -ExpectedSigner $thumbprint
+    - name: Attest release candidates
+      uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+      with:
+        subject-path: dist/packages/*-setup.exe
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: brick-Windows
+        path: dist/packages/*-setup.exe
+        if-no-files-found: error
+        retention-days: 14

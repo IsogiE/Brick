@@ -1,0 +1,24 @@
+# Remove this workflow after the fixed 0.5.3 bridge has been published and verified.
+name: Legacy update bridge
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bridge:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22.23.2
+          package-manager-cache: false
+      - name: Publish only the locally authorized immutable migration release
+        env:
+          GH_TOKEN: ${{ secrets.BRICK_RELEASE_TOKEN }}
+          BRICK_ADDON_PRIVATE_KEY_B64: ${{ secrets.BRICK_ADDON_PRIVATE_KEY_B64 }}
+        run: node scripts/publish-legacy-bridge.mjs

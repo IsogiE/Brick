@@ -212,8 +212,8 @@ export function createReplaySyncLibrary({ dataDir, now = Date.now }) {
       return {...replay, startedAt:new Date(clock.origin).toISOString(),
         availableSeconds:live?Math.max(0,Math.floor(replay.availableSeconds-clock.shift/1000)):replay.availableSeconds};
     },
-    // These methods have no HTTP route. Only the bounded worker with the
-    // shared data volume can lease work and publish server measurements.
+    // The private authenticated queue exposes only leasing and bounded results.
+    // The worker never receives this database or the API's data volume.
     enqueue(values) {
       open();
       database.prepare('DELETE FROM timestamp_jobs WHERE updated_at < ?').run(now() - 7 * 86400_000);
@@ -257,6 +257,13 @@ export function createReplaySyncLibrary({ dataDir, now = Date.now }) {
           return { id: row.id, lease, key, attempt: row.attempts+1 };
         }
       } catch (error) { database.exec('ROLLBACK'); throw error; }
+    },
+    finishLease(id, lease, alignment) {
+      open();
+      const row = database.prepare('SELECT payload FROM timestamp_jobs WHERE id=? AND lease=? AND lease_until>?').get(id, lease, now());
+      if (!row) return false;
+      // Derive the job key from the API-owned database, never from worker input.
+      return this.finish({ id, lease, key: JSON.parse(row.payload) }, alignment);
     },
     finish(job, alignment) {
       open();

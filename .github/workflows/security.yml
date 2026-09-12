@@ -1,0 +1,82 @@
+name: Security
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '19 6 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  dependencies:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48
+        with:
+          fail-on-severity: moderate
+          # Stable Caddy requires CEL 0.28; 0.29 breaks its API. The proxy accepts
+          # no CEL expressions, enforced by verify-proxy-image.py below.
+          allow-ghsas: GHSA-gcjh-h69q-9w9g
+          comment-summary-in-pr: never
+  rust-advisories:
+    name: Rust security advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: 1.98.1
+      - run: cargo install cargo-deny --version 0.20.2 --locked
+      - run: cargo deny check advisories
+      - run: cargo deny --manifest-path presence/reader/Cargo.toml check advisories
+  containers:
+    name: Container security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Build runtime images from pinned inputs
+        run: |
+          docker build -f presence/Dockerfile -t brick-api:security presence
+          docker build -f presence/Dockerfile.timestamp -t brick-worker:security .
+          docker build -f presence/Dockerfile.caddy -t brick-proxy:security presence
+      - name: Verify supported media codecs and disabled decoder surface
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python3 scripts/verify-worker-image.py --image brick-worker:security
+          python3 scripts/verify-proxy-image.py --image brick-proxy:security
+          for test in timestamp_frames.test.py timestamp_youtube.test.py; do
+            docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=700 --mount "type=bind,src=$GITHUB_WORKSPACE/presence,dst=/tests,readonly" --entrypoint python3 brick-worker:security "/tests/$test"
+          done
+      - name: Scan for fixable high and critical vulnerabilities
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-64bit.tar.gz -o "$RUNNER_TEMP/trivy.tar.gz"
+          echo "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a  $RUNNER_TEMP/trivy.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP" trivy
+          "$RUNNER_TEMP/trivy" image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 brick-api:security
+          "$RUNNER_TEMP/trivy" image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 brick-worker:security
+          "$RUNNER_TEMP/trivy" image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 brick-proxy:security
+  runtime-versions:
+    name: Runtime update monitoring
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22.23.2
+          package-manager-cache: false
+      - run: node scripts/check-security-runtimes.mjs

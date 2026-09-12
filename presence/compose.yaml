@@ -52,12 +52,15 @@ services:
 
   caddy:
     <<: *restrictions
-    image: caddy:2-alpine
+    build:
+      context: .
+      dockerfile: Dockerfile.caddy
     restart: unless-stopped
     cap_add:
       - NET_BIND_SERVICE
     environment:
       BRICK_DOMAIN: ${BRICK_DOMAIN:?}
+      BRICK_ACME_EMAIL: ${BRICK_ACME_EMAIL:?}
     depends_on:
       api:
         condition: service_healthy

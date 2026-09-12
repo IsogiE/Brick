@@ -5,7 +5,7 @@ import { basename, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const feedRepo = process.env.BRICK_FEED_REPO || 'IsogiE/Brick-Releases';
-const feedTag = process.env.BRICK_FEED_TAG || 'addon-feed';
+const feedTag = process.env.BRICK_FEED_TAG || 'addon-feed-v2';
 const sourceRepo = process.env.BRICK_ADDON_GITHUB_REPO || 'IsogiE/AdvanceRaidTools';
 const sourceDir = resolve(process.env.BRICK_ADDON_SOURCE_DIR || '../AdvanceRaidTools');
 const releaseDir = resolve(process.env.BRICK_ADDON_RELEASE_DIR || join(sourceDir, '.release'));

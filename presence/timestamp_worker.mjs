@@ -1,7 +1,10 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import { createReplaySyncLibrary } from './replay_sync.mjs';
+import { readFile } from 'node:fs/promises';
+import { createTimestampClient } from './timestamp_queue.mjs';
+import { syncKey } from './replay_sync.mjs';
 import { createScanner } from './timestamp_process.mjs';
-const library = createReplaySyncLibrary({ dataDir: process.env.DATA_DIR || '/data' });
+const library = createTimestampClient({ url: process.env.BRICK_TIMESTAMP_QUEUE_URL || 'http://api:8081/',
+  token: (await readFile(process.env.BRICK_TIMESTAMP_TOKEN_FILE, 'utf8')).trim() });
 const shutdown = new AbortController();
 function terminate() { shutdown.abort(); }
 process.on('SIGTERM', terminate);
@@ -9,11 +12,16 @@ process.on('SIGINT', terminate);
 try {
   const scan = await createScanner();
   while (!shutdown.signal.aborted) {
-    const job = library.claim();
+    let job;
+    try { job = await library.claim(shutdown.signal); }
+    catch { if (!shutdown.signal.aborted) console.error('Timestamp queue unavailable'); }
     if (job) {
       const started = Date.now();
+      syncKey(job.key);
       const result = await scan(job, shutdown.signal);
-      const measured = library.finish(job, result);
+      let measured = false;
+      try { measured = await library.finish(job, result, shutdown.signal); }
+      catch { if (!shutdown.signal.aborted) console.error('Timestamp result could not be submitted'); }
       const reason = !measured && ['youtube_auth_required', 'provider_rate_limited'].includes(result?.error)
         ? result.error : undefined;
       // Log only public provider IDs and workload duration, never URLs or images.
@@ -26,7 +34,6 @@ try {
     }
   }
 } finally {
-  library.close();
   process.off('SIGTERM', terminate);
   process.off('SIGINT', terminate);
 }

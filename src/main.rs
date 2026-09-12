@@ -43,6 +43,10 @@ use std::{
 use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
+    if env::args().any(|arg| arg == "--update-restart") {
+        // Give the replaced instance time to release its instance lock.
+        std::thread::sleep(std::time::Duration::from_millis(800));
+    }
     let startup_mode = env::args().any(|arg| arg == "--startup");
     let _instance_guard = match single_instance::acquire() {
         Ok(guard) => Some(guard),

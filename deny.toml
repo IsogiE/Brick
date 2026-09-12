@@ -1,0 +1,7 @@
+[advisories]
+# GTK3/WebKit's build-time macro stack requires this crate. This advisory is
+# maintenance status, not a reported vulnerability; no compatible fix exists.
+# Revisit when Wry/WebKit can migrate off gtk-rs 0.18. Other advisories stay fatal.
+ignore = [
+  { id = "RUSTSEC-2024-0370", reason = "Required build-time proc-macro-error in GTK3/WebKit; no compatible maintained replacement is available upstream." },
+]

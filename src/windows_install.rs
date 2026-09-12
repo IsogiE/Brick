@@ -20,6 +20,30 @@ use windows_sys::Win32::{
     System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY},
 };
 
+pub(super) fn lock_parent_directories(installer: &Path) -> Result<Vec<fs::File>, String> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    let mut parents: Vec<_> = installer.ancestors().skip(1).collect();
+    parents.reverse();
+    let mut locks = Vec::new();
+    for parent in parents {
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3) // FILE_SHARE_READ | FILE_SHARE_WRITE; never FILE_SHARE_DELETE
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(parent)
+            .map_err(|error| format!("Could not protect the update directory: {error}"))?;
+        let metadata = directory.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("Brick cannot update from a redirected directory.".into());
+        }
+        locks.push(directory);
+    }
+    Ok(locks)
+}
+
 fn machine_install_dir() -> Result<Option<PathBuf>, String> {
     let key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Brick\0"
         .encode_utf16()

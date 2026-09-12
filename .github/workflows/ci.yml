@@ -8,6 +8,9 @@ on:
       - 'ci/**'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   rust:
     name: ${{ matrix.os }}
@@ -21,8 +24,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: 1.98.1
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -39,12 +46,12 @@ jobs:
       - name: Check
         env:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
-        run: cargo check
+        run: cargo check --locked
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: runner.os == 'Linux'
         with:
-          node-version: 22
+          node-version: 22.23.2
           package-manager-cache: false
 
       - name: Test presence API and player scripts
@@ -57,12 +64,12 @@ jobs:
 
       - name: Test addon feed publication decisions
         if: runner.os == 'Linux'
-        run: node --test scripts/publish-addon-feed.test.mjs
+        run: node --test scripts/publish-*.test.mjs
 
       - name: Test
         env:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
-        run: cargo test
+        run: cargo test --locked
 
       - name: Test native player resizing
         if: runner.os == 'Linux'
@@ -91,6 +98,18 @@ jobs:
           # NSIS must use the same PowerShell edition as the signing steps.
           pwsh -NoProfile -ExecutionPolicy Bypass -Command 'Get-Item Cert:\CurrentUser | Out-Null'
           if ($LASTEXITCODE -ne 0) { throw 'The NSIS signing shell cannot access the certificate store.' }
+
+      - name: Test updater against a real signed Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RUSTFLAGS: '-D warnings -C target-feature=+crt-static'
+        run: |
+          $env:BRICK_SIGNED_INSTALLER_FIXTURE = Join-Path $env:RUNNER_TEMP 'brick-signed-fixture.exe'
+          Invoke-WebRequest 'https://github.com/IsogiE/Brick-Releases/releases/download/v0.5.2/brick_0.5.2_x64-setup.exe' -OutFile $env:BRICK_SIGNED_INSTALLER_FIXTURE
+          if ((Get-FileHash $env:BRICK_SIGNED_INSTALLER_FIXTURE -Algorithm SHA256).Hash -ne '22a6b59453e70351a5fd255c1c1f96d3795494dfb2565d85bf7b80ebbb63d914') { throw 'The public signing fixture has changed.' }
+          cargo test --locked authenticode_accepts_brick_and_rejects_tampering_and_other_publishers -- --ignored
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime installer signature verification failed.' }
 
       - name: Test Linux keyring storage
         if: runner.os == 'Linux'
@@ -140,4 +159,4 @@ jobs:
       - name: Build release binary
         env:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
-        run: cargo build --release
+        run: cargo build --release --locked
