@@ -12,7 +12,7 @@ use crate::{
     addon::{self, AppView, LogLevel, SyncSummary, WowClient},
     app_update::{self, AvailableAppUpdate},
     autostart,
-    discord_auth::{self, AuthorizedUser, SessionStatus},
+    discord_auth::{self, AuthorizedUser, RefreshError, SessionStatus},
     presence::{self, Roster, RosterMember},
     profile::{self, ProfileUi, RaidRole},
     single_instance,
@@ -41,7 +41,7 @@ pub struct BrickApp {
     profile: ProfileUi,
     active_tab: MainTab,
     sync_rx: Option<mpsc::Receiver<Result<SyncSummary, String>>>,
-    auth_rx: Option<mpsc::Receiver<Result<AuthorizedUser, String>>>,
+    auth_rx: Option<mpsc::Receiver<Result<AuthorizedUser, RefreshError>>>,
     app_update_rx: Option<mpsc::Receiver<Result<Option<AvailableAppUpdate>, String>>>,
     app_update_install_rx: Option<mpsc::Receiver<Result<Option<String>, String>>>,
     roster_rx: Option<mpsc::Receiver<Result<Roster, String>>>,
@@ -69,6 +69,8 @@ enum AuthUiState {
     ConfigMissing(String),
     SignedOut,
     Checking,
+    Refreshing,
+    Retrying,
     Authorized(AuthorizedUser),
     Denied(String),
 }
@@ -134,7 +136,7 @@ impl BrickApp {
         let auth_state = match discord_auth::saved_session_status() {
             Ok(SessionStatus::ConfigMissing(error)) => AuthUiState::ConfigMissing(error),
             Ok(SessionStatus::SignedOut) => AuthUiState::SignedOut,
-            Ok(SessionStatus::NeedsRefresh) => AuthUiState::Checking,
+            Ok(SessionStatus::NeedsRefresh) => AuthUiState::Refreshing,
             Ok(SessionStatus::Authorized(user)) => AuthUiState::Authorized(user),
             Err(error) => AuthUiState::Denied(error),
         };
@@ -179,7 +181,7 @@ impl BrickApp {
             roster_notice: None,
         };
 
-        if matches!(app.auth_state, AuthUiState::Checking) {
+        if matches!(app.auth_state, AuthUiState::Refreshing) {
             app.start_auth_refresh();
         }
         app.start_app_update_check();
@@ -360,7 +362,7 @@ impl BrickApp {
         let (tx, rx) = mpsc::channel();
         let ctx = self.egui_ctx.clone();
         thread::spawn(move || {
-            let result = discord_auth::login_with_browser();
+            let result = discord_auth::login_with_browser().map_err(RefreshError::rejected);
             let _ = tx.send(result);
             ctx.request_repaint();
         });
@@ -373,7 +375,7 @@ impl BrickApp {
             return;
         }
 
-        self.auth_state = AuthUiState::Checking;
+        self.auth_state = AuthUiState::Refreshing;
         let (tx, rx) = mpsc::channel();
         let ctx = self.egui_ctx.clone();
         thread::spawn(move || {
@@ -402,9 +404,14 @@ impl BrickApp {
                 }
             }
             Ok(Err(error)) => {
-                self.auth_state = AuthUiState::Denied(error.clone());
+                self.auth_state = if error.retryable {
+                    AuthUiState::Retrying
+                } else {
+                    AuthUiState::Denied(error.message.clone())
+                };
                 self.auth_rx = None;
-                self.status = error;
+                self.last_auth_check = Instant::now();
+                self.status = error.message;
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 let error = "Discord login stopped unexpectedly.".to_string();
@@ -430,6 +437,7 @@ impl BrickApp {
                 discord_auth::session_expired(user.expires_at_unix)
                     || discord_auth::session_renewal_due(user.created_at_unix)
             }
+            AuthUiState::Retrying => true,
             _ => false,
         };
 
@@ -443,6 +451,7 @@ impl BrickApp {
             Ok(()) => {
                 self.confirm_logout = false;
                 self.auth_state = AuthUiState::SignedOut;
+                self.auth_rx = None;
                 self.sync_rx = None;
                 self.roster_rx = None;
                 self.presence_state = initial_presence_state();
@@ -1029,8 +1038,8 @@ impl BrickApp {
         let (title, detail, button_text, button_enabled) = login_copy(&state);
         let panel_width = canvas.width().clamp(320.0, 420.0);
         let panel_height = match state {
-            AuthUiState::Denied(_) => 350.0,
-            AuthUiState::Checking => 340.0,
+            AuthUiState::Denied(_) | AuthUiState::Retrying => 350.0,
+            AuthUiState::Checking | AuthUiState::Refreshing => 340.0,
             AuthUiState::ConfigMissing(_) => 340.0,
             _ => 300.0,
         };
@@ -1072,7 +1081,7 @@ impl BrickApp {
                 ui.add(egui::Label::new(RichText::new(detail).color(secondary_text())).wrap());
                 ui.add_space(24.0);
 
-                if matches!(state, AuthUiState::Checking) {
+                if matches!(state, AuthUiState::Checking | AuthUiState::Refreshing) {
                     busy_indicator(ui, 24.0, info_accent());
                     ui.add_space(12.0);
                 }
@@ -1082,7 +1091,11 @@ impl BrickApp {
                         .add_sized(egui::vec2(236.0, 46.0), login_button(button_text))
                         .clicked()
                     {
-                        self.start_discord_login();
+                        if matches!(state, AuthUiState::Retrying) {
+                            self.start_auth_refresh();
+                        } else {
+                            self.start_discord_login();
+                        }
                     }
                 } else {
                     ui.add_enabled_ui(false, |ui| {
@@ -1090,7 +1103,7 @@ impl BrickApp {
                     });
                 }
 
-                if matches!(state, AuthUiState::Denied(_)) {
+                if matches!(state, AuthUiState::Denied(_) | AuthUiState::Retrying) {
                     ui.add_space(8.0);
                     if ui
                         .add_sized(egui::vec2(236.0, 36.0), login_secondary_button("Log out"))
@@ -1539,13 +1552,15 @@ impl BrickApp {
             ));
         }
 
+        if (self.auth_state.is_authorized() || matches!(self.auth_state, AuthUiState::Retrying))
+            && self.auth_rx.is_none()
+        {
+            next = next.min(time_until(
+                self.last_auth_check,
+                AUTH_REFRESH_CHECK_INTERVAL_SECS,
+            ));
+        }
         if self.auth_state.is_authorized() {
-            if self.auth_rx.is_none() {
-                next = next.min(time_until(
-                    self.last_auth_check,
-                    AUTH_REFRESH_CHECK_INTERVAL_SECS,
-                ));
-            }
             if self.window_visible && self.sync_rx.is_none() {
                 next = next.min(time_until(
                     self.last_view_refresh,
@@ -2275,9 +2290,9 @@ fn duration_label(seconds: u64) -> String {
 
 fn login_content_height(state: &AuthUiState) -> f32 {
     let base = 52.0 + 18.0 + 30.0 + 6.0 + 20.0 + 24.0 + 46.0;
-    if matches!(state, AuthUiState::Checking) {
+    if matches!(state, AuthUiState::Checking | AuthUiState::Refreshing) {
         base + 44.0
-    } else if matches!(state, AuthUiState::Denied(_)) {
+    } else if matches!(state, AuthUiState::Denied(_) | AuthUiState::Retrying) {
         base + 52.0
     } else {
         base
@@ -2298,6 +2313,18 @@ fn login_copy(state: &AuthUiState) -> (&'static str, String, &'static str, bool)
             "Complete the prompt in your browser.".to_string(),
             "Waiting...",
             false,
+        ),
+        AuthUiState::Refreshing => (
+            "Checking Discord",
+            "Restoring your saved sign-in.".to_string(),
+            "Checking...",
+            false,
+        ),
+        AuthUiState::Retrying => (
+            "Reconnecting to Discord",
+            "Your sign-in is saved. Brick will retry automatically.".to_string(),
+            "Retry now",
+            true,
         ),
         AuthUiState::Authorized(user) => (
             "Ready",
@@ -2326,7 +2353,7 @@ fn friendly_auth_problem(status: &str) -> String {
         "Discord login timed out. Try again when the browser prompt is ready.".to_string()
     } else if lower.contains("invalid_client") || lower.contains("configured") {
         "Brick could not use its Discord app configuration.".to_string()
-    } else if lower.contains("401") || lower.contains("unauthorized") || lower.contains("revoked") {
+    } else if lower.contains("401") || lower.contains("unauthorized") || lower.contains("revoked") || lower.contains("expired") {
         "The saved Discord session expired or was revoked.".to_string()
     } else {
         "Discord could not verify access right now.".to_string()
@@ -2979,4 +3006,44 @@ pub(crate) mod tests {
             output.viewport_output[&egui::ViewportId::ROOT].repaint_delay > Duration::from_secs(1)
         );
     }
+    #[test]
+    fn a_temporary_refresh_failure_preserves_retry_state_without_busy_polling() {
+        let mut app = app();
+        app.auth_state = AuthUiState::Refreshing;
+        let (tx, rx) = mpsc::channel();
+        app.auth_rx = Some(rx);
+        tx.send(Err(RefreshError { message: "Temporary Discord failure".into(), retryable: true })).unwrap();
+        app.poll_auth();
+        assert!(matches!(app.auth_state, AuthUiState::Retrying));
+        assert!(!app.auth_state.is_authorized());
+        assert!(app.auth_rx.is_none());
+        let delay = app.next_repaint_after();
+        assert!(delay >= Duration::from_secs(59) && delay <= Duration::from_secs(60));
+        let (title, detail, button, enabled) = login_copy(&app.auth_state);
+        assert_eq!(title, "Reconnecting to Discord");
+        assert!(detail.contains("sign-in is saved"));
+        assert_eq!(button, "Retry now");
+        assert!(enabled);
+    }
+
+    #[test]
+    fn a_confirmed_authentication_rejection_requires_login_instead_of_retrying_forever() {
+        let mut app = app();
+        let (tx, rx) = mpsc::channel();
+        app.auth_rx = Some(rx);
+        tx.send(Err(RefreshError::rejected("Discord login was revoked".into()))).unwrap();
+        app.poll_auth();
+        assert!(matches!(app.auth_state, AuthUiState::Denied(_)));
+        assert!(!app.auth_state.is_authorized());
+        assert!(login_copy(&app.auth_state).1.contains("revoked"));
+    }
+
+    #[test]
+    fn restoring_saved_credentials_does_not_ask_for_a_browser_prompt() {
+        let copy = login_copy(&AuthUiState::Refreshing);
+        assert_eq!(copy.0, "Checking Discord");
+        assert!(!copy.1.contains("browser"));
+        assert!(!copy.3);
+    }
+
 }

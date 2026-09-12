@@ -3,7 +3,10 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    sync::{LazyLock, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        LazyLock, Mutex,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -25,6 +28,7 @@ const AUTH_CALLBACK_POLL_PATH: &str = "/v1/auth/callback";
 const SESSION_FILE: &str = "discord-auth.dat";
 const LEGACY_SESSION_FILE: &str = "discord-auth.json";
 const SESSION_SCHEMA: u32 = 2;
+const REFRESH_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MAX_AUTH_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAX_CALLBACK_BYTES: u64 = 16 * 1024;
 const MAX_SESSION_BYTES: u64 = 128 * 1024;
@@ -69,8 +73,9 @@ const DISCORD_REDIRECT_URI: &str = match option_env!("BRICK_DISCORD_REDIRECT_URI
     None => "",
 };
 
+static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SESSION_STORAGE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-static SESSION_REFRESH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static SESSION_REFRESH_LOCK: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 static HTTP_CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
     Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -118,6 +123,38 @@ pub struct AuthSession {
     role_ids: Vec<String>,
     authorized_role_ids: Vec<String>,
     authorized_at_unix: u64,
+    #[serde(default)]
+    authorization_pending: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RefreshError {
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl RefreshError {
+    pub fn rejected(message: String) -> Self {
+        Self {
+            message,
+            retryable: false,
+        }
+    }
+}
+
+impl From<String> for RefreshError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            retryable: true,
+        }
+    }
+}
+
+impl From<RefreshError> for String {
+    fn from(error: RefreshError) -> Self {
+        error.message
+    }
 }
 
 #[derive(Deserialize)]
@@ -200,66 +237,113 @@ pub fn saved_session_status() -> Result<SessionStatus, String> {
 }
 
 pub fn login_with_browser() -> Result<AuthorizedUser, String> {
+    let generation = SESSION_GENERATION.load(Ordering::SeqCst);
     let config = auth_config()?;
     let request = login_request(&config)?;
     crate::browser::open(&request.authorize_url)?;
     let code = wait_for_remote_callback(&request.state)?;
     let token = exchange_code(&config, &code, &request.verifier)?;
     let session = verified_session_from_token(&config, token, None)?;
-    save_session(&session)?;
+    save_session_if_current(&session, generation)?;
     Ok(authorized_user(&session, &config))
 }
 
-pub fn refresh_saved_session() -> Result<AuthorizedUser, String> {
+pub fn refresh_saved_session() -> Result<AuthorizedUser, RefreshError> {
     let config = auth_config()?;
-    let _guard = SESSION_REFRESH_LOCK
-        .lock()
-        .map_err(|_| "Discord session refresh lock was poisoned.".to_string())?;
-    let Some(session) = load_session()? else {
-        return Err("Please sign in with Discord.".to_string());
-    };
-
-    if !session_matches_config(&session, &config) {
-        clear_session()?;
-        return Err("Please sign in with Discord.".to_string());
-    }
-
-    let now = now_unix_secs();
-    if session_age_expired(&session, now) {
-        clear_session()?;
-        return Err(SESSION_RENEWAL_MESSAGE.to_string());
-    }
-
-    if session_access_token_current(&session, now) {
-        return Ok(authorized_user(&session, &config));
-    }
-
-    let created_at_unix = session_created_at_unix(&session);
-
-    let token = match refresh_token(&config, &session.refresh_token) {
-        Ok(token) => token,
-        Err(error) => {
-            let _ = clear_session();
-            return Err(error);
-        }
-    };
-
-    let session = match verified_session_from_token(&config, token, Some(created_at_unix)) {
-        Ok(session) => session,
-        Err(error) => {
-            let _ = clear_session();
-            return Err(error);
-        }
-    };
-
-    save_session(&session)?;
+    let session = current_or_refreshed_session(&config, true)?
+        .ok_or_else(|| RefreshError::rejected("Please sign in with Discord.".to_string()))?;
     Ok(authorized_user(&session, &config))
+}
+
+fn current_or_refreshed_session(
+    config: &AuthConfig,
+    retry_now: bool,
+) -> Result<Option<AuthSession>, RefreshError> {
+    let mut retry_at = SESSION_REFRESH_LOCK
+        .lock()
+        .map_err(|_| "Discord session refresh is unavailable.".to_string())?;
+    let generation = SESSION_GENERATION.load(Ordering::SeqCst);
+    let Some(session) = load_session()? else {
+        return Ok(None);
+    };
+    if !session_matches_config(&session, config) {
+        clear_session_if_current(Some(generation))?;
+        *retry_at = None;
+        return Ok(None);
+    }
+    if session_age_expired(&session, now_unix_secs()) {
+        clear_session_if_current(Some(generation))?;
+        *retry_at = None;
+        return Err(RefreshError::rejected(SESSION_RENEWAL_MESSAGE.to_string()));
+    }
+    if session_access_token_current(&session, now_unix_secs()) {
+        return Ok(Some(session));
+    }
+    if !retry_now && retry_at.is_some_and(|deadline| Instant::now() < deadline) {
+        return Err(
+            "Discord is temporarily unavailable. Your saved sign-in will be retried."
+                .to_string()
+                .into(),
+        );
+    }
+    let result = renew_session(
+        config,
+        session,
+        now_unix_secs(),
+        |refresh| refresh_token(config, refresh),
+        |session| verify_session(config, session),
+        |session| save_session_if_current(session, generation),
+    );
+    match result {
+        Ok(session) => {
+            *retry_at = None;
+            Ok(Some(session))
+        }
+        Err(error) => {
+            if error.retryable {
+                *retry_at = Some(Instant::now() + REFRESH_RETRY_DELAY);
+            } else {
+                clear_session_if_current(Some(generation))?;
+                *retry_at = None;
+            }
+            Err(error)
+        }
+    }
+}
+
+// Persist a rotated refresh token before any fallible identity/role request.
+// Pending credentials carry no authorization, including when read by old builds.
+fn renew_session(
+    config: &AuthConfig,
+    mut session: AuthSession,
+    now: u64,
+    refresh: impl FnOnce(&str) -> Result<DiscordTokenResponse, RefreshError>,
+    verify: impl FnOnce(AuthSession) -> Result<AuthSession, RefreshError>,
+    mut save: impl FnMut(&AuthSession) -> Result<(), String>,
+) -> Result<AuthSession, RefreshError> {
+    if token_expired(session.expires_at_unix, now) {
+        let created_at = session_created_at_unix(&session);
+        let token = refresh(&session.refresh_token)?;
+        session = pending_session(config, token, created_at, now);
+        save(&session)?;
+    }
+    let session = verify(session)?;
+    save(&session)?;
+    Ok(session)
 }
 
 pub fn clear_session() -> Result<(), String> {
+    clear_session_if_current(None)
+}
+
+fn clear_session_if_current(generation: Option<u64>) -> Result<(), String> {
     let _guard = SESSION_STORAGE_LOCK
         .lock()
         .map_err(|_| "Discord session storage is unavailable.".to_string())?;
+    if generation.is_some_and(|value| SESSION_GENERATION.load(Ordering::SeqCst) != value) {
+        return Ok(());
+    }
+    SESSION_GENERATION.fetch_add(1, Ordering::SeqCst);
     let path = session_path()?;
     #[cfg(target_os = "linux")]
     if path.exists() {
@@ -301,49 +385,13 @@ pub fn current_access_token() -> Result<String, String> {
 }
 
 pub fn current_or_refreshed_access_token() -> Result<Option<String>, String> {
+    refreshed_access_token().map_err(String::from)
+}
+
+pub fn refreshed_access_token() -> Result<Option<String>, RefreshError> {
     let config = auth_config()?;
-    let _guard = SESSION_REFRESH_LOCK
-        .lock()
-        .map_err(|_| "Discord session refresh lock was poisoned.".to_string())?;
-    let Some(session) = load_session()? else {
-        return Ok(None);
-    };
-
-    if !session_matches_config(&session, &config) {
-        clear_session()?;
-        return Ok(None);
-    }
-
-    let now = now_unix_secs();
-    if session_age_expired(&session, now) {
-        clear_session()?;
-        return Ok(None);
-    }
-
-    if session_access_token_current(&session, now) {
-        return Ok(Some(session.access_token));
-    }
-
-    let created_at_unix = session_created_at_unix(&session);
-
-    let token = match refresh_token(&config, &session.refresh_token) {
-        Ok(token) => token,
-        Err(error) => {
-            let _ = clear_session();
-            return Err(error);
-        }
-    };
-
-    let session = match verified_session_from_token(&config, token, Some(created_at_unix)) {
-        Ok(session) => session,
-        Err(error) => {
-            let _ = clear_session();
-            return Err(error);
-        }
-    };
-    let access_token = session.access_token.clone();
-    save_session(&session)?;
-    Ok(Some(access_token))
+    current_or_refreshed_session(&config, false)
+        .map(|session| session.map(|session| session.access_token))
 }
 
 pub fn role_label() -> &'static str {
@@ -490,10 +538,13 @@ fn exchange_code(
         ("redirect_uri", redirect_uri.as_str()),
         ("code_verifier", verifier),
     ];
-    post_token_request(&params, "Discord token exchange failed")
+    post_token_request(&params, "Discord token exchange failed").map_err(String::from)
 }
 
-fn refresh_token(config: &AuthConfig, refresh_token: &str) -> Result<DiscordTokenResponse, String> {
+fn refresh_token(
+    config: &AuthConfig,
+    refresh_token: &str,
+) -> Result<DiscordTokenResponse, RefreshError> {
     let params = [
         ("client_id", config.client_id.as_str()),
         ("grant_type", "refresh_token"),
@@ -505,7 +556,7 @@ fn refresh_token(config: &AuthConfig, refresh_token: &str) -> Result<DiscordToke
 fn post_token_request(
     params: &[(&str, &str)],
     error_prefix: &str,
-) -> Result<DiscordTokenResponse, String> {
+) -> Result<DiscordTokenResponse, RefreshError> {
     let client = http_client()?;
     let response = client
         .post(format!("{API_BASE}/oauth2/token"))
@@ -516,18 +567,18 @@ fn post_token_request(
     let body = download::read_response(response, MAX_AUTH_RESPONSE_BYTES, error_prefix)?;
 
     if !status.is_success() {
-        return Err(format!(
-            "{error_prefix}: {}",
-            discord_error_message(status.as_u16(), &body)
+        return Err(refresh_http_error(
+            status.as_u16(),
+            &body,
+            error_prefix,
+            true,
         ));
     }
 
     let token: DiscordTokenResponse = serde_json::from_slice(&body)
         .map_err(|error| format!("{error_prefix}: invalid Discord response: {error}"))?;
     if !token.token_type.eq_ignore_ascii_case("bearer") {
-        return Err(format!(
-            "{error_prefix}: Discord returned an unsupported token type."
-        ));
+        return Err(format!("{error_prefix}: Discord returned an unsupported token type.").into());
     }
     if token
         .refresh_token
@@ -538,52 +589,90 @@ fn post_token_request(
     {
         return Err(format!(
             "{error_prefix}: Discord did not return a refresh token. Make sure the Brick Discord app is configured as a public OAuth2 client."
-        ));
+        ).into());
     }
     Ok(token)
 }
 
-fn verified_session_from_token(
+fn pending_session(
     config: &AuthConfig,
     token: DiscordTokenResponse,
-    created_at_unix: Option<u64>,
-) -> Result<AuthSession, String> {
-    let user = fetch_user(&token.access_token)?;
-    let member = fetch_member(config, &token.access_token)?;
-    let authorized_role_ids = member
-        .roles
-        .iter()
-        .filter(|role_id| config.allowed_role_ids.contains(*role_id))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if authorized_role_ids.is_empty() {
-        return Err(format!(
-            "This Discord account does not have {} in {}.",
-            config.role_label, config.guild_name
-        ));
-    }
-
-    let now = now_unix_secs();
-    Ok(AuthSession {
+    created_at: u64,
+    now: u64,
+) -> AuthSession {
+    AuthSession {
         schema: SESSION_SCHEMA,
         client_id: config.client_id.clone(),
         guild_id: config.guild_id.clone(),
         access_token: token.access_token,
         refresh_token: token.refresh_token.unwrap_or_default(),
         expires_at_unix: now.saturating_add(token.expires_in),
-        created_at_unix: created_at_unix.filter(|value| *value > 0).unwrap_or(now),
-        user_id: user.id,
-        username: user.username,
-        global_name: user.global_name,
-        guild_nick: member.nick,
-        role_ids: member.roles,
-        authorized_role_ids,
-        authorized_at_unix: now,
-    })
+        created_at_unix: created_at,
+        user_id: String::new(),
+        username: String::new(),
+        global_name: None,
+        guild_nick: None,
+        role_ids: Vec::new(),
+        authorized_role_ids: Vec::new(),
+        authorized_at_unix: 0,
+        authorization_pending: true,
+    }
 }
 
-fn fetch_user(access_token: &str) -> Result<DiscordUser, String> {
+fn verified_session_from_token(
+    config: &AuthConfig,
+    token: DiscordTokenResponse,
+    created_at_unix: Option<u64>,
+) -> Result<AuthSession, RefreshError> {
+    let now = now_unix_secs();
+    verify_session(
+        config,
+        pending_session(
+            config,
+            token,
+            created_at_unix.filter(|v| *v > 0).unwrap_or(now),
+            now,
+        ),
+    )
+}
+
+fn verify_session(config: &AuthConfig, session: AuthSession) -> Result<AuthSession, RefreshError> {
+    let user = fetch_user(&session.access_token)?;
+    let member = fetch_member(config, &session.access_token)?;
+    authorize_session(config, session, user, member, now_unix_secs())
+}
+
+fn authorize_session(
+    config: &AuthConfig,
+    mut session: AuthSession,
+    user: DiscordUser,
+    member: DiscordMember,
+    now: u64,
+) -> Result<AuthSession, RefreshError> {
+    let authorized_role_ids = member
+        .roles
+        .iter()
+        .filter(|role_id| config.allowed_role_ids.contains(*role_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if authorized_role_ids.is_empty() {
+        return Err(RefreshError::rejected(format!(
+            "This Discord account does not have {} in {}.",
+            config.role_label, config.guild_name
+        )));
+    }
+    session.user_id = user.id;
+    session.username = user.username;
+    session.global_name = user.global_name;
+    session.guild_nick = member.nick;
+    session.role_ids = member.roles;
+    session.authorized_role_ids = authorized_role_ids;
+    session.authorized_at_unix = now;
+    session.authorization_pending = false;
+    Ok(session)
+}
+
+fn fetch_user(access_token: &str) -> Result<DiscordUser, RefreshError> {
     get_discord_json(
         &format!("{API_BASE}/users/@me"),
         access_token,
@@ -591,7 +680,7 @@ fn fetch_user(access_token: &str) -> Result<DiscordUser, String> {
     )
 }
 
-fn fetch_member(config: &AuthConfig, access_token: &str) -> Result<DiscordMember, String> {
+fn fetch_member(config: &AuthConfig, access_token: &str) -> Result<DiscordMember, RefreshError> {
     get_discord_json(
         &format!("{API_BASE}/users/@me/guilds/{}/member", config.guild_id),
         access_token,
@@ -603,7 +692,7 @@ fn get_discord_json<T: for<'de> Deserialize<'de>>(
     url: &str,
     access_token: &str,
     error_prefix: &str,
-) -> Result<T, String> {
+) -> Result<T, RefreshError> {
     let client = http_client()?;
     let response = client
         .get(url)
@@ -614,14 +703,37 @@ fn get_discord_json<T: for<'de> Deserialize<'de>>(
     let body = download::read_response(response, MAX_AUTH_RESPONSE_BYTES, error_prefix)?;
 
     if !status.is_success() {
-        return Err(format!(
-            "{error_prefix}: {}",
-            discord_error_message(status.as_u16(), &body)
+        return Err(refresh_http_error(
+            status.as_u16(),
+            &body,
+            error_prefix,
+            false,
         ));
     }
 
     serde_json::from_slice(&body)
-        .map_err(|error| format!("{error_prefix}: invalid Discord response: {error}"))
+        .map_err(|error| format!("{error_prefix}: invalid Discord response: {error}").into())
+}
+
+fn refresh_http_error(
+    status: u16,
+    body: &[u8],
+    prefix: &str,
+    token_endpoint: bool,
+) -> RefreshError {
+    let message = format!("{prefix}: {}", discord_error_message(status, body));
+    let rejected = if token_endpoint {
+        status == 400
+            && serde_json::from_slice::<DiscordErrorResponse>(body)
+                .is_ok_and(|error| error.error.as_deref() == Some("invalid_grant"))
+    } else {
+        matches!(status, 401 | 403 | 404)
+    };
+    if rejected {
+        RefreshError::rejected(message)
+    } else {
+        message.into()
+    }
 }
 
 fn authorized_user(session: &AuthSession, config: &AuthConfig) -> AuthorizedUser {
@@ -657,14 +769,15 @@ fn session_matches_config(session: &AuthSession, config: &AuthConfig) -> bool {
     (session.schema == 1 || session.schema == SESSION_SCHEMA)
         && session.client_id == config.client_id
         && session.guild_id == config.guild_id
-        && session
-            .authorized_role_ids
-            .iter()
-            .any(|role_id| config.allowed_role_ids.contains(role_id))
+        && (session.authorization_pending
+            || session
+                .authorized_role_ids
+                .iter()
+                .any(|role_id| config.allowed_role_ids.contains(role_id)))
 }
 
 fn session_access_token_current(session: &AuthSession, now: u64) -> bool {
-    !token_expired(session.expires_at_unix, now)
+    !session.authorization_pending && !token_expired(session.expires_at_unix, now)
 }
 
 fn session_age_expired(session: &AuthSession, now: u64) -> bool {
@@ -726,10 +839,13 @@ fn load_session_at(path: &Path, legacy_path: &Path) -> Result<Option<AuthSession
     Ok(None)
 }
 
-fn save_session(session: &AuthSession) -> Result<(), String> {
+fn save_session_if_current(session: &AuthSession, generation: u64) -> Result<(), String> {
     let _guard = SESSION_STORAGE_LOCK
         .lock()
         .map_err(|_| "Discord session storage is unavailable.".to_string())?;
+    if SESSION_GENERATION.load(Ordering::SeqCst) != generation {
+        return Err("The Discord sign-in changed while access was being checked.".to_string());
+    }
     save_session_unlocked(session)
 }
 
@@ -1303,5 +1419,189 @@ mod tests {
         assert!(!path.exists());
         assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
         std::fs::remove_file(legacy).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    fn config() -> AuthConfig {
+        AuthConfig {
+            client_id: "test-client".into(),
+            guild_id: "test-guild".into(),
+            guild_name: "Test".into(),
+            role_label: "Raider".into(),
+            allowed_role_ids: HashSet::from(["test-role".into()]),
+        }
+    }
+    fn token(access: &str, refresh: &str, expires_in: u64) -> DiscordTokenResponse {
+        DiscordTokenResponse {
+            access_token: access.into(),
+            refresh_token: Some(refresh.into()),
+            token_type: "Bearer".into(),
+            expires_in,
+        }
+    }
+    fn authorized(session: AuthSession, roles: Vec<String>) -> Result<AuthSession, RefreshError> {
+        authorize_session(
+            &config(),
+            session,
+            DiscordUser {
+                id: "123".into(),
+                username: "Test".into(),
+                global_name: None,
+            },
+            DiscordMember { nick: None, roles },
+            1000,
+        )
+    }
+    fn expired() -> AuthSession {
+        authorized(
+            pending_session(&config(), token("old-access", "old-refresh", 100), 500, 500),
+            vec!["test-role".into()],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn temporary_http_errors_do_not_revoke_personal_credentials() {
+        for status in [408, 429, 500, 502, 503, 504] {
+            for token_endpoint in [false, true] {
+                assert!(
+                    refresh_http_error(
+                        status,
+                        br#"{"error":"temporarily_unavailable"}"#,
+                        "Discord",
+                        token_endpoint
+                    )
+                    .retryable
+                );
+            }
+        }
+        assert!(
+            refresh_http_error(400, br#"{"error":"invalid_client"}"#, "Discord", true).retryable
+        );
+        assert!(
+            refresh_http_error(400, br#"{"message":"invalid_grant"}"#, "Discord", true).retryable
+        );
+        assert!(
+            !refresh_http_error(400, br#"{"error":"invalid_grant"}"#, "Discord", true).retryable
+        );
+        for status in [401, 403, 404] {
+            assert!(!refresh_http_error(status, b"{}", "Discord", false).retryable);
+        }
+    }
+
+    #[test]
+    fn failed_refresh_preserves_the_existing_saved_credential() {
+        let session = expired();
+        let result = renew_session(
+            &config(),
+            session,
+            1000,
+            |refresh| {
+                assert_eq!(refresh, "old-refresh");
+                Err("Connection timed out".to_string().into())
+            },
+            |_| panic!("No identity lookup before a successful refresh"),
+            |_| panic!("Do not overwrite credentials after a failed refresh"),
+        );
+        assert!(result.err().unwrap().retryable);
+    }
+
+    #[test]
+    fn a_rotated_token_survives_failed_role_lookup_and_can_resume_after_restart() {
+        let mut saved = Vec::new();
+        let result = renew_session(
+            &config(),
+            expired(),
+            1000,
+            |_| Ok(token("new-access", "new-refresh", 3600)),
+            |session| {
+                assert_eq!(session.access_token, "new-access");
+                Err(refresh_http_error(503, b"{}", "Discord roles", false))
+            },
+            |session| {
+                saved.push(serde_json::to_vec(session).unwrap());
+                Ok(())
+            },
+        );
+        assert!(result.err().unwrap().retryable);
+        assert_eq!(saved.len(), 1);
+        let pending: AuthSession = serde_json::from_slice(&saved[0]).unwrap();
+        assert_eq!(pending.refresh_token, "new-refresh");
+        assert!(pending.authorization_pending);
+        assert!(pending.authorized_role_ids.is_empty());
+        assert!(pending.role_ids.is_empty());
+        assert!(session_matches_config(&pending, &config()));
+        assert!(!session_access_token_current(&pending, 1001));
+        let result = renew_session(
+            &config(),
+            pending,
+            1001,
+            |_| {
+                panic!(
+                    "Retry the role lookup using the saved replacement, not another token rotation"
+                )
+            },
+            |session| authorized(session, vec!["test-role".into()]),
+            |session| {
+                saved.push(serde_json::to_vec(session).unwrap());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(result.created_at_unix, 500);
+        assert_eq!(result.expires_at_unix, 4600);
+        assert!(!result.authorization_pending);
+        assert!(session_access_token_current(&result, 1001));
+        assert_eq!(saved.len(), 2);
+    }
+
+    #[test]
+    fn revoked_roles_never_reuse_the_previous_authorization() {
+        let mut saved = Vec::new();
+        let result = renew_session(
+            &config(),
+            expired(),
+            1000,
+            |_| Ok(token("new-access", "new-refresh", 3600)),
+            |session| authorized(session, vec!["unrelated-role".into()]),
+            |session| {
+                saved.push(session.clone());
+                Ok(())
+            },
+        );
+        assert!(!result.err().unwrap().retryable);
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].authorized_role_ids.is_empty());
+        assert!(!session_access_token_current(&saved[0], 1001));
+    }
+
+    #[test]
+    fn failed_secure_storage_never_returns_a_new_authorization() {
+        let result = renew_session(
+            &config(),
+            expired(),
+            1000,
+            |_| Ok(token("new-access", "new-refresh", 3600)),
+            |_| panic!("Stop when pending credentials cannot be saved securely"),
+            |_| Err("Keyring unavailable".into()),
+        );
+        assert!(result.err().unwrap().retryable);
+    }
+
+    #[test]
+    fn existing_session_records_default_to_verified_and_keep_the_original_age_limit() {
+        let mut value = serde_json::to_value(expired()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("authorizationPending");
+        let session: AuthSession = serde_json::from_value(value).unwrap();
+        assert!(!session.authorization_pending);
+        assert!(session_matches_config(&session, &config()));
+        assert!(session_age_expired(&session, 500 + MAX_SESSION_AGE_SECS));
     }
 }

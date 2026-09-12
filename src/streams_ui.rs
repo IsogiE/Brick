@@ -1765,10 +1765,21 @@ fn live_people(streams: &[Stream]) -> Vec<&Stream> {
 }
 
 fn access_token() -> Result<String, streams::Error> {
-    discord_auth::current_access_token().map_err(|message| streams::Error {
-        message,
-        access_denied: true,
-    })
+    refreshed_token_result(discord_auth::refreshed_access_token())
+}
+
+fn refreshed_token_result(
+    result: Result<Option<String>, discord_auth::RefreshError>,
+) -> Result<String, streams::Error> {
+    result
+        .map_err(|error| streams::Error {
+            message: error.message,
+            access_denied: !error.retryable,
+        })?
+        .ok_or_else(|| streams::Error {
+            message: "Please sign in with Discord.".to_string(),
+            access_denied: true,
+        })
 }
 
 pub(crate) fn player_url_for_playback(
@@ -1810,7 +1821,6 @@ mod tests {
             },
         );
     }
-
     #[test]
     fn fullscreen_toolbar_keeps_video_bounds_stable_with_long_pov_name() {
         for width in [720.0, 980.0, 1920.0] {
@@ -2016,6 +2026,27 @@ mod tests {
         assert!(!ui.can_delete_recordings);
         assert!(ui.recordings.is_none());
         assert!(ui.confirm_remove_recording.is_none());
+    }
+
+
+    #[test]
+    fn temporary_token_refresh_failures_do_not_discard_stream_authorization() {
+        let mut ui = StreamsUi::default();
+        ui.recordings = Some(Rc::new(vec![recording("987", "1")]));
+        let (tx, rx) = mpsc::channel();
+        ui.work = Some(rx);
+        let error = refreshed_token_result(Err(discord_auth::RefreshError {
+            message: "Discord unavailable".into(),
+            retryable: true,
+        })).unwrap_err();
+        assert!(!error.access_denied);
+        tx.send(Err(error)).unwrap();
+        assert!(!ui.tick(&egui::Context::default(), true, false));
+        assert_eq!(ui.recordings.as_ref().unwrap().len(), 1);
+        assert!(refreshed_token_result(Ok(None)).unwrap_err().access_denied);
+        assert!(refreshed_token_result(Err(discord_auth::RefreshError::rejected(
+            "Revoked".into(),
+        ))).unwrap_err().access_denied);
     }
 
     #[test]
