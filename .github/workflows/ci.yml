@@ -164,3 +164,13 @@ jobs:
         env:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo build --release --locked
+
+      - name: Retain Windows native test binaries
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: brick-windows-native-tests
+          path: |
+            target/debug/deps/brick-*.exe
+          if-no-files-found: error
+          retention-days: 7
