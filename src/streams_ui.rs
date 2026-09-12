@@ -2028,7 +2028,6 @@ mod tests {
         assert!(ui.confirm_remove_recording.is_none());
     }
 
-
     #[test]
     fn temporary_token_refresh_failures_do_not_discard_stream_authorization() {
         let mut ui = StreamsUi::default();
@@ -2038,15 +2037,18 @@ mod tests {
         let error = refreshed_token_result(Err(discord_auth::RefreshError {
             message: "Discord unavailable".into(),
             retryable: true,
-        })).unwrap_err();
+        }))
+        .unwrap_err();
         assert!(!error.access_denied);
         tx.send(Err(error)).unwrap();
         assert!(!ui.tick(&egui::Context::default(), true, false));
         assert_eq!(ui.recordings.as_ref().unwrap().len(), 1);
         assert!(refreshed_token_result(Ok(None)).unwrap_err().access_denied);
-        assert!(refreshed_token_result(Err(discord_auth::RefreshError::rejected(
-            "Revoked".into(),
-        ))).unwrap_err().access_denied);
+        assert!(
+            refreshed_token_result(Err(discord_auth::RefreshError::rejected("Revoked".into(),)))
+                .unwrap_err()
+                .access_denied
+        );
     }
 
     #[test]

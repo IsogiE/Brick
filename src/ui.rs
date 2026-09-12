@@ -2353,7 +2353,11 @@ fn friendly_auth_problem(status: &str) -> String {
         "Discord login timed out. Try again when the browser prompt is ready.".to_string()
     } else if lower.contains("invalid_client") || lower.contains("configured") {
         "Brick could not use its Discord app configuration.".to_string()
-    } else if lower.contains("401") || lower.contains("unauthorized") || lower.contains("revoked") || lower.contains("expired") {
+    } else if lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("revoked")
+        || lower.contains("expired")
+    {
         "The saved Discord session expired or was revoked.".to_string()
     } else {
         "Discord could not verify access right now.".to_string()
@@ -3012,7 +3016,11 @@ pub(crate) mod tests {
         app.auth_state = AuthUiState::Refreshing;
         let (tx, rx) = mpsc::channel();
         app.auth_rx = Some(rx);
-        tx.send(Err(RefreshError { message: "Temporary Discord failure".into(), retryable: true })).unwrap();
+        tx.send(Err(RefreshError {
+            message: "Temporary Discord failure".into(),
+            retryable: true,
+        }))
+        .unwrap();
         app.poll_auth();
         assert!(matches!(app.auth_state, AuthUiState::Retrying));
         assert!(!app.auth_state.is_authorized());
@@ -3031,7 +3039,10 @@ pub(crate) mod tests {
         let mut app = app();
         let (tx, rx) = mpsc::channel();
         app.auth_rx = Some(rx);
-        tx.send(Err(RefreshError::rejected("Discord login was revoked".into()))).unwrap();
+        tx.send(Err(RefreshError::rejected(
+            "Discord login was revoked".into(),
+        )))
+        .unwrap();
         app.poll_auth();
         assert!(matches!(app.auth_state, AuthUiState::Denied(_)));
         assert!(!app.auth_state.is_authorized());
@@ -3045,5 +3056,4 @@ pub(crate) mod tests {
         assert!(!copy.1.contains("browser"));
         assert!(!copy.3);
     }
-
 }
