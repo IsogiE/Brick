@@ -33,7 +33,7 @@ webkit2gtk = "2.0"
 keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 ksni = { version = "0.3", features = ["blocking"] }
 winit = { version = "=0.30.13", default-features = false, features = ["x11", "wayland"] }
-x11rb = "0.13"
+x11rb = "0.14"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 tray-icon = { version = "0.24", default-features = false }
