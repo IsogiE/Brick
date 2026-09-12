@@ -5,7 +5,7 @@ import { basename, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const feedRepo = process.env.BRICK_FEED_REPO || 'IsogiE/Brick-Releases';
-const feedTag = process.env.BRICK_FEED_TAG || 'addon-feed-v2';
+const feedTag = process.env.BRICK_FEED_TAG || 'addon-feed-v3';
 const sourceRepo = process.env.BRICK_ADDON_GITHUB_REPO || 'IsogiE/AdvanceRaidTools';
 const sourceDir = resolve(process.env.BRICK_ADDON_SOURCE_DIR || '../AdvanceRaidTools');
 const releaseDir = resolve(process.env.BRICK_ADDON_RELEASE_DIR || join(sourceDir, '.release'));
@@ -234,55 +234,15 @@ function signManifest(manifestJson, privateKeyB64) {
   return sign(null, Buffer.from(manifestJson), privateKey).toString('base64');
 }
 
-function ensureFeedRelease(ghToken) {
-  let releaseExists = false;
-  try {
-    gh(['release', 'view', feedTag, '--repo', feedRepo], ghToken, 'ignore');
-    releaseExists = true;
-  } catch {
-    // The feed release is addressed by a fixed tag so clients have a stable URL.
-  }
-
-  if (!releaseExists) {
-    const createArgs = [
-      'release',
-      'create',
-      feedTag,
-      '--repo',
-      feedRepo,
-      '--title',
-      'Brick Addon Feed',
-      '--notes',
-      'Signed machine-readable addon feed used by Brick clients.',
-      '--prerelease',
-      '--latest=false'
-    ];
-
-    try {
-      gh(createArgs, ghToken);
-    } catch {
-      gh(createArgs.filter((arg) => arg !== '--latest=false'), ghToken);
-    }
-  }
-
-  const editArgs = [
-    'release',
-    'edit',
-    feedTag,
-    '--repo',
-    feedRepo,
-    '--title',
-    'Brick Addon Feed',
-    '--notes',
-    'Signed machine-readable addon feed used by Brick clients.',
-    '--prerelease',
-    '--latest=false'
-  ];
-
-  try {
-    gh(editArgs, ghToken, 'ignore');
-  } catch {
-    gh(editArgs.filter((arg) => arg !== '--latest=false'), ghToken, 'ignore');
+export function ensureFeedRelease(ghToken, invoke = gh) {
+  // Editing a grandfathered mutable release can permanently freeze its assets
+  // when repository immutability is enabled. Only inspect this channel here;
+  // creation is an explicit maintainer operation outside the CI publisher.
+  const release = JSON.parse(invoke([
+    'api', `repos/${feedRepo}/releases/tags/${feedTag}`
+  ], ghToken, 'pipe'));
+  if (release.tag_name !== feedTag || release.draft !== false || release.immutable !== false) {
+    throw new Error('The addon channel must be an existing published mutable release.');
   }
 }
 
@@ -302,7 +262,8 @@ function gitMaybe(args) {
 }
 
 function gh(args, ghToken, stdio = 'inherit') {
-  execFileSync('gh', args, {
+  return execFileSync('gh', args, {
+    encoding: 'utf8',
     env: {
       ...process.env,
       GH_TOKEN: ghToken

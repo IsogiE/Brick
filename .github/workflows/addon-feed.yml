@@ -91,7 +91,7 @@ jobs:
           BRICK_ADDON_PRIVATE_KEY_B64: ${{ secrets.BRICK_ADDON_V2_PRIVATE_KEY_B64 }}
           GH_TOKEN: ${{ secrets.BRICK_RELEASE_TOKEN }}
           BRICK_FEED_REPO: IsogiE/Brick-Releases
-          BRICK_FEED_TAG: addon-feed-v2
+          BRICK_FEED_TAG: addon-feed-v3
           BRICK_ADDON_GITHUB_REPO: IsogiE/AdvanceRaidTools
           BRICK_ADDON_SOURCE_DIR: ${{ github.workspace }}/addon-source
           BRICK_ADDON_RELEASE_DIR: ${{ github.workspace }}/.release/addon

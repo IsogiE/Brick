@@ -23,12 +23,12 @@ use crate::{atomic_file, discord_auth, download};
 const APP_ID: &str = "dev.isogi.brick";
 const FEED_OWNER: &str = "IsogiE";
 const FEED_REPO: &str = "Brick-Releases";
-const FEED_TAG: &str = "addon-feed-v2";
+const FEED_TAG: &str = "addon-feed-v3";
 const PACKAGE_ID: &str = "AdvanceRaidTools";
 const FEED_URL: &str =
-    "https://github.com/IsogiE/Brick-Releases/releases/download/addon-feed-v2/addon-manifest.json";
+    "https://github.com/IsogiE/Brick-Releases/releases/download/addon-feed-v3/addon-manifest.json";
 const FEED_SIG_URL: &str =
-    "https://github.com/IsogiE/Brick-Releases/releases/download/addon-feed-v2/addon-manifest.json.sig";
+    "https://github.com/IsogiE/Brick-Releases/releases/download/addon-feed-v3/addon-manifest.json.sig";
 const APP_USER_AGENT: &str = "Brick/0.1 (+https://github.com/IsogiE/Brick-Releases)";
 const FEED_UNAVAILABLE_MESSAGE: &str =
     "No signed addon feed is available yet. Brick will check again automatically.";
