@@ -6,14 +6,17 @@ COPY src/replay_digits.rs src/replay_edge.rs ./src/
 COPY src/assets/replay-digits.json ./src/assets/replay-digits.json
 RUN cargo build --locked --release --manifest-path presence/reader/Cargo.toml
 
-FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
+FROM node:22-trixie-slim@sha256:7b8a0c89c54499bee567618f96578e1a12a800f062fbdbfd1fb6a443fa6f6284
 ENV NODE_ENV=production PATH=/opt/media/bin:$PATH
 COPY presence/requirements.txt /tmp/requirements.txt
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg python3-venv ca-certificates \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends ffmpeg python3-venv ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/media \
     && /opt/media/bin/pip install --no-cache-dir --only-binary=:all: --require-hashes -r /tmp/requirements.txt \
-    && rm /tmp/requirements.txt
+    && /opt/media/bin/pip uninstall -y pip setuptools \
+    && rm /tmp/requirements.txt \
+    && rm -rf /usr/local/lib/node_modules /opt/yarn-v* \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg
 WORKDIR /app
 COPY LICENSE src/assets/PTSansNarrow-LICENSE.txt ./
 COPY --from=reader /build/presence/reader/target/release/brick-timestamp-reader ./

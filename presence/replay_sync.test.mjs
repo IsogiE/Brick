@@ -221,3 +221,18 @@ test('large clock corrections remain exclusive to precise, leased YouTube worker
   const replay={provider:'youtube',videoId:youtube.videoId,broadcastId:youtube.broadcastId,startedAt:new Date(key.recordingStartMs).toISOString(),availableSeconds:20000};
   assert.deepEqual(f.library.correctReplay(replay,true),replay);
 });
+
+test('private queue completion derives the stored job and rejects expired or superseded leases', async t => {
+  const f = await fixture(t);
+  f.library.enqueue([key]);
+  const first = f.library.claim();
+  assert.equal(f.library.finishLease(first.id, 'wrong', alignment), false);
+  f.advance(600_001);
+  assert.equal(f.library.finishLease(first.id, first.lease, alignment), false);
+  const next = f.library.claim();
+  assert.notEqual(first.lease, next.lease);
+  assert.equal(f.library.finishLease(first.id, first.lease, alignment), false);
+  assert.equal(f.library.finishLease(next.id, next.lease, alignment), true);
+  assert.equal(f.library.lookup(key).verifiedBy, 'server');
+  assert.equal(f.library.finishLease(next.id, next.lease, alignment), false);
+});
