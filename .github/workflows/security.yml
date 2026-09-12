@@ -20,9 +20,6 @@ jobs:
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294
         with:
           fail-on-severity: moderate
-          # Stable Caddy requires CEL 0.28; 0.29 breaks its API. The proxy accepts
-          # no CEL expressions, enforced by verify-proxy-image.py below.
-          allow-ghsas: GHSA-gcjh-h69q-9w9g
           comment-summary-in-pr: never
   rust-advisories:
     name: Rust security advisories

@@ -26,6 +26,9 @@ after = before.replace(old, b"let mut p: *mut libc::c_char = std::ptr::null_mut(
 old = b"                &p,\n                std::ptr::null::<i8>(),"
 assert after.count(old) == 1
 original[name] = after.replace(old, old.replace(b"&p,", b"&mut p,"))
+name = "glib-0.18.5/src/lib.rs"
+original[name] = (b"// Keep this upstream dependency compatible with modern warning-as-error builds.\n"
+                  b"#![allow(mismatched_lifetime_syntaxes, unused_parens)]\n" + original[name])
 vendored = ROOT / "vendor"
 actual = {}
 for path in (vendored / "glib-0.18.5").rglob("*"):
@@ -35,4 +38,4 @@ for path in (vendored / "glib-0.18.5").rglob("*"):
 assert actual.keys() == original.keys(), "Vendored file list differs from upstream"
 for name, expected in original.items():
     assert actual[name] == expected, f"Unexpected vendored modification: {name}"
-print("GLib backport matches the authenticated upstream crate and exact two-line fix.")
+print("GLib backport matches the authenticated upstream crate and exact security fix and two compatibility lint allowances.")

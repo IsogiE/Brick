@@ -1,3 +1,5 @@
+// Keep this upstream dependency compatible with modern warning-as-error builds.
+#![allow(mismatched_lifetime_syntaxes, unused_parens)]
 // Take a look at the license at the top of the repository in the LICENSE file.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]

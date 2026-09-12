@@ -1,4 +1,4 @@
-"""Validate the proxy and keep its known CEL advisory outside the active policy."""
+"""Validate the proxy and keep unneeded expression matchers outside the active policy."""
 import argparse
 import json
 from pathlib import Path

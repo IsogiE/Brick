@@ -8,6 +8,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      webview-windows-bindings:
+        patterns:
+          - wry
+          - webview2-com
+          - windows
   - package-ecosystem: cargo
     directory: /presence/reader
     schedule:
