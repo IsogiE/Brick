@@ -71,7 +71,7 @@ export async function createProfileStore({ dataDir, env = process.env }) {
     const envelope = JSON.parse(payload.toString("utf8"));
     if (envelope.version !== 1 || !/^[a-f0-9]{24}$/.test(envelope.iv)
       || !/^[a-f0-9]{32}$/.test(envelope.tag) || typeof envelope.data !== "string") throw new Error("Invalid encrypted profiles");
-    const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(envelope.iv, "hex"));
+    const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(envelope.iv, "hex"), { authTagLength: 16 });
     decipher.setAAD(AAD);
     decipher.setAuthTag(Buffer.from(envelope.tag, "hex"));
     const cleartext = Buffer.concat([decipher.update(Buffer.from(envelope.data, "base64")), decipher.final()]);
@@ -101,7 +101,7 @@ export async function createProfileStore({ dataDir, env = process.env }) {
       if (value.customName === null && value.raidRole === null) next.delete(id);
       else next.set(id, value);
       const iv = randomBytes(12);
-      const cipher = createCipheriv("aes-256-gcm", key, iv);
+      const cipher = createCipheriv("aes-256-gcm", key, iv, { authTagLength: 16 });
       cipher.setAAD(AAD);
       const cleartext = Buffer.from(JSON.stringify(Object.fromEntries(next)));
       let encrypted;

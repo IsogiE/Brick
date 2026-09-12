@@ -143,7 +143,14 @@ mod tests {
     #[test]
     fn streaming_retains_the_five_second_edge_and_rejects_gaps() {
         let root = std::env::temp_dir().join(format!("brick-reader-test-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
+        let mut directory = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        // Fail if the fixture already exists; never follow a pre-created link.
+        directory.create(&root).unwrap();
         let absent = root.join("absent.png");
         let present = root.join("present.png");
         let unix = 1_789_060_078_i64;

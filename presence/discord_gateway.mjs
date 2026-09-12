@@ -77,12 +77,14 @@ export function startDiscordGateway({ lookup, token, WebSocket = globalThis.WebS
       if (!payload || typeof payload !== 'object' || Array.isArray(payload)) { reconnect(); return; }
       if (Number.isSafeInteger(payload.s) && payload.s >= 0) sequence = payload.s;
       if (payload.op === 10) {
-        const interval = payload.d?.heartbeat_interval;
-        if (helloReceived || !Number.isSafeInteger(interval) || interval < 1000 || interval > 120_000) {
+        const requestedInterval = payload.d?.heartbeat_interval;
+        if (helloReceived || !Number.isSafeInteger(requestedInterval) || requestedInterval < 1000 || requestedInterval > 120_000) {
           reconnect();
           return;
         }
         helloReceived = true;
+        // Keep the bound explicit on the value captured by the timer callback.
+        const interval = Math.min(120_000, Math.max(1000, requestedInterval));
         firstHeartbeat = setTimeout(() => {
           heartbeat();
           if (!stopped && !closed) heartbeatTimer = setInterval(heartbeat, interval);
