@@ -5,8 +5,8 @@ import { HttpError, RateLimit, readBounded } from './security.mjs';
 const MAX_BYTES = 4096;
 const isObject = value => value && typeof value === 'object' && !Array.isArray(value);
 
-// This listener is bound only to the container's private worker network. Its
-// credential grants lease/result access, never Discord or profile access.
+// This private container listener is neither published nor reverse-proxied.
+// Its credential grants lease/result access, never Discord or profile access.
 export function createTimestampQueue({ library, token }) {
   if (!/^[a-f0-9]{64}$/.test(token || '')) throw new Error('Invalid timestamp worker credential');
   const expected = Buffer.from(`Bearer ${token}`);
