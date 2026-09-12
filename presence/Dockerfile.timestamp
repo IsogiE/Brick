@@ -1,4 +1,4 @@
-FROM rust:1.98-bookworm AS reader
+FROM rust:1.98.1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa AS reader
 WORKDIR /build
 COPY presence/reader/Cargo.toml presence/reader/Cargo.lock ./presence/reader/
 COPY presence/reader/src ./presence/reader/src
@@ -6,16 +6,18 @@ COPY src/replay_digits.rs src/replay_edge.rs ./src/
 COPY src/assets/replay-digits.json ./src/assets/replay-digits.json
 RUN cargo build --locked --release --manifest-path presence/reader/Cargo.toml
 
-FROM node:22-bookworm-slim
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
 ENV NODE_ENV=production PATH=/opt/media/bin:$PATH
+COPY presence/requirements.txt /tmp/requirements.txt
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg python3-venv ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/media \
-    && /opt/media/bin/pip install --no-cache-dir yt-dlp==2026.8.19 yt-dlp-ejs==0.8.0
+    && /opt/media/bin/pip install --no-cache-dir --only-binary=:all: --require-hashes -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
 WORKDIR /app
 COPY LICENSE src/assets/PTSansNarrow-LICENSE.txt ./
 COPY --from=reader /build/presence/reader/target/release/brick-timestamp-reader ./
-COPY presence/timestamp_worker.mjs presence/timestamp_process.mjs presence/timestamp_scan.py presence/timestamp_youtube.py presence/timestamp_frames.py presence/replay_sync.mjs presence/security.mjs ./
+COPY presence/timestamp_worker.mjs presence/timestamp_queue.mjs presence/timestamp_process.mjs presence/timestamp_scan.py presence/timestamp_youtube.py presence/timestamp_frames.py presence/replay_sync.mjs presence/security.mjs ./
 RUN mkdir /scratch && chown node:node /scratch
 USER node
 CMD ["node", "timestamp_worker.mjs"]

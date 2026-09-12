@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       addon_ref:
-        description: 'AdvanceRaidTools commit, branch, or tag to package'
+        description: 'AdvanceRaidTools main commit to package'
         required: false
         default: 'main'
   schedule:
@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   publish:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -24,17 +25,27 @@ jobs:
       - name: Checkout Brick source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+        with:
+          persist-credentials: false
+
       - name: Checkout addon source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           repository: IsogiE/AdvanceRaidTools
           path: addon-source
           fetch-depth: 0
           ref: ${{ github.event.inputs.addon_ref || 'main' }}
 
+      - name: Require addon source from protected main
+        run: |
+          set -euo pipefail
+          git -C addon-source fetch --no-tags origin main
+          git -C addon-source merge-base --is-ancestor HEAD FETCH_HEAD
+
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          node-version: 22.23.2
           package-manager-cache: false
 
       - name: Ignore non-version addon tags
@@ -60,6 +71,7 @@ jobs:
         if: steps.feed_status.outputs.current != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           repository: BigWigsMods/packager
           ref: 20a3713ec537df54db5c0d8b4822d88ee63c70e8
           path: bigwigs-packager
@@ -76,10 +88,10 @@ jobs:
       - name: Publish signed addon feed
         if: steps.feed_status.outputs.current != 'true'
         env:
-          BRICK_ADDON_PRIVATE_KEY_B64: ${{ secrets.BRICK_ADDON_PRIVATE_KEY_B64 }}
+          BRICK_ADDON_PRIVATE_KEY_B64: ${{ secrets.BRICK_ADDON_V2_PRIVATE_KEY_B64 }}
           GH_TOKEN: ${{ secrets.BRICK_RELEASE_TOKEN }}
           BRICK_FEED_REPO: IsogiE/Brick-Releases
-          BRICK_FEED_TAG: addon-feed
+          BRICK_FEED_TAG: addon-feed-v2
           BRICK_ADDON_GITHUB_REPO: IsogiE/AdvanceRaidTools
           BRICK_ADDON_SOURCE_DIR: ${{ github.workspace }}/addon-source
           BRICK_ADDON_RELEASE_DIR: ${{ github.workspace }}/.release/addon

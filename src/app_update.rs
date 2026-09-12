@@ -22,14 +22,18 @@ use crate::download;
 #[path = "windows_install.rs"]
 mod windows_install;
 
+#[cfg(target_os = "windows")]
+#[path = "windows_authenticode.rs"]
+mod windows_authenticode;
+
 const APP_UPDATE_OWNER: &str = "IsogiE";
 const APP_UPDATE_REPO: &str = "Brick-Releases";
-const APP_UPDATE_TAG: &str = "app-feed";
+const APP_UPDATE_TAG: &str = "app-feed-v2";
 const APP_PACKAGE_ID: &str = "Brick";
 const APP_MANIFEST_URL: &str =
-    "https://github.com/IsogiE/Brick-Releases/releases/download/app-feed/app-manifest.json";
+    "https://github.com/IsogiE/Brick-Releases/releases/download/app-feed-v2/app-manifest.json";
 const APP_MANIFEST_SIG_URL: &str =
-    "https://github.com/IsogiE/Brick-Releases/releases/download/app-feed/app-manifest.json.sig";
+    "https://github.com/IsogiE/Brick-Releases/releases/download/app-feed-v2/app-manifest.json.sig";
 const APP_UPDATE_USER_AGENT: &str = concat!(
     "Brick/",
     env!("CARGO_PKG_VERSION"),
@@ -38,10 +42,8 @@ const APP_UPDATE_USER_AGENT: &str = concat!(
 const FEED_UNAVAILABLE_MESSAGE: &str = "No signed Brick app update feed is available yet.";
 const INSTALLER_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
-const APP_UPDATE_PUBLIC_KEY_B64: &str = match option_env!("BRICK_ADDON_PUBLIC_KEY_B64") {
-    Some(value) => value,
-    None => "",
-};
+// This key is independent of the addon signer and its private half never enters CI.
+const APP_UPDATE_PUBLIC_KEY_B64: &str = include_str!("../security/app-update-public-key.b64");
 
 static HTTP_CLIENT: LazyLock<Result<reqwest::blocking::Client, String>> = LazyLock::new(|| {
     reqwest::blocking::Client::builder()
@@ -87,6 +89,7 @@ struct AppUpdateManifest {
     version: String,
     commit: String,
     built_at: String,
+    expires_at: String,
     artifacts: Vec<AppUpdateArtifact>,
 }
 
@@ -189,14 +192,28 @@ fn select_artifact_index(manifest: &AppUpdateManifest, update_kind: &UpdateKind)
 }
 
 pub fn launch_installer(update: &PreparedAppUpdate) -> Result<(), String> {
-    verify_prepared_installer(update)?;
-    match update.kind {
+    // Keep the verified file and its Windows parent directories locked until
+    // ShellExecute has accepted the launch, including any UAC interaction.
+    let verified = verify_prepared_installer(update)?;
+    #[cfg(target_os = "windows")]
+    windows_authenticode::verify(&update.installer_path, &verified._file)?;
+    let result = match update.kind {
         UpdateKind::WindowsNsis => launch_windows_nsis_installer(update),
         UpdateKind::LinuxAppImage => launch_linux_appimage(update),
-    }
+    };
+    drop(verified);
+    result
 }
 
-fn verify_prepared_installer(update: &PreparedAppUpdate) -> Result<(), String> {
+struct VerifiedInstaller {
+    _file: fs::File,
+    #[cfg(target_os = "windows")]
+    _directories: Vec<fs::File>,
+}
+
+fn verify_prepared_installer(update: &PreparedAppUpdate) -> Result<VerifiedInstaller, String> {
+    #[cfg(target_os = "windows")]
+    let directories = windows_install::lock_parent_directories(&update.installer_path)?;
     let metadata = fs::symlink_metadata(&update.installer_path)
         .map_err(|error| format!("Failed to inspect Brick installer: {error}"))?;
     if !metadata.is_file() || metadata.len() != update.size {
@@ -204,14 +221,31 @@ fn verify_prepared_installer(update: &PreparedAppUpdate) -> Result<(), String> {
             "Brick installer changed after download. Please try updating again.".to_string(),
         );
     }
-    let mut file = fs::File::open(&update.installer_path)
-        .map_err(|error| format!("Failed to read Brick installer: {error}"))?
-        .take(update.size.saturating_add(1));
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Permit readers (including the Windows loader) but deny replacement,
+        // writes, and deletion while hashing, checking the signer, and launching.
+        options.share_mode(1).custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options
+        .open(&update.installer_path)
+        .map_err(|error| format!("Failed to lock Brick installer: {error}"))?;
+    if !file
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err("Brick installer is not a regular file.".to_string());
+    }
+    let mut reader = (&file).take(update.size.saturating_add(1));
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     let mut size = 0_u64;
     loop {
-        let count = file
+        let count = reader
             .read(&mut buffer)
             .map_err(|error| format!("Failed to verify Brick installer: {error}"))?;
         if count == 0 {
@@ -225,7 +259,11 @@ fn verify_prepared_installer(update: &PreparedAppUpdate) -> Result<(), String> {
             "Brick installer changed after download. Please try updating again.".to_string(),
         );
     }
-    Ok(())
+    Ok(VerifiedInstaller {
+        _file: file,
+        #[cfg(target_os = "windows")]
+        _directories: directories,
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -255,11 +293,8 @@ fn launch_linux_appimage(update: &PreparedAppUpdate) -> Result<(), String> {
         )
     })?;
 
-    Command::new("sh")
-        .arg("-c")
-        .arg("sleep 0.8; exec \"$1\"")
-        .arg("brick-restart")
-        .arg(replacement_path)
+    Command::new(replacement_path)
+        .arg("--update-restart")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -350,7 +385,7 @@ fn verify_manifest_signature(
     signature_response: &[u8],
 ) -> Result<(), String> {
     let public_key_bytes = B64
-        .decode(APP_UPDATE_PUBLIC_KEY_B64)
+        .decode(APP_UPDATE_PUBLIC_KEY_B64.trim())
         .map_err(|error| format!("Invalid embedded Brick app update public key: {error}"))?;
     let public_key: [u8; 32] = public_key_bytes
         .as_slice()
@@ -375,6 +410,13 @@ fn verify_manifest_signature(
 }
 
 fn validate_manifest(manifest: &AppUpdateManifest) -> Result<(), String> {
+    validate_manifest_at(manifest, time::OffsetDateTime::now_utc())
+}
+
+fn validate_manifest_at(
+    manifest: &AppUpdateManifest,
+    now: time::OffsetDateTime,
+) -> Result<(), String> {
     if manifest.schema != 1 {
         return Err(format!(
             "Unsupported Brick app manifest schema {}.",
@@ -388,8 +430,23 @@ fn validate_manifest(manifest: &AppUpdateManifest) -> Result<(), String> {
         ));
     }
     parse_semver(&manifest.version)?;
-    if manifest.commit.trim().is_empty() || manifest.built_at.trim().is_empty() {
+    if manifest.commit.len() != 40 || !manifest.commit.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("Brick app manifest is missing build metadata.".to_string());
+    }
+    let parse_date = |value: &str| {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+            .map_err(|_| "Brick app manifest contains an invalid date.".to_string())
+    };
+    let issued = parse_date(&manifest.built_at)?;
+    let expires = parse_date(&manifest.expires_at)?;
+    if issued > now + time::Duration::minutes(5)
+        || expires <= now
+        || expires <= issued
+        || expires - issued > time::Duration::days(90)
+    {
+        return Err(
+            "Brick app update metadata has expired or has an invalid validity period.".into(),
+        );
     }
     if manifest.artifacts.is_empty() {
         return Err("Brick app manifest does not list installers.".to_string());
@@ -939,8 +996,9 @@ mod tests {
             schema: 1,
             package_id: "Brick".to_string(),
             version: "0.2.0".to_string(),
-            commit: "abc123".to_string(),
+            commit: "a".repeat(40),
             built_at: "2026-09-04T00:00:00Z".to_string(),
+            expires_at: "2026-12-03T00:00:00Z".to_string(),
             artifacts,
         }
     }
@@ -957,6 +1015,30 @@ mod tests {
             sha256: "a".repeat(64),
             size: 1,
         }
+    }
+
+    #[test]
+    fn expired_future_and_excessively_long_lived_manifests_are_rejected() {
+        let mut manifest = test_manifest(vec![artifact(
+            "windows",
+            "x86_64",
+            "nsis",
+            "brick_0.2.0_x64-setup.exe",
+        )]);
+        let now = time::OffsetDateTime::parse(
+            "2026-09-12T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert!(super::validate_manifest_at(&manifest, now).is_ok());
+        manifest.expires_at = "2026-09-12T00:00:00Z".into();
+        assert!(super::validate_manifest_at(&manifest, now).is_err());
+        manifest.expires_at = "2027-01-01T00:00:00Z".into();
+        assert!(super::validate_manifest_at(&manifest, now).is_err());
+        manifest.built_at = "2026-12-01T00:00:00Z".into();
+        assert!(super::validate_manifest_at(&manifest, now).is_err());
+        manifest.expires_at.clear();
+        assert!(super::validate_manifest_at(&manifest, now).is_err());
     }
 
     #[test]
@@ -983,5 +1065,29 @@ mod tests {
         fs::remove_file(&path).unwrap();
         assert!(super::verify_prepared_installer(&update).is_err());
         assert!(super::launch_installer(&update).is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn verified_installer_cannot_be_replaced_or_written_during_launch() {
+        let root = TestDirectory::new();
+        let directory = root.0.join("updates");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("fixture.exe");
+        fs::write(&path, b"locked fixture").unwrap();
+        let update = super::PreparedAppUpdate {
+            version: "1.0.0".into(),
+            installer_path: path.clone(),
+            replacement_path: None,
+            kind: super::UpdateKind::WindowsNsis,
+            sha256: super::sha256_hex(b"locked fixture"),
+            size: 14,
+        };
+        let verified = super::verify_prepared_installer(&update).unwrap();
+        assert!(fs::write(&path, b"changed").is_err());
+        assert!(fs::remove_file(&path).is_err());
+        assert!(fs::rename(&directory, root.0.join("moved")).is_err());
+        drop(verified);
+        fs::remove_file(&path).unwrap();
     }
 }

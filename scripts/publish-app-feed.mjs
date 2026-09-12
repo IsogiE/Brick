@@ -1,235 +1,168 @@
-import { createHash, createPrivateKey, sign } from 'node:crypto';
+import { createHash, createPrivateKey, createPublicKey, sign, verify } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
+import { lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { parseArgs } from 'node:util';
 
-const feedRepo = process.env.BRICK_APP_FEED_REPO || 'IsogiE/Brick-Releases';
-const feedTag = process.env.BRICK_APP_FEED_TAG || 'app-feed';
-const releaseAssetsDir = resolve(process.env.BRICK_RELEASE_ASSETS_DIR || 'release-assets');
-const packageId = 'Brick';
-const manifestName = 'app-manifest.json';
-const signatureName = `${manifestName}.sig`;
-const outputDir = resolve('.release/brick-app-feed');
+const trustedRoot = fileURLToPath(new URL('../', import.meta.url));
+let root = trustedRoot;
+const sourceRepo = 'IsogiE/Brick';
+const feedRepo = 'IsogiE/Brick-Releases';
+const feedTag = 'app-feed-v2';
+const publicKeyBytes = Buffer.from(readFileSync(new URL('../security/app-update-public-key.b64', import.meta.url), 'utf8').trim(), 'base64');
+export const publicKey = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), publicKeyBytes]), format: 'der', type: 'spki' });
+const MAX_ARTIFACT_BYTES = 256 * 1024 * 1024;
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
-
-async function main() {
-  const version = releaseVersion();
-  const releaseTag = `v${version}`;
-  const artifacts = findAppArtifacts(releaseAssetsDir, releaseTag, version);
-
-  if (process.argv.includes('--list-artifacts')) {
-    console.log(JSON.stringify(artifacts, null, 2));
-    return;
-  }
-
-  const privateKeyB64 = requiredEnv('BRICK_ADDON_PRIVATE_KEY_B64');
-  const ghToken = requiredEnvAny(['GH_TOKEN', 'GITHUB_TOKEN']);
-
-  if (artifacts.length === 0) {
-    throw new Error(`No Brick ${version} NSIS installer or AppImage found under ${releaseAssetsDir}.`);
-  }
-
-  const manifest = {
-    schema: 1,
-    packageId,
-    version,
-    commit: process.env.GITHUB_SHA || git(['rev-parse', 'HEAD']),
-    builtAt: new Date().toISOString(),
-    source: {
-      provider: 'github-actions',
-      repo: process.env.GITHUB_REPOSITORY || 'IsogiE/Brick',
-      workflow: process.env.GITHUB_WORKFLOW || 'Release',
-      runId: process.env.GITHUB_RUN_ID || '',
-      releaseTag
-    },
-    artifacts
-  };
-
-  mkdirSync(outputDir, { recursive: true });
-  const manifestPath = join(outputDir, manifestName);
-  const signaturePath = join(outputDir, signatureName);
-  const manifestJson = `${JSON.stringify(manifest, null, 2)}\n`;
-
-  writeFileSync(manifestPath, manifestJson);
-  writeFileSync(signaturePath, `${signManifest(manifestJson, privateKeyB64)}\n`);
-
-  ensureFeedRelease(ghToken);
-  gh(['release', 'upload', feedTag, manifestPath, signaturePath, '--repo', feedRepo, '--clobber'], ghToken);
-
-  console.log(`Published Brick app update feed ${version} to ${feedRepo}@${feedTag}.`);
-}
-
-function releaseVersion() {
-  const versionInput =
-    process.env.BRICK_APP_VERSION
-    || process.env.GITHUB_REF_NAME?.replace(/^v/, '')
-    || null;
-  const version = versionInput?.replace(/^v/, '') || null;
-
-  if (!version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
-    throw new Error('BRICK_APP_VERSION or a v* SemVer tag is required.');
-  }
-
-  return version;
-}
-
-function findAppArtifacts(dir, releaseTag, version) {
-  return findFiles(dir)
-    .filter((path) => /\.(exe|appimage)$/i.test(path) && fileBelongsToVersion(basename(path), version))
-    .map((path) => appArtifact(path, releaseTag))
-    .sort((a, b) => a.fileName.localeCompare(b.fileName));
-}
-
-function fileBelongsToVersion(fileName, version) {
-  const escaped = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(^|[\\s._-])v?${escaped}($|[\\s._-])`, 'i').test(fileName);
-}
-
-function appArtifact(path, releaseTag) {
-  const file = readFileSync(path);
-  const fileName = basename(path);
-  const kind = inferKind(fileName);
-
-  return {
-    os: kind === 'appimage' ? 'linux' : 'windows',
-    arch: inferArch(fileName),
-    kind,
-    fileName,
-    url: `https://github.com/${feedRepo}/releases/download/${encodeURIComponent(releaseTag)}/${encodeURIComponent(fileName)}`,
-    sha256: createHash('sha256').update(file).digest('hex'),
-    size: file.length
-  };
-}
-
-function inferKind(fileName) {
-  if (/\.appimage$/i.test(fileName)) {
-    return 'appimage';
-  }
-  return 'nsis';
-}
-
-function inferArch(fileName) {
-  const lower = fileName.toLowerCase();
-  if (/(arm64|aarch64)/.test(lower)) {
-    return 'aarch64';
-  }
-  if (/(x86|i686|win32)/.test(lower) && !/(x86_64|x64)/.test(lower)) {
-    return 'x86';
-  }
-  return 'x86_64';
-}
-
-function findFiles(dir) {
-  const files = [];
-  for (const name of readdirSync(dir)) {
-    const path = join(dir, name);
-    if (statSync(path).isDirectory()) {
-      files.push(...findFiles(path));
-    } else {
-      files.push(path);
-    }
-  }
-  return files;
-}
-
-function signManifest(manifestJson, privateKeyB64) {
-  const privateKey = createPrivateKey({
-    key: Buffer.from(privateKeyB64, 'base64'),
-    format: 'der',
-    type: 'pkcs8'
-  });
-
-  return sign(null, Buffer.from(manifestJson), privateKey).toString('base64');
-}
-
-function ensureFeedRelease(ghToken) {
-  let releaseExists = false;
-  try {
-    gh(['release', 'view', feedTag, '--repo', feedRepo], ghToken, 'ignore');
-    releaseExists = true;
-  } catch {
-    // The app feed release is addressed by a fixed tag so clients have a stable URL.
-  }
-
-  const title = 'Brick App Feed';
-  const notes = 'Signed machine-readable app update feed used by Brick clients.';
-  if (!releaseExists) {
-    const createArgs = [
-      'release',
-      'create',
-      feedTag,
-      '--repo',
-      feedRepo,
-      '--title',
-      title,
-      '--notes',
-      notes,
-      '--prerelease',
-      '--latest=false'
-    ];
-
-    try {
-      gh(createArgs, ghToken);
-    } catch {
-      gh(createArgs.filter((arg) => arg !== '--latest=false'), ghToken);
-    }
-  }
-
-  const editArgs = [
-    'release',
-    'edit',
-    feedTag,
-    '--repo',
-    feedRepo,
-    '--title',
-    title,
-    '--notes',
-    notes,
-    '--prerelease',
-    '--latest=false'
-  ];
-
-  try {
-    gh(editArgs, ghToken, 'ignore');
-  } catch {
-    gh(editArgs.filter((arg) => arg !== '--latest=false'), ghToken, 'ignore');
-  }
-}
-
-function git(args) {
-  return execFileSync('git', args, {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe']
-  }).trim();
-}
-
-function gh(args, ghToken, stdio = 'inherit') {
-  execFileSync('gh', args, {
-    env: {
-      ...process.env,
-      GH_TOKEN: ghToken
-    },
-    stdio
-  });
-}
-
-function requiredEnv(name) {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`${name} is required.`);
-  }
+export function releaseVersion(value) {
+  if (typeof value !== 'string' || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value)) throw new Error('An exact stable SemVer version is required.');
   return value;
 }
 
-function requiredEnvAny(names) {
-  for (const name of names) {
-    if (process.env[name]) {
-      return process.env[name];
+export function findReleaseArtifacts(directory, version) {
+  releaseVersion(version);
+  const expected = new Map([
+    [`brick_${version}_x64-setup.exe`, { os: 'windows', arch: 'x86_64', kind: 'nsis' }],
+    [`brick_${version}_x86_64.AppImage`, { os: 'linux', arch: 'x86_64', kind: 'appimage' }],
+    [`brick_${version}_amd64.deb`, { os: 'linux', arch: 'x86_64', kind: 'deb' }],
+    [`brick_${version}_x86_64.tar.gz`, { os: 'linux', arch: 'x86_64', kind: 'pacman' }],
+    ['PKGBUILD', { os: 'linux', arch: 'x86_64', kind: 'pkgbuild' }],
+  ]);
+  const found = new Map();
+  function visit(dir, depth = 0) {
+    if (depth > 2) throw new Error('Unexpected release artifact directory.');
+    for (const name of readdirSync(dir)) {
+      const path = join(dir, name);
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink()) throw new Error('Release artifacts cannot be links.');
+      if (stat.isDirectory()) { visit(path, depth + 1); continue; }
+      if (!stat.isFile() || !expected.has(name) || found.has(name) || stat.size <= 0 || stat.size > MAX_ARTIFACT_BYTES) throw new Error(`Unexpected or duplicate release artifact: ${name}`);
+      const bytes = readFileSync(path);
+      found.set(name, { path, ...expected.get(name), fileName: name,
+        url: `https://github.com/${feedRepo}/releases/download/v${version}/${encodeURIComponent(name)}`,
+        sha256: createHash('sha256').update(bytes).digest('hex'), size: bytes.length });
     }
   }
-  throw new Error(`${names.join(' or ')} is required.`);
+  visit(directory);
+  if (found.size !== expected.size) throw new Error('Both desktop installers and all three Linux package files are required.');
+  return [...found.values()].sort((a, b) => a.fileName.localeCompare(b.fileName));
+}
+
+export function buildManifest({ version, commit, runId, artifacts, now = new Date() }) {
+  releaseVersion(version);
+  if (!/^[a-f0-9]{40}$/.test(commit) || !/^[0-9]+$/.test(String(runId))) throw new Error('Exact source commit and release run are required.');
+  return { schema: 1, packageId: 'Brick', version, commit, builtAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + 90 * 86400_000).toISOString(),
+    source: { provider: 'github-actions', repo: sourceRepo, workflow: 'Release', runId: String(runId), releaseTag: `v${version}` },
+    artifacts: artifacts.map(({ path, ...artifact }) => artifact) };
+}
+
+export function signManifest(manifest, privateKey, expected = publicKey) {
+  if (privateKey.asymmetricKeyType !== 'ed25519'
+      || !createPublicKey(privateKey).export({ format: 'der', type: 'spki' }).equals(expected.export({ format: 'der', type: 'spki' }))) {
+    throw new Error('This is not the dedicated Brick app-update key.');
+  }
+  const bytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+  const signature = sign(null, bytes, privateKey);
+  if (!verify(null, bytes, expected, signature)) throw new Error('Local signature verification failed.');
+  return { bytes, signature };
+}
+
+function command(name, args, { capture = false } = {}) {
+  return execFileSync(name, args, { cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
+    stdio: capture ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'inherit', 'inherit'] })?.trim();
+}
+const gh = (args, options) => command('gh', args, options);
+const api = endpoint => JSON.parse(gh(['api', endpoint], { capture: true }));
+
+async function main() {
+  if (process.env.CI || process.env.GITHUB_ACTIONS) throw new Error('App-update signing and publication must run locally, never in CI.');
+  const { values } = parseArgs({ options: {
+    version: { type: 'string' }, assets: { type: 'string' }, key: { type: 'string' }, run: { type: 'string' },
+    source: { type: 'string' }, 'reviewed-commit': { type: 'string' },
+    output: { type: 'string' }, publish: { type: 'boolean', default: false },
+  } });
+  root = resolve(values.source || root);
+  const version = releaseVersion(values.version);
+  if (!/^[a-f0-9]{40}$/.test(values['reviewed-commit'] || '')) throw new Error('Provide --reviewed-commit with the full source SHA you independently reviewed for this release.');
+  if (!values.assets || !values.key || !/^[0-9]+$/.test(values.run || '')) throw new Error('Provide --assets, --key and --run. Without --publish this only verifies and prepares local files.');
+  command('git', ['diff', '--exit-code']);
+  command('git', ['diff', '--cached', '--exit-code']);
+  const commit = command('git', ['rev-parse', 'HEAD'], { capture: true });
+  if (values['reviewed-commit'] !== commit) throw new Error('Source differs from your reviewed commit.');
+  const configured = readFileSync(join(root, 'Cargo.toml'), 'utf8').match(/^version = "([^"]+)"/m)?.[1];
+  if (configured !== version) throw new Error('Release version does not match the reviewed source.');
+  const run = api(`repos/${sourceRepo}/actions/runs/${values.run}`);
+  if (run.conclusion !== 'success' || run.head_sha !== commit || run.path !== '.github/workflows/release.yml'
+      || run.head_repository?.full_name !== sourceRepo || !['push', 'workflow_dispatch'].includes(run.event)) {
+    throw new Error('Artifacts must come from a successful Release run for this exact source commit.');
+  }
+  const mainBranch = api(`repos/${sourceRepo}/branches/main`);
+  if (!mainBranch.protected || mainBranch.commit.sha !== commit) throw new Error('Only the current protected main commit may be released.');
+  const checks = api(`repos/${sourceRepo}/commits/${commit}/check-runs?per_page=100`).check_runs;
+  for (const name of ['ubuntu-22.04', 'windows-latest']) {
+    const latest = checks.filter(check => check.name === name && check.app?.id === 15368).sort((a, b) => b.id - a.id)[0];
+    if (latest?.conclusion !== 'success') throw new Error(`Required source check is missing: ${name}`);
+  }
+  const artifacts = findReleaseArtifacts(resolve(values.assets), version);
+  for (const artifact of artifacts) {
+    gh(['attestation', 'verify', artifact.path, '--repo', sourceRepo,
+      '--signer-workflow', `${sourceRepo}/.github/workflows/release.yml`, '--source-digest', commit,
+      '--signer-digest', commit, '--deny-self-hosted-runners']);
+    if (artifact.kind === 'nsis') {
+      const publishers = JSON.parse(readFileSync(join(trustedRoot, 'security/windows-publishers.json'), 'utf8'));
+      let accepted = false;
+      for (const publisher of publishers) {
+        try {
+          command(process.env.BRICK_OSSLSIGNCODE || 'osslsigncode', ['verify', '-in', artifact.path, '-require-leaf-hash', `sha256:${publisher}`]);
+          accepted = true; break;
+        } catch { /* Only a listed publisher with a valid signature is accepted. */ }
+      }
+      if (!accepted) throw new Error('Windows installer publisher verification failed.');
+    }
+  }
+  // Read the private key only after all downloaded input verification is complete.
+  const keyPath = resolve(values.key);
+  const keyStat = lstatSync(keyPath);
+  if (!keyStat.isFile() || keyStat.isSymbolicLink() || keyStat.size > 4096
+      || (process.platform !== 'win32' && (keyStat.mode & 0o077))) throw new Error('The local signing key must be a private regular file.');
+  const privateKey = createPrivateKey({ key: readFileSync(keyPath), format: 'der', type: 'pkcs8' });
+  const manifest = buildManifest({ version, commit, runId: values.run, artifacts });
+  const { bytes, signature } = signManifest(manifest, privateKey);
+  const output = resolve(values.output || join(root, '.release', `signed-${version}`));
+  mkdirSync(output, { recursive: true, mode: 0o700 });
+  const manifestPath = join(output, 'app-manifest.json');
+  const signaturePath = `${manifestPath}.sig`;
+  writeFileSync(manifestPath, bytes);
+  writeFileSync(signaturePath, `${signature.toString('base64')}\n`);
+  const detached = [];
+  for (const artifact of artifacts) {
+    const path = join(output, `${artifact.fileName}.sig`);
+    writeFileSync(path, `${sign(null, readFileSync(artifact.path), privateKey).toString('base64')}\n`);
+    detached.push(path);
+  }
+  console.log(`Verified and locally signed Brick ${version} from ${commit}. Manifest: ${manifestPath}`);
+  if (!values.publish) return;
+  if (!api(`repos/${feedRepo}/immutable-releases`).enabled) throw new Error('Enable immutable version releases before publication.');
+  const feed = api(`repos/${feedRepo}/releases/tags/${feedTag}`);
+  if (feed.immutable || feed.draft) throw new Error('The mutable app-feed-v2 channel must already exist.');
+  // Never overwrite an existing published version. Everything is attached while draft.
+  let release;
+  try { release = api(`repos/${feedRepo}/releases/tags/v${version}`); } catch { /* create below */ }
+  if (release && !release.draft) throw new Error('This version is already published; use a new version.');
+  if (!release) gh(['release', 'create', `v${version}`, '--repo', feedRepo, '--draft', '--title', `Brick v${version}`, '--notes', '']);
+  gh(['release', 'upload', `v${version}`, ...artifacts.map(artifact => artifact.path), manifestPath, signaturePath, ...detached, '--repo', feedRepo]);
+  // Confirm GitHub has the exact signed artifact digests before making the release public.
+  release = api(`repos/${feedRepo}/releases/tags/v${version}`);
+  for (const artifact of artifacts) {
+    if (!release.assets.some(asset => asset.name === artifact.fileName && asset.digest === `sha256:${artifact.sha256}` && asset.size === artifact.size)) throw new Error('Uploaded artifact did not match its signed digest.');
+  }
+  gh(['release', 'edit', `v${version}`, '--repo', feedRepo, '--draft=false', '--latest']);
+  if (!api(`repos/${feedRepo}/releases/tags/v${version}`).immutable) throw new Error('Version publication did not become immutable; the update feed was not changed.');
+  gh(['release', 'upload', feedTag, manifestPath, signaturePath, '--repo', feedRepo, '--clobber']);
+  console.log(`Published immutable Brick ${version} and its locally signed update feed.`);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch(error => { console.error(error.message); process.exitCode = 1; });
 }

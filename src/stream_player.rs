@@ -170,6 +170,8 @@ pub struct StreamPlayer {
     #[cfg(target_os = "windows")]
     _web_context: wry::WebContext,
     allowed_url: Arc<Mutex<String>>,
+    #[cfg(target_os = "windows")]
+    bearer_tokens: Arc<Mutex<Vec<String>>>,
     bounds: [i32; 4],
     visible: Cell<bool>,
     loaded: Arc<AtomicBool>,
@@ -376,6 +378,8 @@ impl StreamPlayer {
             #[cfg(target_os = "windows")]
             _web_context: web_context,
             allowed_url,
+            #[cfg(target_os = "windows")]
+            bearer_tokens: Arc::new(Mutex::new(vec![token.to_owned()])),
             bounds,
             visible: Cell::new(true),
             occlusion: occlusion::Controller::default(),
@@ -419,7 +423,14 @@ impl StreamPlayer {
             }
         }
         #[cfg(target_os = "windows")]
-        protect_windows_permissions(webview)?;
+        {
+            protect_windows_permissions(webview)?;
+            protect_windows_requests(
+                webview,
+                Arc::clone(&player.allowed_url),
+                Arc::clone(&player.bearer_tokens),
+            )?;
+        }
         player.fullscreen.attach(webview)?;
 
         #[cfg(target_os = "linux")]
@@ -513,6 +524,19 @@ impl StreamPlayer {
             .is_some_and(|bridge| bridge.retarget(url.as_str()))
         {
             return Err("The player could not protect recording preferences.".into());
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let mut tokens = self
+                .bearer_tokens
+                .lock()
+                .map_err(|_| "The player could not protect its credentials.")?;
+            if !tokens.iter().any(|existing| existing == token) {
+                tokens.push(token.to_owned());
+                if tokens.len() > 4 {
+                    tokens.remove(0);
+                }
+            }
         }
         self.capture.cancel();
         *self
@@ -1494,6 +1518,96 @@ fn protect_linux_navigation(
 }
 
 #[cfg(target_os = "windows")]
+fn protect_windows_requests(
+    webview: &WebView,
+    allowed: Arc<Mutex<String>>,
+    tokens: Arc<Mutex<Vec<String>>>,
+) -> Result<(), String> {
+    use webview2_com::{
+        take_pwstr, Microsoft::Web::WebView2::Win32::COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+        NavigationStartingEventHandler, WebResourceRequestedEventHandler,
+    };
+    use windows::core::{w, PWSTR};
+    use wry::WebViewExtWindows;
+
+    let navigation = std::cell::RefCell::new(ProviderNavigation::default());
+    let frames = NavigationStartingEventHandler::create(Box::new(move |_, args| {
+        if let Some(args) = args {
+            unsafe {
+                args.SetCancel(true)?;
+                let mut destination = PWSTR::null();
+                args.Uri(&mut destination)?;
+                let destination = take_pwstr(destination);
+                let mut gesture = windows::core::BOOL(0);
+                args.IsUserInitiated(&mut gesture)?;
+                let mut credential = windows::core::BOOL(0);
+                args.RequestHeaders()?
+                    .Contains(w!("Authorization"), &mut credential)?;
+                if navigation.borrow_mut().allow(
+                    &destination,
+                    credential.as_bool(),
+                    gesture.as_bool(),
+                ) {
+                    args.SetCancel(false)?;
+                }
+            }
+        }
+        Ok(())
+    }));
+    let environment = webview.environment();
+    let resources = WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
+        if let Some(args) = args {
+            let permitted = (|| -> windows::core::Result<bool> {
+                unsafe {
+                    let request = args.Request()?;
+                    let mut destination = PWSTR::null();
+                    request.Uri(&mut destination)?;
+                    let destination = take_pwstr(destination);
+                    let headers = request.Headers()?;
+                    let mut present = windows::core::BOOL(0);
+                    headers.Contains(w!("Authorization"), &mut present)?;
+                    if !present.as_bool() {
+                        return Ok(true);
+                    }
+                    let mut value = PWSTR::null();
+                    headers.GetHeader(w!("Authorization"), &mut value)?;
+                    let value = take_pwstr(value);
+                    // Provider SDKs can use their own credentials. A Brick
+                    // credential is allowed only on its exact wrapper request.
+                    Ok(allowed.lock().is_ok_and(|wrapper| destination == *wrapper)
+                        || tokens
+                            .lock()
+                            .is_ok_and(|tokens| !tokens.iter().any(|token| value.contains(token))))
+                }
+            })()
+            .unwrap_or(false);
+            if !permitted {
+                unsafe {
+                    let response = environment.CreateWebResourceResponse(
+                        None::<&windows::Win32::System::Com::IStream>,
+                        403,
+                        w!("Forbidden"),
+                        w!("Content-Type: text/plain\r\nCache-Control: no-store"),
+                    )?;
+                    args.SetResponse(&response)?;
+                }
+            }
+        }
+        Ok(())
+    }));
+    let mut registration = 0;
+    unsafe {
+        let view = webview.webview();
+        view.add_FrameNavigationStarting(&frames, &mut registration)
+            .and_then(|_| {
+                view.AddWebResourceRequestedFilter(w!("*"), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)
+            })
+            .and_then(|_| view.add_WebResourceRequested(&resources, &mut registration))
+    }
+    .map_err(|_| "The stream player could not protect its network requests.".to_string())
+}
+
+#[cfg(target_os = "windows")]
 fn protect_windows_permissions(webview: &WebView) -> Result<(), String> {
     use webview2_com::{
         Microsoft::Web::WebView2::Win32::{
@@ -1597,13 +1711,13 @@ fn diagnostic_destination(value: &str) -> String {
         .unwrap_or_else(|_| "Invalid URL".to_string())
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 #[derive(Default)]
 struct ProviderNavigation {
     document: Option<Url>,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 impl ProviderNavigation {
     fn allow(&mut self, destination: &str, has_authorization: bool, user_gesture: bool) -> bool {
         if has_authorization || !allowed_provider_frame(destination) {
@@ -1635,7 +1749,7 @@ impl ProviderNavigation {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn allowed_provider_frame(value: &str) -> bool {
     if value == "about:blank" {
         return true;
@@ -2248,6 +2362,8 @@ mod tests {
                 _cache_usage: crate::cache_maintenance::PlayerLease::new(),
                 webview: Some(webview),
                 allowed_url: Arc::new(Mutex::new(wrapper.clone())),
+                #[cfg(target_os = "windows")]
+                bearer_tokens: Arc::new(Mutex::new(Vec::new())),
                 bounds: [0; 4],
                 visible: Cell::new(true),
                 occlusion: occlusion::Controller::default(),
@@ -2334,6 +2450,8 @@ mod tests {
             #[cfg(target_os = "windows")]
             _web_context: wry::WebContext::default(),
             allowed_url: Arc::new(Mutex::new(String::new())),
+            #[cfg(target_os = "windows")]
+            bearer_tokens: Arc::new(Mutex::new(Vec::new())),
             preferences: None,
             playback_state: Arc::new(Mutex::new(PlaybackState::default())),
             last_state_poll: None,

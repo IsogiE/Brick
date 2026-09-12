@@ -23,12 +23,12 @@ use crate::{atomic_file, discord_auth, download};
 const APP_ID: &str = "dev.isogi.brick";
 const FEED_OWNER: &str = "IsogiE";
 const FEED_REPO: &str = "Brick-Releases";
-const FEED_TAG: &str = "addon-feed";
+const FEED_TAG: &str = "addon-feed-v2";
 const PACKAGE_ID: &str = "AdvanceRaidTools";
 const FEED_URL: &str =
-    "https://github.com/IsogiE/Brick-Releases/releases/download/addon-feed/addon-manifest.json";
+    "https://github.com/IsogiE/Brick-Releases/releases/download/addon-feed-v2/addon-manifest.json";
 const FEED_SIG_URL: &str =
-    "https://github.com/IsogiE/Brick-Releases/releases/download/addon-feed/addon-manifest.json.sig";
+    "https://github.com/IsogiE/Brick-Releases/releases/download/addon-feed-v2/addon-manifest.json.sig";
 const APP_USER_AGENT: &str = "Brick/0.1 (+https://github.com/IsogiE/Brick-Releases)";
 const FEED_UNAVAILABLE_MESSAGE: &str =
     "No signed addon feed is available yet. Brick will check again automatically.";
@@ -70,10 +70,7 @@ static HTTP_CLIENT: LazyLock<Result<reqwest::blocking::Client, String>> = LazyLo
         .map_err(|error| format!("Failed to create HTTP client: {error}"))
 });
 
-const ADDON_PUBLIC_KEY_B64: &str = match option_env!("BRICK_ADDON_PUBLIC_KEY_B64") {
-    Some(value) => value,
-    None => "",
-};
+const ADDON_PUBLIC_KEY_B64: &str = include_str!("../security/addon-public-key.b64");
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1197,7 +1194,7 @@ fn verify_manifest_signature(
     }
 
     let public_key_bytes = B64
-        .decode(ADDON_PUBLIC_KEY_B64)
+        .decode(ADDON_PUBLIC_KEY_B64.trim())
         .map_err(|error| format!("Invalid embedded addon public key: {error}"))?;
     let public_key: [u8; 32] = public_key_bytes
         .as_slice()

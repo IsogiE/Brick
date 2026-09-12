@@ -11,6 +11,7 @@ import { createReplaySyncLibrary, syncKey } from "./replay_sync.mjs";
 import { createLogsHandoff } from "./stream_review.mjs";
 import { createProfileStore } from "./profiles.mjs";
 import { createCooldownCatalog } from "./cooldown_catalog.mjs";
+import { createTimestampQueue } from "./timestamp_queue.mjs";
 
 export async function createPresenceServer({ env = process.env, fetch = globalThis.fetch, now = Date.now, firstStreamCheckWaitMs = 5_000 } = {}) {
   const DISCORD_API = "https://discord.com/api/v10";
@@ -900,6 +901,16 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
       streamTimer.unref();
     }
   });
+  server.startTimestampQueue = async () => {
+    if (!env.BRICK_TIMESTAMP_TOKEN_FILE) return;
+    const token = (await fs.readFile(env.BRICK_TIMESTAMP_TOKEN_FILE, "utf8")).trim();
+    const queue = createTimestampQueue({ library: replaySync, token });
+    server.once("close", () => { queue.closeAllConnections(); queue.close(); });
+    await new Promise((resolve, reject) => {
+      queue.once("error", reject);
+      queue.listen(Number(env.BRICK_TIMESTAMP_QUEUE_PORT || 8081), resolve);
+    });
+  };
   return server;
 
   function startBotGatewayPresence() {
@@ -1041,6 +1052,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const server = await createPresenceServer();
+  await server.startTimestampQueue();
   const port = Number(process.env.PORT || 8080);
   server.listen(port, () => console.log(`Brick presence API listening on ${port}`));
 }
