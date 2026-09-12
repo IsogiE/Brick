@@ -53,3 +53,7 @@ winresource = "0.1"
 codegen-units = 1
 lto = "thin"
 opt-level = "z"
+
+# GTK3/WebKit still requires GLib 0.18. Backport the reviewed upstream pointer fix.
+[patch.crates-io]
+glib = { path = "vendor/glib-0.18.5" }

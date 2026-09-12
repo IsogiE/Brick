@@ -71,6 +71,10 @@ jobs:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo test --locked
 
+      - name: Test GLib pointer backport with optimization
+        if: runner.os == 'Linux'
+        run: cargo test --locked --config 'profile.dev.package.glib.opt-level=3' --test glib_backport
+
       - name: Test native player resizing
         if: runner.os == 'Linux'
         env:
