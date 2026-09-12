@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isSameSource } from './publish-addon-feed.mjs';
+import { isSameSource, ensureFeedRelease } from './publish-addon-feed.mjs';
 
 const source = {
   provider: 'github-packager', repo: 'IsogiE/AdvanceRaidTools',
@@ -43,4 +43,27 @@ test('missing or incomplete feed metadata cannot suppress publication', () => {
 test('a package from another repository or schema is not considered current', () => {
   assert.equal(isSameSource(manifest(), { ...source, repo: 'another/repo' }), false);
   assert.equal(isSameSource({ ...manifest(), schema: 2 }, source), false);
+});
+
+
+test('publisher only reads channel metadata and never republishes a mutable release', () => {
+  const calls = [];
+  ensureFeedRelease('fixture', (args) => {
+    calls.push(args);
+    return JSON.stringify({ tag_name: 'addon-feed-v3', draft: false, immutable: false });
+  });
+  assert.deepEqual(calls, [['api', 'repos/IsogiE/Brick-Releases/releases/tags/addon-feed-v3']]);
+});
+
+test('missing, draft or immutable channels fail before any asset mutation', () => {
+  for (const state of [null, {}, { draft: true, immutable: false }, { draft: false, immutable: true }]) {
+    const calls = [];
+    assert.throws(() => ensureFeedRelease('fixture', (args) => {
+      calls.push(args);
+      if (!state) throw new Error('HTTP 404');
+      return JSON.stringify({ tag_name: 'addon-feed-v3', ...state });
+    }));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][0], 'api');
+  }
 });
