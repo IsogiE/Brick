@@ -20,3 +20,7 @@ updates:
     directory: /presence
     schedule:
       interval: weekly
+  - package-ecosystem: gomod
+    directory: /presence/proxy
+    schedule:
+      interval: weekly

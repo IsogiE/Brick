@@ -6,7 +6,7 @@ App updates only run a Brick installer verified against signed release metadata.
 
 Versioned releases are prepared as drafts, with all artifacts attached before publication as immutable releases. Release candidates carry GitHub build provenance; final artifacts also have detached application-key signatures. The public verification keys and Windows publisher certificate hashes are in `security/`. Verifying a first download requires obtaining those keys through an independently trusted copy; a key and binary fetched from the same compromised account do not establish independent trust.
 
-The Linux AppImage bundles WebKitGTK. OS package updates do not update that bundled copy; new WebKit security releases require a new Brick release. Dependencies and release tools are pinned and security advisories are checked in CI. Pins must still be updated when upstream fixes are available.
+The Linux AppImage bundles WebKitGTK. OS package updates do not update that bundled copy; new WebKit security releases require a new Brick release. Dependencies and release tools are pinned and security advisories are checked in CI. Pins must still be updated when upstream fixes are available. A recurring check flags new stable WebKitGTK and FFmpeg releases; container CI rejects fixable high and critical findings. The worker compiles only the media codecs and protocols it uses, and has no mount of the API data store. Its private authenticated queue accepts only job claims and lease-bound timestamp results.
 
 Discord login uses OAuth with PKCE. Windows stores cached sessions with DPAPI protection. Bot tokens and publishing credentials belong on the server or in the release environment, never in the desktop app.
 

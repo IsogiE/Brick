@@ -100,7 +100,7 @@ async function main() {
   const mainBranch = api(`repos/${sourceRepo}/branches/main`);
   if (!mainBranch.protected || mainBranch.commit.sha !== commit) throw new Error('Only the current protected main commit may be released.');
   const checks = api(`repos/${sourceRepo}/commits/${commit}/check-runs?per_page=100`).check_runs;
-  for (const name of ['ubuntu-22.04', 'windows-latest']) {
+  for (const name of ['ubuntu-22.04', 'windows-latest', 'Rust security advisories', 'Container security']) {
     const latest = checks.filter(check => check.name === name && check.app?.id === 15368).sort((a, b) => b.id - a.id)[0];
     if (latest?.conclusion !== 'success') throw new Error(`Required source check is missing: ${name}`);
   }
