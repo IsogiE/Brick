@@ -8,7 +8,7 @@ RUN cargo build --locked --release --manifest-path presence/reader/Cargo.toml
 
 # Only the codecs, containers, protocols and filters used by timestamp scanning
 # are compiled. No subtitle, device, GPU, XML or arbitrary external-codec stack.
-FROM node:22-trixie-slim@sha256:7b8a0c89c54499bee567618f96578e1a12a800f062fbdbfd1fb6a443fa6f6284 AS media
+FROM node:26-trixie-slim@sha256:14bf3eac4bf209d906d3c41256597d3ab1f926b2e93a79e9bdfe1efd32454239 AS media
 ARG FFMPEG_VERSION=9.0.1
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential nasm pkg-config curl xz-utils ca-certificates zlib1g-dev libssl-dev libdav1d-dev \
     && curl --fail --location --retry 3 https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz -o /tmp/ffmpeg.tar.xz \
@@ -24,7 +24,7 @@ RUN ./configure --prefix=/opt/ffmpeg --disable-everything --disable-autodetect -
     && make -j2 && make install \
     && install -Dm644 COPYING.LGPLv2.1 /opt/ffmpeg/share/COPYING.LGPLv2.1
 
-FROM node:22-trixie-slim@sha256:7b8a0c89c54499bee567618f96578e1a12a800f062fbdbfd1fb6a443fa6f6284
+FROM node:26-trixie-slim@sha256:14bf3eac4bf209d906d3c41256597d3ab1f926b2e93a79e9bdfe1efd32454239
 ENV NODE_ENV=production PATH=/opt/media/bin:$PATH
 COPY presence/requirements.txt /tmp/requirements.txt
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends python3-venv ca-certificates libssl3t64 zlib1g libdav1d7 \
