@@ -1,4 +1,4 @@
-# Release candidates only; final update signing and publication run locally.
+# Manually requested candidates only; final update signing and publication run locally.
 name: Release
 'on':
   workflow_dispatch:
@@ -6,10 +6,6 @@ name: Release
       version:
         description: Version of the unpublished release candidate
         required: true
-        default: 0.5.3
-  push:
-    tags:
-    - v*
 env:
   BRICK_WINDOWS_SIGNING: certum
 jobs:
