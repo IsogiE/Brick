@@ -85,7 +85,7 @@ jobs:
     - name: Verify bundled Linux runtime and updater size limit
       run: node packaging/linux/verify-appimage.mjs
     - name: Attest release candidates
-      uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
       with:
         subject-path: |-
           dist/packages/*.AppImage
@@ -223,7 +223,7 @@ jobs:
         ./scripts/sign-windows.ps1 -Path 'target/release/brick.exe', 'dist/packages/*-setup.exe' -Thumbprint $thumbprint -VerifyOnly
         ./scripts/verify-windows-installer.ps1 -RunInstallSmoke -RequireSignature -ExpectedSigner $thumbprint
     - name: Attest release candidates
-      uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
       with:
         subject-path: dist/packages/*-setup.exe
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
