@@ -10,7 +10,7 @@ RUN apk upgrade --no-cache \
     && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg \
     && mkdir -p /data && chown node:node /data
 
-COPY server.mjs timestamp_queue.mjs security.mjs profiles.mjs cooldown_catalog.mjs cooldown-catalog.json streams.mjs stream_vods.mjs stream_review.mjs player_control.mjs replay_sync.mjs replay_warmup.mjs ./
+COPY server.mjs discord_gateway.mjs timestamp_queue.mjs security.mjs profiles.mjs cooldown_catalog.mjs cooldown-catalog.json streams.mjs stream_vods.mjs stream_review.mjs player_control.mjs replay_sync.mjs replay_warmup.mjs ./
 
 USER node
 EXPOSE 8080

@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createPresenceServer } from "./server.mjs";
-import { clientAddress, RateLimit, readBounded } from "./security.mjs";
+import { bearerToken, clientAddress, RateLimit, readBounded } from "./security.mjs";
 
 const state = (n) => n.toString(16).padStart(64, "0");
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status });
@@ -37,6 +37,27 @@ function discordFixture(url, options) {
   if (url.endsWith("/member")) return json({ roles: ["789"] });
   return json([{ user: { id: "12345", username: "Tester" }, roles: ["789"] }]);
 }
+
+test("authorization parsing bounds input before checking an unambiguous token", () => {
+  for (const value of [undefined, [], '', 'Basic abc', 'Bearer ', 'Bearer  abc', 'Bearer abc def', 'Bearer\tabc',
+    'Bearer ' + ' '.repeat(100_000), 'Bearer ' + 'a'.repeat(2049), 'Bearer abc\n', 'Bearer \u0000abc']) {
+    assert.equal(bearerToken(value), null);
+  }
+  assert.equal(bearerToken('bEaReR valid-._~+/='), 'valid-._~+/=');
+  assert.equal(bearerToken('Bearer ' + 'a'.repeat(2048)), 'a'.repeat(2048));
+});
+
+test("OAuth error callback can only reject a login and never authorizes API access", async t => {
+  const f = await fixture(t, () => { throw new Error('No authorization was verified'); });
+  const response = await f.request(`/discord/callback?state=${state(100)}&error=access_denied&code=untrusted`);
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /Brick login failed/);
+  const poll = await f.request(`/v1/auth/callback?state=${state(100)}`);
+  assert.equal(poll.status, 400);
+  assert.equal((await poll.json()).code, undefined);
+  assert.equal((await f.request('/v1/roster')).status, 401);
+  assert.equal((await f.request(`/v1/auth/callback?state=${state(100)}`)).status, 202);
+});
 
 test("cooldown catalogue requires guild authorization and exposes only a read-only bounded versioned policy", async t => {
   let calls = 0;

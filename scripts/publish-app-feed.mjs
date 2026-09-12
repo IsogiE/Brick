@@ -1,6 +1,6 @@
 import { createHash, createPrivateKey, createPublicKey, sign, verify } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, mkdirSync, mkdtempSync, openSync, readSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -14,12 +14,37 @@ const publicKeyBytes = Buffer.from(readFileSync(new URL('../security/app-update-
 export const publicKey = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), publicKeyBytes]), format: 'der', type: 'spki' });
 const MAX_ARTIFACT_BYTES = 256 * 1024 * 1024;
 
+// Validate and read the same open file, never a path checked earlier. A bounded
+// descriptor read also rejects devices, FIFOs, links and files growing mid-read.
+export function readRegularFile(path, limit, { privateFile = false } = {}) {
+  if (constants.O_NOFOLLOW === undefined) throw new Error('Local signing requires a host with no-follow file opens.');
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const before = fstatSync(fd);
+    if (!before.isFile() || before.size <= 0 || before.size > limit
+        || (privateFile && ((before.mode & 0o077) || before.uid !== process.getuid()))) {
+      throw new Error('Expected a bounded regular file with private permissions for signing keys.');
+    }
+    const bytes = Buffer.alloc(before.size + 1);
+    let size = 0;
+    while (size < bytes.length) {
+      const count = readSync(fd, bytes, size, bytes.length - size, null);
+      if (!count) break;
+      size += count;
+    }
+    const after = fstatSync(fd);
+    if (size !== before.size || after.size !== before.size || after.mtimeMs !== before.mtimeMs
+        || after.ctimeMs !== before.ctimeMs) throw new Error('File changed while reading.');
+    return bytes.subarray(0, size);
+  } finally { closeSync(fd); }
+}
+
 export function releaseVersion(value) {
   if (typeof value !== 'string' || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value)) throw new Error('An exact stable SemVer version is required.');
   return value;
 }
 
-export function findReleaseArtifacts(directory, version) {
+export function findReleaseArtifacts(directory, version, { snapshotDirectory } = {}) {
   releaseVersion(version);
   const expected = new Map([
     [`brick_${version}_x64-setup.exe`, { os: 'windows', arch: 'x86_64', kind: 'nsis' }],
@@ -31,14 +56,18 @@ export function findReleaseArtifacts(directory, version) {
   const found = new Map();
   function visit(dir, depth = 0) {
     if (depth > 2) throw new Error('Unexpected release artifact directory.');
-    for (const name of readdirSync(dir)) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const name = entry.name;
       const path = join(dir, name);
-      const stat = lstatSync(path);
-      if (stat.isSymbolicLink()) throw new Error('Release artifacts cannot be links.');
-      if (stat.isDirectory()) { visit(path, depth + 1); continue; }
-      if (!stat.isFile() || !expected.has(name) || found.has(name) || stat.size <= 0 || stat.size > MAX_ARTIFACT_BYTES) throw new Error(`Unexpected or duplicate release artifact: ${name}`);
-      const bytes = readFileSync(path);
-      found.set(name, { path, ...expected.get(name), fileName: name,
+      if (entry.isSymbolicLink()) throw new Error('Release artifacts cannot be links.');
+      if (entry.isDirectory()) { visit(path, depth + 1); continue; }
+      if (!entry.isFile() || !expected.has(name) || found.has(name)) throw new Error(`Unexpected or duplicate release artifact: ${name}`);
+      const bytes = readRegularFile(path, MAX_ARTIFACT_BYTES);
+      // All subsequent attestation, publisher, signature and upload operations
+      // use this private snapshot, independent of the downloaded input tree.
+      const checkedPath = snapshotDirectory ? join(snapshotDirectory, name) : path;
+      if (snapshotDirectory) writeFileSync(checkedPath, bytes, { flag: 'wx', mode: 0o400 });
+      found.set(name, { path: checkedPath, ...expected.get(name), fileName: name,
         url: `https://github.com/${feedRepo}/releases/download/v${version}/${encodeURIComponent(name)}`,
         sha256: createHash('sha256').update(bytes).digest('hex'), size: bytes.length });
     }
@@ -104,7 +133,15 @@ async function main() {
     const latest = checks.filter(check => check.name === name && check.app?.id === 15368).sort((a, b) => b.id - a.id)[0];
     if (latest?.conclusion !== 'success') throw new Error(`Required source check is missing: ${name}`);
   }
-  const artifacts = findReleaseArtifacts(resolve(values.assets), version);
+  const outputRoot = resolve(values.output || join(root, '.release', `signed-${version}`));
+  mkdirSync(outputRoot, { recursive: true, mode: 0o700 });
+  const outputFd = openSync(outputRoot, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    const stat = fstatSync(outputFd);
+    if (!stat.isDirectory() || (stat.mode & 0o077) || stat.uid !== process.getuid()) throw new Error('The signing output directory must be private and owned by you.');
+  } finally { closeSync(outputFd); }
+  const output = mkdtempSync(join(outputRoot, 'release-'));
+  const artifacts = findReleaseArtifacts(resolve(values.assets), version, { snapshotDirectory: output });
   for (const artifact of artifacts) {
     gh(['attestation', 'verify', artifact.path, '--repo', sourceRepo,
       '--signer-workflow', `${sourceRepo}/.github/workflows/release.yml`, '--source-digest', commit,
@@ -122,23 +159,19 @@ async function main() {
     }
   }
   // Read the private key only after all downloaded input verification is complete.
-  const keyPath = resolve(values.key);
-  const keyStat = lstatSync(keyPath);
-  if (!keyStat.isFile() || keyStat.isSymbolicLink() || keyStat.size > 4096
-      || (process.platform !== 'win32' && (keyStat.mode & 0o077))) throw new Error('The local signing key must be a private regular file.');
-  const privateKey = createPrivateKey({ key: readFileSync(keyPath), format: 'der', type: 'pkcs8' });
+  const privateKey = createPrivateKey({ key: readRegularFile(resolve(values.key), 4096, { privateFile: true }), format: 'der', type: 'pkcs8' });
   const manifest = buildManifest({ version, commit, runId: values.run, artifacts });
   const { bytes, signature } = signManifest(manifest, privateKey);
-  const output = resolve(values.output || join(root, '.release', `signed-${version}`));
-  mkdirSync(output, { recursive: true, mode: 0o700 });
   const manifestPath = join(output, 'app-manifest.json');
   const signaturePath = `${manifestPath}.sig`;
-  writeFileSync(manifestPath, bytes);
-  writeFileSync(signaturePath, `${signature.toString('base64')}\n`);
+  writeFileSync(manifestPath, bytes, { flag: 'wx', mode: 0o400 });
+  writeFileSync(signaturePath, `${signature.toString('base64')}\n`, { flag: 'wx', mode: 0o400 });
   const detached = [];
   for (const artifact of artifacts) {
     const path = join(output, `${artifact.fileName}.sig`);
-    writeFileSync(path, `${sign(null, readFileSync(artifact.path), privateKey).toString('base64')}\n`);
+    const artifactBytes = readRegularFile(artifact.path, MAX_ARTIFACT_BYTES);
+    if (createHash('sha256').update(artifactBytes).digest('hex') !== artifact.sha256) throw new Error('Verified artifact changed before signing.');
+    writeFileSync(path, `${sign(null, artifactBytes, privateKey).toString('base64')}\n`, { flag: 'wx', mode: 0o400 });
     detached.push(path);
   }
   console.log(`Verified and locally signed Brick ${version} from ${commit}. Manifest: ${manifestPath}`);

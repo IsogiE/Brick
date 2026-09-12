@@ -7,6 +7,15 @@ export class HttpError extends Error {
   }
 }
 
+export function bearerToken(authorization) {
+  // Reject oversized input before parsing. Splitting the fixed scheme from a
+  // bounded token avoids overlapping regex quantifiers on hostile whitespace.
+  if (typeof authorization !== 'string' || authorization.length > 2055
+      || authorization.slice(0, 7).toLowerCase() !== 'bearer ') return null;
+  const token = authorization.slice(7);
+  return token.length > 0 && token.length <= 2048 && /^[\x21-\x7e]+$/.test(token) ? token : null;
+}
+
 // Bounded token buckets: a flood of new addresses cannot evict existing budgets.
 export class RateLimit {
   constructor(burst, perSecond, clientBurst, clientPerSecond, now = Date.now) {

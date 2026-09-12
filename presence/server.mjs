@@ -3,7 +3,7 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import { HttpError, RateLimit, readBounded, clientAddress } from "./security.mjs";
+import { HttpError, RateLimit, readBounded, clientAddress, bearerToken } from "./security.mjs";
 import { createStreamService, streamPlayerPage } from "./streams.mjs";
 import { playerScriptPolicy } from "./player_control.mjs";
 import { createReplayWarmup } from "./replay_warmup.mjs";
@@ -12,13 +12,11 @@ import { createLogsHandoff } from "./stream_review.mjs";
 import { createProfileStore } from "./profiles.mjs";
 import { createCooldownCatalog } from "./cooldown_catalog.mjs";
 import { createTimestampQueue } from "./timestamp_queue.mjs";
+import { startDiscordGateway } from "./discord_gateway.mjs";
 
 export async function createPresenceServer({ env = process.env, fetch = globalThis.fetch, now = Date.now, firstStreamCheckWaitMs = 5_000 } = {}) {
   const DISCORD_API = "https://discord.com/api/v10";
   const MAX_BODY_BYTES = 32 * 1024;
-  const GATEWAY_INTENTS = 1;
-  const GATEWAY_RECONNECT_MIN_MS = 5_000;
-  const GATEWAY_RECONNECT_MAX_MS = 60_000;
 
   const dataDir = env.DATA_DIR || "/data";
   const heartbeatFile = path.join(dataDir, "heartbeats.json");
@@ -105,13 +103,6 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
       "cache-control": "no-store",
     });
     response.end(body);
-  }
-
-  function bearerToken(request) {
-    const auth = request.headers.authorization || "";
-    const match = auth.match(/^Bearer\s+(.+)$/i);
-    const token = match?.[1]?.trim();
-    return token && token.length <= 2048 && /^[\x21-\x7e]+$/.test(token) ? token : null;
   }
 
   function requestUrl(request) {
@@ -204,7 +195,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   }
 
   async function verifyRequester(request, { allowStale = true } = {}) {
-    const token = bearerToken(request);
+    const token = bearerToken(request.headers.authorization);
     if (!token) {
       throw new HttpError(401, "Missing Discord authorization token.");
     }
@@ -868,6 +859,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
   server.maxRequestsPerSocket = 100;
   server.keepAliveTimeout = 5_000;
   server.setTimeout(15_000, (socket) => socket.destroy());
+  let stopGateway = () => {};
   let streamTimer;
   let streamPollingClosed = false;
   const pollStreams = async () => {
@@ -888,6 +880,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     }
   };
   server.on("close", () => {
+    stopGateway();
     replayWarmup.close();
     replaySync.close();
     streamPollingClosed = true;
@@ -895,7 +888,7 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     streams.close();
   });
   server.on("listening", () => {
-    if (gatewayEnabled) startBotGatewayPresence();
+    if (gatewayEnabled) stopGateway = startDiscordGateway({ lookup: () => discordJson("/gateway/bot", `Bot ${botToken}`), token: botToken });
     if (env.STREAM_BACKGROUND_ENABLED !== "false") {
       streamTimer = setTimeout(pollStreams, 0);
       streamTimer.unref();
@@ -912,141 +905,6 @@ export async function createPresenceServer({ env = process.env, fetch = globalTh
     });
   };
   return server;
-
-  function startBotGatewayPresence() {
-    let reconnectDelayMs = GATEWAY_RECONNECT_MIN_MS;
-    let reconnectTimer = null;
-
-    const scheduleReconnect = () => {
-      if (reconnectTimer) {
-        return;
-      }
-      const delay = reconnectDelayMs;
-      reconnectDelayMs = Math.min(reconnectDelayMs * 2, GATEWAY_RECONNECT_MAX_MS);
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        connectGateway();
-      }, delay);
-    };
-
-    const connectGateway = async () => {
-      let gatewayUrl;
-      try {
-        const gateway = await discordJson("/gateway/bot", `Bot ${botToken}`);
-        gatewayUrl = gateway?.url;
-        if (!gatewayUrl) {
-          throw new Error("Discord did not return a Gateway URL.");
-        }
-      } catch (error) {
-        console.error(`Discord Gateway lookup failed: ${error.message}`);
-        scheduleReconnect();
-        return;
-      }
-
-      let socket;
-      let heartbeatTimer = null;
-      let lastSequence = null;
-      let lastHeartbeatAcked = true;
-
-      const cleanup = () => {
-        if (heartbeatTimer) {
-          clearInterval(heartbeatTimer);
-          heartbeatTimer = null;
-        }
-      };
-
-      const reconnect = () => {
-        cleanup();
-        scheduleReconnect();
-      };
-
-      const sendPayload = (payload) => {
-        if (socket?.readyState === WebSocket.OPEN) {
-          socket.send(JSON.stringify(payload));
-        }
-      };
-
-      const sendHeartbeat = () => {
-        if (!lastHeartbeatAcked) {
-          try {
-            socket.close(4000, "missed heartbeat ack");
-          } catch {
-            reconnect();
-          }
-          return;
-        }
-
-        lastHeartbeatAcked = false;
-        sendPayload({ op: 1, d: lastSequence });
-      };
-
-      try {
-        socket = new WebSocket(`${gatewayUrl}/?v=10&encoding=json`);
-      } catch (error) {
-        console.error(`Discord Gateway connection failed: ${error.message}`);
-        scheduleReconnect();
-        return;
-      }
-
-      socket.addEventListener("open", () => {
-        reconnectDelayMs = GATEWAY_RECONNECT_MIN_MS;
-      });
-
-      socket.addEventListener("message", (event) => {
-        let payload;
-        try {
-          payload = JSON.parse(event.data.toString());
-        } catch {
-          return;
-        }
-
-        if (typeof payload.s === "number") {
-          lastSequence = payload.s;
-        }
-
-        if (payload.op === 10) {
-          const heartbeatInterval = Number(payload.d?.heartbeat_interval);
-          if (Number.isFinite(heartbeatInterval) && heartbeatInterval > 0) {
-            setTimeout(sendHeartbeat, Math.floor(Math.random() * heartbeatInterval));
-            heartbeatTimer = setInterval(sendHeartbeat, heartbeatInterval);
-          }
-          sendPayload({
-            op: 2,
-            d: {
-              token: botToken,
-              intents: GATEWAY_INTENTS,
-              properties: {
-                os: process.platform,
-                browser: "brick-presence",
-                device: "brick-presence",
-              },
-              presence: {
-                since: null,
-                activities: [],
-                status: "online",
-                afk: false,
-              },
-            },
-          });
-        } else if (payload.op === 11) {
-          lastHeartbeatAcked = true;
-        } else if (payload.op === 1) {
-          sendPayload({ op: 1, d: lastSequence });
-        } else if (payload.op === 7 || payload.op === 9) {
-          socket.close(4000, "discord requested reconnect");
-        } else if (payload.op === 0 && payload.t === "READY") {
-          console.log(`Discord Gateway ready as ${payload.d?.user?.username || "bot"}`);
-        }
-      });
-
-      socket.addEventListener("close", reconnect);
-      socket.addEventListener("error", (event) => {
-        console.error(`Discord Gateway socket error: ${event.message || "unknown error"}`);
-      });
-    };
-
-    connectGateway();
-  }
 
 }
 

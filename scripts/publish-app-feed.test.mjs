@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, verify } from 'node:crypto';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildManifest, findReleaseArtifacts, releaseVersion, signManifest } from './publish-app-feed.mjs';
+import { buildManifest, findReleaseArtifacts, readRegularFile, releaseVersion, signManifest } from './publish-app-feed.mjs';
 
 function fixture(t) {
   const directory = mkdtempSync(join(tmpdir(), 'brick-release-policy-'));
@@ -49,6 +49,33 @@ test('release signatures bind installer bytes, source identity, and bounded expi
   const changed = Buffer.from(signed.bytes.toString().replace(artifacts[0].sha256, 'f'.repeat(64)));
   assert.equal(verify(null, changed, keys.publicKey, signed.signature), false);
   assert.equal(verify(null, signed.bytes, wrong.publicKey, signed.signature), false);
+});
+
+test('release verification snapshots cannot be replaced through the download tree', t => {
+  const directory = fixture(t);
+  const snapshotDirectory = mkdtempSync(join(tmpdir(), 'brick-signing-snapshot-'));
+  t.after(() => rmSync(snapshotDirectory, { recursive: true, force: true }));
+  const artifacts = findReleaseArtifacts(directory, '0.5.3', { snapshotDirectory });
+  for (const artifact of artifacts) {
+    const original = readFileSync(artifact.path);
+    writeFileSync(join(directory, artifact.fileName), 'replaced after verification');
+    assert.deepEqual(readFileSync(artifact.path), original);
+    assert.notDeepEqual(readFileSync(join(directory, artifact.fileName)), original);
+  }
+  assert.throws(() => findReleaseArtifacts(directory, '0.5.3', { snapshotDirectory }), /EEXIST/);
+});
+
+test('signing file reads reject links, directories, oversized input and public key-file permissions', t => {
+  const directory = fixture(t);
+  const file = join(directory, 'key');
+  writeFileSync(file, 'private fixture', { mode: 0o600 });
+  assert.equal(readRegularFile(file, 4096, { privateFile: true }).toString(), 'private fixture');
+  assert.throws(() => readRegularFile(file, 2), /bounded/);
+  assert.throws(() => readRegularFile(directory, 4096), /bounded/);
+  chmodSync(file, 0o644);
+  assert.throws(() => readRegularFile(file, 4096, { privateFile: true }), /private/);
+  symlinkSync(file, join(directory, 'key-link'));
+  assert.throws(() => readRegularFile(join(directory, 'key-link'), 4096), /ELOOP/);
 });
 
 test('release identity rejects branch names, partial commits, and version injection', () => {

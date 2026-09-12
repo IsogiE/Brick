@@ -895,7 +895,13 @@ test("authenticated players use only official iframes, trusted parent and safe r
       assert.match(html, /<iframe[^>]+allow="[^"]*; clipboard-write"/);
       assert(!html.includes("clipboard-read"));
     }
-    assert(html.includes("brick.example.com"));
+    const source = id === '11' ? html.match(/<div id="media" data-src="([^"]+)"/) : html.match(/<iframe\b[^>]*\bsrc="([^"]+)"/);
+    assert(source, 'the trusted media element must exist');
+    const iframe = new URL(source[1].replaceAll('&amp;', '&'));
+    assert.equal(iframe.protocol, 'https:');
+    assert.equal(iframe.hostname, id === '11' ? 'player.twitch.tv' : 'www.youtube.com');
+    if (id === '11') assert.equal(iframe.searchParams.get('parent'), 'brick.example.com');
+    else assert.equal(new URL(iframe.searchParams.get('origin')).origin, 'https://brick.example.com');
     for (const secret of ["alice-token", "test-bot", "test-secret", "test-app-token", "test-key", "evil.example", '<script>alert("x")</script>']) assert(!html.includes(secret));
   }
   const anonymous = await f.request("/v1/streams/player/11?token=alice-token");
