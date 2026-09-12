@@ -17,14 +17,6 @@ function newer(a, b) {
   for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i];
   return false;
 }
-const dockerfile = readFileSync(new URL('../presence/Dockerfile.timestamp', import.meta.url), 'utf8');
-const ffmpeg = dockerfile.match(/^ARG FFMPEG_VERSION=(\d+\.\d+\.\d+)$/m)?.[1];
-assert(ffmpeg, 'Missing reviewed FFmpeg version');
-const ffmpegPage = await text('https://ffmpeg.org/download.html');
-const latestFfmpeg = ffmpegPage.match(/Download Source Code ffmpeg-(\d+\.\d+\.\d+)\.tar/)?.[1]
-  || [...ffmpegPage.matchAll(/ffmpeg-(\d+\.\d+\.\d+)\.tar\.xz/g)].map(m => m[1]).sort((a,b) => newer(a,b) ? -1 : newer(b,a) ? 1 : 0)[0];
-assert(latestFfmpeg, 'FFmpeg release metadata changed format; review it manually');
-assert(!newer(latestFfmpeg, ffmpeg), `Review new FFmpeg ${latestFfmpeg}; worker currently builds ${ffmpeg}`);
 const workflow = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
 const webkit = workflow.match(/--atleast-version=(\d+\.\d+\.\d+) webkit2gtk/)?.[1];
 assert(webkit, 'Missing reviewed WebKit minimum version');
@@ -34,4 +26,4 @@ const stable = [...releases.matchAll(/webkitgtk-(2\.\d+\.\d+)\.tar\.xz/g)]
   .sort((a,b) => newer(a,b) ? -1 : newer(b,a) ? 1 : 0)[0];
 assert(stable, 'WebKit release metadata changed format; review it manually');
 assert(!newer(stable, webkit), `Review new WebKitGTK ${stable}; Brick AppImage minimum is ${webkit}`);
-console.log(`Reviewed runtime versions remain current: FFmpeg ${ffmpeg}; WebKitGTK ${webkit}`);
+console.log(`Reviewed WebKitGTK version remains current: ${webkit}`);

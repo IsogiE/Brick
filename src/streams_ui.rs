@@ -413,8 +413,8 @@ impl StreamsUi {
             }
         }
         // One metadata-only observer finds new raid pulls while Brick is idle.
-        // The VPS queues all covered POVs; no background video decoder is
-        // created on the client. The selected review takes over while watching.
+        // No background video decoder is created on the client.
+        // The selected review takes over while watching.
         let warmup_stream = self
             .snapshot
             .as_ref()

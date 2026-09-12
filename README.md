@@ -69,7 +69,7 @@ Then run `cargo packager --release --formats nsis` on Windows, or `NO_STRIP=1 ca
 | `src/addon.rs` | WoW detection, settings, and addon installation |
 | `src/app_update.rs`, `src/download.rs` | App updates and bounded downloads |
 | `src/discord_auth.rs`, `src/presence.rs` | Discord login and roster client |
-| `scripts/`, `packaging/` | Release tooling, installer template, and smoke tests |
+| `scripts/`, `packaging/` | Build tooling, installer template, and build checks |
 
 Run the checks before opening a pull request:
 
@@ -77,10 +77,10 @@ Run the checks before opening a pull request:
 cargo fmt --check
 cargo check --locked
 cargo test --locked
-node --test scripts/publish-addon-feed.test.mjs presence/*.test.mjs
+node --test scripts/publish-addon-feed.test.mjs tests/*.test.mjs packaging/linux/bwrap-wrapper.test.mjs
 ```
 
-Node.js 22.13 or newer is used for the service and release scripts. The desktop app itself only needs Rust and its native dependencies. CI checks Windows and Linux.
+Node.js 22.23.2 or newer is used for build scripts. The desktop app itself only needs Rust and its native dependencies. CI checks Windows and Linux.
 
 Bug reports should include the Brick version, operating system, and steps to reproduce. For tray or startup issues, mention whether Brick was opened manually or started at login.
 

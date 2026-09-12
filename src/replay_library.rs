@@ -53,7 +53,7 @@ fn request(token: &str, route: &str, body: Value) -> Option<Value> {
 }
 
 // Loading and saving run only on the metadata/submission workers. The UI
-// neither opens files nor waits for the VPS before accepting a local result.
+// neither opens files nor waits for a network request before accepting a local result.
 fn local_cache() -> &'static Mutex<Cache> {
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     CACHE.get_or_init(|| {

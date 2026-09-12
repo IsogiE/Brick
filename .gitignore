@@ -3,8 +3,10 @@ node_modules/
 target/
 .release/
 *.log
-presence/.env
-presence/secrets/
+**/.env
+**/secrets/
+.local-docs/
+windows-smoke/
 
 # Keep investigation notes local; retain the public project documents below.
 *.[mM][dD]
