@@ -94,16 +94,26 @@ impl TwitchUi {
                 Err(mpsc::TryRecvError::Empty) => (),
             }
         }
-        if !self.initialized && Account::configured() {
+        let configured = Account::configured();
+        // A failed store load may still need a bounded Restore retry. A
+        // successful empty restore clears its deadline through check_after().
+        // Lost workers and revoked grants must never retain a repaint timer.
+        let can_check = configured && self.account.as_ref().is_some_and(|a| !a.needs_reconnect());
+        if !self.initialized && configured {
             self.initialized = true;
             self.start(ctx, Action::Restore);
         } else if !self.busy()
-            && self.account.as_ref().is_some_and(|a| !a.needs_reconnect())
+            && can_check
             && self.next_check.is_some_and(|at| Instant::now() >= at)
         {
             self.start(ctx, Action::Check);
         }
-        if let Some(at) = self.next_check {
+        self.schedule_check_repaint(ctx, can_check);
+    }
+    fn schedule_check_repaint(&mut self, ctx: &egui::Context, can_check: bool) {
+        if !can_check {
+            self.next_check = None;
+        } else if let Some(at) = self.next_check {
             ctx.request_repaint_after(
                 at.saturating_duration_since(Instant::now())
                     .max(Duration::from_secs(1)),
@@ -227,5 +237,56 @@ mod tests {
             url: "https://www.twitch.tv/fixture".into(),
         });
         assert!(ui.channel().is_none());
+    }
+    #[test]
+    fn paused_connection_drops_expired_deadlines_without_repainting() {
+        let ctx = egui::Context::default();
+        let mut ui = TwitchUi::default();
+        ui.next_check = Some(Instant::now() - Duration::from_secs(1));
+        let mut delay = Duration::ZERO;
+        for _ in 0..5 {
+            let output = ctx.run_ui(egui::RawInput::default(), |_| {
+                // The common paused path for revoked or unconfigured accounts.
+                ui.schedule_check_repaint(&ctx, false);
+            });
+            delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        }
+        assert!(ui.next_check.is_none());
+        assert_eq!(delay, Duration::MAX);
+    }
+    #[test]
+    fn disconnected_worker_cannot_leave_an_endless_repaint_timer() {
+        let ctx = egui::Context::default();
+        let mut ui = TwitchUi::default();
+        ui.initialized = true;
+        let (tx, rx) = mpsc::channel();
+        ui.work = Some(rx);
+        drop(tx);
+        let mut delay = Duration::ZERO;
+        for _ in 0..5 {
+            let output = ctx.run_ui(egui::RawInput::default(), |_| ui.tick(&ctx));
+            delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        }
+        assert!(ui.work.is_none());
+        assert!(ui.next_check.is_none());
+        assert_eq!(delay, Duration::MAX);
+    }
+    #[test]
+    fn transient_restore_failure_retains_its_fifteen_minute_retry() {
+        let ctx = egui::Context::default();
+        let mut ui = TwitchUi::default();
+        ui.next_check = Some(Instant::now() + Duration::from_secs(15 * 60));
+        let mut delay = Duration::ZERO;
+        for _ in 0..5 {
+            let output = ctx.run_ui(egui::RawInput::default(), |_| {
+                // A present Account with a temporarily locked store remains
+                // retryable; no credential store or provider is used here.
+                ui.schedule_check_repaint(&ctx, true);
+            });
+            delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        }
+        assert!(ui.next_check.is_some());
+        assert!(delay > Duration::from_secs(14 * 60));
+        assert!(delay <= Duration::from_secs(15 * 60));
     }
 }
