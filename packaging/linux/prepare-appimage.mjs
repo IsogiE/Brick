@@ -90,6 +90,11 @@ for (const name of ['libxkbcommon.so.0', 'libxkbcommon-x11.so.0', 'libxcb-xkb.so
 execFileSync('cc', ['-O2', '-Wall', '-Wextra', '-Werror', '-o', path.join(output, 'usr/bin/bwrap'), 'packaging/linux/bwrap-wrapper.c']);
 await chmod(path.join(output, 'usr/bin/bwrap'), 0o755);
 
+const bootstrap = path.join(output, 'usr/lib/brick/apprun');
+await mkdir(path.dirname(bootstrap), { recursive: true });
+execFileSync('rustc', ['--edition=2021', '-Dwarnings', '-Copt-level=z', '-Cpanic=abort', '-Cstrip=symbols', '-o', bootstrap, 'packaging/linux/apprun.rs']);
+await chmod(bootstrap, 0o755);
+
 // Preserve the distribution's copyright notices for bundled runtime packages.
 // These small notices also identify upstream sources and applicable licenses.
 const notices = path.join(output, 'usr/share/doc/brick-runtime');

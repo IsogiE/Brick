@@ -37,7 +37,7 @@ jobs:
         # Brick does not use the runner's optional Chrome package repository.
         sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/google-chrome*.sources
         sudo apt-get update
-        sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav patchelf
+        sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav patchelf squashfs-tools
     - name: Verify Linux playback runtime
       run: |
         pkg-config --atleast-version=2.52.6 webkit2gtk-4.1
@@ -80,7 +80,9 @@ jobs:
         RUSTFLAGS: -D warnings
       run: cargo packager --release --formats appimage,deb,pacman
     - name: Verify bundled Linux runtime and updater size limit
-      run: node packaging/linux/verify-appimage.mjs
+      run: |
+        node packaging/linux/finalize-appimage.mjs
+        node packaging/linux/verify-appimage.mjs
     - name: Attest release candidates
       uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
       with:
