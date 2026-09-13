@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -91,4 +91,77 @@ test('AppImage finalization preserves the runtime and generated hooks, is idempo
   await writeFile(artifact, invalid); await chmod(artifact, 0o755);
   await assert.rejects(finalizeAppImage(artifact), /generated AppRun script/);
   assert((await readFile(artifact)).equals(invalid));
+});
+
+async function packageFixture(t) {
+  const result = await fixture(t);
+  const appdir = path.join(result.root, 'input');
+  await mkdir(path.join(appdir, 'usr/lib/brick'), { recursive: true });
+  await copyFile(result.bootstrap, path.join(appdir, 'usr/lib/brick/apprun'));
+  await writeFile(path.join(appdir, 'AppRun'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+  const runtime = await readFile(result.bootstrap);
+  const artifact = path.join(result.root, 'fixture.AppImage');
+  async function pack() {
+    const squash = path.join(result.root, 'filesystem');
+    execFileSync('mksquashfs', [appdir, squash, '-noappend', '-no-progress', '-comp', 'gzip', '-processors', '2'], { stdio: 'pipe' });
+    const bytes = Buffer.concat([runtime, await readFile(squash)]);
+    await writeFile(artifact, bytes, { mode: 0o755 });
+    return bytes;
+  }
+  return { ...result, appdir, runtime, artifact, pack };
+}
+
+test('finalization rejects input and bundled symlinks without following leaf or ancestor targets', async t => {
+  const { root, appdir, artifact, pack } = await packageFixture(t);
+  const original = await pack();
+  const linked = path.join(root, 'linked.AppImage');
+  await symlink(artifact, linked);
+  await assert.rejects(finalizeAppImage(linked), { code: 'ELOOP' });
+  assert((await readFile(artifact)).equals(original));
+  for (const relative of ['AppRun', 'usr/lib/brick/apprun', 'usr/lib/brick']) {
+    const target = path.join(appdir, relative);
+    const saved = path.join(root, 'original-target');
+    await rename(target, saved);
+    await symlink(saved, target);
+    const bytes = await pack();
+    await assert.rejects(finalizeAppImage(artifact), error => ['ELOOP', 'ENOTDIR'].includes(error.code));
+    assert((await readFile(artifact)).equals(bytes));
+    assert(!(await readdir(root)).some(name => name.startsWith('.brick-apprun-')));
+    await rm(target); await rename(saved, target);
+  }
+});
+
+test('extraction uses the private validated snapshot when the artifact path is replaced by a symlink', async t => {
+  const { root, artifact, runtime, pack } = await packageFixture(t);
+  const original = await pack();
+  const victim = path.join(root, 'unrelated-file');
+  const contents = 'This file must never be read as an AppImage or overwritten.';
+  await writeFile(victim, contents);
+  const tools = path.join(root, 'tools'); await mkdir(tools);
+  const actual = execFileSync('sh', ['-c', 'command -v unsquashfs'], { encoding: 'utf8' }).trim();
+  const wrapper = `#!${process.execPath}
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { readFileSync, renameSync, statSync, symlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import path from 'node:path';
+const input = process.argv.at(-1);
+assert.notEqual(input, ${JSON.stringify(artifact)});
+assert.equal(statSync(path.dirname(input)).mode & 0o777, 0o700);
+assert.equal(createHash('sha256').update(readFileSync(input)).digest('hex'), ${JSON.stringify(digest(original))});
+renameSync(${JSON.stringify(artifact)}, ${JSON.stringify(path.join(root, 'original.AppImage'))});
+symlinkSync(${JSON.stringify(victim)}, ${JSON.stringify(artifact)});
+execFileSync(${JSON.stringify(actual)}, process.argv.slice(2), { stdio: 'inherit' });
+`;
+  await writeFile(path.join(tools, 'unsquashfs'), wrapper, { mode: 0o755 });
+  const previousPath = process.env.PATH;
+  try {
+    process.env.PATH = `${tools}:${previousPath}`;
+    await finalizeAppImage(artifact);
+  } finally {
+    process.env.PATH = previousPath;
+  }
+  assert.equal(await readFile(victim, 'utf8'), contents);
+  assert((await readFile(artifact)).subarray(0, runtime.length).equals(runtime));
+  assert(!(await readdir(root)).some(name => name.startsWith('.brick-apprun-')));
 });

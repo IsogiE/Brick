@@ -1,10 +1,59 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmod, copyFile, lstat, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { mkdtemp, open, readdir, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const MAX_BYTES = 256 * 1024 * 1024;
+const READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
+async function readRegularFile(filename) {
+  const file = await open(filename, READ_FLAGS);
+  try {
+    const info = await file.stat();
+    assert(info.isFile() && info.size > 0 && info.size <= MAX_BYTES, 'Invalid AppImage file');
+    const bytes = Buffer.alloc(info.size);
+    let position = 0;
+    while (position < bytes.length) {
+      const { bytesRead } = await file.read(bytes, position, Math.min(1024 * 1024, bytes.length - position), position);
+      assert(bytesRead > 0, 'AppImage file changed while reading');
+      position += bytesRead;
+    }
+    const extra = await file.read(Buffer.alloc(1), 0, 1, position);
+    const after = await file.stat();
+    assert(extra.bytesRead === 0 && after.size === info.size
+      && after.mtimeMs === info.mtimeMs && after.ctimeMs === info.ctimeMs, 'AppImage file changed while reading');
+    return { bytes, info };
+  } finally {
+    await file.close();
+  }
+}
+
+async function readBundledFile(directory, relative) {
+  const parts = relative.split('/');
+  const parents = [];
+  try {
+    let parent = directory;
+    for (const part of parts.slice(0, -1)) {
+      parent = await open(`/proc/self/fd/${parent.fd}/${part}`, READ_FLAGS | constants.O_DIRECTORY);
+      parents.push(parent);
+    }
+    return await readRegularFile(`/proc/self/fd/${parent.fd}/${parts.at(-1)}`);
+  } finally {
+    for (const parent of parents.reverse()) await parent.close();
+  }
+}
+
+async function writeExclusive(filename, bytes, mode) {
+  const file = await open(filename, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
+  try {
+    await file.writeFile(bytes);
+    await file.chmod(mode);
+  } finally {
+    await file.close();
+  }
+}
 
 function filesystem(bytes) {
   assert(bytes.length >= 64 && bytes.subarray(0, 4).equals(Buffer.from([127, 69, 76, 70]))
@@ -22,39 +71,50 @@ function filesystem(bytes) {
 }
 
 export async function finalizeAppImage(artifact) {
-  const info = await lstat(artifact);
-  assert(info.isFile() && info.size > 0 && info.size <= MAX_BYTES, 'Invalid AppImage package');
-  const bytes = await readFile(artifact);
+  const { bytes, info } = await readRegularFile(artifact);
   const { offset, compression, blockSize } = filesystem(bytes);
   // Keep the original type-2 runtime byte-for-byte. All work stays next to the
   // package, so a failed rebuild cannot truncate it or spill into the host home.
   const temporary = await mkdtemp(path.join(path.dirname(artifact), '.brick-apprun-'));
   try {
+    // Extract exactly the bytes validated through the original file handle.
+    // The caller's artifact path is never reopened by the extraction process.
+    const snapshot = path.join(temporary, 'input.AppImage');
+    await writeExclusive(snapshot, bytes, 0o600);
     const appdir = path.join(temporary, 'AppDir');
-    execFileSync('unsquashfs', ['-no-progress', '-processors', '4', '-offset', String(offset), '-dest', appdir, artifact], { stdio: 'ignore', timeout: 120_000 });
+    execFileSync('unsquashfs', ['-no-progress', '-processors', '4', '-offset', String(offset), '-dest', appdir, snapshot], { stdio: 'ignore', timeout: 120_000 });
     const apprun = path.join(appdir, 'AppRun');
     const launcher = path.join(appdir, 'AppRun.launcher');
-    const bootstrap = path.join(appdir, 'usr/lib/brick/apprun');
-    assert((await lstat(apprun)).isFile() && (await lstat(bootstrap)).isFile(), 'Missing regular AppRun/bootstrap');
-    const bootstrapBytes = await readFile(bootstrap);
-    assert(bootstrapBytes.subarray(0, 4).equals(Buffer.from([127, 69, 76, 70])), 'AppRun bootstrap must be native');
-    const existing = await readFile(apprun);
-    if (existing.equals(bootstrapBytes)) {
-      assert((await lstat(launcher)).isFile() && (await readFile(launcher)).subarray(0, 2).toString() === '#!', 'Missing generated AppRun');
-      return;
+    const directory = await open(appdir, READ_FLAGS | constants.O_DIRECTORY);
+    try {
+      const { bytes: bootstrapBytes } = await readBundledFile(directory, 'usr/lib/brick/apprun');
+      assert(bootstrapBytes.subarray(0, 4).equals(Buffer.from([127, 69, 76, 70])), 'AppRun bootstrap must be native');
+      const { bytes: existing, info: launcherInfo } = await readBundledFile(directory, 'AppRun');
+      if (existing.equals(bootstrapBytes)) {
+        const generated = await readBundledFile(directory, 'AppRun.launcher');
+        assert(generated.bytes.subarray(0, 2).toString() === '#!', 'Missing generated AppRun');
+        // Even an idempotent call publishes the verified bytes atomically;
+        // a replaced caller path must not escape finalization unchecked.
+        const unchanged = path.join(temporary, 'unchanged.AppImage');
+        await writeExclusive(unchanged, bytes, info.mode & 0o777);
+        await rename(unchanged, artifact);
+        return;
+      }
+      assert(existing.subarray(0, 2).toString() === '#!', 'Expected the generated AppRun script');
+      await writeExclusive(launcher, existing, launcherInfo.mode & 0o777);
+      const native = path.join(temporary, 'native.AppRun');
+      await writeExclusive(native, bootstrapBytes, 0o755);
+      await rename(native, apprun);
+    } finally {
+      await directory.close();
     }
-    assert(existing.subarray(0, 2).toString() === '#!', 'Expected the generated AppRun script');
-    assert(!(await lstat(launcher).catch(error => { if (error.code !== 'ENOENT') throw error; })), 'AppRun launcher already exists');
-    await rename(apprun, launcher);
-    await copyFile(bootstrap, apprun);
-    await chmod(apprun, 0o755);
     const squash = path.join(temporary, 'filesystem');
     execFileSync('mksquashfs', [appdir, squash, '-noappend', '-all-root', '-no-progress', '-comp', compression, '-b', String(blockSize)], { stdio: 'ignore', timeout: 180_000 });
-    const rebuilt = Buffer.concat([bytes.subarray(0, offset), await readFile(squash)]);
+    const rebuilt = Buffer.concat([bytes.subarray(0, offset), (await readRegularFile(squash)).bytes]);
     assert(rebuilt.length <= MAX_BYTES, 'Final AppImage exceeds the updater size limit');
     filesystem(rebuilt);
     const output = path.join(temporary, 'updated.AppImage');
-    await writeFile(output, rebuilt, { mode: info.mode & 0o777 });
+    await writeExclusive(output, rebuilt, info.mode & 0o777);
     await rename(output, artifact);
   } finally {
     await rm(temporary, { recursive: true, force: true });
