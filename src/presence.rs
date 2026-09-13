@@ -1,8 +1,8 @@
 use std::{
     env,
-    sync::LazyLock,
+    sync::{mpsc, LazyLock, Mutex, OnceLock},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::blocking::Client;
@@ -90,7 +90,56 @@ pub fn configuration_error() -> String {
     "Brick was built without BRICK_PRESENCE_API_URL.".to_string()
 }
 
+#[derive(Default)]
+struct HeartbeatState {
+    last_success: Option<(String, Instant)>,
+}
+
+impl HeartbeatState {
+    fn send_if_due(
+        &mut self,
+        scope: String,
+        now: Instant,
+        send: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.last_success.as_ref().is_some_and(|(saved, sent)| {
+            saved == &scope
+                && now.duration_since(*sent) < Duration::from_secs(HEARTBEAT_INTERVAL_SECS)
+        }) {
+            return Ok(());
+        }
+        send()?;
+        self.last_success = Some((scope, now));
+        Ok(())
+    }
+}
+
+static HEARTBEAT_STATE: LazyLock<Mutex<HeartbeatState>> =
+    LazyLock::new(|| Mutex::new(HeartbeatState::default()));
+static HEARTBEAT_WAKE: OnceLock<mpsc::SyncSender<()>> = OnceLock::new();
+
+/// Wake the existing worker after the UI publishes a guild/account context.
+/// The one-slot channel collapses rapid changes without blocking the UI.
+pub fn context_changed() {
+    if let Some(wake) = HEARTBEAT_WAKE.get() {
+        let _ = wake.try_send(());
+    }
+}
+
 pub fn send_heartbeat(access_token: &crate::guild::Access) -> Result<(), String> {
+    // Roster loading and the periodic worker share one bounded request. Only
+    // successful, still-current announcements suppress another heartbeat.
+    let mut state = HEARTBEAT_STATE
+        .lock()
+        .map_err(|_| "Presence is unavailable.")?;
+    access_token.check()?;
+    state.send_if_due(access_token.cache_id(), Instant::now(), || {
+        transmit_heartbeat(access_token)?;
+        access_token.check()
+    })
+}
+
+fn transmit_heartbeat(access_token: &crate::guild::Access) -> Result<(), String> {
     let client = http_client()?;
     let url = access_token.endpoint("/v1/heartbeat")?;
     let body = HeartbeatRequest {
@@ -114,16 +163,23 @@ pub fn spawn_heartbeat_watcher() {
         return;
     }
 
+    let (wake, receiver) = mpsc::sync_channel(1);
+    if HEARTBEAT_WAKE.set(wake).is_err() {
+        return;
+    }
     thread::spawn(move || loop {
         if let Ok(Some(access_token)) = discord_auth::current_or_refreshed_access_token() {
             let _ = send_heartbeat(&access_token);
         }
 
-        thread::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+        let _ = receiver.recv_timeout(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
     });
 }
 
 pub fn fetch_roster(access_token: &crate::guild::Access) -> Result<Roster, String> {
+    // Announce before taking the first roster snapshot of a selected guild.
+    // A temporary heartbeat failure must not prevent reading a valid roster.
+    let _ = send_heartbeat(access_token);
     let client = http_client()?;
     let url = access_token.endpoint("/v1/roster")?;
     let response = client
@@ -254,6 +310,109 @@ fn now_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{api_error, ApiError, Roster};
+
+    #[test]
+    fn switching_guild_announces_immediately_without_repeating_recent_heartbeats() {
+        use super::HeartbeatState;
+        use std::{
+            cell::Cell,
+            time::{Duration, Instant},
+        };
+        let mut state = HeartbeatState::default();
+        let start = Instant::now();
+        let requests = Cell::new(0);
+        let sent = || {
+            requests.set(requests.get() + 1);
+            Ok(())
+        };
+        state
+            .send_if_due("advance:123".into(), start, sent)
+            .unwrap();
+        state
+            .send_if_due("advance:123".into(), start + Duration::from_secs(30), sent)
+            .unwrap();
+        assert_eq!(requests.get(), 1);
+        state
+            .send_if_due(
+                "ascendance:123".into(),
+                start + Duration::from_secs(31),
+                sent,
+            )
+            .unwrap();
+        assert_eq!(requests.get(), 2);
+        state
+            .send_if_due(
+                "ascendance:123".into(),
+                start + Duration::from_secs(32),
+                sent,
+            )
+            .unwrap();
+        assert_eq!(requests.get(), 2);
+        state
+            .send_if_due(
+                "ascendance:456".into(),
+                start + Duration::from_secs(33),
+                sent,
+            )
+            .unwrap();
+        assert_eq!(requests.get(), 3);
+        state
+            .send_if_due(
+                "ascendance:456".into(),
+                start + Duration::from_secs(93),
+                sent,
+            )
+            .unwrap();
+        assert_eq!(requests.get(), 4);
+        assert!(state
+            .send_if_due(
+                "advance:123".into(),
+                start + Duration::from_secs(94),
+                || Err("temporary failure".into())
+            )
+            .is_err());
+        state
+            .send_if_due("advance:123".into(), start + Duration::from_secs(95), sent)
+            .unwrap();
+        assert_eq!(requests.get(), 5);
+    }
+
+    #[test]
+    fn simultaneous_roster_and_watcher_wait_for_one_successful_announcement() {
+        use super::HeartbeatState;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier, Mutex};
+        let state = Arc::new(Mutex::new(HeartbeatState::default()));
+        let barrier = Arc::new(Barrier::new(3));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..2)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                let barrier = Arc::clone(&barrier);
+                let requests = Arc::clone(&requests);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state
+                        .lock()
+                        .unwrap()
+                        .send_if_due("ascendance:123".into(), std::time::Instant::now(), || {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                        .unwrap();
+                    // Either caller may fetch the roster only after the shared
+                    // announcement has completed, never while it is in flight.
+                    assert_eq!(requests.load(Ordering::SeqCst), 1);
+                })
+            })
+            .collect();
+        barrier.wait();
+        for task in tasks {
+            task.join().unwrap();
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn parses_roster_response() {

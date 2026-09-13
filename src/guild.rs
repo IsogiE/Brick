@@ -13,7 +13,11 @@ static PANEL: Mutex<Option<(String, String)>> = Mutex::new(None);
 /// Only the UI publishes a context, after discarding the previous panel.
 pub fn activate(guild: &str, user: &str) {
     if let Ok(mut panel) = PANEL.lock() {
-        *panel = Some((guild.to_string(), user.to_string()));
+        let next = (guild.to_string(), user.to_string());
+        if panel.as_ref() != Some(&next) {
+            *panel = Some(next);
+            crate::presence::context_changed();
+        }
     }
 }
 
