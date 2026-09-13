@@ -365,8 +365,7 @@ impl StreamsUi {
                         self.start(ctx, Action::Refresh);
                     }
                     Ok(ResultData::Recordings(recordings)) => {
-                        self.recordings_retry_at =
-                            Some(Instant::now() + Duration::from_secs(5 * 60));
+                        self.recordings_retry_at = None;
                         self.pov_revision = self.pov_revision.wrapping_add(1);
                         self.can_delete_recordings = recordings.can_delete_recordings;
                         if !self.can_delete_recordings {
@@ -428,15 +427,16 @@ impl StreamsUi {
                 self.start(ctx, Action::Refresh);
             }
         }
-        self.recording_filter.tick(
-            ctx,
-            self.recordings.as_ref(),
-            active && self.recordings_open,
-            self.review.recording_filter_client(),
-        );
         // One metadata-only observer finds new raid pulls while Brick is idle.
         // No background video decoder is created on the client.
         // The selected review takes over while watching.
+        let archive = self.recording_filter.tick(
+            ctx,
+            self.recordings.as_ref(),
+            self.snapshot.as_ref(),
+            active && self.recordings_open,
+            &mut self.warmup,
+        );
         let warmup_stream = self
             .snapshot
             .as_ref()
@@ -448,7 +448,11 @@ impl StreamsUi {
                     .filter(|s| s.status == Status::Live)
                     .min_by_key(|s| (&s.user_id, s.provider.key(), &s.channel_id))
             });
-        self.warmup.tick(ctx, warmup_stream);
+        if let Some(archive) = archive.as_ref() {
+            self.warmup.tick_recording_match(ctx, archive);
+        } else {
+            self.warmup.tick(ctx, warmup_stream);
+        }
         if self.review.tick(
             ctx,
             self.selected
