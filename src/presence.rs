@@ -90,9 +90,9 @@ pub fn configuration_error() -> String {
     "Brick was built without BRICK_PRESENCE_API_URL.".to_string()
 }
 
-pub fn send_heartbeat(access_token: &str) -> Result<(), String> {
+pub fn send_heartbeat(access_token: &crate::guild::Access) -> Result<(), String> {
     let client = http_client()?;
-    let url = endpoint_url("/v1/heartbeat")?;
+    let url = access_token.endpoint("/v1/heartbeat")?;
     let body = HeartbeatRequest {
         app_version: env!("CARGO_PKG_VERSION"),
         platform: env::consts::OS,
@@ -101,7 +101,7 @@ pub fn send_heartbeat(access_token: &str) -> Result<(), String> {
 
     let response = client
         .post(url)
-        .bearer_auth(access_token)
+        .bearer_auth(access_token.secret())
         .json(&body)
         .send()
         .map_err(|error| format!("Roster heartbeat failed: {error}"))?;
@@ -123,12 +123,12 @@ pub fn spawn_heartbeat_watcher() {
     });
 }
 
-pub fn fetch_roster(access_token: &str) -> Result<Roster, String> {
+pub fn fetch_roster(access_token: &crate::guild::Access) -> Result<Roster, String> {
     let client = http_client()?;
-    let url = endpoint_url("/v1/roster")?;
+    let url = access_token.endpoint("/v1/roster")?;
     let response = client
         .get(url)
-        .bearer_auth(access_token)
+        .bearer_auth(access_token.secret())
         .send()
         .map_err(|error| format!("Roster refresh failed: {error}"))?;
 
@@ -155,15 +155,15 @@ pub fn fetch_roster(access_token: &str) -> Result<Roster, String> {
 pub(crate) fn profile_request(
     method: reqwest::Method,
     path: &str,
-    access_token: &str,
+    access_token: &crate::guild::Access,
     expected_user: &str,
     body: Option<&serde_json::Value>,
 ) -> Result<crate::profile::Profile, String> {
     let client = http_client()?;
     for attempt in 0..2 {
         let mut request = client
-            .request(method.clone(), endpoint_url(path)?)
-            .bearer_auth(access_token)
+            .request(method.clone(), access_token.endpoint(path)?)
+            .bearer_auth(access_token.secret())
             .header("x-brick-profile-user", expected_user);
         if let Some(body) = body {
             request = request.json(body);

@@ -1,7 +1,6 @@
 use std::{
     collections::VecDeque,
     sync::mpsc,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -346,7 +345,7 @@ impl ProfileUi {
             _ => None,
         };
         self.pending = Some(rx);
-        thread::spawn(move || {
+        crate::guild::spawn(move || {
             let expected_user = own_id.clone();
             let (target, method, path, body, saved) = match operation {
                 Operation::Load => (
@@ -401,6 +400,8 @@ mod tests {
             role_label: "Raider".into(),
             expires_at_unix: u64::MAX,
             created_at_unix: u64::MAX,
+            guild_id: crate::guild::ADVANCE.into(),
+            guilds: Vec::new(),
         }
     }
 

@@ -1211,7 +1211,17 @@ fn validate_player_address(value: &str, configured: &str) -> Result<Url, String>
     let base = Url::parse(configured).map_err(|_| invalid())?;
     let allowed_transport =
         url.scheme() == "https" || (url.scheme() == "http" && url.host_str() == Some("127.0.0.1"));
-    let member = url.path().strip_prefix("/v1/streams/player/");
+    let member = url
+        .path()
+        .strip_prefix("/v2/guilds/")
+        .and_then(|path| {
+            let (guild, route) = path.split_once('/')?;
+            if guild.is_empty() || guild.len() > 20 || !guild.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            route.strip_prefix("v1/streams/player/")
+        })
+        .or_else(|| url.path().strip_prefix("/v1/streams/player/"));
     if !allowed_transport
         || url.origin() != base.origin()
         || !url.username().is_empty()
@@ -2539,6 +2549,11 @@ mod tests {
     fn bearer_navigation_stays_on_configured_protected_endpoint() {
         let base = "https://brick.example";
         assert!(validate_player_address(
+            "https://brick.example/v2/guilds/481024965852921856/v1/streams/player/12345/twitch",
+            base
+        )
+        .is_ok());
+        assert!(validate_player_address(
             "https://brick.example/v1/streams/player/12345/twitch",
             base
         )
@@ -2549,6 +2564,9 @@ mod tests {
         )
         .is_ok());
         for destination in [
+            "https://brick.example/v2/guilds/other/v1/streams/player/12345/twitch",
+            "https://brick.example/v2/guilds/481024965852921856/v1/streams/player/12345/twitch?token=secret",
+            "https://evil.example/v2/guilds/481024965852921856/v1/streams/player/12345/twitch",
             "https://brick.example/v1/streams/player/12345/unknown",
             "https://brick.example/v1/streams/player/12345/twitch/other",
             "https://brick.example/v1/streams/player/12345/twitch?token=secret",

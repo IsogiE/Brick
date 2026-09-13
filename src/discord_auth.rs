@@ -103,6 +103,19 @@ pub struct AuthorizedUser {
     pub role_label: String,
     pub expires_at_unix: u64,
     pub created_at_unix: u64,
+    pub guild_id: String,
+    pub guilds: Vec<GuildGrant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuildGrant {
+    pub guild_id: String,
+    pub guild_name: String,
+    pub display_name: String,
+    pub role_label: String,
+    role_ids: Vec<String>,
+    authorized_role_ids: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -125,6 +138,8 @@ pub struct AuthSession {
     authorized_at_unix: u64,
     #[serde(default)]
     authorization_pending: bool,
+    #[serde(default)]
+    guilds: Vec<GuildGrant>,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +187,7 @@ struct DiscordUser {
     global_name: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct DiscordMember {
     nick: Option<String>,
@@ -244,7 +260,10 @@ pub fn login_with_browser() -> Result<AuthorizedUser, String> {
     let code = wait_for_remote_callback(&request.state)?;
     let token = exchange_code(&config, &code, &request.verifier)?;
     let session = verified_session_from_token(&config, token, None)?;
-    save_session_if_current(&session, generation)?;
+    let _refresh = SESSION_REFRESH_LOCK
+        .lock()
+        .map_err(|_| "Discord session refresh is unavailable.".to_string())?;
+    commit_session_if_current(&session, generation, None)?;
     Ok(authorized_user(&session, &config))
 }
 
@@ -262,6 +281,14 @@ fn current_or_refreshed_session(
     let mut retry_at = SESSION_REFRESH_LOCK
         .lock()
         .map_err(|_| "Discord session refresh is unavailable.".to_string())?;
+    current_or_refreshed_session_locked(config, retry_now, &mut retry_at)
+}
+
+fn current_or_refreshed_session_locked(
+    config: &AuthConfig,
+    retry_now: bool,
+    retry_at: &mut Option<Instant>,
+) -> Result<Option<AuthSession>, RefreshError> {
     let generation = SESSION_GENERATION.load(Ordering::SeqCst);
     let Some(session) = load_session()? else {
         return Ok(None);
@@ -286,13 +313,20 @@ fn current_or_refreshed_session(
                 .into(),
         );
     }
+    let previous = (session.guild_id.clone(), session.user_id.clone());
     let result = renew_session(
         config,
         session,
         now_unix_secs(),
         |refresh| refresh_token(config, refresh),
         |session| verify_session(config, session),
-        |session| save_session_if_current(session, generation),
+        |session| {
+            if session.authorization_pending {
+                save_session_if_current(session, generation)
+            } else {
+                commit_session_if_current(session, generation, Some(&previous))
+            }
+        },
     );
     match result {
         Ok(session) => {
@@ -323,8 +357,10 @@ fn renew_session(
 ) -> Result<AuthSession, RefreshError> {
     if token_expired(session.expires_at_unix, now) {
         let created_at = session_created_at_unix(&session);
+        let selected = session.guild_id.clone();
         let token = refresh(&session.refresh_token)?;
         session = pending_session(config, token, created_at, now);
+        session.guild_id = selected;
         save(&session)?;
     }
     let session = verify(session)?;
@@ -344,6 +380,7 @@ fn clear_session_if_current(generation: Option<u64>) -> Result<(), String> {
         return Ok(());
     }
     SESSION_GENERATION.fetch_add(1, Ordering::SeqCst);
+    crate::guild::invalidate();
     let path = session_path()?;
     #[cfg(target_os = "linux")]
     if path.exists() {
@@ -363,7 +400,9 @@ pub fn session_renewal_due(created_at_unix: u64) -> bool {
     session_age_expired_at(created_at_unix, now_unix_secs())
 }
 
-pub fn current_access_token() -> Result<String, String> {
+pub fn current_access_token() -> Result<crate::guild::Access, String> {
+    let generation = crate::guild::request_generation();
+    crate::guild::ensure_current(generation)?;
     let config = auth_config()?;
     let Some(session) = load_session()? else {
         return Err("Please sign in with Discord.".to_string());
@@ -381,17 +420,71 @@ pub fn current_access_token() -> Result<String, String> {
         return Err("Discord session needs refresh.".to_string());
     }
 
-    Ok(session.access_token)
+    access_from_session(session, generation)
 }
 
-pub fn current_or_refreshed_access_token() -> Result<Option<String>, String> {
+pub fn current_or_refreshed_access_token() -> Result<Option<crate::guild::Access>, String> {
     refreshed_access_token().map_err(String::from)
 }
 
-pub fn refreshed_access_token() -> Result<Option<String>, RefreshError> {
+pub fn refreshed_access_token() -> Result<Option<crate::guild::Access>, RefreshError> {
+    let generation = crate::guild::request_generation();
+    crate::guild::ensure_current(generation)?;
     let config = auth_config()?;
-    current_or_refreshed_session(&config, false)
-        .map(|session| session.map(|session| session.access_token))
+    current_or_refreshed_session(&config, false).and_then(|session| {
+        session
+            .map(|session| access_from_session(session, generation).map_err(RefreshError::from))
+            .transpose()
+    })
+}
+
+fn access_from_session(
+    session: AuthSession,
+    generation: u64,
+) -> Result<crate::guild::Access, String> {
+    crate::guild::ensure_current(generation)?;
+    crate::guild::ensure_panel(&session.guild_id, &session.user_id)?;
+    Ok(crate::guild::Access::new(
+        session.access_token,
+        session.guild_id,
+        session.user_id,
+        generation,
+    ))
+}
+
+/// Called on a background worker. Discovery never rotates a still-current token.
+pub fn discover_guilds() -> Result<AuthorizedUser, RefreshError> {
+    update_guilds(None)
+}
+
+/// A selection changes no OAuth credentials or session age. Persist before publishing it.
+pub fn select_guild(guild_id: &str) -> Result<AuthorizedUser, RefreshError> {
+    update_guilds(Some(guild_id))
+}
+
+fn update_guilds(selected: Option<&str>) -> Result<AuthorizedUser, RefreshError> {
+    let config = auth_config()?;
+    let mut retry_at = SESSION_REFRESH_LOCK
+        .lock()
+        .map_err(|_| "Discord session refresh is unavailable.".to_string())?;
+    let session = current_or_refreshed_session_locked(&config, false, &mut retry_at)?
+        .ok_or_else(|| RefreshError::rejected("Please sign in with Discord.".into()))?;
+    let generation = SESSION_GENERATION.load(Ordering::SeqCst);
+    let previous = (session.guild_id.clone(), session.user_id.clone());
+    let mut session = match verify_session(&config, session) {
+        Ok(session) => session,
+        Err(error) => {
+            if !error.retryable {
+                clear_session_if_current(Some(generation))?;
+            }
+            return Err(error);
+        }
+    };
+    if let Some(guild) = selected {
+        apply_guild(&mut session, guild)?;
+    }
+    commit_session_if_current(&session, generation, Some(&previous))?;
+    Ok(authorized_user(&session, &config))
 }
 
 pub fn role_label() -> &'static str {
@@ -453,7 +546,7 @@ fn login_request(config: &AuthConfig) -> Result<LoginRequest, String> {
         .append_pair("response_type", "code")
         .append_pair("client_id", &config.client_id)
         .append_pair("redirect_uri", &redirect)
-        .append_pair("scope", "identify guilds.members.read")
+        .append_pair("scope", "identify guilds guilds.members.read")
         .append_pair("state", &state)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256");
@@ -616,6 +709,7 @@ fn pending_session(
         authorized_role_ids: Vec::new(),
         authorized_at_unix: 0,
         authorization_pending: true,
+        guilds: Vec::new(),
     }
 }
 
@@ -636,12 +730,109 @@ fn verified_session_from_token(
     )
 }
 
-fn verify_session(config: &AuthConfig, session: AuthSession) -> Result<AuthSession, RefreshError> {
+fn verify_session(_config: &AuthConfig, session: AuthSession) -> Result<AuthSession, RefreshError> {
     let user = fetch_user(&session.access_token)?;
-    let member = fetch_member(config, &session.access_token)?;
-    authorize_session(config, session, user, member, now_unix_secs())
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GuildAccess {
+        user_id: String,
+        guilds: Vec<GuildGrant>,
+    }
+    let url = service_endpoint_url("/v1/guilds")?;
+    let response = http_client()?
+        .get(url)
+        .bearer_auth(&session.access_token)
+        .send()
+        .map_err(|_| "Guild access could not be checked. Brick will retry.".to_string())?;
+    let status = response.status();
+    let bytes = download::read_response(response, MAX_AUTH_RESPONSE_BYTES, "Guild access lookup")?;
+    if !status.is_success() {
+        // An unavailable route or infrastructure denial must not erase valid
+        // Discord credentials during a server-first rollout or outage.
+        return Err(guild_access_error(status.as_u16()));
+    }
+    let grants: GuildAccess =
+        serde_json::from_slice(&bytes).map_err(|_| "Invalid guild access response.".to_string())?;
+    if grants.user_id != user.id {
+        return Err("Guild access belongs to a different account."
+            .to_string()
+            .into());
+    }
+    authorize_grants(session, user, grants.guilds, now_unix_secs())
 }
 
+fn authorize_grants(
+    mut session: AuthSession,
+    user: DiscordUser,
+    grants: Vec<GuildGrant>,
+    now: u64,
+) -> Result<AuthSession, RefreshError> {
+    let valid_id =
+        |id: &str| !id.is_empty() && id.len() <= 20 && id.bytes().all(|b| b.is_ascii_digit());
+    let valid_label = |value: &str| {
+        !value.is_empty() && value.chars().count() <= 128 && !value.chars().any(char::is_control)
+    };
+    let mut ids = HashSet::new();
+    if grants.len() > 64
+        || grants.iter().any(|grant| {
+            !valid_id(&grant.guild_id)
+                || !ids.insert(grant.guild_id.clone())
+                || !valid_label(&grant.guild_name)
+                || !valid_label(&grant.display_name)
+                || !matches!(grant.role_label.as_str(), "Raider" | "Officer")
+                || grant.authorized_role_ids.is_empty()
+                || grant.authorized_role_ids.len() > 8
+                || grant.role_ids.len() > 250
+                || grant.role_ids.iter().any(|id| !valid_id(id))
+                || grant
+                    .authorized_role_ids
+                    .iter()
+                    .any(|id| !valid_id(id) || !grant.role_ids.contains(id))
+        })
+    {
+        return Err("Invalid guild access response.".to_string().into());
+    }
+    if grants.is_empty() {
+        return Err(RefreshError::rejected(
+            "This Discord account needs a Raider or Officer role in an eligible guild.".into(),
+        ));
+    }
+    let preferred = session.guild_id.clone();
+    session.user_id = user.id;
+    session.username = user.username;
+    session.global_name = user.global_name;
+    session.guilds = grants;
+    session.authorized_at_unix = now;
+    session.authorization_pending = false;
+    let selected = if session
+        .guilds
+        .iter()
+        .any(|grant| grant.guild_id == preferred)
+    {
+        preferred
+    } else {
+        session.guilds[0].guild_id.clone()
+    };
+    apply_guild(&mut session, &selected)?;
+    Ok(session)
+}
+
+fn apply_guild(session: &mut AuthSession, guild_id: &str) -> Result<(), RefreshError> {
+    let grant = session
+        .guilds
+        .iter()
+        .find(|grant| grant.guild_id == guild_id)
+        .ok_or_else(|| {
+            RefreshError::rejected("This account cannot access the selected guild.".into())
+        })?;
+    session.guild_id = grant.guild_id.clone();
+    session.guild_nick = Some(grant.display_name.clone());
+    session.role_ids = grant.role_ids.clone();
+    session.authorized_role_ids = grant.authorized_role_ids.clone();
+    Ok(())
+}
+
+#[cfg(test)]
 fn authorize_session(
     config: &AuthConfig,
     mut session: AuthSession,
@@ -680,12 +871,12 @@ fn fetch_user(access_token: &str) -> Result<DiscordUser, RefreshError> {
     )
 }
 
-fn fetch_member(config: &AuthConfig, access_token: &str) -> Result<DiscordMember, RefreshError> {
-    get_discord_json(
-        &format!("{API_BASE}/users/@me/guilds/{}/member", config.guild_id),
-        access_token,
-        "Discord guild role lookup failed",
-    )
+fn guild_access_error(status: u16) -> RefreshError {
+    if status == 401 {
+        RefreshError::rejected("Discord authorization was revoked. Please sign in again.".into())
+    } else {
+        format!("Guild access could not be verified (HTTP {status}). Brick will retry.").into()
+    }
 }
 
 fn get_discord_json<T: for<'de> Deserialize<'de>>(
@@ -737,6 +928,28 @@ fn refresh_http_error(
 }
 
 fn authorized_user(session: &AuthSession, config: &AuthConfig) -> AuthorizedUser {
+    // 0.5.4's existing protected session is immediately usable. Discover other
+    // guilds later without changing credentials, storage identity or session age.
+    let guilds = if session.guilds.is_empty() {
+        vec![GuildGrant {
+            guild_id: session.guild_id.clone(),
+            guild_name: config.guild_name.clone(),
+            display_name: session
+                .guild_nick
+                .clone()
+                .or_else(|| session.global_name.clone())
+                .unwrap_or_else(|| session.username.clone()),
+            role_label: authorized_role_label(
+                &session.user_id,
+                &session.authorized_role_ids,
+                config,
+            ),
+            role_ids: session.role_ids.clone(),
+            authorized_role_ids: session.authorized_role_ids.clone(),
+        }]
+    } else {
+        session.guilds.clone()
+    };
     AuthorizedUser {
         user_id: session.user_id.clone(),
         display_name: session
@@ -745,10 +958,20 @@ fn authorized_user(session: &AuthSession, config: &AuthConfig) -> AuthorizedUser
             .or_else(|| session.global_name.clone())
             .unwrap_or_else(|| session.username.clone()),
         username: session.username.clone(),
-        guild_name: config.guild_name.clone(),
-        role_label: authorized_role_label(&session.user_id, &session.authorized_role_ids, config),
+        guild_name: guilds
+            .iter()
+            .find(|grant| grant.guild_id == session.guild_id)
+            .map(|grant| grant.guild_name.clone())
+            .unwrap_or_else(|| config.guild_name.clone()),
+        role_label: guilds
+            .iter()
+            .find(|grant| grant.guild_id == session.guild_id)
+            .map(|grant| grant.role_label.clone())
+            .unwrap_or_else(|| config.role_label.clone()),
         expires_at_unix: session.expires_at_unix,
         created_at_unix: session_created_at_unix(session),
+        guild_id: session.guild_id.clone(),
+        guilds,
     }
 }
 
@@ -766,14 +989,19 @@ fn authorized_role_label(user_id: &str, role_ids: &[String], config: &AuthConfig
 }
 
 fn session_matches_config(session: &AuthSession, config: &AuthConfig) -> bool {
+    let legacy = session.guild_id == config.guild_id
+        && session
+            .authorized_role_ids
+            .iter()
+            .any(|role| config.allowed_role_ids.contains(role));
+    let current = session.guilds.iter().any(|guild| {
+        guild.guild_id == session.guild_id
+            && !guild.authorized_role_ids.is_empty()
+            && guild.authorized_role_ids == session.authorized_role_ids
+    });
     (session.schema == 1 || session.schema == SESSION_SCHEMA)
         && session.client_id == config.client_id
-        && session.guild_id == config.guild_id
-        && (session.authorization_pending
-            || session
-                .authorized_role_ids
-                .iter()
-                .any(|role_id| config.allowed_role_ids.contains(role_id)))
+        && (session.authorization_pending || legacy || current)
 }
 
 fn session_access_token_current(session: &AuthSession, now: u64) -> bool {
@@ -847,6 +1075,25 @@ fn save_session_if_current(session: &AuthSession, generation: u64) -> Result<(),
         return Err("The Discord sign-in changed while access was being checked.".to_string());
     }
     save_session_unlocked(session)
+}
+
+fn commit_session_if_current(
+    session: &AuthSession,
+    generation: u64,
+    previous: Option<&(String, String)>,
+) -> Result<(), String> {
+    let _guard = SESSION_STORAGE_LOCK
+        .lock()
+        .map_err(|_| "Discord session storage is unavailable.".to_string())?;
+    if SESSION_GENERATION.load(Ordering::SeqCst) != generation {
+        return Err("The Discord sign-in changed while access was being checked.".into());
+    }
+    save_session_unlocked(session)?;
+    SESSION_GENERATION.fetch_add(1, Ordering::SeqCst);
+    if previous.is_none_or(|(guild, user)| guild != &session.guild_id || user != &session.user_id) {
+        crate::guild::invalidate();
+    }
+    Ok(())
 }
 
 fn save_session_unlocked(session: &AuthSession) -> Result<(), String> {
@@ -1603,5 +1850,131 @@ mod refresh_tests {
         assert!(!session.authorization_pending);
         assert!(session_matches_config(&session, &config()));
         assert!(session_age_expired(&session, 500 + MAX_SESSION_AGE_SECS));
+    }
+}
+
+#[cfg(test)]
+mod guild_tests {
+    use super::*;
+
+    fn baseline() -> (AuthConfig, AuthSession) {
+        let config = AuthConfig {
+            client_id: "fixture".into(),
+            guild_id: ADVANCE_GUILD_ID.into(),
+            guild_name: "Advance".into(),
+            role_label: "Raider or Officer".into(),
+            allowed_role_ids: HashSet::from([OFFICER_ROLE_ID.into(), RAIDER_ROLE_ID.into()]),
+        };
+        // Exactly the 0.5.4 schema, with no new fields and existing credentials.
+        let session = serde_json::from_value(serde_json::json!({
+            "schema": 2, "clientId": "fixture", "guildId": ADVANCE_GUILD_ID,
+            "accessToken": "existing-access", "refreshToken": "existing-refresh", "expiresAtUnix": 5000,
+            "createdAtUnix": 1000, "userId": "123", "username": "Account", "globalName": null,
+            "guildNick": "Advance nickname", "roleIds": [RAIDER_ROLE_ID], "authorizedRoleIds": [RAIDER_ROLE_ID],
+            "authorizedAtUnix": 1100, "authorizationPending": false
+        })).unwrap();
+        (config, session)
+    }
+    fn user() -> DiscordUser {
+        DiscordUser {
+            id: "123".into(),
+            username: "Account".into(),
+            global_name: None,
+        }
+    }
+    fn grant(id: &str, name: &str, officer: bool) -> GuildGrant {
+        GuildGrant {
+            guild_id: id.into(),
+            guild_name: name.into(),
+            display_name: format!("{name} nickname"),
+            role_label: if officer { "Officer" } else { "Raider" }.into(),
+            role_ids: vec!["10".into()],
+            authorized_role_ids: vec!["10".into()],
+        }
+    }
+
+    #[test]
+    fn baseline_session_restores_without_new_login_and_guild_discovery_preserves_credentials_and_age(
+    ) {
+        let (config, original) = baseline();
+        assert!(session_matches_config(&original, &config));
+        assert!(session_access_token_current(&original, 2000));
+        assert_eq!(authorized_user(&original, &config).guilds.len(), 1);
+        let session = authorize_grants(
+            original.clone(),
+            user(),
+            vec![
+                grant(ADVANCE_GUILD_ID, "Advance", false),
+                grant(crate::guild::ASCENDANCE, "Ascendance", true),
+                grant("999", "Third guild", false),
+            ],
+            2000,
+        )
+        .unwrap();
+        assert_eq!(session.guilds.len(), 3);
+        assert_eq!(session.guild_id, ADVANCE_GUILD_ID);
+        assert_eq!(session.access_token, original.access_token);
+        assert_eq!(session.refresh_token, original.refresh_token);
+        assert_eq!(session.created_at_unix, original.created_at_unix);
+        assert_eq!(session.expires_at_unix, original.expires_at_unix);
+    }
+
+    #[test]
+    fn selected_guild_survives_restart_and_leaving_falls_back_only_to_an_eligible_membership() {
+        let (config, original) = baseline();
+        let mut session = authorize_grants(
+            original,
+            user(),
+            vec![
+                grant(ADVANCE_GUILD_ID, "Advance", false),
+                grant(crate::guild::ASCENDANCE, "Ascendance", true),
+                grant("999", "Third guild", false),
+            ],
+            2000,
+        )
+        .unwrap();
+        apply_guild(&mut session, crate::guild::ASCENDANCE).unwrap();
+        let restored: AuthSession =
+            serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+        assert!(session_matches_config(&restored, &config));
+        assert_eq!(authorized_user(&restored, &config).role_label, "Officer");
+        assert_eq!(restored.guild_id, crate::guild::ASCENDANCE);
+        let mut next = authorize_grants(
+            restored,
+            user(),
+            vec![grant("999", "Third guild", false)],
+            3000,
+        )
+        .unwrap();
+        assert_eq!(next.guild_id, "999");
+        assert!(apply_guild(&mut next, ADVANCE_GUILD_ID).is_err());
+        assert_eq!(next.guild_id, "999");
+        assert!(
+            !authorize_grants(next, user(), vec![], 3001)
+                .err()
+                .unwrap()
+                .retryable
+        );
+    }
+
+    #[test]
+    fn invalid_grants_fail_closed_and_server_outages_retain_saved_credentials() {
+        let (_, session) = baseline();
+        let mut invalid = grant("999", "Third guild", false);
+        invalid.authorized_role_ids = vec!["unverified".into()];
+        assert!(
+            authorize_grants(session.clone(), user(), vec![invalid], 2000)
+                .err()
+                .unwrap()
+                .retryable
+        );
+        let duplicate = grant("999", "Third guild", false);
+        assert!(
+            authorize_grants(session, user(), vec![duplicate.clone(), duplicate], 2000).is_err()
+        );
+        for status in [403, 404, 429, 500, 502, 503] {
+            assert!(guild_access_error(status).retryable);
+        }
+        assert!(!guild_access_error(401).retryable);
     }
 }

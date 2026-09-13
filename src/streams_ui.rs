@@ -2,7 +2,6 @@ use std::{
     collections::HashSet,
     rc::Rc,
     sync::mpsc,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -36,7 +35,7 @@ enum ResultData {
     RecordingRemoved(Provider, String),
 }
 type WorkResult = Result<ResultData, streams::Error>;
-type PlayerResult = Result<(String, String, Option<Preferences>), streams::Error>;
+type PlayerResult = Result<(String, crate::guild::Access, Option<Preferences>), streams::Error>;
 
 pub struct StreamsUi {
     snapshot: Option<Rc<Snapshot>>,
@@ -514,7 +513,7 @@ impl StreamsUi {
         };
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
-        thread::spawn(move || {
+        crate::guild::spawn(move || {
             let result = access_token().and_then(|token| match action {
                 Action::Refresh => streams::fetch(&token).map(ResultData::Snapshot),
                 Action::Save(provider, url) => {
@@ -1407,10 +1406,10 @@ impl StreamsUi {
             let playback = self.review.playback().cloned();
             let (tx, rx) = mpsc::channel();
             let ctx = ctx.clone();
-            thread::spawn(move || {
+            crate::guild::spawn(move || {
                 let result = access_token().and_then(|token| {
                     let preferences = Some(preferences.unwrap_or_else(Preferences::load));
-                    streams::player_url_for_stream(&stream).map(|url| {
+                    streams::player_url_for_stream(&stream, &token).map(|url| {
                         let url = player_url_for_playback(&url, playback.as_ref());
                         (url, token, preferences)
                     })
@@ -1764,13 +1763,13 @@ fn live_people(streams: &[Stream]) -> Vec<&Stream> {
     people
 }
 
-fn access_token() -> Result<String, streams::Error> {
+fn access_token() -> Result<crate::guild::Access, streams::Error> {
     refreshed_token_result(discord_auth::refreshed_access_token())
 }
 
 fn refreshed_token_result(
-    result: Result<Option<String>, discord_auth::RefreshError>,
-) -> Result<String, streams::Error> {
+    result: Result<Option<crate::guild::Access>, discord_auth::RefreshError>,
+) -> Result<crate::guild::Access, streams::Error> {
     result
         .map_err(|error| streams::Error {
             message: error.message,
