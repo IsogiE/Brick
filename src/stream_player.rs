@@ -199,6 +199,7 @@ pub struct StreamPlayer {
 }
 
 impl StreamPlayer {
+    #[cfg(test)]
     pub fn new(
         frame: &eframe::Frame,
         ctx: &egui::Context,

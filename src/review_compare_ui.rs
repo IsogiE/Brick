@@ -9,6 +9,7 @@ use crate::{
 };
 use eframe::egui::{self, Color32, RichText};
 use std::{
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc,
@@ -37,6 +38,7 @@ impl Drop for PreparationPermit {
 /// A second, explicitly requested media child. Metadata uses the same protected
 /// WCL client and cancellation rules as the primary workspace; no player pool.
 pub(crate) struct Comparison {
+    provider_sessions: Rc<crate::stream_player::ProviderSessions>,
     selected: Stream,
     cancelled: Arc<AtomicBool>,
     metadata: ReviewUi,
@@ -122,8 +124,26 @@ impl Comparison {
         &mut self.metadata
     }
 
+    #[cfg(test)]
     pub fn new(review: &ReviewUi, selected: Stream, at_ms: i64, playing: bool) -> Self {
+        Self::new_with_sessions(
+            review,
+            selected,
+            at_ms,
+            playing,
+            Rc::new(Default::default()),
+        )
+    }
+
+    pub fn new_with_sessions(
+        review: &ReviewUi,
+        selected: Stream,
+        at_ms: i64,
+        playing: bool,
+        provider_sessions: Rc<crate::stream_player::ProviderSessions>,
+    ) -> Self {
         Self {
+            provider_sessions,
             selected,
             cancelled: Arc::new(AtomicBool::new(false)),
             metadata: review.metadata_peer(),
@@ -147,6 +167,31 @@ impl Comparison {
 
     pub fn expanded_stream(&self) -> Option<&Stream> {
         self.fullscreen().then_some(&self.selected)
+    }
+
+    pub fn provider_player(&self) -> Option<&StreamPlayer> {
+        self.player.as_ref()
+    }
+
+    pub fn reload_provider(&mut self, name: &str) {
+        if !self
+            .player
+            .as_ref()
+            .is_some_and(|player| player.provider_name() == name)
+        {
+            return;
+        }
+        self.save_position();
+        self.player = None;
+        self.work = None;
+        self.attempted = false;
+        self.navigating = true;
+        self.secondary_key.clear();
+        self.controller = None;
+        self.clock_versions = None;
+        self.provider_navigation = None;
+        self.provider_seeks = std::array::from_fn(|_| ProviderSeekTracker::new(Instant::now()));
+        self.error = None;
     }
 
     pub fn fullscreen(&self) -> bool {
@@ -819,10 +864,17 @@ impl Comparison {
                             };
                             let url =
                                 crate::streams_ui::player_url_for_playback(&url, Some(&playback));
+                            if self
+                                .player
+                                .as_ref()
+                                .is_some_and(|player| !player.can_reuse_for_url(&url))
+                            {
+                                self.player = None;
+                            }
                             let result = if let Some(player) = &mut self.player {
                                 player.load_replay(ctx, &url, &token)
                             } else {
-                                StreamPlayer::new(
+                                StreamPlayer::new_with_sessions(
                                     frame,
                                     ctx,
                                     &url,
@@ -830,6 +882,7 @@ impl Comparison {
                                     rect,
                                     ctx.pixels_per_point(),
                                     preferences,
+                                    self.provider_sessions.clone(),
                                 )
                                 .map(|player| self.player = Some(player))
                             };

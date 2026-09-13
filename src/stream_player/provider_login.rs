@@ -23,6 +23,11 @@ pub struct ProviderSessions {
 }
 
 impl ProviderSessions {
+    #[cfg(test)]
+    pub(crate) fn ended_for_test(&self) -> bool {
+        self.closed.get()
+    }
+
     pub fn login_open(&self) -> bool {
         let contexts = self.contexts.borrow().clone();
         contexts

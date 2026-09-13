@@ -39,6 +39,9 @@ type PlayerResult = Result<(String, crate::guild::Access, Option<Preferences>), 
 
 pub struct StreamsUi {
     youtube: crate::youtube_account_ui::YoutubeUi,
+    provider_sessions: Rc<crate::stream_player::ProviderSessions>,
+    provider_user_id: Option<String>,
+    provider_notice: Option<String>,
     snapshot: Option<Rc<Snapshot>>,
     received_at: Option<Instant>,
     last_attempt: Option<Instant>,
@@ -83,6 +86,9 @@ impl Default for StreamsUi {
         let warmup = review.metadata_peer();
         Self {
             youtube: Default::default(),
+            provider_sessions: Rc::new(Default::default()),
+            provider_user_id: None,
+            provider_notice: None,
             snapshot: None,
             received_at: None,
             last_attempt: None,
@@ -229,7 +235,45 @@ impl StreamsUi {
     }
 
     pub fn clear(&mut self) {
+        self.provider_sessions.close();
         *self = Self::default();
+    }
+
+    /// A personal viewing context is reusable only for the same authenticated
+    /// Brick account, including when a routine renewal temporarily hides it.
+    pub(crate) fn bind_provider_account(&mut self, user_id: &str) {
+        if self.provider_user_id.as_deref() != Some(user_id) {
+            self.clear();
+            self.provider_user_id = Some(user_id.to_owned());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn personal_provider_sessions(&self) -> Rc<crate::stream_player::ProviderSessions> {
+        self.provider_sessions.clone()
+    }
+
+    /// Clear every guild-specific view/worker while retaining personal viewing
+    /// identity only when the caller has confirmed the same Brick account.
+    pub(crate) fn clear_for_guild_switch(&mut self) {
+        let sessions = self.provider_sessions.clone();
+        let user_id = self.provider_user_id.clone();
+        self.stop_player();
+        *self = Self {
+            provider_sessions: sessions,
+            provider_user_id: user_id,
+            ..Self::default()
+        };
+    }
+
+    pub(crate) fn tick_guild_switch(&mut self, ctx: &egui::Context) {
+        if self.provider_sessions.login_open() {
+            crate::stream_player::pump_events();
+            #[cfg(target_os = "linux")]
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = ctx;
     }
 
     pub fn stop_player(&mut self) {
@@ -298,6 +342,7 @@ impl StreamsUi {
         if !active {
             self.stop_player();
         }
+        self.tick_guild_switch(ctx);
         if self.youtube.tick(
             ctx,
             self.snapshot
@@ -529,7 +574,7 @@ impl StreamsUi {
 
     pub fn repaint_after(&self, active: bool) -> Duration {
         #[cfg(target_os = "linux")]
-        if self.player.is_some() {
+        if self.player.is_some() || self.provider_sessions.login_open() {
             return Duration::from_millis(33);
         }
         if self.player.is_some() && self.review.active() {
@@ -607,9 +652,102 @@ impl StreamsUi {
         self.last_attempt = Some(Instant::now());
     }
 
+    fn draw_provider_accounts(&mut self, ui: &mut egui::Ui) {
+        let primary = self.player.as_ref();
+        let secondary = self
+            .comparison
+            .as_ref()
+            .and_then(|comparison| comparison.provider_player());
+        if primary.is_none() && secondary.is_none() && self.provider_notice.is_none() {
+            return;
+        }
+        let mut reload = None;
+        let mut disconnect = None;
+        let mut login_result = None;
+        ui.horizontal(|ui| {
+            for provider in [Provider::Youtube, Provider::Twitch] {
+                let Some(player) = primary
+                    .filter(|player| player.provider_name() == provider.label())
+                    .or_else(|| {
+                        secondary.filter(|player| player.provider_name() == provider.label())
+                    })
+                else {
+                    continue;
+                };
+                ui.menu_button(format!("{} account", provider.label()), |ui| {
+                    ui.set_max_width(260.0);
+                    ui.label("Sign-in lasts until Brick closes.");
+                    let label = if player.provider_login_open() {
+                        "Return to sign-in"
+                    } else {
+                        "Sign in"
+                    };
+                    if ui.button(label).clicked() {
+                        login_result = Some(player.open_provider_login(ui.ctx()));
+                        ui.close();
+                    }
+                    if player.provider_login_open() && ui.button("Close sign-in window").clicked() {
+                        player.close_provider_login();
+                        ui.close();
+                    }
+                    if ui.button("Reload video").clicked() {
+                        reload = Some(provider.clone());
+                        ui.close();
+                    }
+                    if player.provider_session_started()
+                        && ui.button("Sign out of player").clicked()
+                    {
+                        disconnect = Some(provider.clone());
+                        ui.close();
+                    }
+                });
+            }
+        });
+        if let Some(result) = login_result {
+            self.provider_notice = result.err();
+        }
+        if let Some(provider) = disconnect {
+            self.provider_sessions.disconnect(&provider);
+            reload = Some(provider);
+            self.provider_notice = None;
+        }
+        if let Some(provider) = reload {
+            self.reload_provider(provider.label());
+        }
+        if let Some(notice) = &self.provider_notice {
+            ui.label(notice);
+        }
+    }
+
+    fn reload_provider(&mut self, name: &str) {
+        let primary = self
+            .player
+            .as_ref()
+            .is_some_and(|player| player.provider_name() == name);
+        if primary {
+            self.review.cancel_marker(self.player.as_ref());
+            self.player = None;
+            self.player_work = None;
+            self.player_attempted = false;
+            self.player_switch_pending = false;
+            self.player_error = None;
+            self.player_retries = 0;
+            self.player_retry_at = None;
+        }
+        if let Some(comparison) = &mut self.comparison {
+            if primary {
+                comparison.primary_changed();
+            }
+            comparison.reload_provider(name);
+        }
+    }
+
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         self.finish_recording_review();
         self.player_rect = None;
+        if !self.recordings_open {
+            self.draw_provider_accounts(ui);
+        }
         if self.review.active() && !self.recordings_open {
             if let Some(stream) = self.selected.clone() {
                 let span = self.review.report_span();
@@ -700,12 +838,14 @@ impl StreamsUi {
                             })
                             .cloned()
                         {
-                            self.comparison = Some(crate::review_compare_ui::Comparison::new(
-                                &self.review,
-                                other,
-                                at_ms,
-                                playing,
-                            ));
+                            self.comparison =
+                                Some(crate::review_compare_ui::Comparison::new_with_sessions(
+                                    &self.review,
+                                    other,
+                                    at_ms,
+                                    playing,
+                                    self.provider_sessions.clone(),
+                                ));
                             self.review.set_comparing(true);
                             if let Some(player) = &mut self.player {
                                 let _ =
@@ -1331,6 +1471,17 @@ impl StreamsUi {
         if let Some(comparison) = &self.comparison {
             comparison.update_overlays(ctx);
         }
+        if allowed && !denied {
+            for player in self.player.iter().chain(
+                self.comparison
+                    .as_ref()
+                    .and_then(|comparison| comparison.provider_player()),
+            ) {
+                if player.take_provider_login_request() {
+                    self.provider_notice = player.open_provider_login(ctx).err();
+                }
+            }
+        }
         denied
     }
 
@@ -1402,6 +1553,15 @@ impl StreamsUi {
                         // latest playback intent before constructing the player.
                         let url = player_url_for_playback(&url, self.review.playback());
                         self.preferences = preferences;
+                        if self.player_switch_pending
+                            && self
+                                .player
+                                .as_ref()
+                                .is_some_and(|player| !player.can_reuse_for_url(&url))
+                        {
+                            self.player = None;
+                            self.player_switch_pending = false;
+                        }
                         if let Some(player) = &mut self.player {
                             if self.player_switch_pending {
                                 match player.load_replay(ctx, &url, &token) {
@@ -1417,7 +1577,7 @@ impl StreamsUi {
                                 return false;
                             }
                         }
-                        match StreamPlayer::new(
+                        match StreamPlayer::new_with_sessions(
                             frame,
                             ctx,
                             &url,
@@ -1425,6 +1585,7 @@ impl StreamsUi {
                             rect,
                             ctx.pixels_per_point(),
                             self.preferences.clone(),
+                            self.provider_sessions.clone(),
                         ) {
                             Ok(player) => {
                                 self.player = Some(player);
@@ -1852,6 +2013,40 @@ pub(crate) fn player_url_for_playback(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guild_switch_drops_private_panel_but_keeps_personal_viewing_session() {
+        let mut host = super::StreamsUi::default();
+        host.bind_provider_account("fixture-account");
+        let sessions = host.personal_provider_sessions();
+        host.selected = Some(recording("987", "1").as_stream());
+        host.notice = Some("Previous guild notice".into());
+        host.provider_notice = Some("Previous viewing notice".into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        host.work = Some(rx);
+        host.clear_for_guild_switch();
+        assert!(std::rc::Rc::ptr_eq(
+            &sessions,
+            &host.personal_provider_sessions()
+        ));
+        assert!(!sessions.ended_for_test());
+        assert_eq!(host.provider_user_id.as_deref(), Some("fixture-account"));
+        assert!(host.selected.is_none());
+        assert!(host.notice.is_none());
+        assert!(host.provider_notice.is_none());
+        assert!(host.work.is_none());
+        assert!(tx
+            .send(Err("Stale guild result".to_string().into()))
+            .is_err());
+        host.stop_player();
+        assert!(!sessions.ended_for_test());
+        host.clear();
+        assert!(sessions.ended_for_test());
+        assert!(!std::rc::Rc::ptr_eq(
+            &sessions,
+            &host.personal_provider_sessions()
+        ));
+    }
+
     #[test]
     fn stream_actions_keep_painted_geometry_on_hover() {
         crate::ui::tests::assert_static_button_hover(

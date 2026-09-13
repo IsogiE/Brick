@@ -192,6 +192,9 @@ impl BrickApp {
             roster_notice: None,
         };
 
+        if let AuthUiState::Authorized(user) = &app.auth_state {
+            app.streams.bind_provider_account(&user.user_id);
+        }
         if matches!(app.auth_state, AuthUiState::Refreshing) {
             app.start_auth_refresh();
         }
@@ -386,7 +389,7 @@ impl BrickApp {
             return;
         }
 
-        self.auth_state = AuthUiState::Refreshing;
+        self.prepare_auth_refresh();
         let (tx, rx) = mpsc::channel();
         let ctx = self.egui_ctx.clone();
         thread::spawn(move || {
@@ -398,6 +401,39 @@ impl BrickApp {
         self.status = "Checking Discord session.".to_string();
     }
 
+    fn prepare_auth_refresh(&mut self) {
+        // Retain personal provider state only for the known account. No guild
+        // player, worker or discovery result remains authorized during renewal.
+        crate::guild::invalidate();
+        self.guild_rx = None;
+        self.guild_switching = false;
+        if let AuthUiState::Authorized(user) = &self.auth_state {
+            self.streams.bind_provider_account(&user.user_id);
+            self.reset_guild_panel_for_switch();
+        } else if matches!(self.auth_state, AuthUiState::Retrying) {
+            self.reset_guild_panel_for_switch();
+        } else {
+            self.reset_guild_panel();
+        }
+        self.auth_state = AuthUiState::Refreshing;
+    }
+
+    fn tick_streams(&mut self, ctx: &egui::Context) -> bool {
+        let renewing = (matches!(self.auth_state, AuthUiState::Refreshing)
+            && self.auth_rx.is_some())
+            || matches!(self.auth_state, AuthUiState::Retrying);
+        if renewing || (self.auth_state.is_authorized() && self.guild_switching) {
+            self.streams.tick_guild_switch(ctx);
+            false
+        } else {
+            self.streams.tick(
+                ctx,
+                self.auth_state.is_authorized() && !self.guild_access_lost,
+                self.window_visible && self.active_tab == MainTab::Streams,
+            )
+        }
+    }
+
     fn poll_auth(&mut self) {
         let Some(rx) = self.auth_rx.as_ref() else {
             return;
@@ -406,6 +442,7 @@ impl BrickApp {
         match rx.try_recv() {
             Ok(Ok(user)) => {
                 self.reset_changed_guild(&user);
+                self.guild_access_lost = false;
                 self.auth_state = AuthUiState::Authorized(user);
                 self.auth_rx = None;
                 self.status = "Discord access verified.".to_string();
@@ -417,7 +454,11 @@ impl BrickApp {
             }
             Ok(Err(error)) => {
                 crate::guild::invalidate();
-                self.reset_guild_panel();
+                if error.retryable {
+                    self.reset_guild_panel_for_switch();
+                } else {
+                    self.reset_guild_panel();
+                }
                 self.auth_state = if error.retryable {
                     AuthUiState::Retrying
                 } else {
@@ -429,6 +470,8 @@ impl BrickApp {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 let error = "Discord login stopped unexpectedly.".to_string();
+                crate::guild::invalidate();
+                self.reset_guild_panel();
                 self.auth_state = AuthUiState::Denied(error.clone());
                 self.auth_rx = None;
                 self.status = error;
@@ -462,6 +505,15 @@ impl BrickApp {
 
     fn reset_guild_panel(&mut self) {
         self.streams.clear();
+        self.reset_guild_panel_fields();
+    }
+
+    fn reset_guild_panel_for_switch(&mut self) {
+        self.streams.clear_for_guild_switch();
+        self.reset_guild_panel_fields();
+    }
+
+    fn reset_guild_panel_fields(&mut self) {
         self.profile = ProfileUi::default();
         self.roster_rx = None;
         self.presence_state = initial_presence_state();
@@ -476,8 +528,14 @@ impl BrickApp {
             if previous.guild_id != next.guild_id || previous.user_id != next.user_id)
         {
             crate::guild::invalidate();
-            self.reset_guild_panel();
+            if matches!(&self.auth_state, AuthUiState::Authorized(previous) if previous.user_id == next.user_id)
+            {
+                self.reset_guild_panel_for_switch();
+            } else {
+                self.reset_guild_panel();
+            }
         }
+        self.streams.bind_provider_account(&next.user_id);
         crate::guild::activate(&next.guild_id, &next.user_id);
     }
 
@@ -497,7 +555,7 @@ impl BrickApp {
         self.guild_switching = selected.is_some();
         if self.guild_switching {
             crate::guild::invalidate();
-            self.reset_guild_panel();
+            self.reset_guild_panel_for_switch();
         }
         self.last_guild_check = Instant::now();
         let (tx, rx) = mpsc::channel();
@@ -1798,11 +1856,7 @@ impl eframe::App for BrickApp {
         self.poll_app_update(ctx);
         self.start_periodic_app_update_check();
         self.handle_close_request(ctx);
-        if self.streams.tick(
-            ctx,
-            self.auth_state.is_authorized() && !self.guild_switching && !self.guild_access_lost,
-            self.window_visible && self.active_tab == MainTab::Streams,
-        ) {
+        if self.tick_streams(ctx) {
             self.handle_guild_access_loss();
         }
         if self.auth_state.is_authorized() && !self.guild_switching && !self.guild_access_lost {
@@ -2692,7 +2746,7 @@ pub(crate) mod tests {
     // No disk, network, tray, or saved user session is needed to exercise scheduling.
     fn app() -> BrickApp {
         let now = Instant::now();
-        BrickApp {
+        let mut app = BrickApp {
             view: AppView::default(),
             status: "Ready".into(),
             view_error: None,
@@ -2739,7 +2793,125 @@ pub(crate) mod tests {
             last_app_update_check: now,
             last_roster_refresh: now,
             roster_notice: None,
+        };
+        app.streams.bind_provider_account("test");
+        app
+    }
+
+    #[test]
+    fn routine_auth_renewal_preserves_only_the_same_accounts_viewing_session() {
+        let mut app = app();
+        let AuthUiState::Authorized(user) = &app.auth_state else {
+            unreachable!()
+        };
+        let user = user.clone();
+        let sessions = app.streams.personal_provider_sessions();
+        let old_access = crate::guild::Access::new(
+            "fixture".into(),
+            user.guild_id.clone(),
+            user.user_id.clone(),
+            crate::guild::generation(),
+        );
+        let (guild_tx, guild_rx) = mpsc::channel();
+        app.guild_rx = Some(guild_rx);
+        app.prepare_auth_refresh();
+        assert!(!app.auth_state.is_authorized());
+        assert!(old_access.check().is_err());
+        assert!(guild_tx.send(Ok(user.clone())).is_err());
+        let (_auth_tx, auth_rx) = mpsc::channel();
+        app.auth_rx = Some(auth_rx);
+        let ctx = egui::Context::default();
+        assert!(!app.tick_streams(&ctx));
+        assert!(!sessions.ended_for_test());
+        assert!(std::rc::Rc::ptr_eq(
+            &sessions,
+            &app.streams.personal_provider_sessions()
+        ));
+        // Successful restore checks the retained account even though the auth
+        // enum no longer contains its previous Authorized value.
+        app.reset_changed_guild(&user);
+        app.auth_state = AuthUiState::Authorized(user.clone());
+        assert!(std::rc::Rc::ptr_eq(
+            &sessions,
+            &app.streams.personal_provider_sessions()
+        ));
+        app.prepare_auth_refresh();
+        let mut other = user;
+        other.user_id = "different-account".into();
+        app.reset_changed_guild(&other);
+        assert!(sessions.ended_for_test());
+        assert!(!std::rc::Rc::ptr_eq(
+            &sessions,
+            &app.streams.personal_provider_sessions()
+        ));
+    }
+
+    #[test]
+    fn auth_renewal_retains_personal_state_only_across_retryable_failures() {
+        for outcome in [Some(false), Some(true), None] {
+            let mut app = app();
+            let sessions = app.streams.personal_provider_sessions();
+            app.prepare_auth_refresh();
+            let (tx, rx) = mpsc::channel();
+            app.auth_rx = Some(rx);
+            if let Some(retryable) = outcome {
+                tx.send(Err(RefreshError {
+                    message: "Synthetic renewal failure".into(),
+                    retryable,
+                }))
+                .unwrap();
+            }
+            drop(tx);
+            app.poll_auth();
+            assert!(!app.auth_state.is_authorized());
+            if outcome == Some(true) {
+                let ctx = egui::Context::default();
+                assert!(!app.tick_streams(&ctx));
+                assert!(matches!(app.auth_state, AuthUiState::Retrying));
+                assert!(!sessions.ended_for_test());
+                assert!(std::rc::Rc::ptr_eq(
+                    &sessions,
+                    &app.streams.personal_provider_sessions()
+                ));
+                app.prepare_auth_refresh();
+                assert!(!sessions.ended_for_test());
+                assert!(std::rc::Rc::ptr_eq(
+                    &sessions,
+                    &app.streams.personal_provider_sessions()
+                ));
+            } else {
+                assert!(sessions.ended_for_test());
+                assert!(!std::rc::Rc::ptr_eq(
+                    &sessions,
+                    &app.streams.personal_provider_sessions()
+                ));
+            }
         }
+    }
+
+    #[test]
+    fn guild_change_preserves_viewing_identity_but_account_change_ends_it() {
+        let mut app = app();
+        let sessions = app.streams.personal_provider_sessions();
+        let AuthUiState::Authorized(user) = &app.auth_state else {
+            unreachable!();
+        };
+        let mut next = user.clone();
+        next.guild_id = crate::guild::ASCENDANCE.into();
+        app.reset_changed_guild(&next);
+        assert!(std::rc::Rc::ptr_eq(
+            &sessions,
+            &app.streams.personal_provider_sessions()
+        ));
+        assert!(!sessions.ended_for_test());
+        app.auth_state = AuthUiState::Authorized(next.clone());
+        next.user_id = "another-account".into();
+        app.reset_changed_guild(&next);
+        assert!(sessions.ended_for_test());
+        assert!(!std::rc::Rc::ptr_eq(
+            &sessions,
+            &app.streams.personal_provider_sessions()
+        ));
     }
 
     #[test]
