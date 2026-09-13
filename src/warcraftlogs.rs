@@ -414,6 +414,8 @@ pub struct Client {
     config_stamp: Option<ConfigStamp>,
     masters: MasterCache,
     session: Option<Session>,
+    recording_auth_epoch: u64,
+    recording_catalog: crate::recording_filter::Catalog,
     cooldowns: Option<defensives::Preferences>,
     cooldown_catalog: defensives::CatalogCache,
     http: HttpClient,
@@ -465,6 +467,8 @@ impl Client {
             config_stamp: None,
             masters: HashMap::new(),
             session: None,
+            recording_auth_epoch: 0,
+            recording_catalog: Default::default(),
             cooldowns: None,
             cooldown_catalog: Default::default(),
             http,
@@ -510,7 +514,7 @@ impl Client {
         })?
         .map_err(|e| {
             if e.access_denied {
-                self.session = None;
+                self.set_session(None);
                 self.reports.clear();
                 self.events.clear();
                 self.masters.clear();
@@ -541,7 +545,7 @@ impl Client {
         }
         if self.config.as_ref() != Some(&config) || !restore {
             self.cooldowns = None;
-            self.session = None;
+            self.set_session(None);
             self.reports.clear();
             self.events.clear();
             self.masters.clear();
@@ -559,7 +563,7 @@ impl Client {
                     && credential(&session.access_token)
                     && session.refresh_token.as_ref().is_none_or(|t| credential(t))
                 {
-                    self.session = Some(session);
+                    self.set_session(Some(session));
                 }
             }
             // A locked keyring must remain retryable after it is unlocked.
@@ -573,14 +577,70 @@ impl Client {
         Ok(())
     }
 
+    fn set_session(&mut self, session: Option<Session>) {
+        if self.session.is_some() || session.is_some() {
+            self.recording_auth_epoch = self.recording_auth_epoch.wrapping_add(1);
+            self.recording_catalog = Default::default();
+        }
+        self.session = session;
+    }
+
+    pub(crate) fn recording_auth_epoch(&self) -> u64 {
+        self.recording_auth_epoch
+    }
+
     pub fn connected(&self) -> bool {
         self.session.is_some()
+    }
+
+    pub(crate) fn unrelated_recordings(
+        &mut self,
+        discord_token: &crate::guild::Access,
+        vods: &[streams::Vod],
+    ) -> Result<std::collections::HashSet<String>, String> {
+        self.configure(discord_token, true)?;
+        self.access_token()?;
+        let guild_id = self
+            .config
+            .as_ref()
+            .ok_or("Choose a guild first.")?
+            .guild_id;
+        let now_ms = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| "The system clock is unavailable.")?
+                .as_millis(),
+        )
+        .map_err(|_| "The system clock is unavailable.")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let epoch = self.recording_auth_epoch;
+        let mut catalog = std::mem::take(&mut self.recording_catalog);
+        let result = crate::recording_filter::load_hidden_with_catalog(
+            vods,
+            guild_id,
+            now_ms,
+            &mut catalog,
+            |query, variables| {
+                let timeout = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(3));
+                if timeout.is_zero() {
+                    return Err("The recording raid check will continue later.".into());
+                }
+                self.query_with_timeout(query, variables, timeout)
+            },
+        );
+        if self.recording_auth_epoch == epoch {
+            self.recording_catalog = catalog;
+        }
+        check_cancelled(&self.cancel)?;
+        result
     }
 
     pub fn disconnect(&mut self, discord_token: &crate::guild::Access) -> Result<(), String> {
         self.configure(discord_token, false)?;
         store(self.config.as_ref().unwrap())?.remove()?;
-        self.session = None;
+        self.set_session(None);
         self.reports.clear();
         self.events.clear();
         self.masters.clear();
@@ -702,7 +762,7 @@ impl Client {
         store(config)?.save(
             &serde_json::to_vec(&session).map_err(|_| "Couldn't save Warcraft Logs sign-in.")?,
         )?;
-        self.session = Some(session);
+        self.set_session(Some(session));
         Ok(())
     }
 
@@ -714,7 +774,7 @@ impl Client {
             .ok_or("Connect Warcraft Logs to see this raid's pulls.")?;
         if session.expires_at <= now_secs() {
             let Some(refresh) = session.refresh_token.clone() else {
-                self.session = None;
+                self.set_session(None);
                 self.reports.clear();
                 self.events.clear();
                 self.masters.clear();
@@ -731,7 +791,7 @@ impl Client {
                 Ok(token) => token,
                 Err(error) => {
                     if error != CANCELLED {
-                        self.session = None;
+                        self.set_session(None);
                         self.reports.clear();
                         self.events.clear();
                         self.masters.clear();
@@ -792,7 +852,7 @@ impl Client {
             return Err("Warcraft Logs is busy. Brick will retry shortly.".into());
         }
         if status == 401 || status == 403 {
-            self.session = None;
+            self.set_session(None);
             self.reports.clear();
             self.events.clear();
             self.masters.clear();
@@ -1646,6 +1706,83 @@ mod tests {
         assert_eq!(pulls[0].id, 2);
         assert_eq!(pulls[0].seconds, 0);
     }
+    #[test]
+    #[ignore = "opt-in live VOD filtering: protected sessions, current guild, counts only"]
+    fn live_recording_filter() {
+        assert_eq!(std::env::var("BRICK_WCL_VOD_FILTER").as_deref(), Ok("1"));
+        let user = match crate::discord_auth::saved_session_status()
+            .expect("Protected login unavailable")
+        {
+            crate::discord_auth::SessionStatus::Authorized(user) => user,
+            crate::discord_auth::SessionStatus::NeedsRefresh => {
+                crate::discord_auth::refresh_saved_session().expect("Login refresh unavailable")
+            }
+            _ => panic!("A current protected login is required"),
+        };
+        crate::guild::activate(&user.guild_id, &user.user_id);
+        let token = crate::discord_auth::current_or_refreshed_access_token()
+            .expect("Protected Discord session unavailable")
+            .expect("Sign in to Discord");
+        let token = if let Ok(guild) = std::env::var("BRICK_WCL_VOD_FILTER_GUILD") {
+            crate::guild::Access::new(
+                token.secret().to_owned(),
+                guild,
+                token.user_id.clone(),
+                crate::guild::generation(),
+            )
+        } else {
+            token
+        };
+        let recordings =
+            streams::fetch_recordings(&token).expect("Recording directory unavailable");
+        let mut client = Client::new().unwrap();
+        let started = Instant::now();
+        let hidden = client
+            .unrelated_recordings(&token, &recordings.vods)
+            .expect("Complete authenticated recording coverage unavailable");
+        let first_requests = client.requests.graphql;
+        eprintln!("vod_filter recordings={} hidden={} hidden_twitch={} hidden_youtube={} elapsed_ms={} graphql_requests={}",
+            recordings.vods.len(), hidden.len(), hidden.iter().filter(|key|key.starts_with("twitch:")).count(),
+            hidden.iter().filter(|key|key.starts_with("youtube:")).count(), started.elapsed().as_millis(), first_requests);
+        let started = Instant::now();
+        let repeated = client
+            .unrelated_recordings(&token, &recordings.vods)
+            .expect("Cached coverage unavailable");
+        assert_eq!(repeated, hidden);
+        assert_eq!(
+            client.requests.graphql, first_requests,
+            "An immediate repeat must reuse the completed catalog and fight checks"
+        );
+        eprintln!(
+            "vod_filter repeat_elapsed_ms={} repeat_graphql_requests={}",
+            started.elapsed().as_millis(),
+            client.requests.graphql - first_requests
+        );
+        if let Ok(path) = std::env::var("BRICK_WCL_VOD_KNOWN_TIMINGS") {
+            let bytes = std::fs::read(path).expect("Private timing fixture unavailable");
+            assert!(bytes.len() <= 4 * 1024 * 1024);
+            let rows: Vec<Value> = serde_json::from_slice(&bytes).expect("Invalid timing fixture");
+            let recordings: std::collections::HashSet<_> = rows
+                .iter()
+                .map(|row| {
+                    let key = &row["key"];
+                    format!(
+                        "{}:{}:",
+                        key["provider"].as_str().unwrap(),
+                        key["videoId"].as_str().unwrap()
+                    )
+                })
+                .collect();
+            assert!(
+                !hidden.iter().any(|hidden| recordings
+                    .iter()
+                    .any(|recording| hidden.starts_with(recording))),
+                "A historically measured raid recording would be filtered"
+            );
+            eprintln!("vod_filter preserved_historical_measurements={} preserved_historical_recordings={}", rows.len(), recordings.len());
+        }
+    }
+
     #[test]
     #[ignore = "opt-in live timing: protected sessions, selected live POV, timings/counts only"]
     fn live_event_query_timing() {

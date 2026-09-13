@@ -283,6 +283,10 @@ impl ReviewUi {
         peer
     }
 
+    pub(crate) fn recording_filter_client(&self) -> Arc<Mutex<Option<Client>>> {
+        self.client.clone()
+    }
+
     pub(crate) fn comparison_notice(&self) -> Option<&str> {
         self.notice.as_deref()
     }

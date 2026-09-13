@@ -46,6 +46,7 @@ pub struct StreamsUi {
     focused: Option<(String, String)>,
     recordings_open: bool,
     recordings: Option<Rc<Vec<Vod>>>,
+    recording_filter: crate::recording_filter::Filter,
     recordings_library: crate::recordings_ui::Library,
     recordings_attempted: bool,
     recordings_retry_at: Option<Instant>,
@@ -88,6 +89,7 @@ impl Default for StreamsUi {
             focused: None,
             recordings_open: false,
             recordings: None,
+            recording_filter: Default::default(),
             recordings_library: crate::recordings_ui::Library::default(),
             recordings_attempted: false,
             recordings_retry_at: None,
@@ -363,7 +365,8 @@ impl StreamsUi {
                         self.start(ctx, Action::Refresh);
                     }
                     Ok(ResultData::Recordings(recordings)) => {
-                        self.recordings_retry_at = None;
+                        self.recordings_retry_at =
+                            Some(Instant::now() + Duration::from_secs(5 * 60));
                         self.pov_revision = self.pov_revision.wrapping_add(1);
                         self.can_delete_recordings = recordings.can_delete_recordings;
                         if !self.can_delete_recordings {
@@ -425,6 +428,12 @@ impl StreamsUi {
                 self.start(ctx, Action::Refresh);
             }
         }
+        self.recording_filter.tick(
+            ctx,
+            self.recordings.as_ref(),
+            active && self.recordings_open,
+            self.review.recording_filter_client(),
+        );
         // One metadata-only observer finds new raid pulls while Brick is idle.
         // No background video decoder is created on the client.
         // The selected review takes over while watching.
@@ -1055,6 +1064,7 @@ impl StreamsUi {
             ui.label(RichText::new("Loading VODs…").color(MUTED));
             return;
         };
+        let recordings = self.recording_filter.visible(&recordings);
         let action = self.recordings_library.draw(
             ui,
             &recordings,
