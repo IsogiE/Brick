@@ -511,12 +511,14 @@ mod tests {
         }
     }
 
-    fn wait_for(mut condition: impl FnMut() -> bool) {
+    #[track_caller]
+    fn wait_for(stage: &str, mut condition: impl FnMut() -> bool) {
+        eprintln!("Native provider fixture: {stage}");
         let deadline = Instant::now() + Duration::from_secs(20);
         while !condition() {
             assert!(
                 Instant::now() < deadline,
-                "Native provider fixture timed out"
+                "Native provider fixture timed out waiting for {stage}"
             );
             pump();
             thread::sleep(Duration::from_millis(5));
@@ -577,8 +579,26 @@ mod tests {
         Some(webview2_com::take_pwstr(title))
     }
 
-    fn state(view: &WebView) -> serde_json::Value {
-        wait_for(|| page_title(view).is_some_and(|value| value.starts_with('{')));
+    #[track_caller]
+    fn state(view: &WebView, stage: &str) -> serde_json::Value {
+        struct Observe<'a>(&'a WebView);
+        impl Drop for Observe<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    let mut source = PWSTR::null();
+                    let source = unsafe { self.0.webview().Source(&mut source) }
+                        .map(|()| webview2_com::take_pwstr(source));
+                    eprintln!(
+                        "Fixture page source: {source:?}; title: {:?}",
+                        page_title(self.0)
+                    );
+                }
+            }
+        }
+        let _observe = Observe(view);
+        wait_for(stage, || {
+            page_title(view).is_some_and(|value| value.starts_with('{'))
+        });
         serde_json::from_str(&page_title(view).unwrap()).unwrap()
     }
 
@@ -655,9 +675,12 @@ mod tests {
             fixture_origin,
         )
         .unwrap();
-        let initial = state(&login.view);
+        let initial = state(&login.view, "initial sign-in page");
         login.present();
-        wait_for(|| unsafe { GetForegroundWindow() } == login.native.handle());
+        wait_for(
+            "initial sign-in foreground",
+            || unsafe { GetForegroundWindow() } == login.native.handle(),
+        );
         for key in ["auth", "ipc", "bridge", "opener"] {
             assert_eq!(initial[key], false, "{key}");
         }
@@ -689,7 +712,7 @@ mod tests {
         let snapshot = |context: &super::super::Context| {
             let view = media_view(&context.platform, &parent, &root);
             view.load_url(&format!("{origin}/state")).unwrap();
-            let result = state(&view);
+            let result = state(&view, "provider/account snapshot page");
             drop(view);
             pump();
             result
@@ -713,9 +736,15 @@ mod tests {
             fixture_origin,
         )
         .unwrap();
-        assert_eq!(state(&reopened.view)["cookie"], true);
+        assert_eq!(
+            state(&reopened.view, "reopened sign-in page")["cookie"],
+            true
+        );
         reopened.present();
-        wait_for(|| unsafe { GetForegroundWindow() } == reopened.native.handle());
+        wait_for(
+            "reopened sign-in foreground",
+            || unsafe { GetForegroundWindow() } == reopened.native.handle(),
+        );
         *youtube.window.borrow_mut() = Some(reopened);
         sessions.disconnect(&Provider::Youtube);
         assert!(!youtube.active());
@@ -723,7 +752,7 @@ mod tests {
         assert!(youtube.platform.keeper.borrow().is_none());
         // Profile deletion closes its views through WebView2's Deleted event.
         // Pump that bounded asynchronous teardown before checking retirement.
-        wait_for(|| {
+        wait_for("disconnected profile view closure", || {
             let mut source = PWSTR::null();
             if unsafe { active_pov.webview().Source(&mut source) }.is_err() {
                 true
