@@ -1,0 +1,264 @@
+//! Personal, memory-only provider sessions. No browser cookie import or export.
+use crate::streams::Provider;
+use eframe::egui;
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
+use url::Url;
+
+#[cfg(target_os = "linux")]
+#[path = "provider_login/linux.rs"]
+mod platform;
+#[cfg(target_os = "windows")]
+#[path = "provider_login/windows.rs"]
+mod platform;
+
+/// Owned by one signed-in Brick account. Retire it before changing accounts.
+/// Provider state is personal; guild data and Brick credentials never enter it.
+#[derive(Default)]
+pub struct ProviderSessions {
+    contexts: RefCell<[Option<Rc<Context>>; 2]>,
+}
+
+impl ProviderSessions {
+    pub fn login_open(&self) -> bool {
+        let contexts = self.contexts.borrow().clone();
+        contexts
+            .iter()
+            .flatten()
+            .any(|context| context.window_open())
+    }
+
+    pub(super) fn release_unused(&self, context: &Rc<Context>) {
+        // Anonymous playback keeps the existing prompt resource teardown. A
+        // user-requested login retains its memory-only session for this run.
+        if !context.attempted() && Rc::strong_count(context) == 2 {
+            let removed = {
+                let mut contexts = self.contexts.borrow_mut();
+                let slot = &mut contexts[index(&context.provider)];
+                if slot
+                    .as_ref()
+                    .is_some_and(|saved| Rc::ptr_eq(saved, context))
+                {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(context) = removed {
+                context.retire();
+            }
+        }
+    }
+    pub fn disconnect(&self, provider: &Provider) {
+        let context = self.contexts.borrow_mut()[index(provider)].take();
+        if let Some(context) = context {
+            context.retire();
+        }
+    }
+
+    pub fn close(&self) {
+        let contexts = std::mem::take(&mut *self.contexts.borrow_mut());
+        for context in contexts.into_iter().flatten() {
+            context.retire();
+        }
+    }
+
+    pub(super) fn context(&self, provider: Provider) -> Result<Rc<Context>, String> {
+        let mut contexts = self.contexts.borrow_mut();
+        let slot = &mut contexts[index(&provider)];
+        if slot.is_none() {
+            *slot = Some(Rc::new(Context::new(provider)?));
+        }
+        Ok(Rc::clone(slot.as_ref().expect("Context was initialized")))
+    }
+}
+
+impl Drop for ProviderSessions {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn index(provider: &Provider) -> usize {
+    match provider {
+        Provider::Twitch => 0,
+        Provider::Youtube => 1,
+    }
+}
+
+pub(super) struct Context {
+    pub provider: Provider,
+    active: Cell<bool>,
+    attempted: Cell<bool>,
+    window: RefCell<Option<platform::Window>>,
+    pub platform: platform::Context,
+}
+
+impl Context {
+    fn new(provider: Provider) -> Result<Self, String> {
+        Ok(Self {
+            provider,
+            active: Cell::new(true),
+            attempted: Cell::new(false),
+            window: RefCell::new(None),
+            platform: platform::Context::new()?,
+        })
+    }
+
+    pub fn active(&self) -> bool {
+        self.active.get()
+    }
+    pub fn attempted(&self) -> bool {
+        self.attempted.get()
+    }
+
+    pub fn open(&self, player: &wry::WebView, ctx: &egui::Context) -> Result<(), String> {
+        if !self.active.get() {
+            return Err("This provider session has ended.".into());
+        }
+        if let Some(window) = self.window.borrow().as_ref().filter(|w| w.open()) {
+            window.present();
+            return Ok(());
+        }
+        self.close_window();
+        let window = platform::Window::new(&self.platform, &self.provider, player, ctx)?;
+        *self.window.borrow_mut() = Some(window);
+        self.attempted.set(true);
+        Ok(())
+    }
+
+    pub fn window_open(&self) -> bool {
+        let closed = {
+            let mut window = self.window.borrow_mut();
+            if window.as_ref().is_some_and(|window| !window.open()) {
+                window.take()
+            } else {
+                None
+            }
+        };
+        // Native controller teardown may pump messages. Do not retain a RefMut
+        // while dropping a window and entering those platform callbacks.
+        drop(closed);
+        self.window.borrow().is_some()
+    }
+
+    pub fn close_window(&self) {
+        let window = self.window.borrow_mut().take();
+        drop(window);
+    }
+
+    fn retire(&self) {
+        if !self.active.replace(false) {
+            return;
+        }
+        self.close_window();
+        self.platform.retire();
+    }
+}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
+pub(super) fn provider(url: &Url) -> Option<Provider> {
+    match url.path().rsplit('/').next()? {
+        "youtube" => Some(Provider::Youtube),
+        "twitch" => Some(Provider::Twitch),
+        _ => None,
+    }
+}
+
+fn start_url(provider: &Provider) -> &'static str {
+    match provider {
+        Provider::Youtube => "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F",
+        Provider::Twitch => "https://www.twitch.tv/login",
+    }
+}
+
+/// Account documents never navigate into Brick or arbitrary destinations.
+/// Subresource requests retain the browser's normal origin/TLS protections.
+fn allowed_document(provider: &Provider, destination: &str) -> bool {
+    let Ok(url) = Url::parse(destination) else {
+        return false;
+    };
+    if destination.len() > 8192
+        || url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return false;
+    }
+    match provider {
+        Provider::Youtube => matches!(
+            url.host_str(),
+            Some(
+                "accounts.google.com"
+                    | "accounts.youtube.com"
+                    | "www.youtube.com"
+                    | "www.google.com"
+            )
+        ),
+        Provider::Twitch => matches!(
+            url.host_str(),
+            Some("www.twitch.tv" | "id.twitch.tv" | "passport.twitch.tv")
+        ),
+    }
+}
+
+fn title(provider: &Provider, destination: &str) -> String {
+    let origin = Url::parse(destination)
+        .ok()
+        .filter(|_| allowed_document(provider, destination))
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| "Connecting…".into());
+    format!("{} sign-in — {}", provider.label(), origin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_documents_are_exact_provider_https_origins() {
+        for provider in [Provider::Twitch, Provider::Youtube] {
+            assert!(allowed_document(&provider, start_url(&provider)));
+            for value in [
+                "http://www.youtube.com/",
+                "https://accounts.google.com.evil.test/",
+                "https://accounts.google.com@evil.test/",
+                "https://token@accounts.google.com/",
+                "https://www.youtube.com:8443/",
+                "file:///tmp/account",
+                "javascript:alert(1)",
+                "https://brick.lusaggo.com/v1/guilds",
+                "about:blank",
+                "data:text/html,hello",
+            ] {
+                assert!(!allowed_document(&provider, value), "{value}");
+            }
+        }
+        assert!(!allowed_document(
+            &Provider::Youtube,
+            start_url(&Provider::Twitch)
+        ));
+        assert!(!allowed_document(
+            &Provider::Twitch,
+            start_url(&Provider::Youtube)
+        ));
+    }
+
+    #[test]
+    fn native_title_never_displays_query_credentials_or_provider_document_title() {
+        let value = title(
+            &Provider::Youtube,
+            "https://accounts.google.com/ServiceLogin?secret=fixture#private",
+        );
+        assert_eq!(value, "YouTube sign-in — https://accounts.google.com");
+        assert!(!title(&Provider::Youtube, "https://evil.test/?secret=fixture").contains("evil"));
+    }
+}

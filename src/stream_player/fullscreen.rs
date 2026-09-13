@@ -531,6 +531,8 @@ mod tests {
                         if let Some(settings) = webkit2gtk::WebViewExt::settings(&view.webview()) { webkit2gtk::SettingsExt::set_hardware_acceleration_policy(&settings, webkit2gtk::HardwareAccelerationPolicy::Never); }
                         view.focus_parent().unwrap();
                         let player = super::super::StreamPlayer {
+                            _provider_sessions: std::rc::Rc::new(super::super::ProviderSessions::default()),
+                            provider_context: None,
                             _cache_usage: crate::cache_maintenance::PlayerLease::new(),
                             #[cfg(target_os = "windows")]
                             _web_context: wry::WebContext::default(),
