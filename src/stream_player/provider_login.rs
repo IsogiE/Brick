@@ -97,6 +97,7 @@ pub(super) struct Context {
     pub provider: Provider,
     active: Cell<bool>,
     attempted: Cell<bool>,
+    login_requested: Cell<bool>,
     window: RefCell<Option<platform::Window>>,
     pub platform: platform::Context,
 }
@@ -107,6 +108,7 @@ impl Context {
             provider,
             active: Cell::new(true),
             attempted: Cell::new(false),
+            login_requested: Cell::new(false),
             window: RefCell::new(None),
             platform: platform::Context::new()?,
         })
@@ -117,6 +119,24 @@ impl Context {
     }
     pub fn attempted(&self) -> bool {
         self.attempted.get()
+    }
+
+    pub fn request_login(&self, destination: &str, user_gesture: bool, has_auth: bool) -> bool {
+        if !self.active.get()
+            || !user_gesture
+            || has_auth
+            || !login_destination(&self.provider, destination)
+        {
+            return false;
+        }
+        // One bounded pending action, consumed by native UI after this browser
+        // callback returns. The requested URL is never retained or followed.
+        self.login_requested.set(true);
+        true
+    }
+
+    pub fn take_login_request(&self) -> bool {
+        self.login_requested.replace(false) && self.active.get()
     }
 
     pub fn open(&self, player: &wry::WebView, ctx: &egui::Context) -> Result<(), String> {
@@ -158,6 +178,7 @@ impl Context {
         if !self.active.replace(false) {
             return;
         }
+        self.login_requested.set(false);
         self.close_window();
         self.platform.retire();
     }
@@ -174,6 +195,37 @@ pub(super) fn provider(url: &Url) -> Option<Provider> {
         "youtube" => Some(Provider::Youtube),
         "twitch" => Some(Provider::Twitch),
         _ => None,
+    }
+}
+
+pub(super) fn watch_requests(
+    view: &wry::WebView,
+    context: &Rc<Context>,
+    ctx: &egui::Context,
+) -> Result<(), String> {
+    platform::watch_requests(view, Rc::downgrade(context), ctx)
+}
+
+pub(super) fn login_destination(provider: &Provider, destination: &str) -> bool {
+    if !allowed_document(provider, destination) {
+        return false;
+    }
+    let Ok(url) = Url::parse(destination) else {
+        return false;
+    };
+    match provider {
+        Provider::Youtube => {
+            matches!(
+                url.host_str(),
+                Some("accounts.google.com" | "accounts.youtube.com")
+            ) || (url.host_str() == Some("www.youtube.com")
+                && url.path().trim_end_matches('/') == "/signin")
+        }
+        Provider::Twitch => {
+            matches!(url.host_str(), Some("id.twitch.tv" | "passport.twitch.tv"))
+                || (url.host_str() == Some("www.twitch.tv")
+                    && url.path().trim_end_matches('/') == "/login")
+        }
     }
 }
 
@@ -279,5 +331,31 @@ mod tests {
         );
         assert_eq!(value, "YouTube sign-in — https://accounts.google.com");
         assert!(!title(&Provider::Youtube, "https://evil.test/?secret=fixture").contains("evil"));
+    }
+
+    #[test]
+    fn only_provider_account_destinations_request_native_login() {
+        for provider in [Provider::Youtube, Provider::Twitch] {
+            assert!(login_destination(&provider, start_url(&provider)));
+            for value in [
+                "https://www.youtube.com/watch?v=fixture",
+                "https://www.twitch.tv/streamer",
+                "https://accounts.google.com.evil.test/",
+                "https://token@accounts.google.com/",
+                "https://accounts.google.com:8443/",
+                "javascript:alert(1)",
+                "https://brick.lusaggo.com/v1/login",
+            ] {
+                assert!(!login_destination(&provider, value), "{value}");
+            }
+        }
+        assert!(!login_destination(
+            &Provider::Twitch,
+            start_url(&Provider::Youtube)
+        ));
+        assert!(!login_destination(
+            &Provider::Youtube,
+            start_url(&Provider::Twitch)
+        ));
     }
 }

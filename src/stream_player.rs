@@ -285,6 +285,7 @@ impl StreamPlayer {
         let allowed_url = Arc::new(Mutex::new(player_url.to_string()));
         let wrapper_url = Arc::clone(&allowed_url);
         let browser_ctx = ctx.clone();
+        let popup_provider = provider_context.provider.clone();
         let preferences = Some(PreferenceBridge::new(
             player_url.as_str(),
             preferences.unwrap_or_else(Preferences::in_memory),
@@ -318,7 +319,13 @@ impl StreamPlayer {
             .with_focused(true)
             .with_background_color((18, 20, 25, 255))
             .with_new_window_req_handler(move |destination, _| {
-                open_provider_window(&browser_ctx, &destination)
+                if provider_login::login_destination(&popup_provider, &destination) {
+                    // Wry lacks a user-gesture flag. Native policy queues only
+                    // verified user actions after this denial returns.
+                    NewWindowResponse::Deny
+                } else {
+                    open_provider_window(&browser_ctx, &destination)
+                }
             })
             .with_download_started_handler(|_, _| false)
             .with_on_page_load_handler(move |event, destination| {
@@ -379,11 +386,14 @@ impl StreamPlayer {
         let builder = {
             let allowed = Arc::clone(&allowed_url);
             let ctx = ctx.clone();
+            let provider = provider_context.provider.clone();
             builder.with_navigation_handler(move |destination| {
                 if allowed.lock().is_ok_and(|url| destination == *url) {
                     true
                 } else {
-                    open_provider_link(&ctx, &destination);
+                    if !provider_login::login_destination(&provider, &destination) {
+                        open_provider_link(&ctx, &destination);
+                    }
                     false
                 }
             })
@@ -449,6 +459,14 @@ impl StreamPlayer {
             .webview
             .as_ref()
             .expect("The player has just been created");
+        provider_login::watch_requests(
+            webview,
+            player
+                .provider_context
+                .as_ref()
+                .expect("The player owns its provider context"),
+            ctx,
+        )?;
         #[cfg(target_os = "linux")]
         {
             use wry::WebViewExtUnix;
@@ -513,6 +531,12 @@ impl StreamPlayer {
             .as_ref()
             .ok_or("This player has no provider session.")?
             .open(view, ctx)
+    }
+
+    pub fn take_provider_login_request(&self) -> bool {
+        self.provider_context
+            .as_ref()
+            .is_some_and(|context| context.take_login_request())
     }
 
     pub fn provider_login_open(&self) -> bool {

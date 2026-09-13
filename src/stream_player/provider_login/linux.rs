@@ -9,6 +9,48 @@ use webkit2gtk::{
     WebsiteDataManagerExt,
 };
 
+pub(super) fn watch_requests(
+    view: &wry::WebView,
+    context: std::rc::Weak<super::Context>,
+    ctx: &egui::Context,
+) -> Result<(), String> {
+    use wry::WebViewExtUnix;
+    let ctx = ctx.clone();
+    // Install before the normal media policy so a recognized account action
+    // can be queued while its navigation is still denied in the media view.
+    view.webview()
+        .connect_decide_policy(move |_, decision, kind| {
+            if !matches!(
+                kind,
+                webkit2gtk::PolicyDecisionType::NavigationAction
+                    | webkit2gtk::PolicyDecisionType::NewWindowAction
+            ) {
+                return false;
+            }
+            let requested = decision
+                .downcast_ref::<webkit2gtk::NavigationPolicyDecision>()
+                .and_then(|decision| decision.navigation_action())
+                .is_some_and(|action| {
+                    action.request().is_some_and(|request| {
+                        let auth = request
+                            .http_headers()
+                            .is_some_and(|headers| headers.one("Authorization").is_some());
+                        request.uri().is_some_and(|uri| {
+                            context.upgrade().is_some_and(|context| {
+                                context.request_login(&uri, action.is_user_gesture(), auth)
+                            })
+                        })
+                    })
+                });
+            if requested {
+                decision.ignore();
+                ctx.request_repaint();
+            }
+            requested
+        });
+    Ok(())
+}
+
 pub(crate) struct Context {
     pub context: webkit2gtk::WebContext,
     views: RefCell<Vec<gtk::glib::WeakRef<webkit2gtk::WebView>>>,
@@ -267,6 +309,14 @@ mod tests {
         let youtube = sessions.context(Provider::Youtube).unwrap();
         assert!(youtube.platform.context.is_sandbox_enabled());
         assert!(youtube.platform.context.is_ephemeral());
+        let destination = super::super::start_url(&Provider::Youtube);
+        assert!(!youtube.request_login(destination, false, false));
+        assert!(!youtube.request_login(destination, true, true));
+        assert!(!youtube.take_login_request());
+        assert!(youtube.request_login(destination, true, false));
+        assert!(youtube.request_login(destination, true, false));
+        assert!(youtube.take_login_request());
+        assert!(!youtube.take_login_request());
         let window = Window::new_at(
             &youtube.platform,
             &Provider::Youtube,
@@ -332,6 +382,8 @@ mod tests {
         assert!(sessions.login_open());
         sessions.disconnect(&Provider::Youtube);
         assert!(!youtube.active());
+        assert!(!youtube.request_login(destination, true, false));
+        assert!(!youtube.take_login_request());
         assert!(!youtube.window_open());
         assert!(twitch.active());
         let replacement = sessions.context(Provider::Youtube).unwrap();

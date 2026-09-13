@@ -12,7 +12,7 @@ use webview2_com::{
         ICoreWebView2Controller, ICoreWebView2Environment, ICoreWebView2Profile6,
         ICoreWebView2Profile8, ICoreWebView2_13,
     },
-    NavigationStartingEventHandler,
+    NavigationStartingEventHandler, NewWindowRequestedEventHandler,
 };
 use windows::core::{Interface, PWSTR};
 use windows::Win32::{
@@ -29,6 +29,63 @@ use windows_sys::Win32::{
     },
 };
 use wry::{WebView, WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows};
+
+pub(super) fn watch_requests(
+    view: &WebView,
+    context: std::rc::Weak<super::Context>,
+    ctx: &egui::Context,
+) -> Result<(), String> {
+    let navigation_context = context.clone();
+    let navigation_ctx = ctx.clone();
+    let navigation = NavigationStartingEventHandler::create(Box::new(move |_, args| {
+        if let Some(args) = args {
+            unsafe {
+                let mut gesture = windows::core::BOOL::default();
+                args.IsUserInitiated(&mut gesture)?;
+                let mut destination = PWSTR::null();
+                args.Uri(&mut destination)?;
+                let destination = webview2_com::take_pwstr(destination);
+                let mut auth = windows::core::BOOL::default();
+                args.RequestHeaders()?
+                    .Contains(windows::core::w!("Authorization"), &mut auth)?;
+                if navigation_context.upgrade().is_some_and(|context| {
+                    context.request_login(&destination, gesture.as_bool(), auth.as_bool())
+                }) {
+                    args.SetCancel(true)?;
+                    navigation_ctx.request_repaint();
+                }
+            }
+        }
+        Ok(())
+    }));
+    let popup_ctx = ctx.clone();
+    let popup = NewWindowRequestedEventHandler::create(Box::new(move |_, args| {
+        if let Some(args) = args {
+            unsafe {
+                let mut gesture = windows::core::BOOL::default();
+                args.IsUserInitiated(&mut gesture)?;
+                let mut destination = PWSTR::null();
+                args.Uri(&mut destination)?;
+                let destination = webview2_com::take_pwstr(destination);
+                if context.upgrade().is_some_and(|context| {
+                    context.request_login(&destination, gesture.as_bool(), false)
+                }) {
+                    args.SetHandled(true)?;
+                    popup_ctx.request_repaint();
+                }
+            }
+        }
+        Ok(())
+    }));
+    let mut registration = 0;
+    unsafe {
+        let view = view.webview();
+        view.add_NavigationStarting(&navigation, &mut registration)
+            .and_then(|_| view.add_FrameNavigationStarting(&navigation, &mut registration))
+            .and_then(|_| view.add_NewWindowRequested(&popup, &mut registration))
+    }
+    .map_err(|_| "The stream player could not protect provider sign-in requests.".into())
+}
 
 pub(crate) struct Context {
     pub profile_name: String,
@@ -440,7 +497,8 @@ mod tests {
         time::{Duration, Instant},
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, IsWindow, PeekMessageW, SendMessageW, TranslateMessage, MSG, PM_REMOVE,
+        DispatchMessageW, GetForegroundWindow, IsWindow, PeekMessageW, SendMessageW,
+        TranslateMessage, MSG, PM_REMOVE,
     };
 
     fn pump() {
@@ -598,6 +656,8 @@ mod tests {
         )
         .unwrap();
         let initial = state(&login.view);
+        login.present();
+        wait_for(|| unsafe { GetForegroundWindow() } == login.native.handle());
         for key in ["auth", "ipc", "bridge", "opener"] {
             assert_eq!(initial[key], false, "{key}");
         }
@@ -654,6 +714,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state(&reopened.view)["cookie"], true);
+        reopened.present();
+        wait_for(|| unsafe { GetForegroundWindow() } == reopened.native.handle());
         *youtube.window.borrow_mut() = Some(reopened);
         sessions.disconnect(&Provider::Youtube);
         assert!(!youtube.active());
