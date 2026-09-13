@@ -14,7 +14,8 @@ permissions:
 jobs:
   rust:
     name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ fromJSON(matrix.os == 'windows-latest' && (vars.BRICK_WINDOWS_RUNNER || '"windows-latest"') || (vars.BRICK_LINUX_RUNNER || '"ubuntu-22.04"')) }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
