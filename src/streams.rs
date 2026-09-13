@@ -121,7 +121,7 @@ pub struct Recordings {
     pub can_delete_recordings: bool,
 }
 
-pub fn fetch_recordings(access_token: &str) -> Result<Recordings, Error> {
+pub fn fetch_recordings(access_token: &crate::guild::Access) -> Result<Recordings, Error> {
     let body = request(Method::GET, "/v1/streams/vods", access_token, None)?;
     let mut recordings: Recordings = serde_json::from_slice(&body)
         .map_err(|_| Error::from("The recording history could not be read.".to_string()))?;
@@ -147,7 +147,11 @@ pub fn fetch_recordings(access_token: &str) -> Result<Recordings, Error> {
     Ok(recordings)
 }
 
-pub fn remove_recording(access_token: &str, provider: &Provider, id: &str) -> Result<(), Error> {
+pub fn remove_recording(
+    access_token: &crate::guild::Access,
+    provider: &Provider,
+    id: &str,
+) -> Result<(), Error> {
     validate_recording_id(provider, id)?;
     request(
         Method::DELETE,
@@ -195,8 +199,11 @@ pub fn review_path(stream: &Stream) -> Result<String, Error> {
     }
 }
 
-pub fn player_url_for_stream(stream: &Stream) -> Result<String, Error> {
-    player_url_for_stream_using(stream, presence::endpoint_url)
+pub fn player_url_for_stream(
+    stream: &Stream,
+    token: &crate::guild::Access,
+) -> Result<String, Error> {
+    player_url_for_stream_using(stream, |path| token.endpoint(path))
 }
 
 fn player_url_for_stream_using(
@@ -268,7 +275,7 @@ impl From<String> for Error {
     }
 }
 
-pub fn fetch(access_token: &str) -> Result<Snapshot, Error> {
+pub fn fetch(access_token: &crate::guild::Access) -> Result<Snapshot, Error> {
     let body = request(Method::GET, "/v1/streams", access_token, None)?;
     serde_json::from_slice(&body).map_err(|_| {
         "The stream service returned an invalid response."
@@ -277,7 +284,7 @@ pub fn fetch(access_token: &str) -> Result<Snapshot, Error> {
     })
 }
 
-pub fn save(access_token: &str, url: &str) -> Result<(), Error> {
+pub fn save(access_token: &crate::guild::Access, url: &str) -> Result<(), Error> {
     request(
         Method::PUT,
         "/v1/streams/me",
@@ -287,7 +294,7 @@ pub fn save(access_token: &str, url: &str) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn remove(access_token: &str, provider: &Provider) -> Result<(), Error> {
+pub fn remove(access_token: &crate::guild::Access, provider: &Provider) -> Result<(), Error> {
     request(
         Method::DELETE,
         "/v1/streams/me",
@@ -307,14 +314,14 @@ fn player_path(user_id: &str, provider: &Provider) -> Result<String, Error> {
 pub(crate) fn request(
     method: Method,
     path: &str,
-    token: &str,
+    token: &crate::guild::Access,
     body: Option<serde_json::Value>,
 ) -> Result<Vec<u8>, Error> {
     let recording_removal = method == Method::DELETE && path.starts_with("/v1/streams/vods/");
     let mut request = presence::http_client()?
-        .request(method, presence::endpoint_url(path)?)
+        .request(method, token.endpoint(path)?)
         .timeout(std::time::Duration::from_secs(20))
-        .bearer_auth(token);
+        .bearer_auth(token.secret());
     if let Some(body) = body {
         request = request.json(&body);
     }

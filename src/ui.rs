@@ -42,6 +42,10 @@ pub struct BrickApp {
     active_tab: MainTab,
     sync_rx: Option<mpsc::Receiver<Result<SyncSummary, String>>>,
     auth_rx: Option<mpsc::Receiver<Result<AuthorizedUser, RefreshError>>>,
+    guild_rx: Option<mpsc::Receiver<Result<AuthorizedUser, RefreshError>>>,
+    guild_switching: bool,
+    guild_access_lost: bool,
+    last_guild_check: Instant,
     app_update_rx: Option<mpsc::Receiver<Result<Option<AvailableAppUpdate>, String>>>,
     app_update_install_rx: Option<mpsc::Receiver<Result<Option<String>, String>>>,
     roster_rx: Option<mpsc::Receiver<Result<Roster, String>>>,
@@ -141,6 +145,9 @@ impl BrickApp {
             Err(error) => AuthUiState::Denied(error),
         };
         let now = Instant::now();
+        if let AuthUiState::Authorized(user) = &auth_state {
+            crate::guild::activate(&user.guild_id, &user.user_id);
+        }
 
         let window_visible = !(startup_mode && view.settings.startup_minimized);
         let view_error = status_needs_attention(&status).then(|| status.clone());
@@ -157,6 +164,10 @@ impl BrickApp {
             active_tab: MainTab::Home,
             sync_rx: None,
             auth_rx: None,
+            guild_rx: None,
+            guild_switching: false,
+            guild_access_lost: false,
+            last_guild_check: now.checked_sub(Duration::from_secs(300)).unwrap_or(now),
             app_update_rx: None,
             app_update_install_rx: None,
             roster_rx: None,
@@ -394,6 +405,7 @@ impl BrickApp {
 
         match rx.try_recv() {
             Ok(Ok(user)) => {
+                self.reset_changed_guild(&user);
                 self.auth_state = AuthUiState::Authorized(user);
                 self.auth_rx = None;
                 self.status = "Discord access verified.".to_string();
@@ -404,6 +416,8 @@ impl BrickApp {
                 }
             }
             Ok(Err(error)) => {
+                crate::guild::invalidate();
+                self.reset_guild_panel();
                 self.auth_state = if error.retryable {
                     AuthUiState::Retrying
                 } else {
@@ -446,12 +460,140 @@ impl BrickApp {
         }
     }
 
+    fn reset_guild_panel(&mut self) {
+        self.streams.clear();
+        self.profile = ProfileUi::default();
+        self.roster_rx = None;
+        self.presence_state = initial_presence_state();
+        self.roster_notice = None;
+        self.last_roster_refresh = Instant::now()
+            .checked_sub(Duration::from_secs(ROSTER_REFRESH_INTERVAL_SECS))
+            .unwrap_or_else(Instant::now);
+    }
+
+    fn reset_changed_guild(&mut self, next: &AuthorizedUser) {
+        if matches!(&self.auth_state, AuthUiState::Authorized(previous)
+            if previous.guild_id != next.guild_id || previous.user_id != next.user_id)
+        {
+            crate::guild::invalidate();
+            self.reset_guild_panel();
+        }
+        crate::guild::activate(&next.guild_id, &next.user_id);
+    }
+
+    fn handle_guild_access_loss(&mut self) {
+        // A denied player or panel request removes this workspace while the
+        // account's other memberships are checked through the same discovery.
+        crate::guild::invalidate();
+        self.reset_guild_panel();
+        self.guild_access_lost = true;
+        self.start_guild_lookup(None);
+    }
+
+    fn start_guild_lookup(&mut self, selected: Option<String>) {
+        if self.guild_rx.is_some() || self.auth_rx.is_some() || !self.auth_state.is_authorized() {
+            return;
+        }
+        self.guild_switching = selected.is_some();
+        if self.guild_switching {
+            crate::guild::invalidate();
+            self.reset_guild_panel();
+        }
+        self.last_guild_check = Instant::now();
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.egui_ctx.clone();
+        thread::spawn(move || {
+            let result = match selected {
+                Some(guild) => discord_auth::select_guild(&guild),
+                None => discord_auth::discover_guilds(),
+            };
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        self.guild_rx = Some(rx);
+    }
+
+    fn poll_guilds(&mut self) {
+        let Some(rx) = &self.guild_rx else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("Guild lookup stopped. Brick will retry.".to_string().into())
+            }
+        };
+        let switching = self.guild_switching;
+        self.guild_rx = None;
+        self.guild_switching = false;
+        match result {
+            Ok(user) => {
+                self.guild_access_lost = false;
+                self.reset_changed_guild(&user);
+                self.auth_state = AuthUiState::Authorized(user);
+            }
+            Err(error) => {
+                if switching {
+                    self.status = error.message.clone();
+                }
+                if !error.retryable && (!switching || self.guild_access_lost) {
+                    crate::guild::invalidate();
+                    self.reset_guild_panel();
+                    self.guild_access_lost = false;
+                    self.auth_state = AuthUiState::Denied(error.message);
+                }
+                if error.retryable {
+                    self.last_guild_check = Instant::now()
+                        .checked_sub(Duration::from_secs(240))
+                        .unwrap_or_else(Instant::now);
+                }
+            }
+        }
+    }
+
+    fn draw_guild_selector(&mut self, ui: &mut egui::Ui) {
+        let AuthUiState::Authorized(user) = &self.auth_state else {
+            return;
+        };
+        if user.guilds.len() <= 1 {
+            return;
+        }
+        let mut selected = user.guild_id.clone();
+        ui.add_enabled_ui(self.guild_rx.is_none() && self.auth_rx.is_none(), |ui| {
+            ui.set_max_width(135.0);
+            ui.spacing_mut().button_padding.y = 4.0;
+            egui::ComboBox::from_id_salt("guild-selector")
+                .selected_text(&user.guild_name)
+                .width(135.0)
+                .truncate()
+                .show_ui(ui, |ui| {
+                    for guild in &user.guilds {
+                        ui.selectable_value(
+                            &mut selected,
+                            guild.guild_id.clone(),
+                            &guild.guild_name,
+                        );
+                    }
+                })
+                .response
+                .on_hover_text(&user.guild_name);
+        });
+        if selected != user.guild_id {
+            self.start_guild_lookup(Some(selected));
+        }
+    }
+
     fn sign_out(&mut self) {
         match discord_auth::clear_session() {
             Ok(()) => {
                 self.confirm_logout = false;
                 self.auth_state = AuthUiState::SignedOut;
                 self.auth_rx = None;
+                self.guild_rx = None;
+                self.guild_switching = false;
+                self.guild_access_lost = false;
+                self.streams.clear();
                 self.sync_rx = None;
                 self.roster_rx = None;
                 self.presence_state = initial_presence_state();
@@ -503,7 +645,7 @@ impl BrickApp {
 
         let (tx, rx) = mpsc::channel();
         let ctx = self.egui_ctx.clone();
-        thread::spawn(move || {
+        crate::guild::spawn(move || {
             let result = discord_auth::current_access_token()
                 .and_then(|access_token| presence::fetch_roster(&access_token));
             let _ = tx.send(result);
@@ -828,6 +970,13 @@ impl BrickApp {
             return;
         }
 
+        if self.guild_switching || self.guild_access_lost {
+            self.draw_header(ui);
+            ui.add_space(18.0);
+            empty_panel_message(ui, "Opening guild", "Checking your Discord access…");
+            return;
+        }
+
         if self.review_workspace_open() {
             self.draw_review_header(ui);
             ui.add_space(8.0);
@@ -868,7 +1017,12 @@ impl BrickApp {
     }
 
     fn draw_tab_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| self.draw_tab_buttons(ui));
+        ui.horizontal(|ui| {
+            self.draw_tab_buttons(ui);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.draw_guild_selector(ui);
+            });
+        });
     }
 
     fn draw_tab_buttons(&mut self, ui: &mut egui::Ui) {
@@ -891,6 +1045,7 @@ impl BrickApp {
     }
 
     fn draw_review_header(&mut self, ui: &mut egui::Ui) {
+        let compact = ui.available_width() < 850.0;
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), 34.0),
             egui::Layout::left_to_right(egui::Align::Center),
@@ -902,18 +1057,23 @@ impl BrickApp {
                         .strong()
                         .color(primary_text()),
                 );
-                ui.label(
-                    RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
-                        .small()
-                        .color(muted_text()),
-                );
+                if !compact {
+                    ui.label(
+                        RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                            .small()
+                            .color(muted_text()),
+                    );
+                }
                 ui.add_space(10.0);
                 self.draw_tab_buttons(ui);
+                self.draw_guild_selector(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let available = matches!(self.app_update_state, AppUpdateUiState::Available(_));
                     let busy = self.app_update_rx.is_some() || self.app_update_install_rx.is_some();
                     let text = if available {
                         "Update now"
+                    } else if compact {
+                        "Updates"
                     } else {
                         "Check updates"
                     };
@@ -1628,18 +1788,24 @@ impl eframe::App for BrickApp {
         self.handle_tray(ctx);
         self.handle_show_request(ctx);
         self.poll_auth();
+        self.poll_guilds();
+        if self.auth_state.is_authorized()
+            && self.last_guild_check.elapsed() >= Duration::from_secs(300)
+        {
+            self.start_guild_lookup(None);
+        }
         self.refresh_auth_if_expired();
         self.poll_app_update(ctx);
         self.start_periodic_app_update_check();
         self.handle_close_request(ctx);
         if self.streams.tick(
             ctx,
-            self.auth_state.is_authorized(),
+            self.auth_state.is_authorized() && !self.guild_switching && !self.guild_access_lost,
             self.window_visible && self.active_tab == MainTab::Streams,
         ) {
-            self.auth_state = AuthUiState::Denied("Sign in again to access guild streams.".into());
+            self.handle_guild_access_loss();
         }
-        if self.auth_state.is_authorized() {
+        if self.auth_state.is_authorized() && !self.guild_switching && !self.guild_access_lost {
             let user = match &self.auth_state {
                 AuthUiState::Authorized(user) => Some(user),
                 _ => None,
@@ -1705,11 +1871,13 @@ impl eframe::App for BrickApp {
             frame,
             &ctx,
             self.auth_state.is_authorized()
+                && !self.guild_switching
+                && !self.guild_access_lost
                 && self.window_visible
                 && self.active_tab == MainTab::Streams
                 && !self.confirm_logout,
         ) {
-            self.auth_state = AuthUiState::Denied("Sign in again to access guild streams.".into());
+            self.handle_guild_access_loss();
         }
 
         if let Err(error) = crate::browser::open_pending_urls(&ctx) {
@@ -2344,11 +2512,7 @@ fn login_copy(state: &AuthUiState) -> (&'static str, String, &'static str, bool)
 fn friendly_auth_problem(status: &str) -> String {
     let lower = status.to_ascii_lowercase();
     if lower.contains("does not have") || lower.contains("role") {
-        format!(
-            "This Discord account needs {} in {}.",
-            discord_auth::role_label(),
-            discord_auth::guild_name()
-        )
+        "This Discord account needs a Raider or Officer role in an eligible guild.".to_string()
     } else if lower.contains("timed out") {
         "Discord login timed out. Try again when the browser prompt is ready.".to_string()
     } else if lower.contains("invalid_client") || lower.contains("configured") {
@@ -2542,6 +2706,8 @@ pub(crate) mod tests {
                 role_label: "Raider".into(),
                 expires_at_unix: u64::MAX,
                 created_at_unix: u64::MAX,
+                guild_id: crate::guild::ADVANCE.into(),
+                guilds: Vec::new(),
             }),
             presence_state: PresenceUiState::Idle,
             streams: StreamsUi::default(),
@@ -2549,6 +2715,10 @@ pub(crate) mod tests {
             active_tab: MainTab::Home,
             sync_rx: None,
             auth_rx: None,
+            guild_rx: None,
+            guild_switching: false,
+            guild_access_lost: false,
+            last_guild_check: now,
             app_update_rx: None,
             app_update_install_rx: None,
             roster_rx: None,
@@ -2570,6 +2740,54 @@ pub(crate) mod tests {
             last_roster_refresh: now,
             roster_notice: None,
         }
+    }
+
+    #[test]
+    fn guild_access_loss_pauses_the_panel_and_recovers_another_membership() {
+        let mut app = app();
+        let AuthUiState::Authorized(user) = &app.auth_state else {
+            unreachable!();
+        };
+        let mut next = user.clone();
+        next.guild_id = crate::guild::ASCENDANCE.into();
+        next.guild_name = "Ascendance".into();
+        let old_access = crate::guild::Access::new(
+            "fixture-token".into(),
+            user.guild_id.clone(),
+            user.user_id.clone(),
+            crate::guild::generation(),
+        );
+        let (guild_tx, guild_rx) = mpsc::channel();
+        app.guild_rx = Some(guild_rx); // Already pending: no network or credential access.
+        let (_roster_tx, roster_rx) = mpsc::channel();
+        app.roster_rx = Some(roster_rx);
+        app.roster_notice = Some("Previous guild data".into());
+
+        app.handle_guild_access_loss();
+        assert!(app.auth_state.is_authorized());
+        assert!(app.guild_access_lost);
+        assert!(app.roster_rx.is_none());
+        assert!(app.roster_notice.is_none());
+        assert!(old_access.check().is_err());
+
+        guild_tx
+            .send(Err("Temporary service failure".to_string().into()))
+            .unwrap();
+        app.poll_guilds();
+        assert!(app.auth_state.is_authorized());
+        assert!(app.guild_access_lost);
+
+        let (guild_tx, guild_rx) = mpsc::channel();
+        app.guild_rx = Some(guild_rx);
+        guild_tx.send(Ok(next.clone())).unwrap();
+        app.poll_guilds();
+        let AuthUiState::Authorized(current) = &app.auth_state else {
+            panic!("The other eligible guild must remain available without login");
+        };
+        assert_eq!(current.guild_id, crate::guild::ASCENDANCE);
+        assert_eq!(current.user_id, next.user_id);
+        assert_eq!(current.created_at_unix, next.created_at_unix);
+        assert!(!app.guild_access_lost);
     }
 
     // Inspect both allocated rows and painted frames/text after the previous-frame
@@ -2717,7 +2935,11 @@ pub(crate) mod tests {
 
     #[test]
     fn review_header_keeps_navigation_and_update_states_in_one_bounded_row() {
-        for size in [egui::vec2(980.0, 600.0), egui::vec2(1440.0, 900.0)] {
+        for size in [
+            egui::vec2(720.0, 560.0),
+            egui::vec2(980.0, 600.0),
+            egui::vec2(1440.0, 900.0),
+        ] {
             for state in [
                 AppUpdateUiState::UpToDate,
                 AppUpdateUiState::Checking,
@@ -2727,6 +2949,15 @@ pub(crate) mod tests {
                 AppUpdateUiState::Error("An unexpectedly long update failure message ".repeat(20)),
             ] {
                 let mut app = app();
+                if let AuthUiState::Authorized(user) = &mut app.auth_state {
+                    user.guild_name =
+                        "A guild with a deliberately long name for layout checks".into();
+                    user.guilds = ["11", "22", "33"].into_iter().map(|id| serde_json::from_value(serde_json::json!({
+                        "guildId": id, "guildName": user.guild_name, "displayName": "Raider", "roleLabel": "Raider",
+                        "roleIds": ["1"], "authorizedRoleIds": ["1"]
+                    })).unwrap()).collect();
+                    user.guild_id = "11".into();
+                }
                 app.active_tab = MainTab::Streams;
                 app.app_update_state = state.clone();
                 if matches!(
@@ -2755,7 +2986,7 @@ pub(crate) mod tests {
                                     );
                                     assert!(
                                         ui.min_rect().bottom() <= before.top() + 35.0,
-                                        "Header wrapped into the replay workspace"
+                                        "Header wrapped into the replay workspace: size={size:?}, actual={:?}, before={before:?}", ui.min_rect()
                                     );
                                 });
                         },

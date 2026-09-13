@@ -35,13 +35,13 @@ fn valid(alignment: Alignment, replay: &Replay, pull: &Pull, max_uncertainty: f6
         && (alignment.video_seconds - estimate).abs() <= 60.0
         && (0.05..=max_uncertainty).contains(&alignment.uncertainty_seconds)
 }
-fn request(token: &str, route: &str, body: Value) -> Option<Value> {
-    let url = crate::presence::endpoint_url(&format!("{BASE}/{route}")).ok()?;
+fn request(token: &crate::guild::Access, route: &str, body: Value) -> Option<Value> {
+    let url = token.endpoint(&format!("{BASE}/{route}")).ok()?;
     let response = crate::presence::http_client()
         .ok()?
         .post(url)
         .timeout(Duration::from_secs(2))
-        .bearer_auth(token)
+        .bearer_auth(token.secret())
         .json(&body)
         .send()
         .ok()?;
@@ -54,44 +54,67 @@ fn request(token: &str, route: &str, body: Value) -> Option<Value> {
 
 // Loading and saving run only on the metadata/submission workers. The UI
 // neither opens files nor waits for a network request before accepting a local result.
-fn local_cache() -> &'static Mutex<Cache> {
-    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        #[cfg(not(test))]
-        let cache = (|| {
-            use std::io::Read;
-            let path = crate::addon::config_dir()
-                .ok()?
-                .join("raid-timestamps-v1.json");
-            let mut bytes = Vec::new();
-            std::fs::File::open(path)
-                .ok()?
-                .take(2 * 1024 * 1024 + 1)
-                .read_to_end(&mut bytes)
-                .ok()?;
-            Some(Cache::from_bytes(&bytes))
-        })()
-        .unwrap_or_default();
-        #[cfg(test)]
-        let cache = Cache::default();
-        Mutex::new(cache)
-    })
+struct ScopedCache {
+    scope: String,
+    cache: Cache,
 }
-fn save_local(cache: &Cache) {
-    #[cfg(not(test))]
-    if let (Ok(dir), Some(bytes)) = (crate::addon::config_dir(), cache.to_bytes()) {
-        let _ = crate::atomic_file::write(&dir.join("raid-timestamps-v1.json"), &bytes);
+fn local_cache(
+    token: &crate::guild::Access,
+) -> Option<std::sync::MutexGuard<'static, ScopedCache>> {
+    token.check().ok()?;
+    static CACHE: OnceLock<Mutex<ScopedCache>> = OnceLock::new();
+    let mut state = CACHE
+        .get_or_init(|| {
+            Mutex::new(ScopedCache {
+                scope: String::new(),
+                cache: Cache::default(),
+            })
+        })
+        .lock()
+        .ok()?;
+    let scope = token.cache_id();
+    if state.scope != scope {
+        // Locked vaults and authentication failures are not missing files.
+        // Retry on a later worker without overwriting ciphertext or migrating.
+        let bytes = crate::protected_cache::load(&scope).ok()?;
+        let mut cache = bytes.as_deref().map(Cache::from_bytes).unwrap_or_default();
+        // The baseline file belonged to Advance. Ascendance never reads it.
+        if bytes.is_none() && token.guild_id == crate::guild::ADVANCE {
+            if let Ok(dir) = crate::addon::config_dir() {
+                use std::io::Read;
+                let legacy = dir.join("raid-timestamps-v1.json");
+                let mut bytes = Vec::new();
+                if std::fs::File::open(&legacy)
+                    .and_then(|file| file.take(2 * 1024 * 1024 + 1).read_to_end(&mut bytes))
+                    .is_ok()
+                    && bytes.len() <= 2 * 1024 * 1024
+                {
+                    cache = Cache::from_bytes(&bytes);
+                    if let Some(bytes) = cache.to_bytes() {
+                        if crate::protected_cache::save(&scope, &bytes).is_ok() {
+                            let _ = std::fs::remove_file(legacy);
+                        }
+                    }
+                }
+            }
+        }
+        *state = ScopedCache { scope, cache };
     }
-    #[cfg(test)]
-    let _ = cache;
+    Some(state)
+}
+fn save_local(state: &ScopedCache) {
+    if let Some(bytes) = state.cache.to_bytes() {
+        let _ = crate::protected_cache::save(&state.scope, &bytes);
+    }
 }
 
 /// One bounded lookup alongside metadata loading. An older/offline server is
 /// optional: it cannot prevent reviewing a VOD or starting a local scan.
-pub fn lookup(token: &str, review: &mut Review) {
-    if let Ok(cache) = local_cache().lock() {
+pub fn lookup(token: &crate::guild::Access, review: &mut Review) {
+    if let Some(state) = local_cache(token) {
         for pull in &review.pulls {
-            if let Some(alignment) = cache
+            if let Some(alignment) = state
+                .cache
                 .get(&review.replay, pull)
                 .filter(|a| valid(*a, &review.replay, pull, 0.35))
             {
@@ -116,13 +139,15 @@ pub fn lookup(token: &str, review: &mut Review) {
     };
     apply_response(review, &keys, &response);
     if !review.marker_timing.is_empty() {
-        if let Ok(mut cache) = local_cache().lock() {
+        if let Some(mut state) = local_cache(token) {
             for pull in &review.pulls {
                 if let Some(alignment) = review.marker_alignment(pull) {
-                    cache.insert(Key::new(&review.replay, pull), alignment);
+                    state
+                        .cache
+                        .insert(Key::new(&review.replay, pull), alignment);
                 }
             }
-            save_local(&cache);
+            save_local(&state);
         }
     }
 }
@@ -165,7 +190,7 @@ fn apply_response(review: &mut Review, requested: &[Value], response: &Value) {
 
 #[derive(Default)]
 struct Queue {
-    pending: VecDeque<(Value, Key, Alignment)>,
+    pending: VecDeque<(Value, Key, Alignment, u64)>,
     running: bool,
 }
 fn queue() -> &'static Mutex<Queue> {
@@ -184,7 +209,10 @@ pub fn submit(replay: &Replay, pull: &Pull, alignment: Alignment) {
     let Ok(mut state) = queue().lock() else {
         return;
     };
-    state.pending.retain(|pending| pending.0["key"] != key);
+    let generation = crate::guild::request_generation();
+    state
+        .pending
+        .retain(|pending| pending.0["key"] != key || pending.3 != generation);
     if state.pending.len() == 32 {
         state.pending.pop_front();
     }
@@ -192,6 +220,7 @@ pub fn submit(replay: &Replay, pull: &Pull, alignment: Alignment) {
         json!({ "key": key, "alignment": alignment }),
         Key::new(replay, pull),
         alignment,
+        generation,
     ));
     if state.running {
         return;
@@ -210,14 +239,16 @@ pub fn submit(replay: &Replay, pull: &Pull, alignment: Alignment) {
                 };
                 item
             };
-            let (item, key, alignment) = item;
-            if let Ok(mut cache) = local_cache().lock() {
-                cache.insert(key, alignment);
-                save_local(&cache);
-            }
-            if let Ok(Some(token)) = crate::discord_auth::current_or_refreshed_access_token() {
-                let _ = request(&token, "observations", item);
-            }
+            let (item, key, alignment, generation) = item;
+            crate::guild::with_generation(generation, || {
+                if let Ok(Some(token)) = crate::discord_auth::current_or_refreshed_access_token() {
+                    if let Some(mut state) = local_cache(&token) {
+                        state.cache.insert(key, alignment);
+                        save_local(&state);
+                    }
+                    let _ = request(&token, "observations", item);
+                }
+            });
         })
         .is_err()
     {

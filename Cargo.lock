@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "brick"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "auto-launch",
  "base64 0.23.1",
@@ -601,6 +601,7 @@ dependencies = [
  "raw-window-handle",
  "reqwest",
  "rfd",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

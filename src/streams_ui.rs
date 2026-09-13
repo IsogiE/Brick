@@ -2,7 +2,6 @@ use std::{
     collections::HashSet,
     rc::Rc,
     sync::mpsc,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -36,7 +35,7 @@ enum ResultData {
     RecordingRemoved(Provider, String),
 }
 type WorkResult = Result<ResultData, streams::Error>;
-type PlayerResult = Result<(String, String, Option<Preferences>), streams::Error>;
+type PlayerResult = Result<(String, crate::guild::Access, Option<Preferences>), streams::Error>;
 
 pub struct StreamsUi {
     snapshot: Option<Rc<Snapshot>>,
@@ -49,6 +48,8 @@ pub struct StreamsUi {
     recordings: Option<Rc<Vec<Vod>>>,
     recordings_library: crate::recordings_ui::Library,
     recordings_attempted: bool,
+    recordings_retry_at: Option<Instant>,
+    loading_recordings: bool,
     can_delete_recordings: bool,
     confirm_remove_recording: Option<Vod>,
     pov_revision: u64,
@@ -89,6 +90,8 @@ impl Default for StreamsUi {
             recordings: None,
             recordings_library: crate::recordings_ui::Library::default(),
             recordings_attempted: false,
+            recordings_retry_at: None,
+            loading_recordings: false,
             can_delete_recordings: false,
             confirm_remove_recording: None,
             pov_revision: 0,
@@ -360,6 +363,7 @@ impl StreamsUi {
                         self.start(ctx, Action::Refresh);
                     }
                     Ok(ResultData::Recordings(recordings)) => {
+                        self.recordings_retry_at = None;
                         self.pov_revision = self.pov_revision.wrapping_add(1);
                         self.can_delete_recordings = recordings.can_delete_recordings;
                         if !self.can_delete_recordings {
@@ -392,7 +396,19 @@ impl StreamsUi {
                             self.clear();
                             return true;
                         }
-                        self.notice = Some(error.message);
+                        if self.loading_recordings {
+                            self.recordings_retry_at =
+                                Some(Instant::now() + Duration::from_secs(60));
+                        }
+                        // Read failures recover on the normal cadence. Keep action errors
+                        // for the form that caused them, without calling attention to Refresh.
+                        self.notice = if self.notice_provider.is_some()
+                            || self.confirm_remove_recording.is_some()
+                        {
+                            Some(error.message)
+                        } else {
+                            None
+                        };
                     }
                 }
             }
@@ -403,10 +419,7 @@ impl StreamsUi {
             } else {
                 Duration::from_secs(60)
             };
-            if active
-                && (self.recordings_open || self.review.active())
-                && !self.recordings_attempted
-            {
+            if active && (self.recordings_open || self.review.active()) && self.recordings_due() {
                 self.start(ctx, Action::Recordings);
             } else if self.last_attempt.is_none_or(|at| at.elapsed() >= refresh) {
                 self.start(ctx, Action::Refresh);
@@ -483,6 +496,13 @@ impl StreamsUi {
         false
     }
 
+    fn recordings_due(&self) -> bool {
+        !self.recordings_attempted
+            || self
+                .recordings_retry_at
+                .is_some_and(|at| Instant::now() >= at)
+    }
+
     pub fn repaint_after(&self, active: bool) -> Duration {
         #[cfg(target_os = "linux")]
         if self.player.is_some() {
@@ -505,8 +525,10 @@ impl StreamsUi {
             return;
         }
         self.notice = None;
-        if matches!(action, Action::Recordings) {
+        self.loading_recordings = matches!(action, Action::Recordings);
+        if self.loading_recordings {
             self.recordings_attempted = true;
+            self.recordings_retry_at = None;
         }
         self.notice_provider = match &action {
             Action::Save(provider, _) | Action::Remove(provider) => Some(provider.clone()),
@@ -514,7 +536,7 @@ impl StreamsUi {
         };
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
-        thread::spawn(move || {
+        crate::guild::spawn(move || {
             let result = access_token().and_then(|token| match action {
                 Action::Refresh => streams::fetch(&token).map(ResultData::Snapshot),
                 Action::Save(provider, url) => {
@@ -755,26 +777,10 @@ impl StreamsUi {
                     self.confirm_remove = None;
                     self.edit_open = true;
                 }
-                let refresh_button = action_button("Refresh");
-                let refresh_button = if self.notice.is_some() && self.notice_provider.is_none() {
-                    refresh_button
-                        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(204, 112, 112)))
-                } else {
-                    refresh_button
-                };
                 let refresh = ui.add_enabled(
                     self.work.is_none() && presence::configured(),
-                    refresh_button,
+                    action_button("Refresh"),
                 );
-                let refresh = if self.notice_provider.is_none() {
-                    if let Some(error) = &self.notice {
-                        refresh.on_hover_text(error)
-                    } else {
-                        refresh
-                    }
-                } else {
-                    refresh
-                };
                 if refresh.clicked() {
                     self.notice = None;
                     self.start(
@@ -855,7 +861,7 @@ impl StreamsUi {
                     ui.add_space(10.0);
                     let count = people.len();
                     if count == 0 {
-                        let message = if self.snapshot.is_none() && self.work.is_some() {
+                        let message = if self.snapshot.is_none() {
                             "Checking who's live…"
                         } else {
                             empty_message
@@ -1045,7 +1051,10 @@ impl StreamsUi {
     }
 
     fn draw_recordings(&mut self, ui: &mut egui::Ui) {
-        let recordings = self.recordings.clone().unwrap_or_default();
+        let Some(recordings) = self.recordings.clone() else {
+            ui.label(RichText::new("Loading VODs…").color(MUTED));
+            return;
+        };
         let action = self.recordings_library.draw(
             ui,
             &recordings,
@@ -1407,10 +1416,10 @@ impl StreamsUi {
             let playback = self.review.playback().cloned();
             let (tx, rx) = mpsc::channel();
             let ctx = ctx.clone();
-            thread::spawn(move || {
+            crate::guild::spawn(move || {
                 let result = access_token().and_then(|token| {
                     let preferences = Some(preferences.unwrap_or_else(Preferences::load));
-                    streams::player_url_for_stream(&stream).map(|url| {
+                    streams::player_url_for_stream(&stream, &token).map(|url| {
                         let url = player_url_for_playback(&url, playback.as_ref());
                         (url, token, preferences)
                     })
@@ -1764,13 +1773,13 @@ fn live_people(streams: &[Stream]) -> Vec<&Stream> {
     people
 }
 
-fn access_token() -> Result<String, streams::Error> {
+fn access_token() -> Result<crate::guild::Access, streams::Error> {
     refreshed_token_result(discord_auth::refreshed_access_token())
 }
 
 fn refreshed_token_result(
-    result: Result<Option<String>, discord_auth::RefreshError>,
-) -> Result<String, streams::Error> {
+    result: Result<Option<crate::guild::Access>, discord_auth::RefreshError>,
+) -> Result<crate::guild::Access, streams::Error> {
     result
         .map_err(|error| streams::Error {
             message: error.message,
@@ -2026,6 +2035,28 @@ mod tests {
         assert!(!ui.can_delete_recordings);
         assert!(ui.recordings.is_none());
         assert!(ui.confirm_remove_recording.is_none());
+    }
+
+    #[test]
+    fn a_failed_vod_read_retries_quietly_without_clearing_confirmed_recordings() {
+        let mut ui = StreamsUi::default();
+        let recordings = Rc::new(vec![recording("987", "1")]);
+        ui.recordings = Some(recordings.clone());
+        ui.recordings_attempted = true;
+        ui.loading_recordings = true;
+        ui.last_attempt = Some(Instant::now());
+        let (tx, rx) = mpsc::channel();
+        ui.work = Some(rx);
+        tx.send(Err("Discord is busy".to_owned().into())).unwrap();
+        assert!(!ui.tick(&egui::Context::default(), true, false));
+        assert!(Rc::ptr_eq(ui.recordings.as_ref().unwrap(), &recordings));
+        assert!(ui.notice.is_none());
+        assert!(!ui.recordings_due());
+        ui.recordings_retry_at = Some(Instant::now() - Duration::from_secs(1));
+        assert!(ui.recordings_due());
+        ui.clear();
+        assert!(ui.recordings.is_none());
+        assert!(ui.recordings_retry_at.is_none());
     }
 
     #[test]

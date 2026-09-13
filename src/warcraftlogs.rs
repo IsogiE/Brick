@@ -51,6 +51,12 @@ pub struct Config {
     pub client_id: String,
     pub guild_id: u64,
     pub user_id: String,
+    #[serde(default = "advance_guild_id")]
+    pub discord_guild_id: String,
+}
+
+fn advance_guild_id() -> String {
+    crate::guild::ADVANCE.into()
 }
 
 #[derive(Clone, Deserialize)]
@@ -312,8 +318,8 @@ struct ConfigStamp {
     at: Instant,
 }
 impl ConfigStamp {
-    fn matches(&self, token: &str) -> bool {
-        self.token_hash == <[u8; 32]>::from(Sha256::digest(token.as_bytes()))
+    fn matches(&self, token: &crate::guild::Access) -> bool {
+        self.token_hash == token.fingerprint()
     }
 }
 #[derive(Clone)]
@@ -476,7 +482,11 @@ impl Client {
         self.cancel = cancel;
     }
 
-    fn configure(&mut self, discord_token: &str, restore: bool) -> Result<(), String> {
+    fn configure(
+        &mut self,
+        discord_token: &crate::guild::Access,
+        restore: bool,
+    ) -> Result<(), String> {
         check_cancelled(&self.cancel)?;
         if restore
             && self.config.is_some()
@@ -515,6 +525,8 @@ impl Client {
             return Err("Warcraft Logs is not available on this server yet.".into());
         }
         if config.client_id.len() > 128
+            || config.discord_guild_id != discord_token.guild_id
+            || config.user_id != discord_token.user_id
             || !config
                 .client_id
                 .bytes()
@@ -554,7 +566,7 @@ impl Client {
             self.config = Some(config);
         }
         self.config_stamp = Some(ConfigStamp {
-            token_hash: Sha256::digest(discord_token.as_bytes()).into(),
+            token_hash: discord_token.fingerprint(),
             at: Instant::now(),
         });
         check_cancelled(&self.cancel)?;
@@ -565,7 +577,7 @@ impl Client {
         self.session.is_some()
     }
 
-    pub fn disconnect(&mut self, discord_token: &str) -> Result<(), String> {
+    pub fn disconnect(&mut self, discord_token: &crate::guild::Access) -> Result<(), String> {
         self.configure(discord_token, false)?;
         store(self.config.as_ref().unwrap())?.remove()?;
         self.session = None;
@@ -579,7 +591,7 @@ impl Client {
 
     pub fn login(
         &mut self,
-        discord_token: &str,
+        discord_token: &crate::guild::Access,
         ctx: &eframe::egui::Context,
         cancel: &Arc<AtomicBool>,
     ) -> Result<(), String> {
@@ -587,6 +599,13 @@ impl Client {
         let config = self.config.clone().unwrap();
         let state = random();
         let verifier = random();
+        streams::request(
+            Method::POST,
+            "/v1/streams/review/session",
+            discord_token,
+            Some(json!({ "state": state })),
+        )
+        .map_err(|error| error.message)?;
         let redirect = presence::endpoint_url("/warcraftlogs/callback")?.to_string();
         let mut url = url::Url::parse("https://www.warcraftlogs.com/oauth/authorize").unwrap();
         url.query_pairs_mut().extend_pairs([
@@ -812,7 +831,11 @@ impl Client {
             .ok_or_else(|| "Warcraft Logs returned an invalid response.".into())
     }
 
-    pub fn review(&mut self, discord_token: &str, stream: &Stream) -> Result<Review, String> {
+    pub fn review(
+        &mut self,
+        discord_token: &crate::guild::Access,
+        stream: &Stream,
+    ) -> Result<Review, String> {
         self.configure(discord_token, true)?;
         self.load_cooldown_preferences(discord_token)?;
         self.access_token()?;
@@ -845,21 +868,24 @@ impl Client {
         preferences
     }
 
-    fn load_cooldown_preferences(&mut self, discord_token: &str) -> Result<(), String> {
+    fn load_cooldown_preferences(
+        &mut self,
+        discord_token: &crate::guild::Access,
+    ) -> Result<(), String> {
         check_cancelled(&self.cancel)?;
         let http = &self.http;
         let cancel = &self.cancel;
         #[cfg(test)]
         let requests = &mut self.requests;
         self.cooldown_catalog.refresh(Instant::now(), || {
-            let endpoint = presence::endpoint_url("/v1/cooldowns/catalog")?;
+            let endpoint = discord_token.endpoint("/v1/cooldowns/catalog")?;
             #[cfg(test)]
             {
                 requests.catalogue += 1;
             }
             let response = while_current(cancel, || {
                 http.get(endpoint)
-                    .bearer_auth(discord_token)
+                    .bearer_auth(discord_token.secret())
                     .timeout(Duration::from_secs(5))
                     .send()
             })?
@@ -893,7 +919,7 @@ impl Client {
 
     pub fn save_cooldown_preferences(
         &mut self,
-        discord_token: &str,
+        discord_token: &crate::guild::Access,
         mut preferences: defensives::Preferences,
     ) -> Result<defensives::Preferences, String> {
         check_cancelled(&self.cancel)?;
@@ -932,7 +958,7 @@ impl Client {
 
     pub fn events(
         &mut self,
-        discord_token: &str,
+        discord_token: &crate::guild::Access,
         pull: &Pull,
         kind: EventKind,
     ) -> Result<Vec<RaidEvent>, String> {
@@ -1416,8 +1442,11 @@ fn clean_label(value: &str) -> String {
 }
 
 fn store(config: &Config) -> Result<Store, String> {
+    // WCL authorization belongs to the person, not their current guild. Keep
+    // the baseline vault identity across switches; report caches remain scoped.
     Store::new(&format!("{}:{}", config.client_id, config.user_id))
 }
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2115,10 +2144,11 @@ mod tests {
         client.config = Some(Config {
             client_id: "fixture".into(),
             guild_id: 1,
+            discord_guild_id: crate::guild::ADVANCE.into(),
             user_id: "123".into(),
         });
         client.config_stamp = Some(ConfigStamp {
-            token_hash: Sha256::digest(b"fixture-discord-token").into(),
+            token_hash: crate::guild::Access::from("fixture-discord-token").fingerprint(),
             at: Instant::now(),
         });
         client.session = Some(Session {
@@ -2139,7 +2169,7 @@ mod tests {
                 raw: raw.clone(),
             },
         );
-        let token = "fixture-discord-token";
+        let token = &crate::guild::Access::from("fixture-discord-token");
         assert_eq!(
             client
                 .events(token, &pull, EventKind::Defensives)
@@ -2229,11 +2259,11 @@ mod tests {
     #[test]
     fn account_config_cache_never_matches_a_different_token_and_master_cache_is_bounded() {
         let stamp = ConfigStamp {
-            token_hash: Sha256::digest(b"account-one").into(),
+            token_hash: crate::guild::Access::from("account-one").fingerprint(),
             at: Instant::now(),
         };
-        assert!(stamp.matches("account-one"));
-        assert!(!stamp.matches("account-two"));
+        assert!(stamp.matches(&"account-one".into()));
+        assert!(!stamp.matches(&"account-two".into()));
         let data = Arc::new(
             MasterData::parse(&json!({"actors":[
             {"id":1,"type":"Player","name":"Player","subType":"Priest"},

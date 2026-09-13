@@ -13,12 +13,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc,
     },
-    thread,
     time::Instant,
 };
 
 const MUTED: Color32 = Color32::from_rgb(145, 155, 173);
-type Preparation = (String, Result<(String, String), String>);
+type Preparation = (String, Result<(String, crate::guild::Access), String>);
 static PREPARING_CREDENTIALS: AtomicBool = AtomicBool::new(false);
 struct PreparationPermit;
 impl PreparationPermit {
@@ -865,7 +864,7 @@ impl Comparison {
             let (tx, rx) = mpsc::sync_channel(1);
             self.work = Some(rx);
             self.attempted = true;
-            thread::spawn(move || {
+            crate::guild::spawn(move || {
                 let _permit = permit;
                 let result = (|| {
                     if cancelled.load(Ordering::Relaxed) {
@@ -873,7 +872,8 @@ impl Comparison {
                     }
                     let token = discord_auth::current_or_refreshed_access_token()?
                         .ok_or("Sign in to Discord again.")?;
-                    let url = streams::player_url_for_stream(&selected).map_err(|e| e.message)?;
+                    let url =
+                        streams::player_url_for_stream(&selected, &token).map_err(|e| e.message)?;
                     Ok((url, token))
                 })();
                 if !cancelled.load(Ordering::Relaxed) {
