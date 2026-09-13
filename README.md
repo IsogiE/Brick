@@ -14,6 +14,10 @@ Brick keeps the guild addon installed across your WoW clients, runs in the syste
 
 If you qualify for more than one guild, use the guild selector beside the navigation tabs. Brick remembers your selection and opens that guild's roster, profile, streams and recordings. Your guild roles are independent; being an Officer in one guild does not grant Officer access in another. Personal settings and your Warcraft Logs sign-in follow your account.
 
+Home's **Streaming accounts** panel connects your YouTube and Twitch accounts on this device. In **Your streams**, choose a channel to share with the current guild; each guild keeps its own sharing settings. YouTube channel sharing includes public and unlisted broadcasts, and you can still add an individual broadcast link. Account credentials stay in the operating system's protected store.
+
+**Sign in to player** opens a separate provider window for watching videos. Its browser session is shared between that provider's players for your current Brick account and lasts until Brick closes. Connecting a channel does not sign the embedded player in. Brick does not import your normal browser's cookies.
+
 On startup and every minute while running and signed in, Brick checks the installed addon versions against the current signed release. If a managed addon's folder or TOC file is missing, or its TOC version differs, Brick reinstalls the current package automatically.
 
 Raid replay review uses ART's small Unix timestamp to calibrate YouTube and Twitch recordings. ART displays it at the top left for five seconds in normal, heroic and mythic raids; `/art unix` previews it in-game. One verified pull establishes the recording's timing, which can then align later pulls across Warcraft Logs reports. New recordings are calibrated separately. Overlapping pulls establish clock corrections between log reports; a new report without overlap may need one background check, shared by the other calibrated POVs. Manual seconds offsets are no longer used.

@@ -39,6 +39,9 @@ type PlayerResult = Result<(String, crate::guild::Access, Option<Preferences>), 
 
 pub struct StreamsUi {
     youtube: crate::youtube_account_ui::YoutubeUi,
+    twitch: crate::twitch_account_ui::TwitchUi,
+    pending_provider_login: Option<Provider>,
+    accounts_home_requested: bool,
     provider_sessions: Rc<crate::stream_player::ProviderSessions>,
     provider_user_id: Option<String>,
     provider_notice: Option<String>,
@@ -86,6 +89,9 @@ impl Default for StreamsUi {
         let warmup = review.metadata_peer();
         Self {
             youtube: Default::default(),
+            twitch: Default::default(),
+            pending_provider_login: None,
+            accounts_home_requested: false,
             provider_sessions: Rc::new(Default::default()),
             provider_user_id: None,
             provider_notice: None,
@@ -343,6 +349,7 @@ impl StreamsUi {
             self.stop_player();
         }
         self.tick_guild_switch(ctx);
+        self.twitch.tick(ctx);
         if self.youtube.tick(
             ctx,
             self.snapshot
@@ -650,6 +657,75 @@ impl StreamsUi {
         });
         self.work = Some(rx);
         self.last_attempt = Some(Instant::now());
+    }
+
+    pub fn draw_home_accounts(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            "Connect once on this device. Choose what to share in each guild's Your streams panel.",
+        );
+        ui.add_space(8.0);
+        self.youtube.draw_account(ui, true);
+        self.draw_home_player_account(ui, Provider::Youtube);
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        self.twitch.draw_account(ui, true);
+        self.draw_home_player_account(ui, Provider::Twitch);
+        if let Some(notice) = &self.provider_notice {
+            ui.label(notice);
+        }
+        ui.add_space(8.0);
+        ui.label(RichText::new("Account connections are protected on this device. Only the channels and broadcasts you choose to share are sent to your guild.").small().color(MUTED));
+    }
+
+    fn draw_home_player_account(&mut self, ui: &mut egui::Ui, provider: Provider) {
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            let open = self.provider_sessions.login_open_for(&provider);
+            if ui
+                .button(if open {
+                    "Return to player sign-in"
+                } else {
+                    "Sign in to player"
+                })
+                .clicked()
+            {
+                self.pending_provider_login = Some(provider.clone());
+            }
+            if open && ui.button("Close sign-in window").clicked() {
+                self.provider_sessions.close_login(&provider);
+            }
+            if self.provider_sessions.session_started(&provider)
+                && ui.button("Sign out of player").clicked()
+            {
+                self.provider_sessions.disconnect(&provider);
+                self.reload_provider(provider.label());
+                self.pending_provider_login = None;
+                self.provider_notice = None;
+            }
+        });
+        ui.label(RichText::new("For watching videos, sign in separately in Brick's player. Player sign-in lasts until Brick closes.").small().color(MUTED));
+    }
+
+    pub fn update_account_windows(
+        &mut self,
+        frame: &eframe::Frame,
+        ctx: &egui::Context,
+        authorized: bool,
+    ) {
+        let pending = self.pending_provider_login.take();
+        if authorized && self.provider_user_id.is_some() {
+            if let Some(provider) = pending {
+                self.provider_notice = self
+                    .provider_sessions
+                    .open_login(frame, ctx, provider)
+                    .err();
+            }
+        }
+    }
+
+    pub fn take_accounts_home_request(&mut self) -> bool {
+        std::mem::take(&mut self.accounts_home_requested)
     }
 
     fn draw_provider_accounts(&mut self, ui: &mut egui::Ui) {
@@ -1341,7 +1417,11 @@ impl StreamsUi {
                     });
                 });
                 ui.separator();
-                ui.label(RichText::new("Add one or both platforms.").strong());
+                ui.label(RichText::new("Share with this guild.").strong());
+                if ui.button("Manage accounts on Home").clicked() {
+                    self.accounts_home_requested = true;
+                    done = true;
+                }
                 ui.add_space(10.0);
                 egui::ScrollArea::vertical().id_salt("stream-setup-help").max_height((ctx.content_rect().height() - 220.0).max(220.0)).show(ui, |ui| {
                     for (index, provider) in [Provider::Twitch, Provider::Youtube].into_iter().enumerate() {
@@ -1350,7 +1430,7 @@ impl StreamsUi {
                         let ended = own.is_some_and(|stream| stream.broadcast_state.as_deref() == Some("ended"));
                         if !twitch {
                             egui::Frame::new().fill(Color32::from_rgb(22, 25, 32)).corner_radius(8).inner_margin(14).show(ui, |ui| {
-                                self.youtube.draw(ui, self.snapshot.as_ref().and_then(|snapshot| snapshot.own_youtube_channel.as_ref()), self.work.is_none() && !self.youtube.busy());
+                                self.youtube.draw_channel(ui, self.snapshot.as_ref().and_then(|snapshot| snapshot.own_youtube_channel.as_ref()), self.work.is_none() && !self.youtube.busy());
                                 if self.snapshot.as_ref().is_some_and(|snapshot| snapshot.own_youtube_channel.is_some())
                                     && ui.add_enabled(self.work.is_none() && !self.youtube.busy(), action_button("Stop sharing channel")).clicked() {
                                     action = Some(Action::Remove(Provider::Youtube));
@@ -1364,6 +1444,16 @@ impl StreamsUi {
                                 ui.label(RichText::new(if twitch { "SET UP ONCE" } else { "OPTIONAL" }).size(10.0).color(if twitch { LIVE } else { Color32::from_rgb(231, 190, 108) }));
                             });
                             ui.add_space(6.0);
+                            if twitch {
+                                if let Some(channel) = self.twitch.channel() {
+                                    ui.label(format!("Connected: {}", channel.title));
+                                    if ui.add_enabled(self.work.is_none() && !self.twitch.busy() && own.is_none_or(|stream| stream.channel_id != channel.login), action_button("Share channel with this guild")).clicked() {
+                                        action = Some(Action::Save(Provider::Twitch, channel.url.clone()));
+                                    }
+                                } else {
+                                    ui.label(RichText::new("Connect Twitch on Home, or paste a channel link below.").small().color(MUTED));
+                                }
+                            }
                             ui.label(RichText::new(if twitch {
                                 "Paste your channel link once. Brick will find your future broadcasts automatically."
                             } else {
@@ -2021,6 +2111,8 @@ mod tests {
         host.selected = Some(recording("987", "1").as_stream());
         host.notice = Some("Previous guild notice".into());
         host.provider_notice = Some("Previous viewing notice".into());
+        host.pending_provider_login = Some(super::Provider::Youtube);
+        host.accounts_home_requested = true;
         let (tx, rx) = std::sync::mpsc::channel();
         host.work = Some(rx);
         host.clear_for_guild_switch();
@@ -2033,6 +2125,8 @@ mod tests {
         assert!(host.selected.is_none());
         assert!(host.notice.is_none());
         assert!(host.provider_notice.is_none());
+        assert!(host.pending_provider_login.is_none());
+        assert!(!host.take_accounts_home_request());
         assert!(host.work.is_none());
         assert!(tx
             .send(Err("Stale guild result".to_string().into()))

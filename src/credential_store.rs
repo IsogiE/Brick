@@ -11,6 +11,7 @@ pub struct Store {
 enum Provider {
     WarcraftLogs,
     Youtube,
+    Twitch,
 }
 
 impl Provider {
@@ -19,6 +20,7 @@ impl Provider {
         match self {
             Self::WarcraftLogs => "warcraftlogs",
             Self::Youtube => "youtube",
+            Self::Twitch => "twitch",
         }
     }
     fn prefix(self, windows: bool) -> &'static [u8] {
@@ -27,6 +29,8 @@ impl Provider {
             (Self::WarcraftLogs, true) => b"BRICK-WCL-DPAPI-v1\n",
             (Self::Youtube, false) => b"BRICK-YOUTUBE-KEYRING-v1\n",
             (Self::Youtube, true) => b"BRICK-YOUTUBE-DPAPI-v1\n",
+            (Self::Twitch, false) => b"BRICK-TWITCH-KEYRING-v1\n",
+            (Self::Twitch, true) => b"BRICK-TWITCH-DPAPI-v1\n",
         }
     }
 }
@@ -45,6 +49,14 @@ impl Store {
         Ok(Self {
             path: crate::addon::config_dir()?.join(format!("youtube-{id}.dat")),
             provider: Provider::Youtube,
+        })
+    }
+
+    pub fn twitch(account: &str) -> Result<Self, String> {
+        let id = hex::encode(Sha256::digest(account.as_bytes()));
+        Ok(Self {
+            path: crate::addon::config_dir()?.join(format!("twitch-{id}.dat")),
+            provider: Provider::Twitch,
         })
     }
 
@@ -217,6 +229,16 @@ mod tests {
         assert_eq!(wcl.provider.prefix(true), b"BRICK-WCL-DPAPI-v1\n");
         assert_ne!(wcl.provider.prefix(false), youtube.provider.prefix(false));
         assert_ne!(wcl.provider.prefix(true), youtube.provider.prefix(true));
+        let twitch = Store::twitch("fixture-account").unwrap();
+        let other_twitch = Store::twitch("other-fixture-account").unwrap();
+        assert_ne!(twitch.path, other_twitch.path);
+        for other in [&wcl, &youtube] {
+            assert_ne!(twitch.path, other.path);
+            assert_ne!(twitch.provider.prefix(false), other.provider.prefix(false));
+            assert_ne!(twitch.provider.prefix(true), other.provider.prefix(true));
+        }
+        assert_eq!(twitch.provider.prefix(false), b"BRICK-TWITCH-KEYRING-v1\n");
+        assert_eq!(twitch.provider.prefix(true), b"BRICK-TWITCH-DPAPI-v1\n");
     }
     #[cfg(target_os = "windows")]
     #[test]

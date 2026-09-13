@@ -198,6 +198,9 @@ pub struct StreamPlayer {
     preference_handler: Option<(webkit2gtk::UserContentManager, gtk::glib::SignalHandlerId)>,
 }
 
+#[cfg(target_os = "windows")]
+const WINDOWS_BROWSER_ARGS: &str = "--autoplay-policy=no-user-gesture-required --disk-cache-size=134217728 --media-cache-size=134217728";
+
 impl StreamPlayer {
     #[cfg(test)]
     pub fn new(
@@ -375,9 +378,7 @@ impl StreamPlayer {
             // Override Wry's default flags so WebView2 keeps SmartScreen enabled.
             // Keep reusable HTTP/media caches bounded without disabling caching.
             // InPrivate mode still protects provider state; never clear its UDF.
-            builder.with_additional_browser_args(
-                "--autoplay-policy=no-user-gesture-required --disk-cache-size=134217728 --media-cache-size=134217728",
-            )
+            builder.with_additional_browser_args(WINDOWS_BROWSER_ARGS)
         };
 
         // WebView2 invokes this for top-level navigations; provider iframe requests
@@ -2467,11 +2468,11 @@ mod tests {
         });
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
         window.set_default_size(640, 480);
+        let sessions = Rc::new(ProviderSessions::default());
 
         for cycle in 0..3 {
-            let context = webkit2gtk::WebContext::new_ephemeral();
-            context.set_sandbox_enabled(true);
-            let seed = webkit2gtk::WebView::with_context(&context);
+            let context = sessions.context(crate::streams::Provider::Twitch).unwrap();
+            let seed = webkit2gtk::WebView::with_context(&context.platform.context);
             let bridge = PreferenceBridge::new(&wrapper, Preferences::load());
             let (relay, capture) = bridge.scripts(&format!("http://127.0.0.1:{port}"));
             // Only this ignored test substitutes a localhost provider. No real
@@ -2493,18 +2494,18 @@ mod tests {
                 seed.destroy();
             }
             drop(seed);
-            drop(context);
             remove_unused_linux_ipc(&webview.webview()).unwrap();
             let handler = attach_linux_preferences(&webview, bridge.clone()).unwrap();
             let view = webview.webview();
+            context.platform.register(&view);
             let weak = view.downgrade();
             let weak_context = view.context().unwrap().downgrade();
             assert!(view.context().unwrap().is_sandbox_enabled());
             let player = StreamPlayer {
                 _cache_usage: crate::cache_maintenance::PlayerLease::new(),
                 webview: Some(webview),
-                _provider_sessions: Rc::new(ProviderSessions::default()),
-                provider_context: None,
+                _provider_sessions: Rc::clone(&sessions),
+                provider_context: Some(context),
                 allowed_url: Arc::new(Mutex::new(wrapper.clone())),
                 #[cfg(target_os = "windows")]
                 bearer_tokens: Arc::new(Mutex::new(Vec::new())),
@@ -2554,6 +2555,7 @@ mod tests {
             );
             drop(view);
             drop(player);
+            assert!(!sessions.session_started(&crate::streams::Provider::Twitch));
             for _ in 0..400 {
                 pump_events();
                 if weak.upgrade().is_none()

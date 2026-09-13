@@ -99,6 +99,21 @@ pub(super) struct Window {
 }
 
 impl Window {
+    pub fn from_frame(
+        context: &Context,
+        provider: &Provider,
+        _frame: &eframe::Frame,
+        ctx: &egui::Context,
+    ) -> Result<Self, String> {
+        Self::new_at(
+            context,
+            provider,
+            start_url(provider),
+            allowed_document,
+            ctx,
+        )
+    }
+
     pub fn new(
         context: &Context,
         provider: &Provider,
@@ -317,30 +332,44 @@ mod tests {
         assert!(youtube.request_login(destination, true, false));
         assert!(youtube.take_login_request());
         assert!(!youtube.take_login_request());
-        let window = Window::new_at(
-            &youtube.platform,
-            &Provider::Youtube,
-            &format!("{origin}/login"),
-            fixture_origin,
-            &egui::Context::default(),
-        )
-        .unwrap();
-        wait_for(|| {
-            window
-                .view
-                .title()
-                .is_some_and(|title| title.starts_with('{'))
-        });
-        let login_state: serde_json::Value =
-            serde_json::from_str(&window.view.title().unwrap()).unwrap();
+        // Home opens the first native view: no media child or authenticated
+        // wrapper is required to create this personal session.
+        assert!(!sessions.session_started(&Provider::Youtube));
+        youtube
+            .open_with(|| {
+                Window::new_at(
+                    &youtube.platform,
+                    &Provider::Youtube,
+                    &format!("{origin}/login"),
+                    fixture_origin,
+                    &egui::Context::default(),
+                )
+            })
+            .unwrap();
+        let login_state: serde_json::Value = {
+            let window = youtube.window.borrow();
+            let window = window.as_ref().unwrap();
+            wait_for(|| {
+                window
+                    .view
+                    .title()
+                    .is_some_and(|title| title.starts_with('{'))
+            });
+            serde_json::from_str(&window.view.title().unwrap()).unwrap()
+        };
         assert_eq!(login_state["ipc"], false);
         assert_eq!(login_state["bridge"], false);
         assert_eq!(login_state["opener"], false);
-        *youtube.window.borrow_mut() = Some(window);
-        youtube.attempted.set(true);
+        assert!(sessions.session_started(&Provider::Youtube));
+        assert!(!sessions.session_started(&Provider::Twitch));
         assert!(sessions.login_open());
-        youtube.close_window();
+        assert!(sessions.login_open_for(&Provider::Youtube));
+        youtube
+            .open_with(|| panic!("An open login must reuse its existing native window"))
+            .unwrap();
+        sessions.close_login(&Provider::Youtube);
         assert!(!sessions.login_open());
+        assert!(sessions.session_started(&Provider::Youtube));
 
         let state = |context: &super::super::Context| {
             let view = webkit2gtk::WebView::with_context(&context.platform.context);
@@ -364,6 +393,10 @@ mod tests {
         assert_eq!(state(&twitch)["storage"], false);
         let other_account = ProviderSessions::default();
         let anonymous = other_account.context(Provider::Twitch).unwrap();
+        assert!(anonymous
+            .open_with(|| Err("synthetic failed open".into()))
+            .is_err());
+        assert!(!other_account.session_started(&Provider::Twitch));
         other_account.release_unused(&anonymous);
         assert!(!anonymous.active());
         assert_eq!(
@@ -395,6 +428,11 @@ mod tests {
         sessions.close();
         assert!(!replacement.active());
         assert!(!twitch.active());
+        assert!(!sessions.session_started(&Provider::Youtube));
+        assert!(!sessions.login_open_for(&Provider::Youtube));
+        assert!(youtube
+            .open_with(|| panic!("A retired session cannot reopen"))
+            .is_err());
         other_account.close();
         stopped.store(true, Ordering::Relaxed);
         worker.join().unwrap();

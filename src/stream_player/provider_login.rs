@@ -1,6 +1,7 @@
 //! Personal, memory-only provider sessions. No browser cookie import or export.
 use crate::streams::Provider;
 use eframe::egui;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -23,6 +24,59 @@ pub struct ProviderSessions {
 }
 
 impl ProviderSessions {
+    /// Open personal viewing sign-in without loading a guild page or video.
+    /// A successful open does not establish whether the provider accepted login.
+    pub fn open_login(
+        &self,
+        frame: &eframe::Frame,
+        ctx: &egui::Context,
+        provider: Provider,
+    ) -> Result<(), String> {
+        if self.closed.get() {
+            return Err("This provider session has ended.".into());
+        }
+        let owner = frame
+            .window_handle()
+            .map_err(|_| "The provider sign-in window could not find Brick.")?;
+        match owner.as_raw() {
+            #[cfg(target_os = "linux")]
+            RawWindowHandle::Xlib(_) | RawWindowHandle::Xcb(_) => {
+                super::initialize_gtk()?;
+            }
+            #[cfg(target_os = "windows")]
+            RawWindowHandle::Win32(_) => (),
+            _ => return Err("Provider sign-in needs Brick's desktop window.".into()),
+        }
+        let context = self.context(provider)?;
+        let result = context.open_with(|| {
+            platform::Window::from_frame(&context.platform, &context.provider, frame, ctx)
+        });
+        if result.is_err() {
+            // Failed first opens must not retain a newly allocated anonymous
+            // context/keeper. Existing media or explicit sessions remain owned.
+            self.release_unused(&context);
+        }
+        result
+    }
+
+    pub fn session_started(&self, provider: &Provider) -> bool {
+        self.contexts.borrow()[index(provider)]
+            .as_ref()
+            .is_some_and(|context| context.attempted())
+    }
+
+    pub fn login_open_for(&self, provider: &Provider) -> bool {
+        let context = self.contexts.borrow()[index(provider)].clone();
+        context.is_some_and(|context| context.window_open())
+    }
+
+    pub fn close_login(&self, provider: &Provider) {
+        let context = self.contexts.borrow()[index(provider)].clone();
+        if let Some(context) = context {
+            context.close_window();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn ended_for_test(&self) -> bool {
         self.closed.get()
@@ -145,6 +199,13 @@ impl Context {
     }
 
     pub fn open(&self, player: &wry::WebView, ctx: &egui::Context) -> Result<(), String> {
+        self.open_with(|| platform::Window::new(&self.platform, &self.provider, player, ctx))
+    }
+
+    fn open_with(
+        &self,
+        create: impl FnOnce() -> Result<platform::Window, String>,
+    ) -> Result<(), String> {
         if !self.active.get() {
             return Err("This provider session has ended.".into());
         }
@@ -153,7 +214,7 @@ impl Context {
             return Ok(());
         }
         self.close_window();
-        let window = platform::Window::new(&self.platform, &self.provider, player, ctx)?;
+        let window = create()?;
         *self.window.borrow_mut() = Some(window);
         self.attempted.set(true);
         Ok(())

@@ -30,6 +30,13 @@ const CLIENT_ID: &str = match option_env!("BRICK_YOUTUBE_CLIENT_ID") {
     Some(value) => value,
     None => "",
 };
+// Google requires this companion value for some Desktop clients. Installed
+// apps cannot keep it confidential: it is application configuration, never a
+// replacement for PKCE or the user's separately protected OAuth grant.
+const CLIENT_SECRET: &str = match option_env!("BRICK_YOUTUBE_CLIENT_SECRET") {
+    Some(value) => value,
+    None => "",
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,7 +95,7 @@ impl Account {
     }
 
     pub fn configured() -> bool {
-        valid_client_id(CLIENT_ID)
+        valid_client_id(CLIENT_ID) && valid_client_companion(CLIENT_SECRET)
     }
     pub fn connected(&self) -> bool {
         self.session
@@ -153,6 +160,7 @@ impl Account {
             .post(TOKEN)
             .form(&[
                 ("client_id", CLIENT_ID),
+                ("client_secret", CLIENT_SECRET),
                 ("grant_type", "authorization_code"),
                 ("code", code.as_str()),
                 ("code_verifier", verifier.as_str()),
@@ -217,6 +225,7 @@ impl Account {
                     .post(TOKEN)
                     .form(&[
                         ("client_id", CLIENT_ID),
+                        ("client_secret", CLIENT_SECRET),
                         ("grant_type", "refresh_token"),
                         ("refresh_token", refresh.as_str()),
                     ])
@@ -507,6 +516,30 @@ struct TokenFailure {
     message: String,
     invalid_grant: bool,
 }
+fn valid_client_companion(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 1024 && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+fn token_failure(status: u16, bytes: &[u8]) -> TokenFailure {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok();
+    let code = value.as_ref().and_then(|value| value["error"].as_str());
+    let invalid_grant = status == 400 && code == Some("invalid_grant");
+    let configuration_error = matches!(code, Some("invalid_client" | "unauthorized_client"))
+        || (code == Some("invalid_request")
+            && value
+                .as_ref()
+                .and_then(|value| value["error_description"].as_str())
+                == Some("client_secret is missing."));
+    TokenFailure {
+        message: if invalid_grant {
+            "Please reconnect YouTube."
+        } else if configuration_error {
+            "This Brick build's YouTube connection is not configured correctly. Please update Brick."
+        } else {
+            "YouTube couldn't authorize the connection. Try again later."
+        }.into(),
+        invalid_grant,
+    }
+}
 fn token_response(response: Response) -> Result<TokenResponse, TokenFailure> {
     let success = response.status().is_success();
     let status = response.status().as_u16();
@@ -515,19 +548,7 @@ fn token_response(response: Response) -> Result<TokenResponse, TokenFailure> {
         invalid_grant: false,
     })?;
     if !success {
-        let invalid_grant = status == 400
-            && serde_json::from_slice::<serde_json::Value>(&bytes)
-                .ok()
-                .is_some_and(|value| value["error"].as_str() == Some("invalid_grant"));
-        return Err(TokenFailure {
-            message: if invalid_grant {
-                "Please reconnect YouTube."
-            } else {
-                "YouTube couldn't authorize the connection. Try again later."
-            }
-            .into(),
-            invalid_grant,
-        });
+        return Err(token_failure(status, &bytes));
     }
     serde_json::from_slice(&bytes).map_err(|_| TokenFailure {
         message: "YouTube returned an invalid connection.".into(),
@@ -783,6 +804,9 @@ fn receive_code(
     Err("YouTube sign-in timed out. Try connecting again.".into())
 }
 fn read_callback(stream: &mut TcpStream) -> Option<Vec<u8>> {
+    // Winsock inherits the listener's nonblocking mode. Accepted callbacks
+    // need bounded blocking reads so delayed/fragmented browser headers work.
+    stream.set_nonblocking(false).ok()?;
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .ok()?;
@@ -957,6 +981,35 @@ mod tests {
         );
     }
     #[test]
+    fn callback_handles_delayed_fragmented_headers_on_nonblocking_accepted_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let host = address.to_string();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            ready_rx.recv().unwrap();
+            for part in [
+                "GET /?state=expected&code=fixture-code HTTP/1.1\r\n".to_owned(),
+                format!("Host: {host}\r\n"),
+                "\r\n".to_owned(),
+            ] {
+                std::thread::sleep(Duration::from_millis(30));
+                stream.write_all(part.as_bytes()).unwrap();
+            }
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        // Reproduce Winsock's inherited mode on every test platform.
+        stream.set_nonblocking(true).unwrap();
+        ready_tx.send(()).unwrap();
+        let request = read_callback(&mut stream).unwrap();
+        assert!(
+            matches!(parse_callback(&request, "expected", &address.to_string()),
+            Some(Callback::Code(code)) if code == "fixture-code")
+        );
+        client.join().unwrap();
+    }
+    #[test]
     fn stale_or_cancelled_workers_never_reach_credential_storage() {
         let token = TokenResponse {
             access_token: "fixture".into(),
@@ -1028,6 +1081,42 @@ mod tests {
         let mut altered = channel;
         altered.url = "https://evil.test".into();
         assert!(!valid_saved_channels(&[altered]));
+    }
+    #[test]
+    fn configuration_errors_do_not_revoke_users_grants_or_echo_provider_data() {
+        for (status, body) in [
+            (
+                400,
+                r#"{"error":"invalid_request","error_description":"client_secret is missing."}"#,
+            ),
+            (
+                401,
+                r#"{"error":"invalid_client","error_description":"synthetic-sensitive-data"}"#,
+            ),
+            (
+                400,
+                r#"{"error":"unauthorized_client","error_description":"synthetic-sensitive-data"}"#,
+            ),
+        ] {
+            let failure = token_failure(status, body.as_bytes());
+            assert!(!failure.invalid_grant);
+            assert!(failure.message.contains("not configured correctly"));
+            assert!(!failure.message.contains("synthetic-sensitive-data"));
+            assert!(!failure.message.contains("client_secret"));
+        }
+        let revoked = token_failure(
+            400,
+            br#"{"error":"invalid_grant","error_description":"synthetic-sensitive-data"}"#,
+        );
+        assert!(revoked.invalid_grant);
+        assert_eq!(revoked.message, "Please reconnect YouTube.");
+        let transient = token_failure(503, br#"{"error":"synthetic-sensitive-data"}"#);
+        assert!(!transient.invalid_grant);
+        assert!(!transient.message.contains("synthetic-sensitive-data"));
+        assert!(!valid_client_companion(""));
+        assert!(!valid_client_companion("value\n"));
+        assert!(!valid_client_companion(&"x".repeat(1025)));
+        assert!(valid_client_companion("synthetic-desktop-companion"));
     }
     fn fixture_session() -> Session {
         session_from_token(

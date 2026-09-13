@@ -37,6 +37,8 @@ mod stream_preferences;
 mod streams;
 mod streams_ui;
 mod tray;
+mod twitch_account;
+mod twitch_account_ui;
 mod ui;
 mod warcraftlogs;
 mod youtube_account;

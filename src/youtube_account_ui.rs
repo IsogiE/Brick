@@ -198,18 +198,12 @@ impl YoutubeUi {
         self.work = Some(rx);
     }
 
-    pub fn draw(&mut self, ui: &mut egui::Ui, shared: Option<&Channel>, available: bool) {
-        ui.label(RichText::new("YouTube channel").strong().size(15.0));
-        ui.label("Connect once to find your live streams and VODs. Choose a channel to share with this guild.");
-        ui.add_space(6.0);
-        if let Some(channel) = shared {
-            ui.label(RichText::new(format!("Shared here: {}", channel.title)).strong());
-        }
+    pub fn draw_account(&mut self, ui: &mut egui::Ui, available: bool) {
+        ui.label(RichText::new("YouTube").strong().size(15.0));
+        ui.label("Connect your channel to find your live streams and VODs.");
         let enabled = available && !self.busy();
         if !Account::configured() {
-            ui.label(
-                "Account connection is being set up. You can still add a broadcast link below.",
-            );
+            ui.label("YouTube connection is not available in this build.");
         } else if !self.connected {
             if ui
                 .add_enabled(enabled, egui::Button::new("Connect YouTube"))
@@ -219,46 +213,13 @@ impl YoutubeUi {
             }
         } else {
             if self.channels.is_empty() {
-                ui.label("This account has no available YouTube channels.");
+                ui.label("Connected. This account has no available YouTube channels.");
             } else {
-                let title = self
-                    .channels
-                    .iter()
-                    .find(|channel| channel.channel_id == self.selected)
-                    .map(|channel| channel.title.as_str())
-                    .unwrap_or("Choose your channel");
-                ui.add_enabled_ui(enabled, |ui| {
-                    egui::ComboBox::from_id_salt("youtube-owned-channel")
-                        .selected_text(title)
-                        .width(260.0)
-                        .show_ui(ui, |ui| {
-                            for channel in &self.channels {
-                                ui.selectable_value(
-                                    &mut self.selected,
-                                    channel.channel_id.clone(),
-                                    &channel.title,
-                                );
-                            }
-                        });
-                });
-                let changed = shared.is_none_or(|channel| channel.channel_id != self.selected);
-                if ui
-                    .add_enabled(
-                        enabled && changed && !self.selected.is_empty(),
-                        egui::Button::new("Share channel with this guild"),
-                    )
-                    .clicked()
-                {
-                    self.start(ui.ctx(), Action::Share(self.selected.clone()));
+                for channel in &self.channels {
+                    ui.label(RichText::new(&channel.title).strong());
                 }
-                ui.label(
-                    RichText::new(
-                        "Sharing includes this channel's public and unlisted broadcasts.",
-                    )
-                    .small(),
-                );
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(enabled, egui::Button::new("Change account"))
                     .clicked()
@@ -273,10 +234,64 @@ impl YoutubeUi {
                 }
             });
         }
+        self.draw_progress(ui);
+    }
+
+    pub fn draw_channel(&mut self, ui: &mut egui::Ui, shared: Option<&Channel>, available: bool) {
+        ui.label(RichText::new("YouTube channel").strong().size(15.0));
+        if let Some(channel) = shared {
+            ui.label(RichText::new(format!("Shared here: {}", channel.title)).strong());
+        }
+        let enabled = available && !self.busy();
+        if !self.connected {
+            ui.label("Connect YouTube on Home to share your channel here.");
+        } else if self.channels.is_empty() {
+            ui.label("Your connected account has no available YouTube channels.");
+        } else {
+            let title = self
+                .channels
+                .iter()
+                .find(|channel| channel.channel_id == self.selected)
+                .map(|channel| channel.title.as_str())
+                .unwrap_or("Choose your channel");
+            ui.add_enabled_ui(enabled, |ui| {
+                egui::ComboBox::from_id_salt("youtube-owned-channel")
+                    .selected_text(title)
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        for channel in &self.channels {
+                            ui.selectable_value(
+                                &mut self.selected,
+                                channel.channel_id.clone(),
+                                &channel.title,
+                            );
+                        }
+                    });
+            });
+            let changed = shared.is_none_or(|channel| channel.channel_id != self.selected);
+            if ui
+                .add_enabled(
+                    enabled && changed && !self.selected.is_empty(),
+                    egui::Button::new("Share channel with this guild"),
+                )
+                .clicked()
+            {
+                self.start(ui.ctx(), Action::Share(self.selected.clone()));
+            }
+            ui.label(
+                RichText::new("Sharing includes this channel's public and unlisted broadcasts.")
+                    .small(),
+            );
+        }
+        self.draw_progress(ui);
+        ui.add_space(8.0);
+    }
+
+    fn draw_progress(&self, ui: &mut egui::Ui) {
         if self.work.is_some() && self.foreground {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Connecting…");
+                ui.label("Working…");
                 if ui.button("Cancel").clicked() {
                     if let Some(cancel) = &self.cancel {
                         cancel.store(true, Ordering::Release);
@@ -287,7 +302,5 @@ impl YoutubeUi {
         if let Some(notice) = &self.notice {
             ui.label(RichText::new(notice).small());
         }
-        ui.label(RichText::new("Your account connection is protected on this device. Only the channel and broadcasts you share are sent to your guild.").small());
-        ui.add_space(8.0);
     }
 }

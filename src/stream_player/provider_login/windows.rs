@@ -141,7 +141,7 @@ impl Context {
         Ok(())
     }
 
-    fn keep_alive(&self, player: &WebView, owner: HWND) -> Result<(), String> {
+    fn keep_alive(&self, owner: HWND) -> Result<(), String> {
         if self.keeper.borrow().is_some() {
             return Ok(());
         }
@@ -170,8 +170,14 @@ impl Context {
         // InPrivate data belongs to live views, not merely a profile handle.
         // Keep one empty, invisible view after explicit sign-in so closing all
         // POVs does not drop this run's session. It never loads any document.
-        let view = WebViewBuilder::new()
-            .with_environment(player.environment())
+        let mut storage = super::super::windows_profile::context()?;
+        let environment = self.environment.borrow().clone();
+        let builder = WebViewBuilder::new_with_web_context(&mut storage);
+        let builder = match environment {
+            Some(environment) => builder.with_environment(environment),
+            None => builder,
+        };
+        let view = builder
             .with_profile_name(&self.profile_name)
             .with_incognito(true)
             .with_visible(false)
@@ -180,6 +186,9 @@ impl Context {
             .with_navigation_handler(|_| false)
             .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
             .with_download_started_handler(|_, _| false)
+            // This can create the environment before any media view exists.
+            // Match media's protected defaults, including enabled SmartScreen.
+            .with_additional_browser_args(super::super::WINDOWS_BROWSER_ARGS)
             .build(&native)
             .map_err(|_| "The private provider session could not start.")?;
         protect_settings(&view)?;
@@ -188,6 +197,7 @@ impl Context {
         *self.keeper.borrow_mut() = Some(Keeper {
             _view: view,
             _native: native,
+            _storage: storage,
         });
         Ok(())
     }
@@ -280,6 +290,7 @@ unsafe extern "system" fn window_lifetime(
 struct Keeper {
     _view: WebView,
     _native: NativeWindow,
+    _storage: wry::WebContext,
 }
 impl HasWindowHandle for NativeWindow {
     fn window_handle(&self) -> Result<WindowHandle<'_>, raw_window_handle::HandleError> {
@@ -313,6 +324,28 @@ fn wide(value: &str) -> Vec<u16> {
 }
 
 impl Window {
+    pub fn from_frame(
+        context: &Context,
+        provider: &Provider,
+        frame: &eframe::Frame,
+        ctx: &egui::Context,
+    ) -> Result<Self, String> {
+        let handle = frame
+            .window_handle()
+            .map_err(|_| "The provider sign-in window could not find Brick.")?;
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return Err("Provider sign-in needs Brick's Windows desktop window.".into());
+        };
+        Self::new_at_owner(
+            context,
+            provider,
+            handle.hwnd.get() as HWND,
+            ctx,
+            start_url(provider),
+            allowed_document,
+        )
+    }
+
     pub fn new(
         context: &Context,
         provider: &Provider,
@@ -340,11 +373,29 @@ impl Window {
         let mut owner = windows::Win32::Foundation::HWND::default();
         unsafe { player.controller().ParentWindow(&mut owner) }
             .map_err(|_| "The provider sign-in window could not find Brick.")?;
-        let owner = unsafe { GetAncestor(owner.0, GA_ROOT) };
+        Self::new_at_owner(context, provider, owner.0, ctx, start, permits)
+    }
+
+    fn new_at_owner(
+        context: &Context,
+        provider: &Provider,
+        owner: HWND,
+        ctx: &egui::Context,
+        start: &str,
+        permits: fn(&Provider, &str) -> bool,
+    ) -> Result<Self, String> {
+        // This is borrowed from the live Frame or media controller. Only the
+        // newly created popup/keeper HWNDs are owned and destroyed by us.
+        let owner = unsafe { GetAncestor(owner, GA_ROOT) };
         if owner.is_null() {
             return Err("The provider sign-in window could not find Brick.".into());
         }
-        context.keep_alive(player, owner)?;
+        context.keep_alive(owner)?;
+        let environment = context
+            .environment
+            .borrow()
+            .clone()
+            .ok_or("The private provider session could not start.")?;
         let width = unsafe { GetSystemMetrics(SM_CXSCREEN) }.clamp(320, 580);
         let height = unsafe { GetSystemMetrics(SM_CYSCREEN) }
             .saturating_sub(80)
@@ -381,7 +432,7 @@ impl Window {
         let title_provider = provider.clone();
         let title_window = Rc::downgrade(&native.0);
         let view = WebViewBuilder::new()
-            .with_environment(player.environment())
+            .with_environment(environment)
             .with_profile_name(&context.profile_name)
             .with_incognito(true)
             .with_devtools(false)
@@ -487,7 +538,7 @@ mod tests {
     use super::*;
     use std::{
         io::{Read, Write},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         path::PathBuf,
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -558,12 +609,16 @@ mod tests {
     }
 
     fn media_view(context: &Context, parent: &NativeWindow, root: &std::path::Path) -> WebView {
-        let path = root.join("WebView2");
-        std::fs::create_dir_all(&path).unwrap();
-        let mut storage = wry::WebContext::new(Some(path));
+        // Every provider/account uses production's one app-owned UDF. Isolation
+        // must come from distinct InPrivate profiles, never fixture directories.
+        assert!(super::super::super::windows_profile::data_directory()
+            .unwrap()
+            .starts_with(root));
+        let mut storage = super::super::super::windows_profile::context().unwrap();
         let builder = WebViewBuilder::new_with_web_context(&mut storage)
             .with_profile_name(&context.profile_name)
-            .with_incognito(true);
+            .with_incognito(true)
+            .with_additional_browser_args(super::super::super::WINDOWS_BROWSER_ARGS);
         let builder = match context.environment.borrow().as_ref() {
             Some(environment) => builder.with_environment(environment.clone()),
             None => builder,
@@ -577,6 +632,38 @@ mod tests {
         let mut title = PWSTR::null();
         unsafe { view.webview().DocumentTitle(&mut title) }.ok()?;
         Some(webview2_com::take_pwstr(title))
+    }
+
+    fn fixture_request(socket: &mut TcpStream) -> std::io::Result<String> {
+        // Winsock accepts can inherit the listener's nonblocking mode. A
+        // browser request may also arrive over multiple reads; do not respond
+        // and close its connection before the complete bounded header arrives.
+        socket.set_nonblocking(false)?;
+        socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut request = Vec::new();
+        let mut chunk = [0; 1024];
+        while request.len() < 8192 {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "Fixture request timed out")
+                })?;
+            socket.set_read_timeout(Some(remaining))?;
+            let available = chunk.len().min(8192 - request.len());
+            let count = socket.read(&mut chunk[..available])?;
+            if count == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            request.extend_from_slice(&chunk[..count]);
+            if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                return Ok(String::from_utf8_lossy(&request).into_owned());
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Fixture request header exceeded its limit",
+        ))
     }
 
     #[track_caller]
@@ -627,12 +714,9 @@ mod tests {
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = [0; 8192];
-                let count = socket.read(&mut request).unwrap_or(0);
-                let request = String::from_utf8_lossy(&request[..count]);
+                let Ok(request) = fixture_request(&mut socket) else {
+                    continue;
+                };
                 let login = request.starts_with("GET /login ");
                 let cookie = request.lines().any(|line| {
                     line.to_ascii_lowercase().starts_with("cookie:")
@@ -665,11 +749,14 @@ mod tests {
         let parent = parent_window();
         let sessions = ProviderSessions::default();
         let youtube = sessions.context(Provider::Youtube).unwrap();
-        let first_pov = media_view(&youtube.platform, &parent, &root);
-        let login = Window::new_at(
+        assert!(youtube.platform.environment.borrow().is_none());
+        assert!(youtube.platform.keeper.borrow().is_none());
+        // Home-first: bootstrap from Brick's borrowed parent HWND, without a
+        // media view, bearer request, authenticated wrapper or real provider.
+        let login = Window::new_at_owner(
             &youtube.platform,
             &Provider::Youtube,
-            &first_pov,
+            parent.handle(),
             &egui::Context::default(),
             &format!("{origin}/login"),
             fixture_origin,
@@ -690,6 +777,16 @@ mod tests {
         *youtube.window.borrow_mut() = Some(login);
         youtube.attempted.set(true);
         assert!(sessions.login_open());
+        assert!(sessions.session_started(&Provider::Youtube));
+        assert!(sessions.login_open_for(&Provider::Youtube));
+        youtube
+            .open_with(|| panic!("An open login must reuse its existing native window"))
+            .unwrap();
+        let first_pov = media_view(&youtube.platform, &parent, &root);
+        first_pov.load_url(&format!("{origin}/state")).unwrap();
+        let first_media_state = state(&first_pov, "first media after Home sign-in");
+        assert_eq!(first_media_state["cookie"], true);
+        assert_eq!(first_media_state["storage"], true);
         unsafe { SendMessageW(login_handle, WM_CLOSE, 0, 0) };
         // The controller closes immediately; the still-owned hidden HWND is
         // destroyed by the next UI inspection, never through a stale handle.
