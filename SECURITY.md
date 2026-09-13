@@ -11,3 +11,5 @@ The Linux AppImage bundles WebKitGTK. OS package updates do not update that bund
 Discord login uses OAuth with PKCE. Windows stores cached sessions with DPAPI protection. Bot tokens and publishing credentials belong on the server or in the release environment, never in the desktop app.
 
 The Discord guild check controls the app's normal workflow. Release downloads are public; the desktop login is not server-side access control for those files.
+
+Private requests carry an explicit guild identity and the user's Discord OAuth token; the server verifies the corresponding membership and roles. Changing guilds discards the previous panel, players and pending results. Persisted raid timing caches use AES-256-GCM, bind ciphertext to the guild and account, and keep independent keys in the existing OS-protected credential store. Keyring failures never fall back to plaintext. This protects normal app access and cached files; it cannot revoke information already downloaded or protect against a compromised operating system.

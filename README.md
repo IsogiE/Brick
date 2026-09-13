@@ -10,7 +10,9 @@ A small desktop updater for [Advance Raid Tools](https://github.com/IsogiE/Advan
 
 Brick is developed and maintained by Lucas Thoolen (GitHub: IsogiE).
 
-Brick keeps the guild addon installed across your WoW clients, runs in the system tray, and checks for updates automatically. Downloads are verified against signed manifests before installation. Discord sign-in is required for Advance guild members to use the app.
+Brick keeps the guild addon installed across your WoW clients, runs in the system tray, and checks for updates automatically. Downloads are verified against signed manifests before installation. Sign in with a Discord account that has a Raider or Officer role in a supported guild.
+
+If you qualify for more than one guild, use the guild selector beside the navigation tabs. Brick remembers your selection and opens that guild's roster, profile, streams and recordings. Your guild roles are independent; being an Officer in one guild does not grant Officer access in another. Personal settings and your Warcraft Logs sign-in follow your account.
 
 On startup and every minute while running and signed in, Brick checks the installed addon versions against the current signed release. If a managed addon's folder or TOC file is missing, or its TOC version differs, Brick reinstalls the current package automatically.
 

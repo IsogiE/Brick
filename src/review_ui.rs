@@ -11,7 +11,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
     },
-    thread,
     time::{Duration, Instant},
 };
 
@@ -905,7 +904,7 @@ impl ReviewUi {
             }
         }
         self.signing_in = matches!(action, Action::Connect);
-        thread::spawn(move || {
+        crate::guild::spawn(move || {
             let _peer_permit = peer_permit;
             let mut connected = false;
             let result = (|| {
