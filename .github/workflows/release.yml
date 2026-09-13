@@ -176,6 +176,9 @@ jobs:
         if ((Get-AuthenticodeSignature SimplySignDesktop.msi).Status -ne 'Valid') {
           throw 'SimplySign Desktop installer signature is invalid.'
         }
+    - name: Prepare verified Certum login automation
+      shell: pwsh
+      run: ./scripts/prepare-certum-action.ps1
     - name: Connect Certum SimplySign
       timeout-minutes: 12
       uses: dismine/windows-app-signing-setup-action@89ae3b032d4bc7a5b98d1a42a34e61ecb6faad64
