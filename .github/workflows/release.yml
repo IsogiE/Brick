@@ -61,6 +61,10 @@ jobs:
       env:
         BRICK_APP_VERSION: ${{ inputs.version }}
       run: node scripts/set-app-version.mjs
+    - name: Verify YouTube connection config
+      env:
+        BRICK_YOUTUBE_CLIENT_ID: ${{ vars.BRICK_YOUTUBE_CLIENT_ID }}
+      run: node -e "if (!/^[a-zA-Z0-9_-]{3,160}[.]apps[.]googleusercontent[.]com$/.test(process.env.BRICK_YOUTUBE_CLIENT_ID || '')) throw new Error('A Google desktop OAuth client ID is required.');"
     - name: Verify Discord login config
       env:
         BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
@@ -74,6 +78,7 @@ jobs:
     - name: Build package
       env:
         BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+        BRICK_YOUTUBE_CLIENT_ID: ${{ vars.BRICK_YOUTUBE_CLIENT_ID }}
         BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
         BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
         NO_STRIP: 1
@@ -132,6 +137,10 @@ jobs:
       env:
         BRICK_APP_VERSION: ${{ inputs.version }}
       run: node scripts/set-app-version.mjs
+    - name: Verify YouTube connection config
+      env:
+        BRICK_YOUTUBE_CLIENT_ID: ${{ vars.BRICK_YOUTUBE_CLIENT_ID }}
+      run: node -e "if (!/^[a-zA-Z0-9_-]{3,160}[.]apps[.]googleusercontent[.]com$/.test(process.env.BRICK_YOUTUBE_CLIENT_ID || '')) throw new Error('A Google desktop OAuth client ID is required.');"
     - name: Verify Discord login config
       env:
         BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
@@ -163,6 +172,7 @@ jobs:
     - name: Build Windows binary for signing
       env:
         BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+        BRICK_YOUTUBE_CLIENT_ID: ${{ vars.BRICK_YOUTUBE_CLIENT_ID }}
         BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
         BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
         RUSTFLAGS: -D warnings -C target-feature=+crt-static
@@ -205,6 +215,7 @@ jobs:
       env:
         BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
         BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+        BRICK_YOUTUBE_CLIENT_ID: ${{ vars.BRICK_YOUTUBE_CLIENT_ID }}
         BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
         BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
         NO_STRIP: 1

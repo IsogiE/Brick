@@ -39,6 +39,8 @@ mod streams_ui;
 mod tray;
 mod ui;
 mod warcraftlogs;
+mod youtube_account;
+mod youtube_account_ui;
 
 use std::{
     env,

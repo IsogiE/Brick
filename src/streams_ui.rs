@@ -38,6 +38,7 @@ type WorkResult = Result<ResultData, streams::Error>;
 type PlayerResult = Result<(String, crate::guild::Access, Option<Preferences>), streams::Error>;
 
 pub struct StreamsUi {
+    youtube: crate::youtube_account_ui::YoutubeUi,
     snapshot: Option<Rc<Snapshot>>,
     received_at: Option<Instant>,
     last_attempt: Option<Instant>,
@@ -81,6 +82,7 @@ impl Default for StreamsUi {
         let review = crate::review_ui::ReviewUi::default();
         let warmup = review.metadata_peer();
         Self {
+            youtube: Default::default(),
             snapshot: None,
             received_at: None,
             last_attempt: None,
@@ -295,6 +297,15 @@ impl StreamsUi {
         }
         if !active {
             self.stop_player();
+        }
+        if self.youtube.tick(
+            ctx,
+            self.snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.own_youtube_channel.as_ref()),
+        ) && self.work.is_none()
+        {
+            self.start(ctx, Action::Refresh);
         }
         if self.received_at.is_some_and(|at| at.elapsed() >= MAX_STALE) {
             self.pov_revision = self.pov_revision.wrapping_add(1);
@@ -1197,20 +1208,30 @@ impl StreamsUi {
                         let twitch = provider == Provider::Twitch;
                         let own = self.snapshot.as_ref().and_then(|s| s.own_streams.iter().find(|stream| stream.provider == provider));
                         let ended = own.is_some_and(|stream| stream.broadcast_state.as_deref() == Some("ended"));
+                        if !twitch {
+                            egui::Frame::new().fill(Color32::from_rgb(22, 25, 32)).corner_radius(8).inner_margin(14).show(ui, |ui| {
+                                self.youtube.draw(ui, self.snapshot.as_ref().and_then(|snapshot| snapshot.own_youtube_channel.as_ref()), self.work.is_none() && !self.youtube.busy());
+                                if self.snapshot.as_ref().is_some_and(|snapshot| snapshot.own_youtube_channel.is_some())
+                                    && ui.add_enabled(self.work.is_none() && !self.youtube.busy(), action_button("Stop sharing channel")).clicked() {
+                                    action = Some(Action::Remove(Provider::Youtube));
+                                }
+                            });
+                            ui.add_space(8.0);
+                        }
                         egui::Frame::new().fill(Color32::from_rgb(22, 25, 32)).corner_radius(8).inner_margin(14).show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(if twitch { "Twitch channel" } else { "YouTube broadcast" }).strong().size(15.0));
-                                ui.label(RichText::new(if twitch { "SET UP ONCE" } else { "NEW LINK EACH BROADCAST" }).size(10.0).color(if twitch { LIVE } else { Color32::from_rgb(231, 190, 108) }));
+                                ui.label(RichText::new(if twitch { "Twitch channel" } else { "YouTube broadcast link" }).strong().size(15.0));
+                                ui.label(RichText::new(if twitch { "SET UP ONCE" } else { "OPTIONAL" }).size(10.0).color(if twitch { LIVE } else { Color32::from_rgb(231, 190, 108) }));
                             });
                             ui.add_space(6.0);
                             ui.label(RichText::new(if twitch {
                                 "Paste your channel link once. Brick will find your future broadcasts automatically."
                             } else {
-                                "Start or schedule your stream in YouTube, choose Share, and paste that broadcast's video link here."
+                                "Share one specific broadcast. Saving a link replaces automatic channel sharing for this guild."
                             }).small().color(MUTED));
                             ui.add_space(8.0);
                             let hint = if twitch { "https://twitch.tv/yourchannel" } else { "https://youtube.com/live/your-video-id" };
-                            ui.add_enabled(self.work.is_none(), egui::TextEdit::singleline(&mut self.drafts[index]).hint_text(hint).desired_width(f32::INFINITY).char_limit(512));
+                            ui.add_enabled(self.work.is_none() && !self.youtube.busy(), egui::TextEdit::singleline(&mut self.drafts[index]).hint_text(hint).desired_width(f32::INFINITY).char_limit(512));
                             if self.notice_provider.as_ref() == Some(&provider) {
                                 if let Some(error) = &self.notice {
                                     ui.label(RichText::new(error).small().color(Color32::from_rgb(244, 144, 144)));
@@ -1218,7 +1239,7 @@ impl StreamsUi {
                             }
                             if !twitch {
                                 ui.collapsing("Where do I find the right link?", |ui| {
-                                    ui.label(RichText::new("1. Open the live or scheduled broadcast on YouTube.\n2. Choose Share, then Copy link.\n3. Paste it above. Use a new link for your next broadcast.").small().color(MUTED));
+                                    ui.label(RichText::new("1. Open the live or scheduled broadcast on YouTube.\n2. Choose Share, then Copy link.\n3. Paste it above. Connect your channel above for automatic discovery.").small().color(MUTED));
                                     ui.label(RichText::new("Use the video's link, rather than your YouTube channel page.").small().color(MUTED));
                                 });
                             }
@@ -1233,7 +1254,7 @@ impl StreamsUi {
                             ui.horizontal(|ui| {
                                 if own.is_some() {
                                     let confirming = self.confirm_remove.as_ref() == Some(&provider);
-                                    if ui.add_enabled(self.work.is_none(), action_button(if confirming { "Confirm removal" } else { "Remove" })).clicked() {
+                                    if ui.add_enabled(self.work.is_none() && !self.youtube.busy(), action_button(if confirming { "Confirm removal" } else { "Remove" })).clicked() {
                                         if confirming { action = Some(Action::Remove(provider.clone())); self.drafts[index].clear(); }
                                         else { self.confirm_remove = Some(provider.clone()); }
                                     }
@@ -1241,7 +1262,7 @@ impl StreamsUi {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     let label = if twitch { "Save channel" } else if ended { "Add next broadcast" } else if own.is_some() { "Replace broadcast" } else { "Add broadcast" };
                                     let changed = own.is_none_or(|stream| stream.url != self.drafts[index].trim());
-                                    if ui.add_enabled(self.work.is_none() && changed && !self.drafts[index].trim().is_empty(), action_button(label)).clicked() {
+                                    if ui.add_enabled(self.work.is_none() && !self.youtube.busy() && changed && !self.drafts[index].trim().is_empty(), action_button(label)).clicked() {
                                         action = Some(Action::Save(provider.clone(), self.drafts[index].trim().to_owned()));
                                     }
                                 });

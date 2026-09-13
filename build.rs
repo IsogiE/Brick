@@ -2,6 +2,7 @@ fn main() {
     for name in [
         "BRICK_ADDON_PUBLIC_KEY_B64",
         "BRICK_DISCORD_CLIENT_ID",
+        "BRICK_YOUTUBE_CLIENT_ID",
         "BRICK_DISCORD_GUILD_ID",
         "BRICK_DISCORD_ALLOWED_ROLE_IDS",
         "BRICK_DISCORD_GUILD_NAME",

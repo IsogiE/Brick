@@ -4,6 +4,31 @@ use std::{fs, io::Read, path::PathBuf};
 
 pub struct Store {
     path: PathBuf,
+    provider: Provider,
+}
+
+#[derive(Clone, Copy)]
+enum Provider {
+    WarcraftLogs,
+    Youtube,
+}
+
+impl Provider {
+    #[cfg(target_os = "linux")]
+    fn key(self) -> &'static str {
+        match self {
+            Self::WarcraftLogs => "warcraftlogs",
+            Self::Youtube => "youtube",
+        }
+    }
+    fn prefix(self, windows: bool) -> &'static [u8] {
+        match (self, windows) {
+            (Self::WarcraftLogs, false) => b"BRICK-WCL-KEYRING-v1\n",
+            (Self::WarcraftLogs, true) => b"BRICK-WCL-DPAPI-v1\n",
+            (Self::Youtube, false) => b"BRICK-YOUTUBE-KEYRING-v1\n",
+            (Self::Youtube, true) => b"BRICK-YOUTUBE-DPAPI-v1\n",
+        }
+    }
 }
 
 impl Store {
@@ -11,6 +36,15 @@ impl Store {
         let id = hex::encode(Sha256::digest(account.as_bytes()));
         Ok(Self {
             path: crate::addon::config_dir()?.join(format!("warcraftlogs-{id}.dat")),
+            provider: Provider::WarcraftLogs,
+        })
+    }
+
+    pub fn youtube(account: &str) -> Result<Self, String> {
+        let id = hex::encode(Sha256::digest(account.as_bytes()));
+        Ok(Self {
+            path: crate::addon::config_dir()?.join(format!("youtube-{id}.dat")),
+            provider: Provider::Youtube,
         })
     }
 
@@ -29,7 +63,7 @@ impl Store {
             return Err("Saved Warcraft Logs login is invalid.".into());
         }
         #[cfg(target_os = "linux")]
-        if bytes == b"BRICK-WCL-KEYRING-v1\n" {
+        if bytes == self.provider.prefix(false) {
             return self
                 .entry()?
                 .get_secret()
@@ -37,7 +71,7 @@ impl Store {
                 .map_err(|_| "Unlock your desktop keyring to use Warcraft Logs.".into());
         }
         #[cfg(target_os = "windows")]
-        if let Some(encrypted) = bytes.strip_prefix(b"BRICK-WCL-DPAPI-v1\n") {
+        if let Some(encrypted) = bytes.strip_prefix(self.provider.prefix(true)) {
             return crypt(encrypted, false).map(Some);
         }
         Err("Saved Warcraft Logs login is not protected. Please sign in again.".into())
@@ -52,11 +86,11 @@ impl Store {
             self.entry()?
                 .set_secret(bytes)
                 .map_err(|_| "Unlock your desktop keyring to save your Warcraft Logs login.")?;
-            b"BRICK-WCL-KEYRING-v1\n".to_vec()
+            self.provider.prefix(false).to_vec()
         };
         #[cfg(target_os = "windows")]
         let payload = {
-            let mut payload = b"BRICK-WCL-DPAPI-v1\n".to_vec();
+            let mut payload = self.provider.prefix(true).to_vec();
             payload.extend(crypt(bytes, true)?);
             payload
         };
@@ -89,7 +123,7 @@ impl Store {
     #[cfg(target_os = "linux")]
     fn entry(&self) -> Result<keyring::Entry, String> {
         let id = hex::encode(Sha256::digest(self.path.as_os_str().as_encoded_bytes()));
-        keyring::Entry::new("dev.isogi.brick.warcraftlogs", &id)
+        keyring::Entry::new(&format!("dev.isogi.brick.{}", self.provider.key()), &id)
             .map_err(|_| "Warcraft Logs credential storage is unavailable.".into())
     }
 }
@@ -156,6 +190,7 @@ mod tests {
     fn store() -> Store {
         Store {
             path: std::env::temp_dir().join(format!("brick-wcl-store-{}", uuid::Uuid::new_v4())),
+            provider: Provider::WarcraftLogs,
         }
     }
     #[test]
@@ -170,6 +205,18 @@ mod tests {
         fs::write(&store.path, vec![b'x'; 128 * 1024 + 1]).unwrap();
         assert!(store.load().is_err());
         fs::remove_file(store.path).unwrap();
+    }
+    #[test]
+    fn youtube_and_wcl_storage_identities_and_prefixes_are_distinct() {
+        let wcl = Store::new("fixture-account").unwrap();
+        let youtube = Store::youtube("fixture-account").unwrap();
+        let other = Store::youtube("other-fixture-account").unwrap();
+        assert_ne!(wcl.path, youtube.path);
+        assert_ne!(youtube.path, other.path);
+        assert_eq!(wcl.provider.prefix(false), b"BRICK-WCL-KEYRING-v1\n");
+        assert_eq!(wcl.provider.prefix(true), b"BRICK-WCL-DPAPI-v1\n");
+        assert_ne!(wcl.provider.prefix(false), youtube.provider.prefix(false));
+        assert_ne!(wcl.provider.prefix(true), youtube.provider.prefix(true));
     }
     #[cfg(target_os = "windows")]
     #[test]
