@@ -184,6 +184,7 @@ pub struct ProfileUi {
     role: Option<RaidRole>,
     pending: Option<mpsc::Receiver<Completed>>,
     pending_role: Option<(String, Option<RaidRole>)>,
+    saving: bool,
     queued_roles: VecDeque<(String, Option<RaidRole>)>,
     completed_role: Option<(String, Option<RaidRole>)>,
     last_fetch: Option<Instant>,
@@ -212,6 +213,7 @@ impl ProfileUi {
             match rx.try_recv() {
                 Ok(completed) => {
                     self.pending = None;
+                    self.saving = false;
                     let role_only = self.pending_role.take().is_some();
                     match completed.result {
                         Ok(profile) => {
@@ -237,6 +239,7 @@ impl ProfileUi {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending = None;
+                    self.saving = false;
                     self.pending_role = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -273,7 +276,20 @@ impl ProfileUi {
 
     pub fn draw(&mut self, ui: &mut egui::Ui, discord_name: &str) {
         ui.label(egui::RichText::new("Your profile").strong());
-        let enabled = self.value.as_ref().is_some_and(|value| value.available) && !self.busy();
+        let Some(value) = self.value.as_ref() else {
+            ui.label(egui::RichText::new("Loading your profile…").small().weak());
+            return;
+        };
+        if !value.available {
+            ui.label(
+                egui::RichText::new("Profile settings aren't available yet.")
+                    .small()
+                    .weak(),
+            );
+            return;
+        }
+        // A background read must not disable a confirmed profile or interrupt a draft.
+        let enabled = !self.saving;
         let mut save = false;
         ui.add_enabled_ui(enabled, |ui| {
             // Size the row before placing labels and icons, so later padded
@@ -294,11 +310,14 @@ impl ProfileUi {
                 role_icon(ui, self.role);
                 role_picker(ui, "own-raid-role", &mut self.role);
                 save |= ui
-                    .add_enabled(self.dirty(), egui::Button::new("Save profile"))
+                    .add_enabled(
+                        self.dirty() && !self.busy(),
+                        egui::Button::new("Save profile"),
+                    )
                     .clicked();
             });
         });
-        if enabled && self.dirty() && save {
+        if enabled && !self.busy() && self.dirty() && save {
             self.start(ui.ctx(), Operation::Save(self.name.clone(), self.role));
         }
         ui.label(egui::RichText::new("Leave the name empty to use your Discord name.").small());
@@ -340,6 +359,7 @@ impl ProfileUi {
         let ctx = ctx.clone();
         let own_id = self.user_id.clone();
         self.last_fetch = Some(Instant::now());
+        self.saving = !matches!(operation, Operation::Load);
         self.pending_role = match &operation {
             Operation::Role(id, role) => Some((id.clone(), *role)),
             _ => None,
