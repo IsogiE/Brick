@@ -12,7 +12,8 @@ jobs:
   dependencies:
     name: Dependency review
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.BRICK_LINUX_RUNNER || '"ubuntu-latest"') }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -23,7 +24,8 @@ jobs:
           comment-summary-in-pr: never
   rust-advisories:
     name: Rust security advisories
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.BRICK_LINUX_RUNNER || '"ubuntu-latest"') }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -37,7 +39,8 @@ jobs:
   runtime-versions:
     name: Runtime update monitoring
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.BRICK_LINUX_RUNNER || '"ubuntu-latest"') }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
