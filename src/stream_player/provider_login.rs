@@ -19,6 +19,7 @@ mod platform;
 #[derive(Default)]
 pub struct ProviderSessions {
     contexts: RefCell<[Option<Rc<Context>>; 2]>,
+    closed: Cell<bool>,
 }
 
 impl ProviderSessions {
@@ -59,6 +60,7 @@ impl ProviderSessions {
     }
 
     pub fn close(&self) {
+        self.closed.set(true);
         let contexts = std::mem::take(&mut *self.contexts.borrow_mut());
         for context in contexts.into_iter().flatten() {
             context.retire();
@@ -66,6 +68,9 @@ impl ProviderSessions {
     }
 
     pub(super) fn context(&self, provider: Provider) -> Result<Rc<Context>, String> {
+        if self.closed.get() {
+            return Err("This provider session has ended.".into());
+        }
         let mut contexts = self.contexts.borrow_mut();
         let slot = &mut contexts[index(&provider)];
         if slot.is_none() {
@@ -222,6 +227,20 @@ fn title(provider: &Provider, destination: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closed_account_holder_cannot_create_new_provider_contexts() {
+        // This must fail before any native browser/GTK initialization. An Rc
+        // held by an old account operation cannot resurrect its viewer login.
+        let sessions = Rc::new(ProviderSessions::default());
+        let stale = Rc::clone(&sessions);
+        sessions.close();
+        stale.disconnect(&Provider::Youtube);
+        for provider in [Provider::Youtube, Provider::Twitch] {
+            assert!(stale.context(provider).is_err());
+        }
+        assert!(!stale.login_open());
+    }
 
     #[test]
     fn login_documents_are_exact_provider_https_origins() {
