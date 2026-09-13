@@ -1,6 +1,8 @@
 use std::{
     fs::{self, File, OpenOptions},
     io,
+    path::Path,
+    time::{Duration, Instant},
 };
 
 use fs2::FileExt;
@@ -13,6 +15,7 @@ const SHOW_REQUEST_FILE: &str = "show-request";
 #[cfg(target_os = "windows")]
 const WINDOW_HANDLE_FILE: &str = "main-window";
 
+#[derive(Debug)]
 pub enum InstanceLockError {
     AlreadyRunning,
     Other(String),
@@ -28,6 +31,34 @@ impl Drop for InstanceGuard {
     fn drop(&mut self) {
         if let Some(file) = &self.file {
             let _ = file.unlock();
+        }
+    }
+}
+
+/// A replacement starts before the old window finishes shutting down. Wait for
+/// its real lock release, without delaying ordinary launches or waiting forever.
+pub fn acquire_for_start(update_restart: bool) -> Result<InstanceGuard, InstanceLockError> {
+    if update_restart {
+        acquire_until_released(acquire, Duration::from_secs(30))
+    } else {
+        acquire()
+    }
+}
+
+fn acquire_until_released<T>(
+    mut acquire: impl FnMut() -> Result<T, InstanceLockError>,
+    timeout: Duration,
+) -> Result<T, InstanceLockError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match acquire() {
+            Err(InstanceLockError::AlreadyRunning) if Instant::now() < deadline => {
+                std::thread::sleep(
+                    Duration::from_millis(100)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            result => return result,
         }
     }
 }
@@ -75,7 +106,11 @@ pub fn acquire() -> Result<InstanceGuard, InstanceLockError> {
 
 fn acquire_file_lock() -> Result<File, InstanceLockError> {
     let dir = addon::config_dir().map_err(InstanceLockError::Other)?;
-    fs::create_dir_all(&dir).map_err(|error| {
+    acquire_file_lock_in(&dir)
+}
+
+fn acquire_file_lock_in(dir: &Path) -> Result<File, InstanceLockError> {
+    fs::create_dir_all(dir).map_err(|error| {
         InstanceLockError::Other(format!("Failed to create {}: {error}", dir.display()))
     })?;
 
@@ -237,5 +272,76 @@ mod tests {
         };
 
         assert!(matches!(acquire(), Err(InstanceLockError::AlreadyRunning)));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod restart_tests {
+    use super::*;
+
+    struct Directory(std::path::PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("brick-restart-lock-{}", Uuid::new_v4())))
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn replacement_waits_for_a_real_lock_after_the_old_800ms_window() {
+        let directory = Directory::new();
+        let old = acquire_file_lock_in(&directory.0).unwrap();
+        assert!(matches!(
+            acquire_file_lock_in(&directory.0),
+            Err(InstanceLockError::AlreadyRunning)
+        ));
+        let started = Instant::now();
+        let close = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1_200));
+            drop(old);
+        });
+        let new = acquire_until_released(
+            || acquire_file_lock_in(&directory.0),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        close.join().unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(1_200));
+        assert!(matches!(
+            acquire_file_lock_in(&directory.0),
+            Err(InstanceLockError::AlreadyRunning)
+        ));
+        drop(new);
+        assert!(acquire_file_lock_in(&directory.0).is_ok());
+    }
+
+    #[test]
+    fn a_stuck_instance_has_a_bounded_wait_and_other_errors_return_immediately() {
+        let directory = Directory::new();
+        let _old = acquire_file_lock_in(&directory.0).unwrap();
+        let started = Instant::now();
+        assert!(matches!(
+            acquire_until_released(
+                || acquire_file_lock_in(&directory.0),
+                Duration::from_millis(150)
+            ),
+            Err(InstanceLockError::AlreadyRunning)
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let mut attempts = 0;
+        let result = acquire_until_released::<()>(
+            || {
+                attempts += 1;
+                Err(InstanceLockError::Other("permission denied".into()))
+            },
+            Duration::from_secs(30),
+        );
+        assert!(matches!(result, Err(InstanceLockError::Other(_))));
+        assert_eq!(attempts, 1);
     }
 }

@@ -5,6 +5,8 @@
 
 mod addon;
 mod app_update;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod appimage_environment;
 mod atomic_file;
 mod autostart;
 mod browser;
@@ -45,12 +47,9 @@ use std::{
 use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
-    if env::args().any(|arg| arg == "--update-restart") {
-        // Give the replaced instance time to release its instance lock.
-        std::thread::sleep(std::time::Duration::from_millis(800));
-    }
+    let update_restart = env::args().any(|arg| arg == "--update-restart");
     let startup_mode = env::args().any(|arg| arg == "--startup");
-    let _instance_guard = match single_instance::acquire() {
+    let _instance_guard = match single_instance::acquire_for_start(update_restart) {
         Ok(guard) => Some(guard),
         Err(single_instance::InstanceLockError::AlreadyRunning) => {
             if !startup_mode {
