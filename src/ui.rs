@@ -481,6 +481,15 @@ impl BrickApp {
         crate::guild::activate(&next.guild_id, &next.user_id);
     }
 
+    fn handle_guild_access_loss(&mut self) {
+        // A denied player or panel request removes this workspace while the
+        // account's other memberships are checked through the same discovery.
+        crate::guild::invalidate();
+        self.reset_guild_panel();
+        self.guild_access_lost = true;
+        self.start_guild_lookup(None);
+    }
+
     fn start_guild_lookup(&mut self, selected: Option<String>) {
         if self.guild_rx.is_some() || self.auth_rx.is_some() || !self.auth_state.is_authorized() {
             return;
@@ -1794,12 +1803,7 @@ impl eframe::App for BrickApp {
             self.auth_state.is_authorized() && !self.guild_switching && !self.guild_access_lost,
             self.window_visible && self.active_tab == MainTab::Streams,
         ) {
-            // A revoked guild membership does not revoke the person's other
-            // guilds. Discard this panel and rediscover before showing any data.
-            crate::guild::invalidate();
-            self.reset_guild_panel();
-            self.guild_access_lost = true;
-            self.start_guild_lookup(None);
+            self.handle_guild_access_loss();
         }
         if self.auth_state.is_authorized() && !self.guild_switching && !self.guild_access_lost {
             let user = match &self.auth_state {
@@ -1868,11 +1872,12 @@ impl eframe::App for BrickApp {
             &ctx,
             self.auth_state.is_authorized()
                 && !self.guild_switching
+                && !self.guild_access_lost
                 && self.window_visible
                 && self.active_tab == MainTab::Streams
                 && !self.confirm_logout,
         ) {
-            self.auth_state = AuthUiState::Denied("Sign in again to access guild streams.".into());
+            self.handle_guild_access_loss();
         }
 
         if let Err(error) = crate::browser::open_pending_urls(&ctx) {
@@ -2735,6 +2740,54 @@ pub(crate) mod tests {
             last_roster_refresh: now,
             roster_notice: None,
         }
+    }
+
+    #[test]
+    fn guild_access_loss_pauses_the_panel_and_recovers_another_membership() {
+        let mut app = app();
+        let AuthUiState::Authorized(user) = &app.auth_state else {
+            unreachable!();
+        };
+        let mut next = user.clone();
+        next.guild_id = crate::guild::ASCENDANCE.into();
+        next.guild_name = "Ascendance".into();
+        let old_access = crate::guild::Access::new(
+            "fixture-token".into(),
+            user.guild_id.clone(),
+            user.user_id.clone(),
+            crate::guild::generation(),
+        );
+        let (guild_tx, guild_rx) = mpsc::channel();
+        app.guild_rx = Some(guild_rx); // Already pending: no network or credential access.
+        let (_roster_tx, roster_rx) = mpsc::channel();
+        app.roster_rx = Some(roster_rx);
+        app.roster_notice = Some("Previous guild data".into());
+
+        app.handle_guild_access_loss();
+        assert!(app.auth_state.is_authorized());
+        assert!(app.guild_access_lost);
+        assert!(app.roster_rx.is_none());
+        assert!(app.roster_notice.is_none());
+        assert!(old_access.check().is_err());
+
+        guild_tx
+            .send(Err("Temporary service failure".to_string().into()))
+            .unwrap();
+        app.poll_guilds();
+        assert!(app.auth_state.is_authorized());
+        assert!(app.guild_access_lost);
+
+        let (guild_tx, guild_rx) = mpsc::channel();
+        app.guild_rx = Some(guild_rx);
+        guild_tx.send(Ok(next.clone())).unwrap();
+        app.poll_guilds();
+        let AuthUiState::Authorized(current) = &app.auth_state else {
+            panic!("The other eligible guild must remain available without login");
+        };
+        assert_eq!(current.guild_id, crate::guild::ASCENDANCE);
+        assert_eq!(current.user_id, next.user_id);
+        assert_eq!(current.created_at_unix, next.created_at_unix);
+        assert!(!app.guild_access_lost);
     }
 
     // Inspect both allocated rows and painted frames/text after the previous-frame
