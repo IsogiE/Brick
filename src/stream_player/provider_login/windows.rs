@@ -262,6 +262,24 @@ impl Window {
         player: &WebView,
         ctx: &egui::Context,
     ) -> Result<Self, String> {
+        Self::new_at(
+            context,
+            provider,
+            player,
+            ctx,
+            start_url(provider),
+            allowed_document,
+        )
+    }
+
+    fn new_at(
+        context: &Context,
+        provider: &Provider,
+        player: &WebView,
+        ctx: &egui::Context,
+        start: &str,
+        permits: fn(&Provider, &str) -> bool,
+    ) -> Result<Self, String> {
         let mut owner = windows::Win32::Foundation::HWND::default();
         unsafe { player.controller().ParentWindow(&mut owner) }
             .map_err(|_| "The provider sign-in window could not find Brick.")?;
@@ -320,7 +338,7 @@ impl Window {
                 )
                 .into(),
             })
-            .with_navigation_handler(move |url| allowed_document(&nav_provider, &url))
+            .with_navigation_handler(move |url| permits(&nav_provider, &url))
             .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
             .with_download_started_handler(|_, _| false)
             .with_on_page_load_handler(move |_, url| {
@@ -348,7 +366,7 @@ impl Window {
                     let mut uri = PWSTR::null();
                     args.Uri(&mut uri)?;
                     let uri = webview2_com::take_pwstr(uri);
-                    if allowed_document(&frame_provider, &uri) {
+                    if permits(&frame_provider, &uri) {
                         args.SetCancel(false)?;
                     }
                 }
@@ -363,7 +381,7 @@ impl Window {
         .map_err(|_| "The provider sign-in browser could not protect navigation.")?;
         context.register(&view)?;
         *native.0.controller.borrow_mut() = Some(view.controller());
-        view.load_url(start_url(provider))
+        view.load_url(start)
             .map_err(|_| "The provider sign-in page could not open.")?;
         unsafe {
             ShowWindow(handle, SW_SHOW);
@@ -403,5 +421,267 @@ impl Drop for Window {
     fn drop(&mut self) {
         let _ = self.view.set_visible(false);
         let _ = unsafe { self.view.webview().Stop() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::ProviderSessions;
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, IsWindow, PeekMessageW, SendMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+
+    fn pump() {
+        let mut message = MSG::default();
+        unsafe {
+            while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+
+    fn wait_for(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "Native provider fixture timed out"
+            );
+            pump();
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn fixture_origin(_: &Provider, value: &str) -> bool {
+        url::Url::parse(value).is_ok_and(|url| {
+            url.scheme() == "http"
+                && url.host_str() == Some("127.0.0.1")
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
+    }
+
+    fn parent_window() -> NativeWindow {
+        let class = wide("STATIC");
+        let caption = wide("Brick synthetic provider fixture");
+        let handle = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                caption.as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                640,
+                480,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!handle.is_null());
+        NativeWindow::new(handle, None).unwrap()
+    }
+
+    fn media_view(context: &Context, parent: &NativeWindow, root: &std::path::Path) -> WebView {
+        let path = root.join("WebView2");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut storage = wry::WebContext::new(Some(path));
+        let builder = WebViewBuilder::new_with_web_context(&mut storage)
+            .with_profile_name(&context.profile_name)
+            .with_incognito(true);
+        let builder = match context.environment.borrow().as_ref() {
+            Some(environment) => builder.with_environment(environment.clone()),
+            None => builder,
+        };
+        let view = builder.build_as_child(parent).unwrap();
+        context.register(&view).unwrap();
+        view
+    }
+
+    fn page_title(view: &WebView) -> Option<String> {
+        let mut title = PWSTR::null();
+        unsafe { view.webview().DocumentTitle(&mut title) }.ok()?;
+        Some(webview2_com::take_pwstr(title))
+    }
+
+    fn state(view: &WebView) -> serde_json::Value {
+        wait_for(|| page_title(view).is_some_and(|value| value.starts_with('{')));
+        serde_json::from_str(&page_title(view).unwrap()).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires an isolated Windows desktop, disposable LOCALAPPDATA and loopback-only network"]
+    fn native_windows_provider_session_lifecycle() {
+        assert_eq!(std::env::var("BRICK_PROVIDER_FIXTURE").as_deref(), Ok("1"));
+        let root = PathBuf::from(std::env::var_os("BRICK_PROVIDER_FIXTURE_DIR").unwrap());
+        assert!(root.is_absolute());
+        assert!(root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("brick-provider-fixture-"));
+        let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+        assert!(local.starts_with(&root));
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop_server = Arc::clone(&stopped);
+        let worker = thread::spawn(move || {
+            while !stop_server.load(Ordering::Relaxed) {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0; 8192];
+                let count = socket.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..count]);
+                let login = request.starts_with("GET /login ");
+                let cookie = request.lines().any(|line| {
+                    line.to_ascii_lowercase().starts_with("cookie:")
+                        && line.contains("brick_fixture_session=fixture-only")
+                });
+                let auth = request
+                    .lines()
+                    .any(|line| line.to_ascii_lowercase().starts_with("authorization:"));
+                let set = if login {
+                    "Set-Cookie: brick_fixture_session=fixture-only; HttpOnly; SameSite=Strict; Path=/\r\n"
+                } else {
+                    ""
+                };
+                let script = if login {
+                    "localStorage.setItem('fixture-login','fixture-only');"
+                } else {
+                    ""
+                };
+                let body = format!("<!doctype html><script>{script}document.title=JSON.stringify({{cookie:{cookie},auth:{auth},storage:localStorage.getItem('fixture-login')==='fixture-only',ipc:typeof window.ipc!=='undefined',bridge:typeof window.brickMedia!=='undefined',opener:window.opener!==null}});</script>");
+                let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\n{set}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _stop = Stop(Arc::clone(&stopped));
+        let parent = parent_window();
+        let sessions = ProviderSessions::default();
+        let youtube = sessions.context(Provider::Youtube).unwrap();
+        let first_pov = media_view(&youtube.platform, &parent, &root);
+        let login = Window::new_at(
+            &youtube.platform,
+            &Provider::Youtube,
+            &first_pov,
+            &egui::Context::default(),
+            &format!("{origin}/login"),
+            fixture_origin,
+        )
+        .unwrap();
+        let initial = state(&login.view);
+        for key in ["auth", "ipc", "bridge", "opener"] {
+            assert_eq!(initial[key], false, "{key}");
+        }
+        let login_handle = login.native.handle();
+        let login_lifetime = Rc::downgrade(&login.native.0);
+        let old_login = login.view.webview();
+        *youtube.window.borrow_mut() = Some(login);
+        youtube.attempted.set(true);
+        assert!(sessions.login_open());
+        unsafe { SendMessageW(login_handle, WM_CLOSE, 0, 0) };
+        // The controller closes immediately; the still-owned hidden HWND is
+        // destroyed by the next UI inspection, never through a stale handle.
+        assert_ne!(unsafe { IsWindow(login_handle) }, 0);
+        let mut closed_title = PWSTR::null();
+        assert!(unsafe { old_login.DocumentTitle(&mut closed_title) }.is_err());
+        assert!(!sessions.login_open());
+        assert!(login_lifetime.upgrade().is_none());
+        drop(first_pov);
+        pump();
+        {
+            let keeper = youtube.platform.keeper.borrow();
+            let mut source = PWSTR::null();
+            unsafe { keeper.as_ref().unwrap()._view.webview().Source(&mut source) }.unwrap();
+            assert!(matches!(
+                webview2_com::take_pwstr(source).as_str(),
+                "" | "about:blank"
+            ));
+        }
+        let snapshot = |context: &super::super::Context| {
+            let view = media_view(&context.platform, &parent, &root);
+            view.load_url(&format!("{origin}/state")).unwrap();
+            let result = state(&view);
+            drop(view);
+            pump();
+            result
+        };
+        // No visible login or POV remains; only the empty keeper carries state.
+        assert_eq!(snapshot(&youtube)["cookie"], true);
+        assert_eq!(snapshot(&youtube)["storage"], true);
+        let twitch = sessions.context(Provider::Twitch).unwrap();
+        assert_ne!(youtube.platform.profile_name, twitch.platform.profile_name);
+        assert_eq!(snapshot(&twitch)["cookie"], false);
+        let other_account = ProviderSessions::default();
+        let other_youtube = other_account.context(Provider::Youtube).unwrap();
+        assert_eq!(snapshot(&other_youtube)["cookie"], false);
+        let active_pov = media_view(&youtube.platform, &parent, &root);
+        let reopened = Window::new_at(
+            &youtube.platform,
+            &Provider::Youtube,
+            &active_pov,
+            &egui::Context::default(),
+            &format!("{origin}/state"),
+            fixture_origin,
+        )
+        .unwrap();
+        assert_eq!(state(&reopened.view)["cookie"], true);
+        *youtube.window.borrow_mut() = Some(reopened);
+        sessions.disconnect(&Provider::Youtube);
+        assert!(!youtube.active());
+        assert!(!sessions.login_open());
+        assert!(youtube.platform.keeper.borrow().is_none());
+        let mut source = PWSTR::null();
+        assert!(unsafe { active_pov.webview().Source(&mut source) }.is_err());
+        assert!(twitch.active());
+        assert_eq!(snapshot(&twitch)["cookie"], false);
+        let replacement = sessions.context(Provider::Youtube).unwrap();
+        assert_ne!(
+            replacement.platform.profile_name,
+            youtube.platform.profile_name
+        );
+        assert_eq!(snapshot(&replacement)["cookie"], false);
+        assert_eq!(snapshot(&replacement)["storage"], false);
+        sessions.close();
+        other_account.close();
+        assert!(sessions.context(Provider::Youtube).is_err());
+        // An OS-owned destruction invalidates the Rust HWND guard as well.
+        let destroyed = parent_window();
+        unsafe { DestroyWindow(destroyed.handle()) };
+        assert!(destroyed.handle().is_null());
+        let unrelated = parent_window();
+        drop(destroyed);
+        assert_ne!(unsafe { IsWindow(unrelated.handle()) }, 0);
+        stopped.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        eprintln!("Native Windows provider sessions: private profile identity; no login auth/IPC/scripts/opener; WM_CLOSE controller teardown; empty keeper across last POV close; provider/account isolation; disconnect/profile retirement; stale HWND ownership passed");
     }
 }
