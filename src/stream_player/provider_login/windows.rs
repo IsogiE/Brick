@@ -270,7 +270,7 @@ unsafe extern "system" fn window_lifetime(
         state.handle.set(std::ptr::null_mut());
         state.closed.set(true);
         unsafe {
-            RemoveWindowSubclass(hwnd, Some(window_lifetime), id);
+            let _ = RemoveWindowSubclass(hwnd, Some(window_lifetime), id);
             drop(Rc::from_raw(data as *const WindowState));
         }
     }
@@ -721,8 +721,17 @@ mod tests {
         assert!(!youtube.active());
         assert!(!sessions.login_open());
         assert!(youtube.platform.keeper.borrow().is_none());
-        let mut source = PWSTR::null();
-        assert!(unsafe { active_pov.webview().Source(&mut source) }.is_err());
+        // Profile deletion closes its views through WebView2's Deleted event.
+        // Pump that bounded asynchronous teardown before checking retirement.
+        wait_for(|| {
+            let mut source = PWSTR::null();
+            if unsafe { active_pov.webview().Source(&mut source) }.is_err() {
+                true
+            } else {
+                let _ = webview2_com::take_pwstr(source);
+                false
+            }
+        });
         assert!(twitch.active());
         assert_eq!(snapshot(&twitch)["cookie"], false);
         let replacement = sessions.context(Provider::Youtube).unwrap();
