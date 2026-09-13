@@ -4,7 +4,6 @@ use std::{
     env, fs,
     io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::LazyLock,
     time::Duration,
 };
@@ -293,15 +292,32 @@ fn launch_linux_appimage(update: &PreparedAppUpdate) -> Result<(), String> {
         )
     })?;
 
-    Command::new(replacement_path)
-        .arg("--update-restart")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+    #[cfg(target_os = "linux")]
+    linux_restart_command(replacement_path, env::vars_os().collect())
         .spawn()
         .map_err(|error| format!("Failed to restart Brick: {error}"))?;
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_restart_command(
+    replacement_path: &Path,
+    environment: crate::appimage_environment::Environment,
+) -> std::process::Command {
+    use std::process::{Command, Stdio};
+
+    let mut command = Command::new(replacement_path);
+    command
+        .arg("--update-restart")
+        .env_clear()
+        .envs(crate::appimage_environment::host_environment(environment))
+        // The old bundle can also be the working directory; it will unmount.
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
 }
 
 fn target_update_kind() -> Option<UpdateKind> {
@@ -821,6 +837,72 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_replacement_launches_without_the_old_mount_and_preserves_the_desktop_session() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+
+        let root = TestDirectory::new();
+        let image = root.0.join("Brick replacement $(false).AppImage");
+        // A local executable fixture checks the environment seen after exec;
+        // its path and restart argument must never pass through a shell command.
+        fs::write(
+            &image,
+            r#"#!/bin/sh
+set -eu
+test "$#" = 1 && test "$1" = --update-restart
+test "${APPDIR-unset}" = unset
+test "${APPIMAGE-unset}" = unset
+test "${ARGV0-unset}" = unset
+test "$PATH" = /custom/bin:/usr/bin
+test "$LD_LIBRARY_PATH" = /host/lib
+test "${GIO_EXTRA_MODULES-unset}" = unset
+test "${GSETTINGS_SCHEMA_DIR-unset}" = unset
+test "$DISPLAY" = :99
+test "$DBUS_SESSION_BUS_ADDRESS" = unix:path=/session/bus
+test "$XDG_CONFIG_HOME" = /profile/config
+test "$XDG_RUNTIME_DIR" = /session/runtime
+test "$HOME" = /profile
+test "$PWD" = /
+printf 'restarted'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&image, fs::Permissions::from_mode(0o700)).unwrap();
+        let environment = [
+            ("APPDIR", "/old/mount"),
+            ("APPIMAGE", "/apps/Brick.AppImage"),
+            ("ARGV0", "/apps/Brick.AppImage"),
+            ("PATH", "/old/mount/usr/bin:/custom/bin:/usr/bin"),
+            ("LD_LIBRARY_PATH", "/old/mount/usr/lib:/host/lib"),
+            ("GIO_EXTRA_MODULES", "/old/mount/usr/lib/gio/modules"),
+            (
+                "GSETTINGS_SCHEMA_DIR",
+                "/old/mount/usr/share/glib-2.0/schemas",
+            ),
+            ("DISPLAY", ":99"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/session/bus"),
+            ("XDG_CONFIG_HOME", "/profile/config"),
+            ("XDG_RUNTIME_DIR", "/session/runtime"),
+            ("HOME", "/profile"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+        let output = super::linux_restart_command(&image, environment)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"restarted");
     }
 
     #[test]

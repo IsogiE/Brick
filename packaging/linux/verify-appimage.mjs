@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, readdir, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -16,12 +16,17 @@ try {
   execFileSync(artifact, ['--appimage-extract'], { cwd: temporary, stdio: 'ignore', timeout: 120_000 });
   const appdir = path.join(temporary, 'squashfs-root');
   assert((await stat(path.join(appdir, 'usr/bin/bwrap'))).isFile(), 'Missing sandbox relocation wrapper');
+  const bootstrap = await readFile(path.join(appdir, 'usr/lib/brick/apprun'));
+  assert(bootstrap.subarray(0, 4).equals(Buffer.from([127, 69, 76, 70])), 'Missing native AppRun bootstrap');
+  assert((await readFile(path.join(appdir, 'AppRun'))).equals(bootstrap), 'AppRun finalization was not applied');
+  assert((await readFile(path.join(appdir, 'AppRun.launcher'))).subarray(0, 2).toString() === '#!', 'Missing generated AppRun launcher');
+
   const files = await readdir(path.join(appdir, 'usr/lib'), { recursive: true });
   for (const library of ['libwebkit2gtk-4.1.so', 'libjavascriptcoregtk-4.1.so', 'libsoup-3.0.so', 'libgtk-3.so', 'libgstreamer-1.0.so']) {
     assert(files.some((file) => path.basename(file).startsWith(library)), `Missing bundled ${library}`);
   }
   const required = [
-    'usr/bin/brick', 'usr/bin/bwrap', 'usr/bin/brick-bwrap', 'usr/bin/xdg-dbus-proxy',
+    'AppRun', 'usr/bin/brick', 'usr/bin/bwrap', 'usr/bin/brick-bwrap', 'usr/bin/xdg-dbus-proxy',
     'usr/lib/libxkbcommon.so.0', 'usr/lib/libxkbcommon-x11.so.0', 'usr/lib/libxcb-xkb.so.1',
     'usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner',
     ...['coreelements', 'playback', 'soup', 'isomp4', 'hls', 'libav', 'audioconvert'].map((name) => `usr/lib/gstreamer-1.0/libgst${name}.so`),

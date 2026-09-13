@@ -414,6 +414,8 @@ pub struct Client {
     config_stamp: Option<ConfigStamp>,
     masters: MasterCache,
     session: Option<Session>,
+    recording_auth_epoch: u64,
+    recording_match_complete: bool,
     cooldowns: Option<defensives::Preferences>,
     cooldown_catalog: defensives::CatalogCache,
     http: HttpClient,
@@ -465,6 +467,8 @@ impl Client {
             config_stamp: None,
             masters: HashMap::new(),
             session: None,
+            recording_auth_epoch: 0,
+            recording_match_complete: false,
             cooldowns: None,
             cooldown_catalog: Default::default(),
             http,
@@ -510,7 +514,7 @@ impl Client {
         })?
         .map_err(|e| {
             if e.access_denied {
-                self.session = None;
+                self.set_session(None);
                 self.reports.clear();
                 self.events.clear();
                 self.masters.clear();
@@ -541,7 +545,7 @@ impl Client {
         }
         if self.config.as_ref() != Some(&config) || !restore {
             self.cooldowns = None;
-            self.session = None;
+            self.set_session(None);
             self.reports.clear();
             self.events.clear();
             self.masters.clear();
@@ -559,7 +563,7 @@ impl Client {
                     && credential(&session.access_token)
                     && session.refresh_token.as_ref().is_none_or(|t| credential(t))
                 {
-                    self.session = Some(session);
+                    self.set_session(Some(session));
                 }
             }
             // A locked keyring must remain retryable after it is unlocked.
@@ -573,6 +577,18 @@ impl Client {
         Ok(())
     }
 
+    fn set_session(&mut self, session: Option<Session>) {
+        if self.session.is_some() || session.is_some() {
+            self.recording_auth_epoch = self.recording_auth_epoch.wrapping_add(1);
+        }
+        self.recording_match_complete = false;
+        self.session = session;
+    }
+
+    pub(crate) fn recording_match_status(&self) -> (u64, bool) {
+        (self.recording_auth_epoch, self.recording_match_complete)
+    }
+
     pub fn connected(&self) -> bool {
         self.session.is_some()
     }
@@ -580,7 +596,7 @@ impl Client {
     pub fn disconnect(&mut self, discord_token: &crate::guild::Access) -> Result<(), String> {
         self.configure(discord_token, false)?;
         store(self.config.as_ref().unwrap())?.remove()?;
-        self.session = None;
+        self.set_session(None);
         self.reports.clear();
         self.events.clear();
         self.masters.clear();
@@ -702,7 +718,7 @@ impl Client {
         store(config)?.save(
             &serde_json::to_vec(&session).map_err(|_| "Couldn't save Warcraft Logs sign-in.")?,
         )?;
-        self.session = Some(session);
+        self.set_session(Some(session));
         Ok(())
     }
 
@@ -714,7 +730,7 @@ impl Client {
             .ok_or("Connect Warcraft Logs to see this raid's pulls.")?;
         if session.expires_at <= now_secs() {
             let Some(refresh) = session.refresh_token.clone() else {
-                self.session = None;
+                self.set_session(None);
                 self.reports.clear();
                 self.events.clear();
                 self.masters.clear();
@@ -731,7 +747,7 @@ impl Client {
                 Ok(token) => token,
                 Err(error) => {
                     if error != CANCELLED {
-                        self.session = None;
+                        self.set_session(None);
                         self.reports.clear();
                         self.events.clear();
                         self.masters.clear();
@@ -792,7 +808,7 @@ impl Client {
             return Err("Warcraft Logs is busy. Brick will retry shortly.".into());
         }
         if status == 401 || status == 403 {
-            self.session = None;
+            self.set_session(None);
             self.reports.clear();
             self.events.clear();
             self.masters.clear();
@@ -836,8 +852,27 @@ impl Client {
         discord_token: &crate::guild::Access,
         stream: &Stream,
     ) -> Result<Review, String> {
+        self.load_review(discord_token, stream, true)
+    }
+
+    pub(crate) fn match_recording(
+        &mut self,
+        discord_token: &crate::guild::Access,
+        stream: &Stream,
+    ) -> Result<Review, String> {
+        self.load_review(discord_token, stream, false)
+    }
+
+    fn load_review(
+        &mut self,
+        discord_token: &crate::guild::Access,
+        stream: &Stream,
+        playback: bool,
+    ) -> Result<Review, String> {
         self.configure(discord_token, true)?;
-        self.load_cooldown_preferences(discord_token)?;
+        if playback {
+            self.load_cooldown_preferences(discord_token)?;
+        }
         self.access_token()?;
         let path = streams::review_path(stream).map_err(|error| error.message)?;
         let bytes = while_current(&self.cancel, || {
@@ -856,9 +891,11 @@ impl Client {
             return Err("The replay does not match this stream.".into());
         }
         let mut review = self.review_replay(replay)?;
-        while_current(&self.cancel, || {
-            crate::replay_library::lookup(discord_token, &mut review)
-        })?;
+        if playback {
+            while_current(&self.cancel, || {
+                crate::replay_library::lookup(discord_token, &mut review)
+            })?;
+        }
         Ok(review)
     }
 
@@ -1078,6 +1115,7 @@ impl Client {
     }
 
     fn review_replay(&mut self, replay: Replay) -> Result<Review, String> {
+        self.recording_match_complete = false;
         check_cancelled(&self.cancel)?;
         let start = replay.start_ms()?;
         if replay.available_seconds == 0 || replay.available_seconds > 7 * 86400 {
@@ -1122,6 +1160,20 @@ impl Client {
                 reports,
             });
         }
+        // The existing matcher tolerates unavailable or malformed individual
+        // reports for playback. They cannot establish a completed no-match.
+        let mut complete = self
+            .directory
+            .as_ref()
+            .unwrap()
+            .reports
+            .iter()
+            .all(|report| {
+                report["code"].as_str().is_some_and(report_code)
+                    && number_ms(&report["startTime"])
+                        .zip(number_ms(&report["endTime"]))
+                        .is_some_and(|(start, end)| start > 0 && end >= start)
+            });
         let reports: Vec<_> = self
             .directory
             .as_ref()
@@ -1156,13 +1208,16 @@ impl Client {
                 let data = self.query("query($code:String!){reportData{report(code:$code){code startTime endTime fights{ id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime }}}}", json!({"code":code}))?;
                 let report = data["reportData"]["report"].clone();
                 if report.is_null() {
+                    complete = false;
                     continue;
                 }
                 check_cancelled(&self.cancel)?;
                 self.reports
                     .insert(code.to_owned(), (Instant::now(), report));
             }
-            pulls.extend(map_pulls(&self.reports[code].1, &replay)?);
+            let report = &self.reports[code].1;
+            complete &= complete_fight_list(report);
+            pulls.extend(map_pulls(report, &replay)?);
         }
         pulls.sort_by_key(|p| (p.start_ms, p.report.clone(), p.id));
         let mut unique: Vec<Pull> = Vec::new();
@@ -1179,12 +1234,39 @@ impl Client {
             unique.push(pull);
         }
         check_cancelled(&self.cancel)?;
+        self.recording_match_complete = complete;
         Ok(Review {
             marker_timing: HashMap::new(),
             replay,
             pulls: unique,
         })
     }
+}
+
+// Match the validation used by map_pulls so skipped, malformed boss rows
+// never turn a partial successful review into a removal decision.
+fn complete_fight_list(report: &Value) -> bool {
+    report["fights"].as_array().is_some_and(|fights| {
+        fights.len() <= 5000
+            && fights.iter().all(|fight| {
+                if fight["encounterID"].as_u64() == Some(0)
+                    || fight["difficulty"].as_u64() == Some(10)
+                {
+                    return true;
+                }
+                fight["encounterID"].as_u64().is_some_and(|id| id > 0)
+                    && fight["id"].as_u64().is_some_and(|id| id > 0)
+                    && fight["difficulty"]
+                        .as_u64()
+                        .is_some_and(|difficulty| (1..=5).contains(&difficulty))
+                    && number_ms(&fight["startTime"])
+                        .zip(number_ms(&fight["endTime"]))
+                        .is_some_and(|(start, end)| end > start)
+                    && fight["name"]
+                        .as_str()
+                        .is_some_and(|name| !name.is_empty() && name.len() <= 300)
+            })
+    })
 }
 
 pub fn map_pulls(report: &Value, replay: &Replay) -> Result<Vec<Pull>, String> {
@@ -1501,6 +1583,103 @@ fn number_ms(value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_boss_rows_cannot_establish_no_match_but_trash_and_dungeons_are_not_raids() {
+        let mut report = json!({"fights":[{"id":1,"encounterID":1,"difficulty":5,"name":"Boss","startTime":0,"endTime":1000}]});
+        assert!(complete_fight_list(&report));
+        report["fights"][0]["difficulty"] = Value::Null;
+        assert!(!complete_fight_list(&report));
+        report["fights"][0]["difficulty"] = json!(5);
+        report["fights"][0]["endTime"] = json!(0);
+        assert!(!complete_fight_list(&report));
+        report["fights"][0]["startTime"] = json!(-1);
+        assert!(!complete_fight_list(&report));
+        report["fights"][0]["startTime"] = json!(0);
+        report["fights"][0]["endTime"] = json!(i64::MAX);
+        assert!(!complete_fight_list(&report));
+        report["fights"][0]["endTime"] = json!(1000);
+        report["fights"][0]["difficulty"] = json!(99);
+        assert!(!complete_fight_list(&report));
+        report["fights"] =
+            json!([{"encounterID":0,"difficulty":null},{"encounterID":1,"difficulty":10}]);
+        assert!(complete_fight_list(&report));
+        assert!(!complete_fight_list(&Value::Null));
+    }
+
+    #[test]
+    #[ignore = "opt-in normal archived-VOD matcher: protected sessions, counts only"]
+    fn live_recording_match_cleanup() {
+        assert_eq!(std::env::var("BRICK_WCL_VOD_FILTER").as_deref(), Ok("1"));
+        let user = match crate::discord_auth::saved_session_status()
+            .expect("Protected login unavailable")
+        {
+            crate::discord_auth::SessionStatus::Authorized(user) => user,
+            crate::discord_auth::SessionStatus::NeedsRefresh => {
+                crate::discord_auth::refresh_saved_session().expect("Login refresh unavailable")
+            }
+            _ => panic!("A current protected login is required"),
+        };
+        crate::guild::activate(&user.guild_id, &user.user_id);
+        let token = crate::discord_auth::current_or_refreshed_access_token()
+            .unwrap()
+            .unwrap();
+        let token = if let Ok(guild) = std::env::var("BRICK_WCL_VOD_FILTER_GUILD") {
+            crate::guild::Access::new(
+                token.secret().to_owned(),
+                guild,
+                token.user_id.clone(),
+                crate::guild::generation(),
+            )
+        } else {
+            token
+        };
+        let mut vods = streams::fetch_recordings(&token).unwrap().vods;
+        vods.sort_by_key(|vod| vod.started_at.clone());
+        let mut client = Client::new().unwrap();
+        let started = Instant::now();
+        let mut counts = [0usize; 4];
+        let mut hidden = std::collections::HashSet::new();
+        for vod in &vods {
+            let Some((_, end)) = vod.as_stream().replay_range() else {
+                continue;
+            };
+            if end
+                > time::OffsetDateTime::now_utc().unix_timestamp() * 1000
+                    - crate::recording_filter::GRACE_MS
+            {
+                continue;
+            }
+            counts[0] += 1;
+            match client.match_recording(&token, &vod.as_stream()) {
+                Ok(review) if review.pulls.iter().any(|pull| pull.difficulty != 10) => {
+                    counts[1] += 1
+                }
+                Ok(_) if client.recording_match_complete => {
+                    counts[2] += 1;
+                    hidden.insert(format!("{}:{}", vod.provider.key(), vod.id));
+                }
+                _ => counts[3] += 1,
+            }
+        }
+        if let Ok(path) = std::env::var("BRICK_WCL_VOD_KNOWN_TIMINGS") {
+            let bytes = std::fs::read(path).unwrap();
+            let rows: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+            for row in &rows {
+                let key = &row["key"];
+                assert!(
+                    !hidden.contains(&format!(
+                        "{}:{}",
+                        key["provider"].as_str().unwrap(),
+                        key["videoId"].as_str().unwrap()
+                    )),
+                    "A known raid recording would be hidden"
+                );
+            }
+            eprintln!("known_timing_measurements_preserved={}", rows.len());
+        }
+        eprintln!("archive_match total={} checked={} raid={} no_match={} incomplete={} graphql_requests={} elapsed_ms={}", vods.len(),counts[0],counts[1],counts[2],counts[3],client.requests.graphql,started.elapsed().as_millis());
+    }
 
     #[test]
     fn cancelled_request_does_not_start_transport() {

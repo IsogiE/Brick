@@ -46,6 +46,7 @@ pub struct StreamsUi {
     focused: Option<(String, String)>,
     recordings_open: bool,
     recordings: Option<Rc<Vec<Vod>>>,
+    recording_filter: crate::recording_filter::Filter,
     recordings_library: crate::recordings_ui::Library,
     recordings_attempted: bool,
     recordings_retry_at: Option<Instant>,
@@ -88,6 +89,7 @@ impl Default for StreamsUi {
             focused: None,
             recordings_open: false,
             recordings: None,
+            recording_filter: Default::default(),
             recordings_library: crate::recordings_ui::Library::default(),
             recordings_attempted: false,
             recordings_retry_at: None,
@@ -428,6 +430,13 @@ impl StreamsUi {
         // One metadata-only observer finds new raid pulls while Brick is idle.
         // No background video decoder is created on the client.
         // The selected review takes over while watching.
+        let archive = self.recording_filter.tick(
+            ctx,
+            self.recordings.as_ref(),
+            self.snapshot.as_ref(),
+            active && self.recordings_open,
+            &mut self.warmup,
+        );
         let warmup_stream = self
             .snapshot
             .as_ref()
@@ -439,7 +448,11 @@ impl StreamsUi {
                     .filter(|s| s.status == Status::Live)
                     .min_by_key(|s| (&s.user_id, s.provider.key(), &s.channel_id))
             });
-        self.warmup.tick(ctx, warmup_stream);
+        if let Some(archive) = archive.as_ref() {
+            self.warmup.tick_recording_match(ctx, archive);
+        } else {
+            self.warmup.tick(ctx, warmup_stream);
+        }
         if self.review.tick(
             ctx,
             self.selected
@@ -1055,6 +1068,7 @@ impl StreamsUi {
             ui.label(RichText::new("Loading VODs…").color(MUTED));
             return;
         };
+        let recordings = self.recording_filter.visible(&recordings);
         let action = self.recordings_library.draw(
             ui,
             &recordings,
