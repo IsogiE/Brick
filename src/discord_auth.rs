@@ -116,6 +116,20 @@ pub struct GuildGrant {
     pub role_label: String,
     role_ids: Vec<String>,
     authorized_role_ids: Vec<String>,
+    #[serde(default)]
+    account_access: bool,
+}
+
+impl GuildGrant {
+    fn has_access(&self) -> bool {
+        if self.account_access {
+            self.role_label == "Raider"
+                && self.authorized_role_ids.is_empty()
+                && self.role_ids.is_empty()
+        } else {
+            !self.authorized_role_ids.is_empty()
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -780,7 +794,7 @@ fn authorize_grants(
                 || !valid_label(&grant.guild_name)
                 || !valid_label(&grant.display_name)
                 || !matches!(grant.role_label.as_str(), "Raider" | "Officer")
-                || grant.authorized_role_ids.is_empty()
+                || !grant.has_access()
                 || grant.authorized_role_ids.len() > 8
                 || grant.role_ids.len() > 250
                 || grant.role_ids.iter().any(|id| !valid_id(id))
@@ -946,6 +960,7 @@ fn authorized_user(session: &AuthSession, config: &AuthConfig) -> AuthorizedUser
             ),
             role_ids: session.role_ids.clone(),
             authorized_role_ids: session.authorized_role_ids.clone(),
+            account_access: false,
         }]
     } else {
         session.guilds.clone()
@@ -996,7 +1011,7 @@ fn session_matches_config(session: &AuthSession, config: &AuthConfig) -> bool {
             .any(|role| config.allowed_role_ids.contains(role));
     let current = session.guilds.iter().any(|guild| {
         guild.guild_id == session.guild_id
-            && !guild.authorized_role_ids.is_empty()
+            && guild.has_access()
             && guild.authorized_role_ids == session.authorized_role_ids
     });
     (session.schema == 1 || session.schema == SESSION_SCHEMA)
@@ -1890,6 +1905,7 @@ mod guild_tests {
             role_label: if officer { "Officer" } else { "Raider" }.into(),
             role_ids: vec!["10".into()],
             authorized_role_ids: vec!["10".into()],
+            account_access: false,
         }
     }
 
@@ -1955,6 +1971,51 @@ mod guild_tests {
                 .unwrap()
                 .retryable
         );
+    }
+
+    #[test]
+    fn explicit_raider_account_grant_can_be_selected_and_restored_without_discord_roles() {
+        let (config, original) = baseline();
+        let test_grant: GuildGrant = serde_json::from_value(serde_json::json!({
+            "guildId": "999", "guildName": "POC guild", "displayName": "POC member",
+            "roleLabel": "Raider", "roleIds": [], "authorizedRoleIds": [], "accountAccess": true
+        }))
+        .unwrap();
+        let mut session = authorize_grants(
+            original.clone(),
+            user(),
+            vec![grant(ADVANCE_GUILD_ID, "Advance", true), test_grant.clone()],
+            2000,
+        )
+        .unwrap();
+        apply_guild(&mut session, "999").unwrap();
+        let restored: AuthSession =
+            serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+        assert!(session_matches_config(&restored, &config));
+        assert_eq!(authorized_user(&restored, &config).role_label, "Raider");
+        assert_eq!(restored.access_token, original.access_token);
+        assert_eq!(restored.refresh_token, original.refresh_token);
+        assert_eq!(restored.created_at_unix, original.created_at_unix);
+        let next = authorize_grants(
+            restored,
+            user(),
+            vec![grant(ADVANCE_GUILD_ID, "Advance", true)],
+            3000,
+        )
+        .unwrap();
+        assert_eq!(next.guild_id, ADVANCE_GUILD_ID);
+        for change in 0..3 {
+            let mut invalid = test_grant.clone();
+            match change {
+                0 => invalid.account_access = false,
+                1 => invalid.role_label = "Officer".into(),
+                _ => {
+                    invalid.role_ids = vec!["10".into()];
+                    invalid.authorized_role_ids = vec!["10".into()];
+                }
+            }
+            assert!(authorize_grants(original.clone(), user(), vec![invalid], 2000).is_err());
+        }
     }
 
     #[test]
