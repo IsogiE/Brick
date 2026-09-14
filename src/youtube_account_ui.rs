@@ -294,7 +294,7 @@ impl YoutubeUi {
             );
             if self.can_disconnect()
                 && ui
-                    .add_enabled(!self.busy(), action_button("Forget account"))
+                    .add_enabled(!self.busy(), action_button("Forget channel"))
                     .on_hover_text("Remove this device's saved channel connection.")
                     .clicked()
             {
@@ -410,7 +410,7 @@ mod tests {
             })
             .collect();
         assert!(labels.contains(&"Choose channel"));
-        assert!(labels.contains(&"Forget account"));
+        assert!(labels.contains(&"Forget channel"));
         assert!(!labels.contains(&"Share channel with this guild"));
         assert!(!panel.busy());
     }
@@ -439,7 +439,7 @@ mod tests {
             .collect();
         assert!(labels.contains(&"Share channel with this guild"));
         assert!(labels.contains(&"Sharing includes this channel's public and unlisted broadcasts."));
-        assert!(labels.contains(&"Forget account"));
+        assert!(labels.contains(&"Forget channel"));
         assert!(!panel.busy());
         assert!(!panel.changed);
     }

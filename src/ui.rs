@@ -1628,10 +1628,6 @@ impl BrickApp {
                 ui.separator();
                 self.draw_discord_settings_row(ui, &user);
                 ui.separator();
-                if !self.guild_switching && !self.guild_access_lost {
-                    self.streams.draw_home_accounts(ui);
-                    ui.separator();
-                }
                 self.profile.draw(ui, &user.display_name);
             }
         });
@@ -2844,6 +2840,9 @@ fn info_accent() -> Color32 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    pub(crate) fn apply_style(ctx: &egui::Context) {
+        super::configure_style(ctx);
+    }
     use super::*;
     use eframe::App as _;
 

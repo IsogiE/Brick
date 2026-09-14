@@ -53,6 +53,7 @@ pub struct StreamsUi {
     provider_sessions: Rc<crate::stream_player::ProviderSessions>,
     provider_user_id: Option<String>,
     viewing_notice: Option<String>,
+    viewing_open: bool,
     snapshot: Option<Rc<Snapshot>>,
     received_at: Option<Instant>,
     last_attempt: Option<Instant>,
@@ -100,6 +101,7 @@ impl Default for StreamsUi {
             provider_sessions: Rc::new(Default::default()),
             provider_user_id: None,
             viewing_notice: None,
+            viewing_open: false,
             snapshot: None,
             received_at: None,
             last_attempt: None,
@@ -654,22 +656,51 @@ impl StreamsUi {
         self.last_attempt = Some(Instant::now());
     }
 
-    pub fn draw_home_accounts(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 16.0;
-            for provider in [Provider::Youtube, Provider::Twitch] {
+    fn draw_viewing_accounts(&mut self, ctx: &egui::Context) {
+        if !self.viewing_open {
+            return;
+        }
+        let mut done = false;
+        let modal = egui::Modal::new(egui::Id::new("video-player-sign-in"))
+            .area(
+                egui::Modal::default_area(egui::Id::new("video-player-sign-in"))
+                    .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 32.0)),
+            )
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(29, 33, 40))
+                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(51, 58, 70)))
+                    .corner_radius(10)
+                    .inner_margin(18),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(470.0_f32.min((ctx.content_rect().width() - 72.0).max(280.0)));
+                ui.horizontal(|ui| {
+                    ui.heading("Video Player Sign In");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        done |= ui.button("×").on_hover_text("Close").clicked();
+                    });
+                });
+                ui.separator();
+                ui.label("Sign in to use your account while watching inside Brick.");
+                ui.add_space(8.0);
+                for provider in [Provider::Youtube, Provider::Twitch] {
+                    ui.horizontal(|ui| self.draw_account_row(ui, provider));
+                    ui.add_space(8.0);
+                }
+                if let Some(error) = &self.viewing_notice {
+                    ui.colored_label(Color32::from_rgb(230, 160, 115), error);
+                }
                 ui.allocate_ui_with_layout(
-                    egui::vec2(240.0, 44.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
+                    egui::vec2(ui.available_width(), 32.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        self.draw_account_row(ui, provider);
+                        done |= ui.add(player_account_button("Done")).clicked();
                     },
                 );
-            }
-        });
-        if let Some(error) = &self.viewing_notice {
-            ui.colored_label(Color32::from_rgb(230, 160, 115), error);
+            });
+        if done || modal.should_close() {
+            self.viewing_open = false;
         }
     }
 
@@ -702,6 +733,9 @@ impl StreamsUi {
         authorized: bool,
         may_open: bool,
     ) {
+        if authorized && may_open {
+            self.draw_viewing_accounts(ctx);
+        }
         if let Some(provider) = self.take_pending_provider_login(authorized, may_open) {
             let result = self.provider_sessions.open_login(frame, ctx, provider);
             if let Err(error) = &result {
@@ -914,76 +948,7 @@ impl StreamsUi {
             }
         }
 
-        ui.horizontal(|ui| {
-            if self.recordings_open {
-                ui.label(
-                    RichText::new("VODs")
-                        .size(18.0)
-                        .strong()
-                        .color(Color32::from_rgb(239, 242, 247)),
-                );
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        presence::configured() && self.work.is_none(),
-                        action_button("Your streams").min_size(egui::vec2(108.0, 32.0)),
-                    )
-                    .clicked()
-                {
-                    for (i, provider) in [Provider::Twitch, Provider::Youtube].iter().enumerate() {
-                        self.drafts[i] = self
-                            .snapshot
-                            .as_ref()
-                            .and_then(|s| {
-                                s.own_streams
-                                    .iter()
-                                    .find(|stream| &stream.provider == provider)
-                            })
-                            .map(|s| s.url.clone())
-                            .unwrap_or_default();
-                    }
-                    self.confirm_remove = None;
-                    self.edit_open = true;
-                }
-                let refresh = ui.add_enabled(
-                    self.work.is_none() && presence::configured(),
-                    action_button("Refresh"),
-                );
-                if refresh.clicked() {
-                    self.notice = None;
-                    self.start(
-                        ui.ctx(),
-                        if self.recordings_open {
-                            Action::Recordings
-                        } else {
-                            Action::Refresh
-                        },
-                    );
-                }
-                if ui
-                    .add_enabled(
-                        self.work.is_none(),
-                        action_button(if self.recordings_open {
-                            "Live streams"
-                        } else {
-                            "VODs"
-                        }),
-                    )
-                    .clicked()
-                {
-                    self.recordings_open = !self.recordings_open;
-                    self.confirm_remove_recording = None;
-                    self.focused = None;
-                    self.selected = None;
-                    self.notice = None;
-                    self.stop_player();
-                    if self.recordings_open {
-                        self.start(ui.ctx(), Action::Recordings);
-                    }
-                }
-            });
-        });
+        self.draw_toolbar(ui);
         ui.add_space(12.0);
         if self.recordings_open && self.confirm_remove_recording.is_none() {
             if let Some(notice) = &self.notice {
@@ -1217,6 +1182,93 @@ impl StreamsUi {
         });
         self.draw_editor(ui.ctx());
         self.draw_recording_removal(ui.ctx());
+    }
+
+    fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if self.recordings_open {
+                ui.label(
+                    RichText::new("VODs")
+                        .size(18.0)
+                        .strong()
+                        .color(Color32::from_rgb(239, 242, 247)),
+                );
+            }
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true),
+                |ui| {
+                    if ui
+                        .add_enabled(
+                            presence::configured() && self.work.is_none(),
+                            action_button("Your streams").min_size(egui::vec2(108.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        for (i, provider) in
+                            [Provider::Twitch, Provider::Youtube].iter().enumerate()
+                        {
+                            self.drafts[i] = self
+                                .snapshot
+                                .as_ref()
+                                .and_then(|s| {
+                                    s.own_streams
+                                        .iter()
+                                        .find(|stream| &stream.provider == provider)
+                                })
+                                .map(|s| s.url.clone())
+                                .unwrap_or_default();
+                        }
+                        self.confirm_remove = None;
+                        self.edit_open = true;
+                        self.viewing_open = false;
+                    }
+                    let refresh = ui.add_enabled(
+                        self.work.is_none() && presence::configured(),
+                        action_button("Refresh"),
+                    );
+                    if refresh.clicked() {
+                        self.notice = None;
+                        self.start(
+                            ui.ctx(),
+                            if self.recordings_open {
+                                Action::Recordings
+                            } else {
+                                Action::Refresh
+                            },
+                        );
+                    }
+                    if ui
+                        .add_enabled(
+                            self.work.is_none(),
+                            action_button(if self.recordings_open {
+                                "Live streams"
+                            } else {
+                                "VODs"
+                            })
+                            .min_size(egui::vec2(108.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        self.recordings_open = !self.recordings_open;
+                        self.confirm_remove_recording = None;
+                        self.focused = None;
+                        self.selected = None;
+                        self.notice = None;
+                        self.stop_player();
+                        if self.recordings_open {
+                            self.start(ui.ctx(), Action::Recordings);
+                        }
+                    }
+                    if ui
+                        .add(player_account_button("Video Player Sign In"))
+                        .clicked()
+                    {
+                        self.viewing_open = true;
+                        self.edit_open = false;
+                    }
+                },
+            );
+        });
     }
 
     fn draw_recordings(&mut self, ui: &mut egui::Ui) {
@@ -2159,7 +2211,10 @@ fn viewing_account_control(
             egui::Label::new(RichText::new(provider.label()).strong()),
         );
         let label = if signed_in { "Sign out" } else { "Sign in" };
-        if ui.add_enabled(ready, action_button(label)).clicked() {
+        if ui
+            .add_enabled(ready, player_account_button(label))
+            .clicked()
+        {
             action = Some(if signed_in {
                 ViewingAccountAction::Clear
             } else {
@@ -2168,6 +2223,14 @@ fn viewing_account_control(
         }
     });
     action
+}
+
+fn player_account_button(label: &str) -> egui::Button<'_> {
+    // Use the theme's interactive fill/stroke so hover, keyboard focus and
+    // pressed feedback remain visible instead of fixing one color in all states.
+    egui::Button::new(label)
+        .corner_radius(8)
+        .min_size(egui::vec2(80.0, 32.0))
 }
 
 pub(crate) fn action_button(label: &str) -> egui::Button<'_> {
@@ -2854,6 +2917,173 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn viewing_dialog_buttons_click_and_toolbar_stays_in_bounds_when_it_wraps() {
+        fn labels(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::epaint::Shape::Text(text) = &shape.shape {
+                        Some((
+                            text.galley.text().into(),
+                            egui::Rect::from_min_size(text.pos, text.galley.size()),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+        for width in [360.0, 480.0, 720.0, 980.0, 1440.0] {
+            let ctx = egui::Context::default();
+            crate::ui::tests::apply_style(&ctx);
+            let mut streams = StreamsUi::default();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 560.0));
+            let frame = |streams: &mut StreamsUi, events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        streams.draw_toolbar(ui);
+                        streams.draw_viewing_accounts(ui.ctx());
+                    },
+                )
+            };
+            let mut position = None;
+            for vods in [false, true, false] {
+                streams.recordings_open = vods;
+                frame(&mut streams, vec![]);
+                let output = frame(&mut streams, vec![]);
+                let labels = labels(&output);
+                let (_, viewing) = labels
+                    .iter()
+                    .find(|(label, _)| label == "Video Player Sign In")
+                    .unwrap();
+                assert!(screen.contains_rect(*viewing), "{width}: {viewing:?}");
+                let (_, mode) = labels
+                    .iter()
+                    .find(|(label, _)| label == if vods { "Live streams" } else { "VODs" })
+                    .unwrap();
+                if width >= 720.0 {
+                    assert!(viewing.right() < mode.left());
+                    assert!((viewing.center().y - mode.center().y).abs() < 1.0);
+                    if let Some(previous) = position {
+                        assert_eq!(previous, viewing.center());
+                    }
+                }
+                position = Some(viewing.center());
+                for (_, rect) in labels {
+                    assert!(screen.contains_rect(rect), "{width}: {rect:?}");
+                }
+            }
+            let click = |streams: &mut StreamsUi, pos| {
+                frame(streams, vec![egui::Event::PointerMoved(pos)]);
+                for pressed in [true, false] {
+                    frame(
+                        streams,
+                        vec![egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                    );
+                }
+            };
+            click(&mut streams, position.unwrap());
+            assert!(streams.viewing_open);
+            for _ in 0..3 {
+                frame(&mut streams, vec![]);
+            }
+            let output = frame(&mut streams, vec![]);
+            let labels = labels(&output);
+            let buttons = labels
+                .iter()
+                .filter(|(label, _)| label == "Sign in")
+                .map(|(_, rect)| rect.center())
+                .collect::<Vec<_>>();
+            assert_eq!(buttons.len(), 2);
+            for provider in ["YouTube", "Twitch", "Done"] {
+                assert!(labels
+                    .iter()
+                    .any(|(label, rect)| label == provider && screen.contains_rect(*rect)));
+            }
+            for (pos, provider) in buttons
+                .into_iter()
+                .zip([Provider::Youtube, Provider::Twitch])
+            {
+                click(&mut streams, pos);
+                assert_eq!(streams.pending_provider_login.pop_front(), Some(provider));
+            }
+            let done = labels
+                .iter()
+                .find(|(label, _)| label == "Done")
+                .unwrap()
+                .1
+                .center();
+            click(&mut streams, done);
+            assert!(!streams.viewing_open);
+        }
+    }
+
+    #[test]
+    fn player_sign_in_controls_show_hover_and_pressed_feedback() {
+        let ctx = egui::Context::default();
+        crate::ui::tests::apply_style(&ctx);
+        ctx.global_style_mut(|style| style.animation_time = 0.0);
+        let frame = |events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.add(player_account_button("Sign in"));
+                },
+            )
+        };
+        frame(vec![]);
+        let idle = frame(vec![]);
+        let position = idle
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::epaint::Shape::Text(text) = &shape.shape {
+                    Some(text.pos + text.galley.size() * 0.5)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let fills = |output: egui::FullOutput| {
+            output
+                .shapes
+                .into_iter()
+                .filter_map(|shape| {
+                    if let egui::epaint::Shape::Rect(rect) = shape.shape {
+                        Some(rect.fill)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let hovered = frame(vec![egui::Event::PointerMoved(position)]);
+        let pressed = frame(vec![egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let hovered = fills(hovered);
+        assert_ne!(fills(idle), hovered);
+        assert_ne!(fills(pressed), hovered);
     }
 
     #[test]

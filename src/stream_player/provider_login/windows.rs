@@ -719,7 +719,7 @@ impl Window {
             view.webview()
                 .add_NavigationCompleted(&completed, &mut completion_token)
         }
-        .map_err(|_| "The provider sign-in browser could not watch its return.".into())?;
+        .map_err(|_| "The provider sign-in browser could not watch its return.".to_owned())?;
         let frame_provider = provider.clone();
         let handler = NavigationStartingEventHandler::create(Box::new(move |_, args| {
             if let Some(args) = args {

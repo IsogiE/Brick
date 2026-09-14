@@ -219,7 +219,7 @@ impl TwitchUi {
             );
             if self.can_disconnect()
                 && ui
-                    .add_enabled(!self.busy(), action_button("Forget account"))
+                    .add_enabled(!self.busy(), action_button("Forget channel"))
                     .on_hover_text("Remove this device's saved channel connection.")
                     .clicked()
             {
@@ -235,7 +235,7 @@ impl TwitchUi {
                 } else if self.connecting {
                     "Choosing channel…"
                 } else {
-                    "Forgetting account…"
+                    "Forgetting channel…"
                 });
                 if self.connecting
                     && ui
@@ -312,7 +312,7 @@ mod tests {
             })
             .collect();
         assert!(labels.contains(&"Choose channel"));
-        assert!(labels.contains(&"Forget account"));
+        assert!(labels.contains(&"Forget channel"));
         assert!(!panel.busy());
         assert!(panel.channel().is_none());
     }
