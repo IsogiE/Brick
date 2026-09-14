@@ -13,7 +13,12 @@ import tempfile
 
 BOOTSTRAP = r'''
 from pathlib import Path
-import subprocess, time
+import os, subprocess, time
+if os.getuid() == 0 or os.getgid() == 0:
+    raise RuntimeError('Fixture must run as an unprivileged user')
+status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line)
+if any(int(status[name].strip(), 16) for name in ['CapEff', 'CapPrm', 'CapAmb']):
+    raise RuntimeError('Fixture must run without capabilities')
 for name in ['home', 'config', 'cache', 'data', 'runtime']:
     (Path('/fixture') / name).mkdir(mode=0o700, exist_ok=True)
 subprocess.run(['dbus-daemon', '--session', '--address=unix:path=/fixture/bus', '--fork'], check=True)
@@ -78,10 +83,20 @@ def main():
     parser.add_argument('--scratch-parent', default=os.environ.get('RUNNER_TEMP'))
     parser.add_argument('--isolated-network', action='store_true',
                         help='Use an existing namespace with only the loopback interface.')
+    parser.add_argument('--privileged-setup', action='store_true',
+                        help='Create namespaces as root, then run as an unprivileged fixture user.')
     args = parser.parse_args()
+    if args.privileged_setup:
+        if os.geteuid() != 0 or not args.isolated_network:
+            raise RuntimeError('Privileged setup requires root in an isolated network namespace')
+        fixture_uid = fixture_gid = 1000
+    else:
+        if os.geteuid() == 0:
+            raise RuntimeError('Root invocation requires explicit privileged fixture setup')
+        fixture_uid, fixture_gid = os.getuid(), os.getgid()
     if args.isolated_network:
-        # CI creates this namespace before dropping to its ordinary user. Some
-        # nested runner policies prevent bwrap from configuring loopback itself.
+        # CI creates this namespace before bwrap. Some nested runner policies
+        # prevent an unprivileged process from configuring loopback itself.
         # Never share an ordinary runner/host network as a fallback.
         interfaces = [line.split(':', 1)[0].strip()
                       for line in Path('/proc/self/net/dev').read_text().splitlines()[2:]
@@ -93,10 +108,11 @@ def main():
         root = Path(temporary)
         (root / 'bootstrap.py').write_text(BOOTSTRAP)
         (root / 'passwd').write_text(
-            f'fixture:x:{os.getuid()}:{os.getgid()}:Fixture:/fixture/home:/bin/sh\n')
-        (root / 'group').write_text(f'fixture:x:{os.getgid()}:\n')
+            f'fixture:x:{fixture_uid}:{fixture_gid}:Fixture:/fixture/home:/bin/sh\n')
+        (root / 'group').write_text(f'fixture:x:{fixture_gid}:\n')
         command = [
             'bwrap', '--die-with-parent', '--new-session', '--unshare-all', '--clearenv',
+            '--uid', str(fixture_uid), '--gid', str(fixture_gid), '--cap-drop', 'ALL',
             '--ro-bind', '/usr', '/usr', '--ro-bind', '/lib', '/lib',
             '--ro-bind', '/lib64', '/lib64', '--symlink', 'usr/bin', '/bin',
             '--dir', '/etc', '--ro-bind', str(root / 'passwd'), '/etc/passwd',

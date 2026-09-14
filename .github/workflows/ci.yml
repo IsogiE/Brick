@@ -170,10 +170,10 @@ jobs:
           RUSTFLAGS: '-D warnings'
         run: |
           cargo test --locked --bin brick --no-run --message-format=json > "$RUNNER_TEMP/brick-erasure-artifacts.json"
-          # Create the offline namespace before dropping to the runner user;
-          # nested bwrap need not configure a network interface itself.
-          sudo unshare --net -- runuser -u "$(id -un)" -- \
-            python3 scripts/test-local-erasure.py --isolated-network \
+          # Namespace setup needs privilege under the runner's user-map policy.
+          # The helper maps to a non-root fixture user and drops all capabilities.
+          sudo unshare --net -- \
+            python3 scripts/test-local-erasure.py --isolated-network --privileged-setup \
             --cargo-artifacts "$RUNNER_TEMP/brick-erasure-artifacts.json" \
             --scratch-parent "$RUNNER_TEMP"
 
