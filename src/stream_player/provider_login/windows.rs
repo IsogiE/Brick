@@ -29,10 +29,11 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, GetAncestor, GetClassLongPtrW,
-        GetClientRect, GetWindowRect, IsWindowVisible, LoadCursorW, RegisterClassExW, SendMessageW,
-        SetForegroundWindow, SetWindowTextW, ShowWindow, GA_ROOT, GCLP_HICON, GCLP_HICONSM,
-        ICON_BIG, ICON_SMALL, IDC_ARROW, SW_HIDE, SW_SHOW, WM_CLOSE, WM_GETICON, WM_NCDESTROY,
-        WM_SETICON, WNDCLASSEXW, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_POPUP,
+        GetClientRect, GetWindowRect, IsIconic, IsWindowVisible, LoadCursorW, RegisterClassExW,
+        SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, GA_ROOT, GCLP_HICON,
+        GCLP_HICONSM, ICON_BIG, ICON_SMALL, IDC_ARROW, SW_HIDE, SW_RESTORE, SW_SHOW, WM_CLOSE,
+        WM_GETICON, WM_NCDESTROY, WM_SETICON, WNDCLASSEXW, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
+        WS_POPUP,
     },
 };
 use wry::{WebView, WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows};
@@ -808,6 +809,9 @@ impl Window {
     }
     pub fn present(&self) {
         unsafe {
+            if IsIconic(self.native.handle()) != 0 {
+                ShowWindow(self.native.handle(), SW_RESTORE);
+            }
             SetForegroundWindow(self.native.handle());
         }
     }
@@ -964,7 +968,7 @@ mod tests {
         use windows_sys::Win32::{
             Foundation::POINT,
             Graphics::Gdi::ClientToScreen,
-            UI::WindowsAndMessaging::{MoveWindow, HTCAPTION, WM_NCHITTEST},
+            UI::WindowsAndMessaging::{MoveWindow, HTCAPTION, SW_MINIMIZE, WM_NCHITTEST},
         };
         let handle = login.native.handle();
         for size in [ICON_SMALL, ICON_BIG] {
@@ -1016,6 +1020,14 @@ mod tests {
                     && browser.bottom == client.bottom
             }
         });
+        unsafe { ShowWindow(handle, SW_MINIMIZE) };
+        assert_ne!(unsafe { IsIconic(handle) }, 0);
+        login.present();
+        assert_eq!(
+            unsafe { IsIconic(handle) },
+            0,
+            "reopening restores a minimized sign-in window"
+        );
     }
 
     struct MediaView {
