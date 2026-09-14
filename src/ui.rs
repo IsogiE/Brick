@@ -1072,12 +1072,6 @@ impl BrickApp {
         self.draw_installs_section(ui);
         ui.add_space(18.0);
         self.draw_settings_panel(ui);
-        if self.auth_state.is_authorized() && !self.guild_switching && !self.guild_access_lost {
-            ui.add_space(18.0);
-            section_title(ui, "Streaming accounts");
-            ui.add_space(8.0);
-            panel_frame().show(ui, |ui| self.streams.draw_home_accounts(ui));
-        }
     }
 
     fn draw_tab_bar(&mut self, ui: &mut egui::Ui) {
@@ -1602,6 +1596,10 @@ impl BrickApp {
                 ui.separator();
                 self.draw_discord_settings_row(ui, &user);
                 ui.separator();
+                if !self.guild_switching && !self.guild_access_lost {
+                    self.streams.draw_home_accounts(ui);
+                    ui.separator();
+                }
                 self.profile.draw(ui, &user.display_name);
             }
         });
@@ -1933,11 +1931,8 @@ impl eframe::App for BrickApp {
         self.streams.update_account_windows(
             frame,
             &ctx,
-            self.auth_state.is_authorized()
-                && !self.guild_switching
-                && !self.guild_access_lost
-                && self.window_visible
-                && !self.confirm_logout,
+            self.auth_state.is_authorized() && !self.guild_switching && !self.guild_access_lost,
+            self.window_visible && !self.confirm_logout,
         );
         if self.streams.update_player(
             frame,

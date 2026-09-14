@@ -70,6 +70,7 @@ struct Validation {
     client_id: String,
     login: String,
     user_id: String,
+    #[serde(default, deserialize_with = "deserialize_scopes")]
     scopes: Vec<String>,
     expires_in: u64,
 }
@@ -81,6 +82,15 @@ struct Provider {
     token_url: String,
     validate_url: String,
     users_url: String,
+}
+
+// An absent/null list carries no scopes, like the empty list. Match Twitch's
+// own client's nullable slice decoding without accepting malformed strings,
+// numbers, objects, or granting any scope we did not request.
+fn deserialize_scopes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    Option::<Vec<String>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -235,6 +245,7 @@ impl Account {
         current(access, cancel)?;
         let session = self.session.as_ref().ok_or("Please reconnect Twitch.")?;
         if validate_binding(&validation, session).is_err() {
+            diagnostic(CheckStage::ValidateBinding, None, &Failure::Binding);
             self.reject_current(access, cancel)?;
             return Err("Please reconnect Twitch.".into());
         }
@@ -254,7 +265,8 @@ impl Account {
             |mut saved| {
                 if saved.access_token == bearer && !saved.reconnect_required {
                     saved.channel = Some(channel);
-                    saved.expires_at = now().saturating_add(validation.expires_in);
+                    saved.expires_at = expiry_timestamp(validation.expires_in, now())
+                        .map_err(|failure| failure.message())?;
                 }
                 Ok(saved)
             },
@@ -418,24 +430,33 @@ impl Provider {
         )
     }
     fn validate(&self, bearer: &str) -> Result<Validation, Failure> {
-        decode(
+        decode_check(
             self.http
                 .get(&self.validate_url)
                 .bearer_auth(bearer)
                 .send()
-                .map_err(|_| Failure::Retry(0))?,
+                .map_err(|_| {
+                    diagnostic(CheckStage::ValidateRequest, None, &Failure::Retry(0));
+                    Failure::Retry(0)
+                })?,
+            CheckStage::ValidateResponse,
         )
     }
     fn channel(&self, bearer: &str, validation: &Validation) -> Result<Channel, Failure> {
-        let body: serde_json::Value = decode(
+        let body: serde_json::Value = decode_check(
             self.http
                 .get(&self.users_url)
                 .bearer_auth(bearer)
                 .header("Client-Id", &self.client_id)
                 .send()
-                .map_err(|_| Failure::Retry(0))?,
+                .map_err(|_| {
+                    diagnostic(CheckStage::UserRequest, None, &Failure::Retry(0));
+                    Failure::Retry(0)
+                })?,
+            CheckStage::UserResponse,
         )?;
         parse_channel(&body, validation)
+            .inspect_err(|failure| diagnostic(CheckStage::UserIdentity, Some(200), failure))
     }
 }
 
@@ -500,6 +521,53 @@ fn decode<T: serde::de::DeserializeOwned>(response: Response) -> Result<T, Failu
     }
     serde_json::from_slice(&bytes).map_err(|_| Failure::Invalid)
 }
+#[derive(Clone, Copy)]
+enum CheckStage {
+    ValidateRequest,
+    ValidateResponse,
+    ValidateBinding,
+    UserRequest,
+    UserResponse,
+    UserIdentity,
+}
+fn decode_check<T: serde::de::DeserializeOwned>(
+    response: Response,
+    stage: CheckStage,
+) -> Result<T, Failure> {
+    let status = response.status().as_u16();
+    decode(response).inspect_err(|failure| diagnostic(stage, Some(status), failure))
+}
+fn diagnostic(stage: CheckStage, status: Option<u16>, failure: &Failure) {
+    // Opt-in local troubleshooting only. Never include provider bodies,
+    // credential-bearing headers, OAuth codes, tokens or account identities.
+    if std::env::var_os("BRICK_PROVIDER_DIAGNOSTICS").is_some_and(|value| value == "1") {
+        eprintln!("{}", diagnostic_line(stage, status, failure));
+    }
+}
+fn diagnostic_line(stage: CheckStage, status: Option<u16>, failure: &Failure) -> String {
+    let stage = match stage {
+        CheckStage::ValidateRequest => "validate_request",
+        CheckStage::ValidateResponse => "validate_response",
+        CheckStage::ValidateBinding => "validate_binding",
+        CheckStage::UserRequest => "users_request",
+        CheckStage::UserResponse => "users_response",
+        CheckStage::UserIdentity => "users_identity",
+    };
+    let category = match failure {
+        Failure::Pending => "pending",
+        Failure::SlowDown => "slow_down",
+        Failure::Retry(_) => "temporary",
+        Failure::Denied => "denied",
+        Failure::Expired => "expired",
+        Failure::InvalidGrant => "invalid_grant",
+        Failure::Invalid => "invalid_response",
+        Failure::Binding => "account_binding",
+    };
+    format!(
+        "Brick Twitch check: stage={stage} status={} failure={category}",
+        status.map_or_else(|| "none".into(), |value| value.to_string())
+    )
+}
 fn response_failure(status: u16, bytes: &[u8], retry: u64) -> Failure {
     if status == 429 || status >= 500 {
         return Failure::Retry(retry);
@@ -563,8 +631,7 @@ fn validate_binding(value: &Validation, session: &Session) -> Result<(), Failure
         || !digits(&value.user_id)
         || !login(&value.login)
         || !value.scopes.is_empty()
-        || value.expires_in == 0
-        || value.expires_in > 604_800
+        || expiry_timestamp(value.expires_in, now()).is_err()
         || session
             .channel
             .as_ref()
@@ -655,7 +722,6 @@ fn session_from_token(
         || !token.scope.is_empty()
         || !credential(&token.access_token)
         || !credential(&token.refresh_token)
-        || !(1..=604_800).contains(&token.expires_in)
     {
         return Err(Failure::Invalid.message());
     }
@@ -665,10 +731,17 @@ fn session_from_token(
         account: account.into(),
         access_token: token.access_token,
         refresh_token: token.refresh_token,
-        expires_at: now().saturating_add(token.expires_in),
+        expires_at: expiry_timestamp(token.expires_in, now())
+            .map_err(|failure| failure.message())?,
         channel,
         reconnect_required: false,
     })
+}
+fn expiry_timestamp(seconds: u64, at: u64) -> Result<u64, Failure> {
+    if seconds == 0 {
+        return Err(Failure::Invalid);
+    }
+    at.checked_add(seconds).ok_or(Failure::Invalid)
 }
 fn store(access: &Access) -> Result<Store, String> {
     if !digits(&access.user_id) {
@@ -944,6 +1017,121 @@ mod tests {
         assert!(requests[2]
             .to_ascii_lowercase()
             .contains(&format!("client-id: {TEST_CLIENT}")));
+    }
+    #[test]
+    fn empty_scope_validation_lists_can_be_null_or_absent() {
+        for scopes in [Some(serde_json::Value::Null), Some(json!([])), None] {
+            let mut validation_body = json!({"client_id":TEST_CLIENT,"login":"fixture","user_id":"42","expires_in":14400});
+            if let Some(scopes) = scopes {
+                validation_body["scopes"] = scopes;
+            }
+            let (provider, _requests, worker) = fixture(vec![
+                (200, token_json()),
+                (200, validation_body.to_string()),
+                (
+                    200,
+                    json!({"data":[{"id":"42","login":"fixture","display_name":"Fixture"}]})
+                        .to_string(),
+                ),
+            ]);
+            let received = provider.poll(&device(), || Ok(()), |_| Ok(())).unwrap();
+            let saved = session_from_token(received, TEST_CLIENT, "123", None).unwrap();
+            let validation = provider.validate(&saved.access_token).unwrap();
+            assert!(validate_binding(&validation, &saved).is_ok());
+            assert_eq!(
+                provider.channel(&saved.access_token, &validation).unwrap(),
+                channel()
+            );
+            worker.join().unwrap();
+        }
+    }
+    #[test]
+    fn scope_normalization_never_accepts_malformed_or_extra_permissions() {
+        for scopes in [
+            json!(""),
+            json!("user:read:email"),
+            json!(42),
+            json!({}),
+            json!([null]),
+        ] {
+            let mut body: serde_json::Value = serde_json::from_str(&token_json()).unwrap();
+            body["scope"] = scopes.clone();
+            assert!(serde_json::from_value::<Token>(body).is_err());
+            let body = json!({"client_id":TEST_CLIENT,"login":"fixture","user_id":"42","scopes":scopes,"expires_in":14400});
+            assert!(serde_json::from_value::<Validation>(body).is_err());
+        }
+        let mut body: serde_json::Value = serde_json::from_str(&token_json()).unwrap();
+        body["scope"] = json!(["user:read:email"]);
+        assert!(session_from_token(
+            serde_json::from_value(body).unwrap(),
+            TEST_CLIENT,
+            "123",
+            None
+        )
+        .is_err());
+        let body = json!({"client_id":TEST_CLIENT,"login":"fixture","user_id":"42","scopes":["user:read:email"],"expires_in":14400});
+        assert!(validate_binding(&serde_json::from_value(body).unwrap(), &session()).is_err());
+    }
+    #[test]
+    fn documented_long_lifetime_is_valid_but_does_not_extend_hourly_validation() {
+        // https://dev.twitch.tv/docs/authentication/validate-tokens/
+        const DOCUMENTED_LIFETIME: u64 = 5_520_838;
+        let mut token = token();
+        token.access_token = uuid::Uuid::new_v4().to_string();
+        token.expires_in = DOCUMENTED_LIFETIME;
+        let saved = session_from_token(token, TEST_CLIENT, "123", Some(channel())).unwrap();
+        assert!(saved.expires_at > now() + 7 * 86_400);
+        let mut validated = validation();
+        validated.expires_in = DOCUMENTED_LIFETIME;
+        assert!(validate_binding(&validated, &saved).is_ok());
+        remember_validation(&saved);
+        let account = Account {
+            provider: Provider::new(TEST_CLIENT).unwrap(),
+            session: Some(saved.clone()),
+        };
+        let delay = account.check_after().unwrap();
+        assert!(delay <= Duration::from_secs(3600));
+        assert!(delay > Duration::from_secs(3590));
+        forget_validation(&saved);
+        validated.client_id = "other-client".into();
+        assert!(validate_binding(&validated, &saved).is_err());
+        validated.client_id = TEST_CLIENT.into();
+        validated.user_id = "999".into();
+        assert!(validate_binding(&validated, &saved).is_err());
+        validated.user_id = "42".into();
+        validated.scopes.push("user:read:email".into());
+        assert!(validate_binding(&validated, &saved).is_err());
+    }
+    #[test]
+    fn zero_negative_and_overflowing_lifetimes_are_rejected() {
+        assert_eq!(expiry_timestamp(0, 100), Err(Failure::Invalid));
+        assert_eq!(expiry_timestamp(1, u64::MAX), Err(Failure::Invalid));
+        assert_eq!(expiry_timestamp(u64::MAX, 1), Err(Failure::Invalid));
+        assert_eq!(expiry_timestamp(1, 100), Ok(101));
+        for seconds in [0, u64::MAX] {
+            let mut token = token();
+            token.expires_in = seconds;
+            assert!(session_from_token(token, TEST_CLIENT, "123", None).is_err());
+            let mut validated = validation();
+            validated.expires_in = seconds;
+            assert!(validate_binding(&validated, &session()).is_err());
+        }
+        let mut body: serde_json::Value = serde_json::from_str(&token_json()).unwrap();
+        body["expires_in"] = json!(-1);
+        assert!(serde_json::from_value::<Token>(body).is_err());
+        let body = json!({"client_id":TEST_CLIENT,"login":"fixture","user_id":"42","scopes":[],"expires_in":-1});
+        assert!(serde_json::from_value::<Validation>(body).is_err());
+    }
+    #[test]
+    fn local_diagnostic_contains_only_fixed_stage_status_and_failure_category() {
+        assert_eq!(
+            diagnostic_line(CheckStage::ValidateResponse, Some(200), &Failure::Invalid),
+            "Brick Twitch check: stage=validate_response status=200 failure=invalid_response"
+        );
+        assert_eq!(
+            diagnostic_line(CheckStage::UserRequest, None, &Failure::Retry(u64::MAX)),
+            "Brick Twitch check: stage=users_request status=none failure=temporary"
+        );
     }
     #[test]
     fn malformed_oversized_and_redirect_responses_are_not_credentials() {

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     rc::Rc,
     sync::mpsc,
     time::{Duration, Instant},
@@ -13,6 +13,75 @@ use crate::{
     stream_preferences::Preferences,
     streams::{self, Provider, Snapshot, Status, Stream, Vod},
 };
+
+fn record_provider_window_result(result: Result<(), String>) {
+    if result.is_err()
+        && std::env::var_os("BRICK_PROVIDER_DIAGNOSTICS").is_some_and(|value| value == "1")
+    {
+        // No provider error, URL, grant, or account value enters diagnostics.
+        eprintln!("Brick viewing sign-in: native window unavailable");
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HomeAccountAction {
+    SignIn,
+    SignOut,
+    Cancel,
+}
+
+fn home_account_action(saved: bool, viewing: bool, connecting: bool) -> HomeAccountAction {
+    if connecting {
+        HomeAccountAction::Cancel
+    } else if saved || viewing {
+        HomeAccountAction::SignOut
+    } else {
+        HomeAccountAction::SignIn
+    }
+}
+
+fn draw_home_account_control(
+    ui: &mut egui::Ui,
+    provider: &Provider,
+    name: Option<&str>,
+    action: HomeAccountAction,
+    enabled: bool,
+    busy: bool,
+) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), 44.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            let details = (ui.available_width() - 92.0).max(60.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(details, 44.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(provider.label()).strong());
+                        if busy {
+                            ui.spinner();
+                        }
+                    });
+                    if let Some(name) = name.filter(|name| !name.is_empty()) {
+                        ui.add(
+                            egui::Label::new(RichText::new(name).small().color(MUTED)).truncate(),
+                        );
+                    }
+                },
+            );
+            ui.add_enabled(
+                enabled,
+                action_button(match action {
+                    HomeAccountAction::SignIn => "Sign in",
+                    HomeAccountAction::SignOut => "Sign out",
+                    HomeAccountAction::Cancel => "Cancel",
+                }),
+            )
+        },
+    )
+    .inner
+}
 
 const REFRESH: Duration = Duration::from_secs(30);
 const MAX_STALE: Duration = Duration::from_secs(90);
@@ -40,11 +109,10 @@ type PlayerResult = Result<(String, crate::guild::Access, Option<Preferences>), 
 pub struct StreamsUi {
     youtube: crate::youtube_account_ui::YoutubeUi,
     twitch: crate::twitch_account_ui::TwitchUi,
-    pending_provider_login: Option<Provider>,
+    pending_provider_login: VecDeque<Provider>,
     accounts_home_requested: bool,
     provider_sessions: Rc<crate::stream_player::ProviderSessions>,
     provider_user_id: Option<String>,
-    provider_notice: Option<String>,
     snapshot: Option<Rc<Snapshot>>,
     received_at: Option<Instant>,
     last_attempt: Option<Instant>,
@@ -90,11 +158,10 @@ impl Default for StreamsUi {
         Self {
             youtube: Default::default(),
             twitch: Default::default(),
-            pending_provider_login: None,
+            pending_provider_login: VecDeque::new(),
             accounts_home_requested: false,
             provider_sessions: Rc::new(Default::default()),
             provider_user_id: None,
-            provider_notice: None,
             snapshot: None,
             received_at: None,
             last_attempt: None,
@@ -358,6 +425,12 @@ impl StreamsUi {
         ) && self.work.is_none()
         {
             self.start(ctx, Action::Refresh);
+        }
+        if self.youtube.take_sign_in_finished() {
+            self.queue_provider_login(Provider::Youtube);
+        }
+        if self.twitch.take_sign_in_finished() {
+            self.queue_provider_login(Provider::Twitch);
         }
         if self.received_at.is_some_and(|at| at.elapsed() >= MAX_STALE) {
             self.pov_revision = self.pov_revision.wrapping_add(1);
@@ -660,51 +733,82 @@ impl StreamsUi {
     }
 
     pub fn draw_home_accounts(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            "Connect once on this device. Choose what to share in each guild's Your streams panel.",
-        );
-        ui.add_space(8.0);
-        self.youtube.draw_account(ui, true);
-        self.draw_home_player_account(ui, Provider::Youtube);
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
-        self.twitch.draw_account(ui, true);
-        self.draw_home_player_account(ui, Provider::Twitch);
-        if let Some(notice) = &self.provider_notice {
-            ui.label(notice);
-        }
-        ui.add_space(8.0);
-        ui.label(RichText::new("Account connections are protected on this device. Only the channels and broadcasts you choose to share are sent to your guild.").small().color(MUTED));
+        ui.columns(2, |columns| {
+            self.draw_account_row(&mut columns[0], Provider::Youtube);
+            self.draw_account_row(&mut columns[1], Provider::Twitch);
+        });
     }
 
-    fn draw_home_player_account(&mut self, ui: &mut egui::Ui, provider: Provider) {
-        ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-            let open = self.provider_sessions.login_open_for(&provider);
-            if ui
-                .button(if open {
-                    "Return to player sign-in"
-                } else {
-                    "Sign in to player"
-                })
-                .clicked()
-            {
-                self.pending_provider_login = Some(provider.clone());
+    fn draw_account_row(&mut self, ui: &mut egui::Ui, provider: Provider) {
+        let (saved, name, busy, connecting, cancelled, configured) = match provider {
+            Provider::Youtube => (
+                self.youtube.can_sign_out(),
+                self.youtube.account_name(),
+                self.youtube.busy(),
+                self.youtube.connecting(),
+                self.youtube.cancellation_pending(),
+                crate::youtube_account::Account::configured(),
+            ),
+            Provider::Twitch => (
+                self.twitch.can_sign_out(),
+                self.twitch.account_name(),
+                self.twitch.busy(),
+                self.twitch.connecting(),
+                self.twitch.cancellation_pending(),
+                crate::twitch_account::Account::configured(),
+            ),
+        };
+        let action = home_account_action(
+            saved,
+            self.provider_sessions.session_started(&provider),
+            connecting,
+        );
+        let enabled = (!busy || (connecting && !cancelled))
+            && (action != HomeAccountAction::SignIn || configured);
+        if draw_home_account_control(ui, &provider, name, action, enabled, busy).clicked() {
+            match action {
+                HomeAccountAction::Cancel => {
+                    self.pending_provider_login
+                        .retain(|queued| queued != &provider);
+                    match provider {
+                        Provider::Youtube => self.youtube.cancel_sign_in(),
+                        Provider::Twitch => self.twitch.cancel_sign_in(),
+                    }
+                }
+                HomeAccountAction::SignOut => {
+                    self.provider_sessions.disconnect(&provider);
+                    self.pending_provider_login
+                        .retain(|queued| queued != &provider);
+                    self.reload_provider(provider.label());
+                    match provider {
+                        Provider::Youtube => self.youtube.sign_out(ui.ctx()),
+                        Provider::Twitch => self.twitch.sign_out(ui.ctx()),
+                    }
+                }
+                HomeAccountAction::SignIn => self.begin_sign_in(ui.ctx(), provider),
             }
-            if open && ui.button("Close sign-in window").clicked() {
-                self.provider_sessions.close_login(&provider);
+        }
+    }
+
+    fn begin_sign_in(&mut self, ctx: &egui::Context, provider: Provider) {
+        let connected = match provider {
+            Provider::Youtube => self.youtube.connected(),
+            Provider::Twitch => self.twitch.connected(),
+        };
+        if connected {
+            self.queue_provider_login(provider);
+        } else {
+            match provider {
+                Provider::Youtube => self.youtube.sign_in(ctx),
+                Provider::Twitch => self.twitch.sign_in(ctx),
             }
-            if self.provider_sessions.session_started(&provider)
-                && ui.button("Sign out of player").clicked()
-            {
-                self.provider_sessions.disconnect(&provider);
-                self.reload_provider(provider.label());
-                self.pending_provider_login = None;
-                self.provider_notice = None;
-            }
-        });
-        ui.label(RichText::new("For watching videos, sign in separately in Brick's player. Player sign-in lasts until Brick closes.").small().color(MUTED));
+        }
+    }
+
+    fn queue_provider_login(&mut self, provider: Provider) {
+        if !self.pending_provider_login.contains(&provider) {
+            self.pending_provider_login.push_back(provider);
+        }
     }
 
     pub fn update_account_windows(
@@ -712,87 +816,31 @@ impl StreamsUi {
         frame: &eframe::Frame,
         ctx: &egui::Context,
         authorized: bool,
+        may_open: bool,
     ) {
-        let pending = self.pending_provider_login.take();
-        if authorized && self.provider_user_id.is_some() {
-            if let Some(provider) = pending {
-                self.provider_notice = self
-                    .provider_sessions
-                    .open_login(frame, ctx, provider)
-                    .err();
-            }
+        if let Some(provider) = self.take_pending_provider_login(authorized, may_open) {
+            record_provider_window_result(self.provider_sessions.open_login(frame, ctx, provider));
+            ctx.request_repaint();
+        }
+    }
+
+    fn take_pending_provider_login(
+        &mut self,
+        authorized: bool,
+        may_open: bool,
+    ) -> Option<Provider> {
+        if !authorized || self.provider_user_id.is_none() {
+            self.pending_provider_login.clear();
+            None
+        } else if may_open {
+            self.pending_provider_login.pop_front()
+        } else {
+            None
         }
     }
 
     pub fn take_accounts_home_request(&mut self) -> bool {
         std::mem::take(&mut self.accounts_home_requested)
-    }
-
-    fn draw_provider_accounts(&mut self, ui: &mut egui::Ui) {
-        let primary = self.player.as_ref();
-        let secondary = self
-            .comparison
-            .as_ref()
-            .and_then(|comparison| comparison.provider_player());
-        if primary.is_none() && secondary.is_none() && self.provider_notice.is_none() {
-            return;
-        }
-        let mut reload = None;
-        let mut disconnect = None;
-        let mut login_result = None;
-        ui.horizontal(|ui| {
-            for provider in [Provider::Youtube, Provider::Twitch] {
-                let Some(player) = primary
-                    .filter(|player| player.provider_name() == provider.label())
-                    .or_else(|| {
-                        secondary.filter(|player| player.provider_name() == provider.label())
-                    })
-                else {
-                    continue;
-                };
-                ui.menu_button(format!("{} account", provider.label()), |ui| {
-                    ui.set_max_width(260.0);
-                    ui.label("Sign-in lasts until Brick closes.");
-                    let label = if player.provider_login_open() {
-                        "Return to sign-in"
-                    } else {
-                        "Sign in"
-                    };
-                    if ui.button(label).clicked() {
-                        login_result = Some(player.open_provider_login(ui.ctx()));
-                        ui.close();
-                    }
-                    if player.provider_login_open() && ui.button("Close sign-in window").clicked() {
-                        player.close_provider_login();
-                        ui.close();
-                    }
-                    if ui.button("Reload video").clicked() {
-                        reload = Some(provider.clone());
-                        ui.close();
-                    }
-                    if player.provider_session_started()
-                        && ui.button("Sign out of player").clicked()
-                    {
-                        disconnect = Some(provider.clone());
-                        ui.close();
-                    }
-                });
-            }
-        });
-        if let Some(result) = login_result {
-            self.provider_notice = result.err();
-        }
-        if let Some(provider) = disconnect {
-            self.provider_sessions.disconnect(&provider);
-            reload = Some(provider);
-            self.provider_notice = None;
-        }
-        if let Some(provider) = reload {
-            self.reload_provider(provider.label());
-        }
-        if let Some(notice) = &self.provider_notice {
-            ui.label(notice);
-        }
     }
 
     fn reload_provider(&mut self, name: &str) {
@@ -821,9 +869,6 @@ impl StreamsUi {
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         self.finish_recording_review();
         self.player_rect = None;
-        if !self.recordings_open {
-            self.draw_provider_accounts(ui);
-        }
         if self.review.active() && !self.recordings_open {
             if let Some(stream) = self.selected.clone() {
                 let span = self.review.report_span();
@@ -1568,7 +1613,7 @@ impl StreamsUi {
                     .and_then(|comparison| comparison.provider_player()),
             ) {
                 if player.take_provider_login_request() {
-                    self.provider_notice = player.open_provider_login(ctx).err();
+                    record_provider_window_result(player.open_provider_login(ctx));
                 }
             }
         }
@@ -2110,8 +2155,7 @@ mod tests {
         let sessions = host.personal_provider_sessions();
         host.selected = Some(recording("987", "1").as_stream());
         host.notice = Some("Previous guild notice".into());
-        host.provider_notice = Some("Previous viewing notice".into());
-        host.pending_provider_login = Some(super::Provider::Youtube);
+        host.queue_provider_login(super::Provider::Youtube);
         host.accounts_home_requested = true;
         let (tx, rx) = std::sync::mpsc::channel();
         host.work = Some(rx);
@@ -2124,8 +2168,7 @@ mod tests {
         assert_eq!(host.provider_user_id.as_deref(), Some("fixture-account"));
         assert!(host.selected.is_none());
         assert!(host.notice.is_none());
-        assert!(host.provider_notice.is_none());
-        assert!(host.pending_provider_login.is_none());
+        assert!(host.pending_provider_login.is_empty());
         assert!(!host.take_accounts_home_request());
         assert!(host.work.is_none());
         assert!(tx
@@ -2139,6 +2182,126 @@ mod tests {
             &sessions,
             &host.personal_provider_sessions()
         ));
+    }
+
+    #[test]
+    fn home_accounts_keep_saved_and_viewing_connections_removable() {
+        for saved in [false, true] {
+            for viewing in [false, true] {
+                assert_eq!(
+                    home_account_action(saved, viewing, false),
+                    if saved || viewing {
+                        HomeAccountAction::SignOut
+                    } else {
+                        HomeAccountAction::SignIn
+                    }
+                );
+                assert_eq!(
+                    home_account_action(saved, viewing, true),
+                    HomeAccountAction::Cancel
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn viewing_sign_in_queue_is_bounded_and_needs_a_verified_account() {
+        let mut ui = StreamsUi::default();
+        for _ in 0..100 {
+            ui.queue_provider_login(Provider::Youtube);
+            ui.queue_provider_login(Provider::Twitch);
+        }
+        assert_eq!(ui.pending_provider_login.len(), 2);
+        assert!(ui.take_pending_provider_login(true, true).is_none());
+        assert!(ui.pending_provider_login.is_empty());
+        ui.bind_provider_account("fixture-account");
+        ui.queue_provider_login(Provider::Youtube);
+        ui.queue_provider_login(Provider::Twitch);
+        assert!(ui.take_pending_provider_login(false, true).is_none());
+        assert!(ui.pending_provider_login.is_empty());
+        ui.queue_provider_login(Provider::Youtube);
+        ui.queue_provider_login(Provider::Twitch);
+        assert!(ui.take_pending_provider_login(true, false).is_none());
+        assert_eq!(ui.pending_provider_login.len(), 2);
+        assert_eq!(
+            ui.take_pending_provider_login(true, true),
+            Some(Provider::Youtube)
+        );
+        assert_eq!(
+            ui.take_pending_provider_login(true, true),
+            Some(Provider::Twitch)
+        );
+        assert!(ui.take_pending_provider_login(true, true).is_none());
+        ui.queue_provider_login(Provider::Youtube);
+        assert!(ui.take_pending_provider_login(false, false).is_none());
+        assert!(ui.pending_provider_login.is_empty());
+    }
+
+    #[test]
+    fn home_account_names_and_single_actions_fit_the_minimum_window() {
+        let name = "A very long account name with spaces ".repeat(12);
+        for width in [720.0, 980.0] {
+            let ctx = egui::Context::default();
+            let mut previous = None;
+            for action in [
+                HomeAccountAction::SignIn,
+                HomeAccountAction::SignOut,
+                HomeAccountAction::Cancel,
+            ] {
+                let mut bounds = Vec::new();
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 560.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        // Include the Home panel's horizontal outer/inner space.
+                        ui.set_width(width - 80.0);
+                        ui.columns(2, |columns| {
+                            for (column, provider) in columns
+                                .iter_mut()
+                                .zip([Provider::Youtube, Provider::Twitch])
+                            {
+                                let available = column.max_rect();
+                                let response = draw_home_account_control(
+                                    column,
+                                    &provider,
+                                    Some(&name),
+                                    action,
+                                    true,
+                                    action == HomeAccountAction::Cancel,
+                                );
+                                assert!(response.rect.left() >= available.left());
+                                assert!(response.rect.right() <= available.right());
+                                assert!(response.rect.width() >= 80.0);
+                                bounds.push(response.rect);
+                            }
+                        });
+                    },
+                );
+                assert_eq!(bounds[0].top(), bounds[1].top());
+                if let Some(previous) = &previous {
+                    assert_eq!(&bounds, previous);
+                }
+                previous = Some(bounds.clone());
+                let names: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == name => Some(text),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(names.len(), 2);
+                for (text, button) in names.into_iter().zip(&bounds) {
+                    assert_eq!(text.galley.rows.len(), 1);
+                    assert!(text.pos.x + text.galley.rect.width() <= button.left() - 4.0);
+                }
+            }
+        }
     }
 
     #[test]

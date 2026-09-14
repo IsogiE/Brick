@@ -5,7 +5,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle, Win32WindowHandle, Win
 use std::{
     cell::{Cell, RefCell},
     num::NonZeroIsize,
-    rc::Rc,
+    rc::{Rc, Weak},
 };
 use webview2_com::{
     Microsoft::Web::WebView2::Win32::{
@@ -92,6 +92,15 @@ pub(crate) struct Context {
     pub environment: RefCell<Option<ICoreWebView2Environment>>,
     profile: RefCell<Option<ICoreWebView2Profile8>>,
     keeper: RefCell<Option<Keeper>>,
+    controllers: RefCell<Vec<Weak<ICoreWebView2Controller>>>,
+    retired: Cell<bool>,
+}
+
+/// Kept beside its WebView. The context holds only weak registrations, so
+/// ordinary POV teardown cannot accumulate controller or browser references.
+#[must_use]
+pub(crate) struct Registration {
+    _controller: Rc<ICoreWebView2Controller>,
 }
 
 impl Context {
@@ -101,10 +110,15 @@ impl Context {
             environment: RefCell::new(None),
             profile: RefCell::new(None),
             keeper: RefCell::new(None),
+            controllers: RefCell::new(Vec::new()),
+            retired: Cell::new(false),
         })
     }
 
-    pub fn register(&self, view: &WebView) -> Result<(), String> {
+    pub fn register(&self, view: &WebView) -> Result<Registration, String> {
+        if self.retired.get() {
+            return Err("This provider session has ended.".into());
+        }
         let profile = unsafe {
             view.webview()
                 .cast::<ICoreWebView2_13>()
@@ -136,9 +150,18 @@ impl Context {
                 .and_then(|_| settings.SetIsGeneralAutofillEnabled(false))
         }
         .map_err(|_| "The provider session could not protect form data.")?;
+        if self.retired.get() {
+            return Err("This provider session has ended.".into());
+        }
         *self.environment.borrow_mut() = Some(view.environment());
         *self.profile.borrow_mut() = Some(managed);
-        Ok(())
+        let registration = Registration {
+            _controller: Rc::new(view.controller()),
+        };
+        let mut controllers = self.controllers.borrow_mut();
+        controllers.retain(|controller| controller.strong_count() != 0);
+        controllers.push(Rc::downgrade(&registration._controller));
+        Ok(registration)
     }
 
     fn keep_alive(&self, owner: HWND) -> Result<(), String> {
@@ -193,9 +216,10 @@ impl Context {
             .map_err(|_| "The private provider session could not start.")?;
         protect_settings(&view)?;
         super::super::protect_windows_permissions(&view)?;
-        self.register(&view)?;
+        let registration = self.register(&view)?;
         *self.keeper.borrow_mut() = Some(Keeper {
             _view: view,
+            _registration: registration,
             _native: native,
             _storage: storage,
         });
@@ -203,13 +227,24 @@ impl Context {
     }
 
     pub fn retire(&self) {
-        self.keeper.borrow_mut().take();
-        if let Some(profile) = self.profile.borrow_mut().take() {
-            // Closes every related WebView. Runtime removes the owned profile
-            // at browser exit, retrying deletion on later starts if necessary.
+        self.retired.set(true);
+        let controllers = std::mem::take(&mut *self.controllers.borrow_mut());
+        let keeper = self.keeper.borrow_mut().take();
+        let profile = self.profile.borrow_mut().take();
+        let environment = self.environment.borrow_mut().take();
+        // End every live controller synchronously, including media retained by
+        // a closing panel. Profile deletion alone may not close InPrivate views
+        // promptly. Release RefCell borrows before COM can reenter native code.
+        for controller in controllers.into_iter().filter_map(|value| value.upgrade()) {
+            let _ = unsafe { controller.Close() };
+        }
+        drop(keeper);
+        if let Some(profile) = profile {
+            // Best-effort cleanup of the owned profile directory; it is never
+            // reused. Runtime retries pending deletion on future browser starts.
             let _ = unsafe { profile.Delete() };
         }
-        self.environment.borrow_mut().take();
+        drop(environment);
     }
 }
 
@@ -289,6 +324,7 @@ unsafe extern "system" fn window_lifetime(
 
 struct Keeper {
     _view: WebView,
+    _registration: Registration,
     _native: NativeWindow,
     _storage: wry::WebContext,
 }
@@ -316,6 +352,7 @@ impl Drop for NativeWindow {
 pub(super) struct Window {
     // Drop the WebView before its native parent.
     view: WebView,
+    _registration: Registration,
     native: NativeWindow,
 }
 
@@ -487,7 +524,7 @@ impl Window {
                 .add_FrameNavigationStarting(&handler, &mut registration)
         }
         .map_err(|_| "The provider sign-in browser could not protect navigation.")?;
-        context.register(&view)?;
+        let registration = context.register(&view)?;
         *native.0.controller.borrow_mut() = Some(view.controller());
         view.load_url(start)
             .map_err(|_| "The provider sign-in page could not open.")?;
@@ -495,7 +532,11 @@ impl Window {
             ShowWindow(handle, SW_SHOW);
             SetForegroundWindow(handle);
         }
-        Ok(Self { view, native })
+        Ok(Self {
+            view,
+            _registration: registration,
+            native,
+        })
     }
 
     pub fn open(&self) -> bool {
@@ -608,7 +649,19 @@ mod tests {
         NativeWindow::new(handle, None).unwrap()
     }
 
-    fn media_view(context: &Context, parent: &NativeWindow, root: &std::path::Path) -> WebView {
+    struct MediaView {
+        view: WebView,
+        _registration: Registration,
+    }
+
+    impl std::ops::Deref for MediaView {
+        type Target = WebView;
+        fn deref(&self) -> &Self::Target {
+            &self.view
+        }
+    }
+
+    fn media_view(context: &Context, parent: &NativeWindow, root: &std::path::Path) -> MediaView {
         // Every provider/account uses production's one app-owned UDF. Isolation
         // must come from distinct InPrivate profiles, never fixture directories.
         assert!(super::super::super::windows_profile::data_directory()
@@ -624,8 +677,11 @@ mod tests {
             None => builder,
         };
         let view = builder.build_as_child(parent).unwrap();
-        context.register(&view).unwrap();
-        view
+        let registration = context.register(&view).unwrap();
+        MediaView {
+            view,
+            _registration: registration,
+        }
     }
 
     fn page_title(view: &WebView) -> Option<String> {
@@ -824,6 +880,48 @@ mod tests {
         let other_youtube = other_account.context(Provider::Youtube).unwrap();
         assert_eq!(snapshot(&other_youtube)["cookie"], false);
         let active_pov = media_view(&youtube.platform, &parent, &root);
+        active_pov.load_url(&format!("{origin}/state")).unwrap();
+        assert_eq!(
+            state(&active_pov, "active media before disconnect")["cookie"],
+            true
+        );
+        // Controller.Close releases its event handlers synchronously. Observe
+        // that teardown from inside the released handler, where native reentry
+        // must see a retired context with none of its RefCells still borrowed.
+        struct ObserveRetirement {
+            context: Weak<super::super::Context>,
+            observed: Rc<Cell<Option<bool>>>,
+        }
+        impl Drop for ObserveRetirement {
+            fn drop(&mut self) {
+                let ready = self.context.upgrade().is_some_and(|context| {
+                    let context = &context.platform;
+                    context.retired.get()
+                        && context.controllers.try_borrow_mut().is_ok()
+                        && context.keeper.try_borrow_mut().is_ok()
+                        && context.profile.try_borrow_mut().is_ok()
+                        && context.environment.try_borrow_mut().is_ok()
+                });
+                self.observed.set(Some(ready));
+            }
+        }
+        let retirement_observed = Rc::new(Cell::new(None));
+        let observation = ObserveRetirement {
+            context: Rc::downgrade(&youtube),
+            observed: Rc::clone(&retirement_observed),
+        };
+        let observer = NavigationStartingEventHandler::create(Box::new(move |_, _| {
+            let _ = &observation;
+            Ok(())
+        }));
+        let mut event_token = 0;
+        unsafe {
+            active_pov
+                .webview()
+                .add_NavigationStarting(&observer, &mut event_token)
+        }
+        .unwrap();
+        drop(observer);
         let reopened = Window::new_at(
             &youtube.platform,
             &Provider::Youtube,
@@ -847,17 +945,23 @@ mod tests {
         assert!(!youtube.active());
         assert!(!sessions.login_open());
         assert!(youtube.platform.keeper.borrow().is_none());
-        // Profile deletion closes its views through WebView2's Deleted event.
-        // Pump that bounded asynchronous teardown before checking retirement.
-        wait_for("disconnected profile view closure", || {
-            let mut source = PWSTR::null();
-            if unsafe { active_pov.webview().Source(&mut source) }.is_err() {
-                true
-            } else {
-                let _ = webview2_com::take_pwstr(source);
-                false
-            }
-        });
+        assert_eq!(retirement_observed.get(), Some(true));
+        // Retirement must end a retained media controller immediately, without
+        // waiting for profile cleanup. Check actual navigation/script rejection,
+        // not only a potentially cached Source getter on the old COM object.
+        assert!(active_pov.load_url(&format!("{origin}/state")).is_err());
+        let completed = webview2_com::ExecuteScriptCompletedHandler::create(Box::new(|_, _| {
+            panic!("A retired provider view must not execute scripts")
+        }));
+        assert!(unsafe {
+            active_pov.webview().ExecuteScript(
+                windows::core::w!("document.title = 'retired-script-ran'"),
+                &completed,
+            )
+        }
+        .is_err());
+        assert!(youtube.platform.controllers.borrow().is_empty());
+        assert!(youtube.platform.register(&active_pov).is_err());
         assert!(twitch.active());
         assert_eq!(snapshot(&twitch)["cookie"], false);
         let replacement = sessions.context(Provider::Youtube).unwrap();
@@ -867,6 +971,13 @@ mod tests {
         );
         assert_eq!(snapshot(&replacement)["cookie"], false);
         assert_eq!(snapshot(&replacement)["storage"], false);
+        // Churning POVs drops their strong registration immediately and prunes
+        // dead weak entries on the next registration, even with a keeper alive.
+        for _ in 0..8 {
+            let view = media_view(&replacement.platform, &parent, &root);
+            assert_eq!(replacement.platform.controllers.borrow().len(), 1);
+            drop(view);
+        }
         sessions.close();
         other_account.close();
         assert!(sessions.context(Provider::Youtube).is_err());

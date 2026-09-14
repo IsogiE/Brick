@@ -19,6 +19,7 @@ enum Action {
     Share(String),
     Discover(String),
 }
+
 enum Completed {
     Ready,
     Disconnected,
@@ -40,6 +41,10 @@ pub struct YoutubeUi {
     notice: Option<String>,
     foreground: bool,
     changed: bool,
+    connecting: bool,
+    disconnecting: bool,
+    sign_in_finished: bool,
+    saved_connection: bool,
 }
 
 impl Drop for YoutubeUi {
@@ -62,6 +67,11 @@ impl YoutubeUi {
             let disconnected = matches!(&received, Err(mpsc::TryRecvError::Disconnected));
             if let Ok((account, result)) = received {
                 self.work = None;
+                self.accept_completion(
+                    account.connected(),
+                    account.connected() || account.needs_reconnect(),
+                    result.is_ok(),
+                );
                 self.cancel = None;
                 self.connected = account.connected();
                 let reconnect_required = account.needs_reconnect();
@@ -139,6 +149,8 @@ impl YoutubeUi {
                 return;
             }
         };
+        self.connecting = matches!(action, Action::Connect);
+        self.disconnecting = matches!(action, Action::Disconnect);
         self.foreground = !matches!(action, Action::Restore | Action::Discover(_));
         if self.foreground {
             self.notice = None;
@@ -198,43 +210,67 @@ impl YoutubeUi {
         self.work = Some(rx);
     }
 
-    pub fn draw_account(&mut self, ui: &mut egui::Ui, available: bool) {
-        ui.label(RichText::new("YouTube").strong().size(15.0));
-        ui.label("Connect your channel to find your live streams and VODs.");
-        let enabled = available && !self.busy();
-        if !Account::configured() {
-            ui.label("YouTube connection is not available in this build.");
-        } else if !self.connected {
-            if ui
-                .add_enabled(enabled, egui::Button::new("Connect YouTube"))
-                .clicked()
-            {
-                self.start(ui.ctx(), Action::Connect);
+    pub fn connected(&self) -> bool {
+        self.connected
+    }
+
+    pub fn can_sign_out(&self) -> bool {
+        self.saved_connection || self.connected
+    }
+
+    pub fn connecting(&self) -> bool {
+        self.busy() && self.connecting
+    }
+
+    pub fn cancellation_pending(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::Acquire))
+    }
+
+    pub fn cancel_sign_in(&mut self) {
+        if self.connecting() {
+            if let Some(cancel) = &self.cancel {
+                cancel.store(true, Ordering::Release);
             }
-        } else {
-            if self.channels.is_empty() {
-                ui.label("Connected. This account has no available YouTube channels.");
-            } else {
-                for channel in &self.channels {
-                    ui.label(RichText::new(&channel.title).strong());
-                }
-            }
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Change account"))
-                    .clicked()
-                {
-                    self.start(ui.ctx(), Action::Connect);
-                }
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Disconnect account"))
-                    .clicked()
-                {
-                    self.start(ui.ctx(), Action::Disconnect);
-                }
-            });
+            self.sign_in_finished = false;
         }
-        self.draw_progress(ui);
+    }
+
+    fn accept_completion(&mut self, connected: bool, saved: bool, succeeded: bool) {
+        // Keep a saved grant removable even if cancellation arrives after its
+        // protected write. A canceled flow never opens the viewing window.
+        self.sign_in_finished |=
+            self.connecting && succeeded && connected && !self.cancellation_pending();
+        if succeeded {
+            self.saved_connection = saved;
+        } else {
+            self.saved_connection |= saved || self.disconnecting;
+        }
+    }
+
+    pub fn account_name(&self) -> Option<&str> {
+        self.connected.then(|| {
+            self.channels
+                .first()
+                .map(|channel| channel.title.as_str())
+                .unwrap_or("")
+        })
+    }
+
+    pub fn sign_in(&mut self, ctx: &egui::Context) {
+        self.sign_in_finished = false;
+        self.start(ctx, Action::Connect);
+    }
+
+    pub fn sign_out(&mut self, ctx: &egui::Context) {
+        self.sign_in_finished = false;
+        self.saved_connection = true;
+        self.start(ctx, Action::Disconnect);
+    }
+
+    pub fn take_sign_in_finished(&mut self) -> bool {
+        std::mem::take(&mut self.sign_in_finished)
     }
 
     pub fn draw_channel(&mut self, ui: &mut egui::Ui, shared: Option<&Channel>, available: bool) {
@@ -299,8 +335,61 @@ impl YoutubeUi {
                 }
             });
         }
-        if let Some(notice) = &self.notice {
-            ui.label(RichText::new(notice).small());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restored_or_partial_grants_are_removable_without_opening_a_viewer() {
+        for connected in [false, true] {
+            let mut ui = YoutubeUi::default();
+            ui.accept_completion(connected, true, connected);
+            assert!(ui.can_sign_out());
+            assert!(!ui.take_sign_in_finished());
         }
+    }
+
+    #[test]
+    fn only_successful_explicit_sign_in_opens_a_viewer_once() {
+        let mut ui = YoutubeUi::default();
+        ui.connecting = true;
+        ui.accept_completion(false, true, false);
+        assert!(!ui.take_sign_in_finished());
+        ui.accept_completion(true, true, true);
+        assert!(ui.take_sign_in_finished());
+        assert!(!ui.take_sign_in_finished());
+    }
+
+    #[test]
+    fn cancel_suppresses_completed_sign_in_without_erasing_a_saved_grant() {
+        for saved in [false, true] {
+            for succeeded in [false, true] {
+                let mut ui = YoutubeUi::default();
+                ui.connecting = true;
+                let (_tx, rx) = mpsc::channel();
+                ui.work = Some(rx);
+                let cancel = Arc::new(AtomicBool::new(false));
+                ui.cancel = Some(cancel.clone());
+                ui.cancel_sign_in();
+                assert!(cancel.load(Ordering::Acquire));
+                ui.accept_completion(saved, saved, succeeded);
+                assert!(!ui.take_sign_in_finished());
+                assert_eq!(ui.can_sign_out(), saved);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_disconnect_keeps_its_retry_until_removal_succeeds() {
+        let mut ui = YoutubeUi::default();
+        ui.disconnecting = true;
+        ui.accept_completion(false, false, false);
+        assert!(ui.can_sign_out());
+        ui.accept_completion(false, false, true);
+        assert!(!ui.can_sign_out());
+        assert!(!ui.take_sign_in_finished());
     }
 }

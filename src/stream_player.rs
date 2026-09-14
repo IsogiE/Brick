@@ -172,6 +172,8 @@ pub struct StreamPlayer {
     webview: Option<WebView>,
     #[cfg(target_os = "windows")]
     _web_context: wry::WebContext,
+    #[cfg(target_os = "windows")]
+    _provider_registration: Option<provider_login::Registration>,
     _provider_sessions: Rc<ProviderSessions>,
     provider_context: Option<Rc<provider_login::Context>>,
     allowed_url: Arc<Mutex<String>>,
@@ -426,6 +428,8 @@ impl StreamPlayer {
             webview: Some(webview),
             #[cfg(target_os = "windows")]
             _web_context: web_context,
+            #[cfg(target_os = "windows")]
+            _provider_registration: None,
             _provider_sessions: sessions,
             provider_context: Some(provider_context),
             allowed_url,
@@ -455,7 +459,7 @@ impl StreamPlayer {
             #[cfg(target_os = "linux")]
             preference_handler: None,
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         let mut player = player;
         let webview = player
             .webview
@@ -490,12 +494,14 @@ impl StreamPlayer {
         }
         #[cfg(target_os = "windows")]
         {
-            player
-                .provider_context
-                .as_ref()
-                .expect("The player owns its provider context")
-                .platform
-                .register(webview)?;
+            player._provider_registration = Some(
+                player
+                    .provider_context
+                    .as_ref()
+                    .expect("The player owns its provider context")
+                    .platform
+                    .register(webview)?,
+            );
             protect_windows_permissions(webview)?;
             protect_windows_requests(
                 webview,
@@ -541,28 +547,10 @@ impl StreamPlayer {
             .is_some_and(|context| context.take_login_request())
     }
 
-    pub fn provider_login_open(&self) -> bool {
-        self.provider_context
-            .as_ref()
-            .is_some_and(|context| context.window_open())
-    }
-
-    pub fn provider_session_started(&self) -> bool {
-        self.provider_context
-            .as_ref()
-            .is_some_and(|context| context.attempted())
-    }
-
     pub fn provider_name(&self) -> &'static str {
         self.provider_context
             .as_ref()
             .map_or("Video service", |context| context.provider.label())
-    }
-
-    pub fn close_provider_login(&self) {
-        if let Some(context) = &self.provider_context {
-            context.close_window();
-        }
     }
 
     pub fn can_reuse_for_url(&self, value: &str) -> bool {
@@ -2597,6 +2585,8 @@ mod tests {
             provider_context: None,
             #[cfg(target_os = "windows")]
             _web_context: wry::WebContext::default(),
+            #[cfg(target_os = "windows")]
+            _provider_registration: None,
             allowed_url: Arc::new(Mutex::new(String::new())),
             #[cfg(target_os = "windows")]
             bearer_tokens: Arc::new(Mutex::new(Vec::new())),

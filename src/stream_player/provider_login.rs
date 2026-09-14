@@ -15,6 +15,9 @@ mod platform;
 #[path = "provider_login/windows.rs"]
 mod platform;
 
+#[cfg(target_os = "windows")]
+pub(super) use platform::Registration;
+
 /// Owned by one signed-in Brick account. Retire it before changing accounts.
 /// Provider state is personal; guild data and Brick credentials never enter it.
 #[derive(Default)]
@@ -65,11 +68,13 @@ impl ProviderSessions {
             .is_some_and(|context| context.attempted())
     }
 
+    #[cfg(test)]
     pub fn login_open_for(&self, provider: &Provider) -> bool {
         let context = self.contexts.borrow()[index(provider)].clone();
         context.is_some_and(|context| context.window_open())
     }
 
+    #[cfg(test)]
     pub fn close_login(&self, provider: &Provider) {
         let context = self.contexts.borrow()[index(provider)].clone();
         if let Some(context) = context {

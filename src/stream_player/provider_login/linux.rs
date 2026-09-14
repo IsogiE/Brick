@@ -2,10 +2,13 @@ use super::{allowed_document, start_url, title};
 use crate::streams::Provider;
 use eframe::egui;
 use gtk::prelude::*;
-use std::cell::RefCell;
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 use webkit2gtk::{
-    DownloadExt, FileChooserRequestExt, NavigationPolicyDecisionExt, PermissionRequestExt,
-    PolicyDecisionExt, SettingsExt, URIRequestExt, WebContextExt, WebViewExt,
+    DownloadExt, FileChooserRequestExt, HardwareAccelerationPolicy, NavigationPolicyDecisionExt,
+    PermissionRequestExt, PolicyDecisionExt, SettingsExt, URIRequestExt, WebContextExt, WebViewExt,
     WebsiteDataManagerExt,
 };
 
@@ -96,6 +99,60 @@ impl Context {
 pub(super) struct Window {
     window: gtk::Window,
     view: webkit2gtk::WebView,
+    _load_status: Rc<LoadStatus>,
+}
+
+struct LoadStatus {
+    panel: gtk::Box,
+    spinner: gtk::Spinner,
+    label: gtk::Label,
+    retry: gtk::Button,
+    failed: Cell<bool>,
+}
+
+impl LoadStatus {
+    fn new() -> Self {
+        let panel = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        panel.set_margin_start(12);
+        panel.set_margin_end(12);
+        panel.set_margin_top(12);
+        panel.set_margin_bottom(12);
+        let spinner = gtk::Spinner::new();
+        let label = gtk::Label::new(Some("Couldn't connect"));
+        let retry = gtk::Button::with_label("Try again");
+        panel.pack_start(&spinner, false, false, 0);
+        panel.pack_start(&label, true, true, 0);
+        panel.pack_end(&retry, false, false, 0);
+        Self {
+            panel,
+            spinner,
+            label,
+            retry,
+            failed: Cell::new(false),
+        }
+    }
+
+    fn loading(&self) {
+        self.failed.set(false);
+        self.panel.show_all();
+        self.label.hide();
+        self.retry.hide();
+        self.spinner.start();
+    }
+
+    fn fail(&self) {
+        self.failed.set(true);
+        self.panel.show_all();
+        self.spinner.stop();
+        self.spinner.hide();
+    }
+
+    fn finished(&self) {
+        self.spinner.stop();
+        if !self.failed.get() {
+            self.panel.hide();
+        }
+    }
 }
 
 impl Window {
@@ -147,11 +204,27 @@ impl Window {
             settings.set_enable_developer_extras(false);
             settings.set_enable_fullscreen(false);
             settings.set_enable_page_cache(false);
+            // Match the existing player: XWayland cannot reliably share GBM
+            // buffers with every GPU driver. This changes compositing only.
+            settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
         }
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
         window.set_default_size(560, 700);
         window.set_title(&title(provider, start_url(provider)));
-        window.add(&view);
+        let contents = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let load_status = Rc::new(LoadStatus::new());
+        contents.pack_start(&load_status.panel, false, false, 0);
+        contents.pack_start(&view, true, true, 0);
+        window.add(&contents);
+        let retry_view = view.downgrade();
+        let retry_start = start.to_owned();
+        load_status.retry.connect_clicked(move |_| {
+            if let Some(view) = retry_view.upgrade() {
+                // Retry only this window's original fixed provider destination.
+                // Never replay a failed redirect or a URL from an error string.
+                view.load_uri(&retry_start);
+            }
+        });
         let closed = ctx.clone();
         window.connect_delete_event(move |window, _| {
             // Owned native widget; all Rust references remain on this UI thread.
@@ -198,7 +271,15 @@ impl Window {
         });
         let title_window = window.downgrade();
         let title_provider = provider.clone();
+        let status = Rc::downgrade(&load_status);
         view.connect_load_changed(move |view, event| {
+            if let Some(status) = status.upgrade() {
+                match event {
+                    webkit2gtk::LoadEvent::Started => status.loading(),
+                    webkit2gtk::LoadEvent::Finished => status.finished(),
+                    _ => (),
+                }
+            }
             if event == webkit2gtk::LoadEvent::Committed {
                 if let Some(window) = title_window.upgrade() {
                     window.set_title(&title(
@@ -208,10 +289,37 @@ impl Window {
                 }
             }
         });
+        let status = Rc::downgrade(&load_status);
+        view.connect_load_failed(move |_, _, _, error| {
+            // Navigating again, closing, or enforcing the origin policy can
+            // cancel a load without a connection failure.
+            if error.matches(webkit2gtk::NetworkError::Cancelled)
+                || error.matches(webkit2gtk::PolicyError::FrameLoadInterruptedByPolicyChange)
+            {
+                return true;
+            }
+            if let Some(status) = status.upgrade() {
+                status.fail();
+            }
+            // Keep provider URLs and raw transport errors out of HTML or logs.
+            // The native strip owns the error and retry UI.
+            true
+        });
+        let status = Rc::downgrade(&load_status);
+        view.connect_web_process_terminated(move |_, _| {
+            if let Some(status) = status.upgrade() {
+                status.fail();
+            }
+        });
         context.register(&view);
         view.load_uri(start);
         window.show_all();
-        Ok(Self { window, view })
+        load_status.loading();
+        Ok(Self {
+            window,
+            view,
+            _load_status: load_status,
+        })
     }
 
     pub fn open(&self) -> bool {
@@ -294,6 +402,9 @@ mod tests {
                 let mut request = [0; 8192];
                 let count = socket.read(&mut request).unwrap_or(0);
                 let request = String::from_utf8_lossy(&request[..count]);
+                if request.starts_with("GET /transport-error ") {
+                    continue;
+                }
                 let login = request.starts_with("GET /login ");
                 let cookie = request.lines().any(|line| {
                     line.to_ascii_lowercase().starts_with("cookie:")
@@ -349,12 +460,29 @@ mod tests {
         let login_state: serde_json::Value = {
             let window = youtube.window.borrow();
             let window = window.as_ref().unwrap();
+            assert_eq!(
+                WebViewExt::settings(&window.view)
+                    .unwrap()
+                    .hardware_acceleration_policy(),
+                HardwareAccelerationPolicy::Never
+            );
             wait_for(|| {
                 window
                     .view
                     .title()
                     .is_some_and(|title| title.starts_with('{'))
             });
+            window.view.load_uri(&format!("{origin}/transport-error"));
+            wait_for(|| window._load_status.failed.get());
+            assert!(window._load_status.panel.is_visible());
+            assert!(window._load_status.retry.is_visible());
+            window._load_status.retry.emit_clicked();
+            wait_for(|| !window._load_status.failed.get() && !window.view.is_loading());
+            assert_eq!(
+                window.view.uri().as_deref(),
+                Some(format!("{origin}/login").as_str())
+            );
+            assert!(!window._load_status.panel.is_visible());
             serde_json::from_str(&window.view.title().unwrap()).unwrap()
         };
         assert_eq!(login_state["ipc"], false);

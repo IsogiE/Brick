@@ -14,9 +14,9 @@ Brick keeps the guild addon installed across your WoW clients, runs in the syste
 
 If you qualify for more than one guild, use the guild selector beside the navigation tabs. Brick remembers your selection and opens that guild's roster, profile, streams and recordings. Your guild roles are independent; being an Officer in one guild does not grant Officer access in another. Personal settings and your Warcraft Logs sign-in follow your account.
 
-Home's **Streaming accounts** panel connects your YouTube and Twitch accounts on this device. In **Your streams**, choose a channel to share with the current guild; each guild keeps its own sharing settings. YouTube channel sharing includes public and unlisted broadcasts, and you can still add an individual broadcast link. Account credentials stay in the operating system's protected store.
+Home has one **Sign in** or **Sign out** control for each streaming account. Sign in connects your channel through the provider's authorization page, then opens the provider's sign-in window for watching videos. Sign out removes the saved connection and closes that provider's viewing session.
 
-**Sign in to player** opens a separate provider window for watching videos. Its browser session is shared between that provider's players for your current Brick account and lasts until Brick closes. Connecting a channel does not sign the embedded player in. Brick does not import your normal browser's cookies.
+In **Your streams**, choose a channel to share with the current guild; each guild keeps its own sharing settings. YouTube channel sharing includes public and unlisted broadcasts, and you can still add an individual broadcast link. Account credentials stay in the operating system's protected store. Viewing sessions remain separate from API authorization, are isolated by provider and Brick account, and last until Brick closes. Brick does not import your normal browser's cookies; the provider controls whether its sign-in succeeds.
 
 On startup and every minute while running and signed in, Brick checks the installed addon versions against the current signed release. If a managed addon's folder or TOC file is missing, or its TOC version differs, Brick reinstalls the current package automatically.
 
