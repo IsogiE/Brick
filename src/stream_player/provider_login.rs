@@ -240,13 +240,17 @@ pub(super) struct Context {
 
 impl Context {
     fn new(provider: Provider, jar: Rc<session::Jar>) -> Result<Self, String> {
+        #[cfg(target_os = "windows")]
+        let platform = platform::Context::new(&provider)?;
+        #[cfg(target_os = "linux")]
+        let platform = platform::Context::new()?;
         Ok(Self {
             provider,
             active: Cell::new(true),
             attempted: Cell::new(false),
             login_requested: Cell::new(false),
             window: RefCell::new(None),
-            platform: platform::Context::new()?,
+            platform,
             jar,
             polling: Cell::new(false),
             next_poll: Cell::new(None),

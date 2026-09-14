@@ -38,6 +38,9 @@ use windows_sys::Win32::{
 };
 use wry::{WebView, WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows};
 
+#[path = "windows_cookie_access.rs"]
+mod cookie_access;
+
 pub(super) fn watch_requests(
     view: &WebView,
     context: std::rc::Weak<super::Context>,
@@ -97,6 +100,7 @@ pub(super) fn watch_requests(
 
 pub(crate) struct Context {
     pub profile_name: String,
+    profile_path: std::path::PathBuf,
     pub environment: RefCell<Option<ICoreWebView2Environment>>,
     profile: RefCell<Option<ICoreWebView2Profile8>>,
     keeper: RefCell<Option<Keeper>>,
@@ -114,9 +118,16 @@ pub(crate) struct Registration {
 }
 
 impl Context {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(provider: &Provider) -> Result<Self, String> {
+        Self::for_origin(provider, crate::presence::endpoint_url("/").ok().as_ref())
+    }
+
+    fn for_origin(provider: &Provider, origin: Option<&url::Url>) -> Result<Self, String> {
+        let profile_name = format!("BrickViewer{}", uuid::Uuid::new_v4().simple());
+        let profile_path = cookie_access::prepare(&profile_name, provider, origin)?;
         Ok(Self {
-            profile_name: format!("BrickViewer{}", uuid::Uuid::new_v4().simple()),
+            profile_name,
+            profile_path,
             environment: RefCell::new(None),
             profile: RefCell::new(None),
             keeper: RefCell::new(None),
@@ -148,6 +159,14 @@ impl Context {
             .map_err(|_| "The provider session could not verify its identity.")?;
         if webview2_com::take_pwstr(name) != self.profile_name {
             return Err("The provider session requires its own private profile.".into());
+        }
+        let mut path = PWSTR::null();
+        unsafe { profile.ProfilePath(&mut path) }
+            .map_err(|_| "The provider session could not verify its storage.")?;
+        let actual = std::fs::canonicalize(webview2_com::take_pwstr(path));
+        let expected = std::fs::canonicalize(&self.profile_path);
+        if !matches!((actual, expected), (Ok(actual), Ok(expected)) if actual == expected) {
+            return Err("The provider session requires its own configured profile.".into());
         }
         let managed = profile
             .cast::<ICoreWebView2Profile8>()
@@ -1184,7 +1203,7 @@ mod tests {
         }
         let _stop = Stop(Arc::clone(&stopped));
         let parent = parent_window();
-        let restored = Context::new().unwrap();
+        let restored = Context::new(&Provider::Youtube).unwrap();
         let saved = ["SID", "HSID"].map(|name| super::super::session::Cookie {
             name: name.into(),
             value: "synthetic-provider-session".into(),
@@ -1435,6 +1454,147 @@ mod tests {
         assert_ne!(unsafe { IsWindow(unrelated.handle()) }, 0);
         stopped.store(true, Ordering::Relaxed);
         worker.join().unwrap();
+        assert_cross_site_viewing(&root, &parent);
         eprintln!("Native Windows provider sessions: private profile identity; no login auth/IPC/scripts/opener; WM_CLOSE controller teardown; empty keeper across last POV close; provider/account isolation; disconnect/profile retirement; stale HWND ownership passed");
+    }
+
+    fn assert_cross_site_viewing(root: &std::path::Path, parent: &NativeWindow) {
+        use super::super::session::{Cookie, Jar};
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            ICoreWebView2_3, COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY_CORS,
+        };
+        use windows::core::HSTRING;
+
+        let origin = url::Url::parse("https://brick-fixture.test/").unwrap();
+        for provider in [Provider::Youtube, Provider::Twitch] {
+            let (host, domain, names) = match provider {
+                Provider::Youtube => ("www.youtube.com", ".youtube.com", vec!["SID", "HSID"]),
+                Provider::Twitch => ("player.twitch.tv", ".twitch.tv", vec!["auth-token"]),
+            };
+            let pages = root.join(format!("cross-site-{}", provider.label()));
+            std::fs::create_dir_all(&pages).unwrap();
+            // These mappings are confined to this offline fixture, which has
+            // never visited a real provider and only uses synthetic cookies.
+            std::fs::write(
+                pages.join("frame.html"),
+                r#"<!doctype html><script>
+const result={cookie:document.cookie.includes('brick_fixture_viewing=fixture-only'),
+ httpOnlyHidden:!document.cookie.includes('brick_fixture_http_only'),
+ strict:document.cookie.includes('brick_fixture_strict=fixture-only')};
+if(parent===window)document.title=JSON.stringify(result);
+else parent.postMessage(result,new URL(document.referrer).origin);
+</script>"#,
+            )
+            .unwrap();
+            std::fs::write(pages.join("wrapper.html"), format!(r#"<!doctype html><script>
+addEventListener('message',e=>{{if(e.origin==='https://{host}'&&e.source===document.querySelector('iframe').contentWindow)document.title=JSON.stringify(e.data);}});
+</script><iframe src="https://{host}/frame.html"></iframe>"#)).unwrap();
+            let cookie = |name: &str, http_only, same_site| Cookie {
+                name: name.into(),
+                value: "fixture-only".into(),
+                domain: domain.into(),
+                path: "/".into(),
+                expires: Some(super::super::session::now() + 3600),
+                secure: true,
+                http_only,
+                same_site,
+            };
+            let mut saved = vec![
+                cookie("brick_fixture_viewing", false, 0),
+                cookie("brick_fixture_http_only", true, 0),
+                cookie("brick_fixture_strict", false, 2),
+            ];
+            saved.extend(names.into_iter().map(|name| cookie(name, true, 0)));
+            let account = "987654321-cross-site-fixture";
+            let jar = Jar::new(provider.clone(), account);
+            wait_for("empty protected viewing jar", || jar.ready());
+            assert!(jar.error().is_none());
+            jar.observe(saved.clone());
+            drop(jar); // Finish the DPAPI write before simulating restart.
+            let jar = Jar::new(provider.clone(), account);
+            wait_for("DPAPI viewing restore", || jar.ready());
+            assert!(jar.error().is_none());
+            assert!(jar.signed_in());
+            assert_eq!(jar.cookies().len(), saved.len());
+
+            let context = Context::for_origin(&provider, Some(&origin)).unwrap();
+            context.restore(&jar.cookies()).unwrap();
+            let map = |view: &WebView| {
+                let core = view.webview().cast::<ICoreWebView2_3>().unwrap();
+                for host in [host, "brick-fixture.test", "outside-fixture.test"] {
+                    unsafe {
+                        core.SetVirtualHostNameToFolderMapping(
+                            &HSTRING::from(host),
+                            &HSTRING::from(pages.to_string_lossy().as_ref()),
+                            COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY_CORS,
+                        )
+                    }
+                    .unwrap();
+                }
+            };
+            let login = media_view(&context, parent, root);
+            map(&login);
+            login
+                .load_url(&format!("https://{host}/frame.html"))
+                .unwrap();
+            let first = state(&login, "first-party synthetic provider login");
+            assert_eq!(first["cookie"], true);
+            assert_eq!(first["strict"], true);
+            assert_eq!(first["httpOnlyHidden"], true);
+            context.keep_alive(parent.handle()).unwrap();
+            drop(login);
+            let snapshot = |context: &Context, origin: &str| {
+                let view = media_view(context, parent, root);
+                map(&view);
+                view.load_url(&format!("{origin}/wrapper.html")).unwrap();
+                state(&view, "cross-site synthetic player")
+            };
+            let embedded = snapshot(&context, "https://brick-fixture.test");
+            assert_eq!(
+                embedded["cookie"],
+                true,
+                "{} viewing login must reach its iframe",
+                provider.label()
+            );
+            assert_eq!(embedded["strict"], false, "SameSite remains enforced");
+            assert_eq!(
+                embedded["httpOnlyHidden"], true,
+                "HttpOnly remains enforced"
+            );
+            assert_eq!(
+                snapshot(&context, "https://outside-fixture.test")["cookie"],
+                false,
+                "unrelated embedding sites stay blocked"
+            );
+            let other_provider = match provider {
+                Provider::Youtube => Provider::Twitch,
+                Provider::Twitch => Provider::Youtube,
+            };
+            let other = Context::for_origin(&other_provider, Some(&origin)).unwrap();
+            // Even cookies placed in the wrong synthetic profile must not get
+            // an exception for the other provider's domain.
+            other.restore(&saved).unwrap();
+            assert_eq!(
+                snapshot(&other, "https://brick-fixture.test")["cookie"],
+                false
+            );
+            other.retire();
+            context.retire();
+            jar.clear();
+            drop(jar);
+            let cleared = Jar::new(provider.clone(), account);
+            wait_for("protected sign-out removal", || cleared.ready());
+            assert!(cleared.error().is_none());
+            assert!(!cleared.signed_in());
+            assert!(cleared.cookies().is_empty());
+            let signed_out = Context::for_origin(&provider, Some(&origin)).unwrap();
+            signed_out.restore(&cleared.cookies()).unwrap();
+            assert_eq!(
+                snapshot(&signed_out, "https://brick-fixture.test")["cookie"],
+                false
+            );
+            signed_out.retire();
+            eprintln!("{}: private cross-site login, DPAPI restore, provider/site isolation, SameSite/HttpOnly and sign-out passed", provider.label());
+        }
     }
 }
