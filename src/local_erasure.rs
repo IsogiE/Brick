@@ -556,7 +556,7 @@ mod tests {
         fs::write(other.join("keep"), b"other application").unwrap();
         fs::write(wow.join("keep"), b"installed addon").unwrap();
         fs::write(&installed, b"installed Brick executable").unwrap();
-        let make_junction = |link: &Path| {
+        let make_junction = |stage: &str, link: &Path| {
             fs::create_dir_all(link.parent().unwrap()).unwrap();
             let result = Command::new(r"C:\Windows\System32\cmd.exe")
                 .args(["/d", "/c", "mklink", "/J"])
@@ -566,12 +566,15 @@ mod tests {
                 .unwrap();
             assert!(
                 result.status.success(),
-                "synthetic junction creation failed"
+                "synthetic junction creation failed at {stage}: status={}; stdout={:?}; stderr={:?}",
+                result.status,
+                String::from_utf8_lossy(&result.stdout[..result.stdout.len().min(4096)]),
+                String::from_utf8_lossy(&result.stderr[..result.stderr.len().min(4096)])
             );
         };
 
         let redirected = profile.join("Local").join(APP_ID);
-        make_junction(&redirected);
+        make_junction("profile root", &redirected);
         assert!(reset().unwrap_err().contains("redirected"));
         assert!(!is_pending().unwrap());
         assert!(write_permit().is_ok());
@@ -591,8 +594,8 @@ mod tests {
         for key in STARTUP_KEYS {
             assert!(startup_value(key, "Brick"));
         }
-        let nested = redirected.join("WebView2/redirected");
-        make_junction(&nested);
+        let nested = redirected.join("WebView2").join("redirected");
+        make_junction("nested browser state", &nested);
         let legacy = profile.join("Local/Brick/brick.exe.WebView2");
         fs::create_dir_all(&legacy).unwrap();
         fs::write(legacy.join("synthetic-cookie"), b"synthetic browser state").unwrap();
