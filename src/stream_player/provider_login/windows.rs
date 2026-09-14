@@ -6,6 +6,7 @@ use std::{
     cell::{Cell, RefCell},
     num::NonZeroIsize,
     rc::{Rc, Weak},
+    sync::OnceLock,
 };
 use webview2_com::{
     GetCookiesCompletedHandler,
@@ -25,10 +26,13 @@ use windows::Win32::{
 use windows_sys::Win32::{
     Foundation::{HWND, RECT},
     Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
+    System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, GetAncestor, GetClientRect, GetWindowRect, IsWindowVisible,
-        SetForegroundWindow, SetWindowTextW, ShowWindow, GA_ROOT, SW_HIDE, SW_SHOW, WM_CLOSE,
-        WM_NCDESTROY, WS_CAPTION, WS_CLIPCHILDREN, WS_POPUP, WS_SYSMENU,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, GetAncestor, GetClassLongPtrW,
+        GetClientRect, GetWindowRect, IsWindowVisible, LoadCursorW, RegisterClassExW, SendMessageW,
+        SetForegroundWindow, SetWindowTextW, ShowWindow, GA_ROOT, GCLP_HICON, GCLP_HICONSM,
+        ICON_BIG, ICON_SMALL, IDC_ARROW, SW_HIDE, SW_SHOW, WM_CLOSE, WM_GETICON, WM_NCDESTROY,
+        WM_SETICON, WNDCLASSEXW, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_POPUP,
     },
 };
 use wry::{WebView, WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows};
@@ -388,6 +392,46 @@ struct WindowState {
 
 struct NativeWindow(Rc<WindowState>);
 
+fn provider_window_class() -> Result<u16, String> {
+    static CLASS: OnceLock<Result<u16, String>> = OnceLock::new();
+    CLASS
+        .get_or_init(|| {
+            let name = wide("Brick.ProviderSignIn");
+            // STATIC is a control class: its WM_NCHITTEST returns
+            // HTTRANSPARENT, including over the caption. Use the normal
+            // window procedure for dragging, resizing and the system menu.
+            let class = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(DefWindowProcW),
+                hInstance: unsafe { GetModuleHandleW(std::ptr::null()) },
+                hCursor: unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) },
+                lpszClassName: name.as_ptr(),
+                ..Default::default()
+            };
+            let atom = unsafe { RegisterClassExW(&class) };
+            if atom == 0 {
+                Err("The provider sign-in window could not register its controls.".into())
+            } else {
+                Ok(atom)
+            }
+        })
+        .clone()
+}
+
+fn inherit_window_icons(handle: HWND, owner: HWND) {
+    // These icons belong to Brick's owner window, which outlives its owned
+    // popups. Borrow them; never destroy or replace the owner's icon handles.
+    for (size, class_icon) in [(ICON_SMALL, GCLP_HICONSM), (ICON_BIG, GCLP_HICON)] {
+        let mut icon = unsafe { SendMessageW(owner, WM_GETICON, size as usize, 0) };
+        if icon == 0 {
+            icon = unsafe { GetClassLongPtrW(owner, class_icon) } as isize;
+        }
+        if icon != 0 {
+            unsafe { SendMessageW(handle, WM_SETICON, size as usize, icon) };
+        }
+    }
+}
+
 impl NativeWindow {
     fn new(handle: HWND, repaint: Option<&egui::Context>) -> Result<Self, String> {
         let state = Rc::new(WindowState {
@@ -619,22 +663,22 @@ impl Window {
         )
         .ok_or("The provider sign-in window could not fit its display.")?;
         let caption = wide(&title(provider, start_url(provider)));
-        let class = wide("STATIC");
-        // Fixed-size native window. The lifetime subclass keeps HWND ownership
-        // valid when the close button ends only this login controller.
+        let class = provider_window_class()?;
+        // Wry follows the native window's size and position. The lifetime
+        // subclass keeps HWND ownership valid when closing this controller.
         let handle = unsafe {
             CreateWindowExW(
                 0,
-                class.as_ptr(),
+                class as usize as *const u16,
                 caption.as_ptr(),
-                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                 bounds.left,
                 bounds.top,
                 bounds.right - bounds.left,
                 bounds.bottom - bounds.top,
                 owner,
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                GetModuleHandleW(std::ptr::null()),
                 std::ptr::null(),
             )
         };
@@ -642,6 +686,7 @@ impl Window {
             return Err("The provider sign-in window could not open.".into());
         }
         let native = NativeWindow::new(handle, Some(ctx))?;
+        inherit_window_icons(handle, owner);
         let mut rect = windows_sys::Win32::Foundation::RECT::default();
         if unsafe { GetClientRect(handle, &mut rect) } == 0 {
             return Err("The provider sign-in window could not size its browser.".into());
@@ -902,7 +947,75 @@ mod tests {
             )
         };
         assert!(!handle.is_null());
+        // Shared synthetic icon: exercise inheritance without the real app
+        // window, any account, or a desktop asset outside this fixture.
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{LoadIconW, IDI_APPLICATION};
+            let icon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
+            assert!(!icon.is_null());
+            for size in [ICON_SMALL, ICON_BIG] {
+                SendMessageW(handle, WM_SETICON, size as usize, icon as isize);
+            }
+        }
         NativeWindow::new(handle, None).unwrap()
+    }
+
+    fn assert_window_controls(login: &Window, owner: HWND) {
+        use windows_sys::Win32::{
+            Foundation::POINT,
+            Graphics::Gdi::ClientToScreen,
+            UI::WindowsAndMessaging::{MoveWindow, HTCAPTION, WM_NCHITTEST},
+        };
+        let handle = login.native.handle();
+        for size in [ICON_SMALL, ICON_BIG] {
+            let icon = unsafe { SendMessageW(handle, WM_GETICON, size as usize, 0) };
+            assert_ne!(icon, 0, "provider window has an icon");
+            assert_eq!(icon, unsafe {
+                SendMessageW(owner, WM_GETICON, size as usize, 0)
+            });
+        }
+        let mut before = RECT::default();
+        let mut client_origin = POINT::default();
+        unsafe {
+            assert_ne!(GetWindowRect(handle, &mut before), 0);
+            assert_ne!(ClientToScreen(handle, &mut client_origin), 0);
+        }
+        let caption_x = (before.left + before.right) / 2;
+        let caption_y = (before.top + client_origin.y) / 2;
+        let point = (caption_x as u16 as u32 | ((caption_y as u16 as u32) << 16)) as isize;
+        assert_eq!(
+            unsafe { SendMessageW(handle, WM_NCHITTEST, 0, point) },
+            HTCAPTION as isize,
+            "the native title bar must accept dragging, not pass through to Brick"
+        );
+        unsafe {
+            assert_ne!(
+                MoveWindow(
+                    handle,
+                    before.left + 32,
+                    before.top + 24,
+                    before.right - before.left + 80,
+                    before.bottom - before.top + 60,
+                    1
+                ),
+                0
+            );
+        }
+        let mut after = RECT::default();
+        assert_ne!(unsafe { GetWindowRect(handle, &mut after) }, 0);
+        assert_eq!((after.left, after.top), (before.left + 32, before.top + 24));
+        wait_for("resized sign-in browser follows its window", || {
+            let mut client = RECT::default();
+            let mut browser = windows::Win32::Foundation::RECT::default();
+            unsafe {
+                GetClientRect(handle, &mut client) != 0
+                    && login.view.controller().Bounds(&mut browser).is_ok()
+                    && browser.left == 0
+                    && browser.top == 0
+                    && browser.right == client.right
+                    && browser.bottom == client.bottom
+            }
+        });
     }
 
     struct MediaView {
@@ -1119,6 +1232,7 @@ mod tests {
             "initial sign-in foreground",
             || unsafe { GetForegroundWindow() } == login.native.handle(),
         );
+        assert_window_controls(&login, parent.handle());
         for key in ["auth", "ipc", "bridge", "opener"] {
             assert_eq!(initial[key], false, "{key}");
         }

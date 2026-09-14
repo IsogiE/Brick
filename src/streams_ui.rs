@@ -695,7 +695,7 @@ impl StreamsUi {
                     egui::vec2(ui.available_width(), 32.0),
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
-                        done |= ui.add(player_account_button("Done")).clicked();
+                        done |= ui.add(interactive_button("Done")).clicked();
                     },
                 );
             });
@@ -1200,7 +1200,7 @@ impl StreamsUi {
                     if ui
                         .add_enabled(
                             presence::configured() && self.work.is_none(),
-                            action_button("Your streams").min_size(egui::vec2(108.0, 32.0)),
+                            interactive_button("Your streams").min_size(egui::vec2(108.0, 32.0)),
                         )
                         .clicked()
                     {
@@ -1224,7 +1224,7 @@ impl StreamsUi {
                     }
                     let refresh = ui.add_enabled(
                         self.work.is_none() && presence::configured(),
-                        action_button("Refresh"),
+                        interactive_button("Refresh"),
                     );
                     if refresh.clicked() {
                         self.notice = None;
@@ -1240,7 +1240,7 @@ impl StreamsUi {
                     if ui
                         .add_enabled(
                             self.work.is_none(),
-                            action_button(if self.recordings_open {
+                            interactive_button(if self.recordings_open {
                                 "Live streams"
                             } else {
                                 "VODs"
@@ -1259,10 +1259,7 @@ impl StreamsUi {
                             self.start(ui.ctx(), Action::Recordings);
                         }
                     }
-                    if ui
-                        .add(player_account_button("Video Player Sign In"))
-                        .clicked()
-                    {
+                    if ui.add(interactive_button("Video Player Sign In")).clicked() {
                         self.viewing_open = true;
                         self.edit_open = false;
                     }
@@ -2211,10 +2208,7 @@ fn viewing_account_control(
             egui::Label::new(RichText::new(provider.label()).strong()),
         );
         let label = if signed_in { "Sign out" } else { "Sign in" };
-        if ui
-            .add_enabled(ready, player_account_button(label))
-            .clicked()
-        {
+        if ui.add_enabled(ready, interactive_button(label)).clicked() {
             action = Some(if signed_in {
                 ViewingAccountAction::Clear
             } else {
@@ -2225,7 +2219,7 @@ fn viewing_account_control(
     action
 }
 
-fn player_account_button(label: &str) -> egui::Button<'_> {
+fn interactive_button(label: &str) -> egui::Button<'_> {
     // Use the theme's interactive fill/stroke so hover, keyboard focus and
     // pressed feedback remain visible instead of fixing one color in all states.
     egui::Button::new(label)
@@ -3033,57 +3027,80 @@ mod tests {
     }
 
     #[test]
-    fn player_sign_in_controls_show_hover_and_pressed_feedback() {
-        let ctx = egui::Context::default();
-        crate::ui::tests::apply_style(&ctx);
-        ctx.global_style_mut(|style| style.animation_time = 0.0);
-        let frame = |events| {
-            ctx.run_ui(
-                egui::RawInput {
-                    events,
-                    ..Default::default()
-                },
-                |ui| {
-                    ui.add(player_account_button("Sign in"));
-                },
-            )
-        };
-        frame(vec![]);
-        let idle = frame(vec![]);
-        let position = idle
-            .shapes
-            .iter()
-            .find_map(|shape| {
-                if let egui::epaint::Shape::Text(text) = &shape.shape {
-                    Some(text.pos + text.galley.size() * 0.5)
-                } else {
-                    None
-                }
-            })
-            .unwrap();
-        let fills = |output: egui::FullOutput| {
-            output
+    fn streams_toolbar_and_sign_in_controls_show_hover_and_pressed_feedback() {
+        for label in [
+            "Video Player Sign In",
+            "VODs",
+            "Live streams",
+            "Refresh",
+            "Your streams",
+            "Sign in",
+            "Sign out",
+        ] {
+            let ctx = egui::Context::default();
+            crate::ui::tests::apply_style(&ctx);
+            ctx.global_style_mut(|style| style.animation_time = 0.0);
+            let mut streams = StreamsUi {
+                recordings_open: label == "Live streams",
+                ..Default::default()
+            };
+            let mut frame = |events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        if matches!(label, "Sign in" | "Sign out") {
+                            ui.add(interactive_button(label));
+                        } else {
+                            streams.draw_toolbar(ui);
+                        }
+                    },
+                )
+            };
+            frame(vec![]);
+            let idle = frame(vec![]);
+            let position = idle
                 .shapes
-                .into_iter()
-                .filter_map(|shape| {
-                    if let egui::epaint::Shape::Rect(rect) = shape.shape {
-                        Some(rect.fill)
+                .iter()
+                .find_map(|shape| {
+                    if let egui::epaint::Shape::Text(text) = &shape.shape {
+                        (text.galley.text() == label).then_some(text.pos + text.galley.size() * 0.5)
                     } else {
                         None
                     }
                 })
-                .collect::<Vec<_>>()
-        };
-        let hovered = frame(vec![egui::Event::PointerMoved(position)]);
-        let pressed = frame(vec![egui::Event::PointerButton {
-            pos: position,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: egui::Modifiers::NONE,
-        }]);
-        let hovered = fills(hovered);
-        assert_ne!(fills(idle), hovered);
-        assert_ne!(fills(pressed), hovered);
+                .unwrap();
+            let fills = |output: egui::FullOutput| {
+                output
+                    .shapes
+                    .into_iter()
+                    .filter_map(|shape| {
+                        if let egui::epaint::Shape::Rect(rect) = shape.shape {
+                            rect.rect.contains(position).then_some(rect.fill)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let hovered = frame(vec![egui::Event::PointerMoved(position)]);
+            let pressed = frame(vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            let hovered = fills(hovered);
+            if matches!(label, "Refresh" | "Your streams") && !presence::configured() {
+                assert_eq!(fills(idle), hovered, "disabled {label}");
+                assert_eq!(fills(pressed), hovered, "disabled {label}");
+            } else {
+                assert_ne!(fills(idle), hovered, "hover {label}");
+                assert_ne!(fills(pressed), hovered, "press {label}");
+            }
+        }
     }
 
     #[test]
