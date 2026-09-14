@@ -51,7 +51,7 @@ enum Action {
     SaveCooldowns(defensives::Preferences),
 }
 enum Data {
-    Review(Review, defensives::Preferences),
+    Review(Review, defensives::Preferences, (u64, bool)),
     Authentication,
     Events(String, EventKind, Vec<RaidEvent>, defensives::Preferences),
     Cooldowns(defensives::Preferences),
@@ -162,6 +162,7 @@ pub struct ReviewUi {
     marker_cache: Arc<Mutex<crate::replay_sync::Cache>>,
     marker_sync: crate::replay_sync::Sync,
     metadata_only: bool,
+    recording_housekeeping: bool,
     work: Option<mpsc::Receiver<Outcome>>,
     work_action: Option<Action>,
     cancel: Arc<AtomicBool>,
@@ -170,6 +171,7 @@ pub struct ReviewUi {
     last_attempt: Option<Instant>,
     refresh_period: Duration,
     review: Option<Review>,
+    recording_match_status: Option<(u64, bool)>,
     replay_coverage: Option<(i64, i64)>,
     notice: Option<String>,
     connected: bool,
@@ -215,6 +217,7 @@ impl Default for ReviewUi {
             marker_cache: Arc::new(Mutex::new(crate::replay_sync::Cache::default())),
             marker_sync: crate::replay_sync::Sync::default(),
             metadata_only: false,
+            recording_housekeeping: false,
             work: None,
             work_action: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -223,6 +226,7 @@ impl Default for ReviewUi {
             last_attempt: None,
             refresh_period: Duration::from_secs(60),
             review: None,
+            recording_match_status: None,
             replay_coverage: None,
             notice: None,
             connected: false,
@@ -281,6 +285,84 @@ impl ReviewUi {
         peer.marker_cache = self.marker_cache.clone();
         peer.metadata_only = true;
         peer
+    }
+
+    pub(crate) fn recording_auth_epoch(&self) -> Option<u64> {
+        self.client
+            .try_lock()
+            .ok()?
+            .as_ref()
+            .map(|client| client.recording_match_status().0)
+    }
+
+    pub(crate) fn publish_recording_match(
+        &self,
+        ctx: &egui::Context,
+        epoch: u64,
+        lease: String,
+        has_raid: bool,
+        cancel: Arc<AtomicBool>,
+    ) -> mpsc::Receiver<Result<(), String>> {
+        let client = self.client.clone();
+        let ctx = ctx.clone();
+        let (tx, rx) = mpsc::channel();
+        crate::guild::spawn(move || {
+            let result = (|| {
+                let token =
+                    while_current(&cancel, discord_auth::current_or_refreshed_access_token)??
+                        .ok_or("Sign in to Discord again.")?;
+                let lock = client.lock().map_err(|_| "Warcraft Logs is unavailable.")?;
+                let client = lock.as_ref().ok_or("Warcraft Logs is unavailable.")?;
+                if !client.connected() || client.recording_match_status().0 != epoch {
+                    return Err("The recording check is no longer current.".into());
+                }
+                // Hold the shared account lock through submission. A WCL account
+                // switch cannot publish a result from the previous account.
+                while_current(&cancel, || {
+                    crate::streams::submit_recording_check(&token, &lease, has_raid)
+                })?
+                .map_err(|error| error.message)
+            })();
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        rx
+    }
+
+    pub(crate) fn recording_match(&self, stream: &Stream) -> Option<(u64, Result<bool, ()>)> {
+        if self.work.is_some() || self.key != pov_key(stream) || self.last_attempt.is_none() {
+            return None;
+        }
+        if !self.connected || self.notice.is_some() {
+            return Some((self.recording_auth_epoch().unwrap_or(0), Err(())));
+        }
+        let epoch = self.recording_auth_epoch()?;
+        let review = self.review.as_ref()?;
+        let (review_epoch, complete) = self.recording_match_status?;
+        if review_epoch != epoch {
+            return Some((epoch, Err(())));
+        }
+        // The archive directory may record when an offline broadcast was first
+        // observed. The fetched replay's complete duration is authoritative.
+        let complete = complete
+            && review.replay.start_ms().ok().is_some_and(|start| {
+                (1..=7 * 86400).contains(&review.replay.available_seconds)
+                    && start
+                        .checked_add(review.replay.available_seconds as i64 * 1000)
+                        .is_some_and(|end| {
+                            end <= time::OffsetDateTime::now_utc().unix_timestamp() * 1000
+                                - crate::recording_filter::GRACE_MS
+                        })
+            });
+        let has_raid = review.pulls.iter().any(|pull| pull.difficulty != 10);
+        Some((
+            review_epoch,
+            if has_raid || complete {
+                Ok(has_raid)
+            } else {
+                Err(())
+            },
+        ))
     }
 
     pub(crate) fn comparison_notice(&self) -> Option<&str> {
@@ -396,6 +478,7 @@ impl ReviewUi {
     pub(crate) fn open_recording(&mut self) {
         self.cancel_read();
         self.review = None;
+        self.recording_match_status = None;
         self.replay_coverage = None;
         self.pull = None;
         self.playback = None;
@@ -498,6 +581,24 @@ impl ReviewUi {
     }
 
     pub fn tick(&mut self, ctx: &egui::Context, stream: Option<&Stream>) -> bool {
+        self.tick_mode(ctx, stream, false)
+    }
+
+    pub(crate) fn tick_recording_match(&mut self, ctx: &egui::Context, stream: &Stream) {
+        self.tick_mode(ctx, Some(stream), true);
+    }
+
+    pub(crate) fn metadata_busy(&self) -> bool {
+        self.work.is_some()
+    }
+
+    fn tick_mode(
+        &mut self,
+        ctx: &egui::Context,
+        stream: Option<&Stream>,
+        housekeeping: bool,
+    ) -> bool {
+        self.recording_housekeeping = housekeeping;
         self.refresh_period = if !self.metadata_only
             && stream.is_some_and(|stream| {
                 stream.status == Status::Live
@@ -517,6 +618,7 @@ impl ReviewUi {
             self.cancel_read();
             self.key = key;
             self.review = None;
+            self.recording_match_status = None;
             self.replay_coverage = None;
             self.notice = None;
             self.last_attempt = None;
@@ -554,10 +656,18 @@ impl ReviewUi {
                         self.connected = connected;
                         self.connection_checked = true;
                         match result {
-                            Ok(Data::Review(review, preferences)) => {
-                                self.accept_cooldown_preferences(preferences);
-                                changed |= self.accept_review(review);
-                                changed |= self.restore_pov_position();
+                            Ok(Data::Review(review, preferences, match_status)) => {
+                                self.recording_match_status = Some(match_status);
+                                if self.recording_housekeeping {
+                                    // Housekeeping never prepares playback, enriches the
+                                    // timestamp cache or schedules a marker scan.
+                                    self.review = Some(review);
+                                    self.notice = None;
+                                } else {
+                                    self.accept_cooldown_preferences(preferences);
+                                    changed |= self.accept_review(review);
+                                    changed |= self.restore_pov_position();
+                                }
                             }
                             Ok(Data::Authentication) => {
                                 self.marker_sync.reset(None);
@@ -565,6 +675,7 @@ impl ReviewUi {
                                     *cache = Default::default();
                                 }
                                 self.review = None;
+                                self.recording_match_status = None;
                                 self.replay_coverage = None;
                                 self.pull = None;
                                 self.events.clear();
@@ -613,6 +724,7 @@ impl ReviewUi {
                         }
                         if !connected {
                             self.review = None;
+                            self.recording_match_status = None;
                             self.replay_coverage = None;
                             self.pull = None;
                             self.events.clear();
@@ -885,6 +997,7 @@ impl ReviewUi {
             None
         };
         let client = self.client.clone();
+        let housekeeping = self.recording_housekeeping;
         let stream = stream.cloned();
         let ctx = ctx.clone();
         let key = self.key.clone();
@@ -927,9 +1040,18 @@ impl ReviewUi {
                     Action::Disconnect => client.disconnect(&token).map(|_| Data::Authentication),
                     Action::Refresh => {
                         let stream = stream.as_ref().ok_or("Choose a VOD first.")?;
-                        client
-                            .review(&token, stream)
-                            .map(|review| Data::Review(review, client.cooldown_preferences()))
+                        let review = if housekeeping {
+                            client.match_recording(&token, stream)
+                        } else {
+                            client.review(&token, stream)
+                        };
+                        review.map(|review| {
+                            Data::Review(
+                                review,
+                                client.cooldown_preferences(),
+                                client.recording_match_status(),
+                            )
+                        })
                     }
                     Action::Events(pull, kind) => {
                         client.events(&token, &pull, kind).map(|events| {
@@ -1558,6 +1680,7 @@ impl ReviewUi {
             self.cancel_read();
             self.playback = None;
             self.review = None;
+            self.recording_match_status = None;
             self.replay_coverage = None;
             self.pull = None;
             self.events.clear();
@@ -3273,6 +3396,76 @@ mod tests {
     use crate::warcraftlogs::Replay;
     use std::collections::HashMap;
 
+    #[test]
+    fn recording_housekeeping_does_not_prepare_playback_or_touch_marker_cache() {
+        let (review, pull, stream) = fixture();
+        let mut peer = ReviewUi::default().metadata_peer();
+        peer.key = pov_key(&stream);
+        peer.marker_cache.lock().unwrap().insert(
+            crate::replay_sync::Key::new(&review.replay, &pull),
+            crate::replay_sync::Alignment {
+                video_seconds: 19_800.0,
+                unix_seconds: pull.start_ms / 1000,
+                uncertainty_seconds: 0.1,
+            },
+        );
+        let before = peer.marker_cache.lock().unwrap().to_bytes().unwrap();
+        let (tx, rx) = mpsc::channel();
+        peer.work = Some(rx);
+        peer.work_action = Some(Action::Refresh);
+        tx.send((
+            peer.generation,
+            peer.key.clone(),
+            Ok(Data::Review(review, Default::default(), (0, true))),
+            true,
+        ))
+        .unwrap();
+        peer.tick_recording_match(&egui::Context::default(), &stream);
+        assert!(peer.review.as_ref().unwrap().marker_timing.is_empty());
+        assert_eq!(
+            peer.marker_cache.lock().unwrap().to_bytes().unwrap(),
+            before
+        );
+        assert!(!peer.active && peer.playback.is_none() && peer.pull.is_none());
+        assert!(peer.events.is_empty() && peer.work.is_none());
+    }
+
+    #[test]
+    fn recording_match_keeps_partial_pending_failed_and_recent_replays_visible() {
+        let (mut review, _, mut stream) = fixture();
+        stream.status = Status::Offline;
+        stream.recording_id = Some(review.replay.video_id.clone());
+        let mut ui = ReviewUi::default();
+        *ui.client.lock().unwrap() = Some(Client::new().unwrap());
+        ui.key = pov_key(&stream);
+        ui.last_attempt = Some(Instant::now());
+        ui.connected = true;
+        ui.recording_match_status = Some((0, true));
+        ui.review = Some(review.clone());
+        assert_eq!(ui.recording_match(&stream), Some((0, Ok(true))));
+        review.pulls.clear();
+        ui.review = Some(review.clone());
+        assert_eq!(ui.recording_match(&stream), Some((0, Ok(false))));
+        ui.recording_match_status = Some((0, false));
+        assert_eq!(ui.recording_match(&stream), Some((0, Err(()))));
+        ui.recording_match_status = Some((0, true));
+        ui.notice = Some("Temporary failure".into());
+        assert_eq!(ui.recording_match(&stream), Some((0, Err(()))));
+        ui.notice = None;
+        let (_tx, rx) = mpsc::channel();
+        ui.work = Some(rx);
+        assert!(ui.recording_match(&stream).is_none());
+        ui.work = None;
+        ui.review.as_mut().unwrap().replay.started_at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        assert_eq!(ui.recording_match(&stream), Some((0, Err(()))));
+        // A late response cannot supply absence after the WCL account changes.
+        ui.review = Some(review);
+        ui.recording_match_status = Some((99, true));
+        assert_eq!(ui.recording_match(&stream), Some((0, Err(()))));
+    }
+
     fn fixture() -> (Review, Pull, Stream) {
         let replay = Replay {
             provider: Provider::Youtube,
@@ -3684,7 +3877,7 @@ mod tests {
         tx.send((
             review_ui.generation,
             review_ui.key.clone(),
-            Ok(Data::Review(review, Default::default())),
+            Ok(Data::Review(review, Default::default(), (0, true))),
             true,
         ))
         .unwrap();
@@ -4295,7 +4488,7 @@ mod tests {
         tx.send((
             generation,
             key,
-            Ok(Data::Review(review, Default::default())),
+            Ok(Data::Review(review, Default::default(), (0, true))),
             true,
         ))
         .unwrap();

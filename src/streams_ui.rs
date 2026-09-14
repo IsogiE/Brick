@@ -34,6 +34,7 @@ enum Action {
     Save(Provider, String),
     Remove(Provider),
     Recordings,
+    RecordingChecks,
     RemoveRecording(Provider, String),
 }
 enum ResultData {
@@ -41,6 +42,7 @@ enum ResultData {
     Saved,
     Removed,
     Recordings(streams::Recordings),
+    RecordingChecks(Vec<streams::RecordingCheck>),
     RecordingRemoved(Provider, String),
 }
 type WorkResult = Result<ResultData, streams::Error>;
@@ -66,6 +68,9 @@ pub struct StreamsUi {
     recordings_attempted: bool,
     recordings_retry_at: Option<Instant>,
     loading_recordings: bool,
+    loading_recording_checks: bool,
+    recording_checks: crate::recording_filter::Filter,
+    recording_peer: crate::review_ui::ReviewUi,
     can_delete_recordings: bool,
     confirm_remove_recording: Option<Vod>,
     pov_revision: u64,
@@ -94,6 +99,7 @@ impl Default for StreamsUi {
     fn default() -> Self {
         let review = crate::review_ui::ReviewUi::default();
         let warmup = review.metadata_peer();
+        let recording_peer = review.metadata_peer();
         Self {
             youtube: Default::default(),
             twitch: Default::default(),
@@ -114,6 +120,9 @@ impl Default for StreamsUi {
             recordings_attempted: false,
             recordings_retry_at: None,
             loading_recordings: false,
+            loading_recording_checks: false,
+            recording_checks: Default::default(),
+            recording_peer,
             can_delete_recordings: false,
             confirm_remove_recording: None,
             pov_revision: 0,
@@ -437,6 +446,8 @@ impl StreamsUi {
                         self.start(ctx, Action::Refresh);
                     }
                     Ok(ResultData::Recordings(recordings)) => {
+                        self.recording_checks
+                            .catalog_received(recordings.log_checks);
                         self.recordings_retry_at = None;
                         self.pov_revision = self.pov_revision.wrapping_add(1);
                         self.can_delete_recordings = recordings.can_delete_recordings;
@@ -460,6 +471,11 @@ impl StreamsUi {
                             self.notice = Some("This VOD is no longer in Brick.".into());
                         }
                     }
+                    Ok(ResultData::RecordingChecks(checks)) => {
+                        // Background results only replenish checks. The catalog
+                        // already on screen stays stable until the next load.
+                        self.recording_checks.catalog_received(checks);
+                    }
                     Ok(ResultData::RecordingRemoved(provider, id)) => {
                         self.apply_recording_removal(&provider, &id);
                         self.notice = Some("VOD removed from Brick.".into());
@@ -475,13 +491,15 @@ impl StreamsUi {
                         }
                         // Read failures recover on the normal cadence. Keep action errors
                         // for the form that caused them, without calling attention to Refresh.
-                        self.notice = if self.notice_provider.is_some()
-                            || self.confirm_remove_recording.is_some()
-                        {
-                            Some(error.message)
-                        } else {
-                            None
-                        };
+                        if !self.loading_recording_checks {
+                            self.notice = if self.notice_provider.is_some()
+                                || self.confirm_remove_recording.is_some()
+                            {
+                                Some(error.message)
+                            } else {
+                                None
+                            };
+                        }
                     }
                 }
             }
@@ -494,6 +512,12 @@ impl StreamsUi {
             };
             if active && (self.recordings_open || self.review.active()) && self.recordings_due() {
                 self.start(ctx, Action::Recordings);
+            } else if active
+                && self.recordings.is_some()
+                && !self.review.active()
+                && self.recording_checks.needs_catalog()
+            {
+                self.start(ctx, Action::RecordingChecks);
             } else if self.last_attempt.is_none_or(|at| at.elapsed() >= refresh) {
                 self.start(ctx, Action::Refresh);
             }
@@ -513,6 +537,12 @@ impl StreamsUi {
                     .min_by_key(|s| (&s.user_id, s.provider.key(), &s.channel_id))
             });
         self.warmup.tick(ctx, warmup_stream);
+        self.recording_checks.tick(
+            ctx,
+            self.snapshot.as_deref(),
+            active && self.recordings.is_some() && !self.review.active(),
+            &mut self.recording_peer,
+        );
         if self.review.tick(
             ctx,
             self.selected
@@ -597,7 +627,13 @@ impl StreamsUi {
         if self.work.is_some() {
             return;
         }
-        self.notice = None;
+        self.loading_recording_checks = matches!(action, Action::RecordingChecks);
+        if !self.loading_recording_checks {
+            self.notice = None;
+        }
+        if matches!(action, Action::Recordings | Action::RecordingChecks) {
+            self.recording_checks.catalog_started();
+        }
         self.loading_recordings = matches!(action, Action::Recordings);
         if self.loading_recordings {
             self.recordings_attempted = true;
@@ -644,6 +680,8 @@ impl StreamsUi {
                     streams::remove(&token, &provider).map(|()| ResultData::Removed)
                 }
                 Action::Recordings => streams::fetch_recordings(&token).map(ResultData::Recordings),
+                Action::RecordingChecks => streams::fetch_recordings(&token)
+                    .map(|recordings| ResultData::RecordingChecks(recordings.log_checks)),
                 Action::RemoveRecording(provider, id) => {
                     streams::remove_recording(&token, &provider, &id)
                         .map(|()| ResultData::RecordingRemoved(provider, id))
@@ -2308,6 +2346,26 @@ pub(crate) fn player_url_for_playback(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn background_log_checks_preserve_visible_vods() {
+        let mut ui = super::StreamsUi::default();
+        let visible = std::rc::Rc::new(vec![recording("987", "1")]);
+        ui.recordings = Some(visible.clone());
+        ui.recordings_attempted = true;
+        ui.pov_revision = 42;
+        ui.loading_recording_checks = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        ui.work = Some(rx);
+        tx.send(Ok(super::ResultData::RecordingChecks(vec![])))
+            .unwrap();
+        ui.tick(&eframe::egui::Context::default(), true, false);
+        assert!(std::rc::Rc::ptr_eq(
+            ui.recordings.as_ref().unwrap(),
+            &visible
+        ));
+        assert_eq!(ui.pov_revision, 42);
+    }
+
     #[test]
     fn guild_switch_drops_private_panel_but_keeps_personal_viewing_session() {
         let mut host = super::StreamsUi::default();

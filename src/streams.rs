@@ -175,6 +175,14 @@ pub struct Recordings {
     pub vods: Vec<Vod>,
     #[serde(default)]
     pub can_delete_recordings: bool,
+    #[serde(default)]
+    pub log_checks: Vec<RecordingCheck>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct RecordingCheck {
+    pub vod: Vod,
+    pub lease: String,
 }
 
 pub fn fetch_recordings(access_token: &crate::guild::Access) -> Result<Recordings, Error> {
@@ -182,7 +190,26 @@ pub fn fetch_recordings(access_token: &crate::guild::Access) -> Result<Recording
     let mut recordings: Recordings = serde_json::from_slice(&body)
         .map_err(|_| Error::from("The recording history could not be read.".to_string()))?;
     recordings.vods.retain(valid_vod_url);
-    for vod in &mut recordings.vods {
+    if recordings.log_checks.len() > 32
+        || recordings.log_checks.iter().any(|check| {
+            !valid_vod_url(&check.vod)
+                || check.lease.is_empty()
+                || check.lease.len() > 1024
+                || !check
+                    .lease
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        })
+    {
+        return Err("The recording checks could not be verified."
+            .to_string()
+            .into());
+    }
+    for vod in recordings
+        .vods
+        .iter_mut()
+        .chain(recordings.log_checks.iter_mut().map(|check| &mut check.vod))
+    {
         let url = url::Url::parse(&vod.url).expect("Validated recording URL");
         let id = match vod.provider {
             Provider::Twitch => url.path().trim_start_matches("/videos/").to_owned(),
@@ -201,6 +228,20 @@ pub fn fetch_recordings(access_token: &crate::guild::Access) -> Result<Recording
         vod.id = id;
     }
     Ok(recordings)
+}
+
+pub(crate) fn submit_recording_check(
+    access: &crate::guild::Access,
+    lease: &str,
+    has_raid: bool,
+) -> Result<(), Error> {
+    request(
+        Method::POST,
+        "/v1/streams/vods/log-checks",
+        access,
+        Some(serde_json::json!({"checks":[{"lease":lease,"hasRaid":has_raid}]})),
+    )?;
+    Ok(())
 }
 
 pub fn remove_recording(

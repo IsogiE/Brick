@@ -22,6 +22,7 @@ mod local_erasure;
 mod presence;
 mod profile;
 mod protected_cache;
+mod recording_filter;
 mod recordings_ui;
 mod replay_digits;
 mod replay_edge;

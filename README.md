@@ -20,6 +20,8 @@ In **Your streams**, add a channel link or optionally authorize channel discover
 
 On startup and every minute while running and signed in, Brick checks the installed addon versions against the current signed release. If a managed addon's folder or TOC file is missing, or its TOC version differs, Brick reinstalls the current package automatically.
 
+Saved VODs without matching raid logs can be hidden after 12 hours. Brick checks the reports your Warcraft Logs account can access and saves only the result, encrypted on the server for your own guild view. The next VOD load applies saved results immediately, keeping the displayed list stable while background checks run. Later matching reports can restore hidden VODs.
+
 Raid replay review uses ART's small Unix timestamp to calibrate YouTube and Twitch recordings. ART displays it at the top left for five seconds in normal, heroic and mythic raids; `/art unix` previews it in-game. One verified pull establishes the recording's timing, which can then align later pulls across Warcraft Logs reports. New recordings are calibrated separately. Overlapping pulls establish clock corrections between log reports; a new report without overlap may need one background check, shared by the other calibrated POVs. Manual seconds offsets are no longer used.
 
 Verified timing is saved locally and shared with the guild. Passive reading during playback never seeks or changes video quality, and a newly discovered timestamp does not move the currently playing pull. Provider timing remains available when a marker cannot be read.
