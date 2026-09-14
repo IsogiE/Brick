@@ -1,7 +1,0 @@
-User-agent: *
-Allow: /
-Disallow: /v1/
-Disallow: /v2/
-Disallow: /discord/
-Disallow: /warcraftlogs/
-Sitemap: https://brick.lusaggo.com/sitemap.xml
