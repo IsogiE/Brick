@@ -1,4 +1,4 @@
-//! Home's personal Twitch connection. Guild sharing uses only channel().url.
+//! Optional personal Twitch grant. Guild sharing uses only channel().url.
 use crate::twitch_account::{Account, Channel};
 use eframe::egui;
 use std::{
@@ -30,7 +30,6 @@ pub struct TwitchUi {
     foreground: bool,
     connecting: bool,
     disconnecting: bool,
-    sign_in_finished: bool,
     saved_connection: bool,
 }
 
@@ -52,7 +51,7 @@ impl TwitchUi {
             .and(self.channel.as_ref())
     }
     pub fn tick(&mut self, ctx: &egui::Context) {
-        // Defense in depth if a caller retains Home across a guild/account
+        // Defense in depth if a caller retains this panel across a guild/account
         // transition. A cancelled refresh may finish persisting its rotation,
         // but its result can never populate the next account's panel.
         let generation = crate::guild::generation();
@@ -65,7 +64,6 @@ impl TwitchUi {
                 Ok((account, result)) => {
                     self.work = None;
                     self.accept_completion(
-                        account.connected(),
                         account.needs_reconnect() || account.check_after().is_some(),
                         result.is_ok(),
                     );
@@ -167,38 +165,27 @@ impl TwitchUi {
         });
         self.work = Some(rx);
     }
-    pub fn connected(&self) -> bool {
-        self.channel().is_some()
+    fn can_disconnect(&self) -> bool {
+        self.saved_connection || self.channel().is_some()
     }
 
-    pub fn can_sign_out(&self) -> bool {
-        self.saved_connection || self.connected()
-    }
-
-    pub fn connecting(&self) -> bool {
-        self.busy() && self.connecting
-    }
-
-    pub fn cancellation_pending(&self) -> bool {
+    fn cancellation_pending(&self) -> bool {
         self.cancel
             .as_ref()
             .is_some_and(|cancel| cancel.load(Ordering::Acquire))
     }
 
-    pub fn cancel_sign_in(&mut self) {
-        if self.connecting() {
+    fn cancel_connect(&mut self) {
+        if self.busy() && self.connecting {
             if let Some(cancel) = &self.cancel {
                 cancel.store(true, Ordering::Release);
             }
-            self.sign_in_finished = false;
         }
     }
 
-    fn accept_completion(&mut self, connected: bool, saved: bool, succeeded: bool) {
-        // Cancellation stops the follow-up window, not a protected write that
-        // may already have completed. Preserve its sign-out path in that race.
-        self.sign_in_finished |=
-            self.connecting && succeeded && connected && !self.cancellation_pending();
+    fn accept_completion(&mut self, saved: bool, succeeded: bool) {
+        // Cancellation may arrive after a protected write. Keep that grant
+        // removable, including when the channel lookup or disconnect failed.
         if succeeded {
             self.saved_connection = saved;
         } else {
@@ -206,23 +193,55 @@ impl TwitchUi {
         }
     }
 
-    pub fn account_name(&self) -> Option<&str> {
-        self.channel().map(|channel| channel.title.as_str())
-    }
-
-    pub fn sign_in(&mut self, ctx: &egui::Context) {
-        self.sign_in_finished = false;
-        self.start(ctx, Action::Connect);
-    }
-
-    pub fn sign_out(&mut self, ctx: &egui::Context) {
-        self.sign_in_finished = false;
-        self.saved_connection = true;
-        self.start(ctx, Action::Disconnect);
-    }
-
-    pub fn take_sign_in_finished(&mut self) -> bool {
-        std::mem::take(&mut self.sign_in_finished)
+    pub fn draw_connection_control(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if let Some(channel) = self.channel() {
+                ui.label(&channel.title);
+            } else if ui
+                .add_enabled(
+                    !self.busy() && Account::configured(),
+                    egui::Button::new("Choose channel"),
+                )
+                .clicked()
+            {
+                self.start(ui.ctx(), Action::Connect);
+            }
+            if self.can_disconnect()
+                && ui
+                    .add_enabled(!self.busy(), egui::Button::new("Forget account").small())
+                    .on_hover_text("Remove this device's saved channel connection.")
+                    .clicked()
+            {
+                self.saved_connection = true;
+                self.start(ui.ctx(), Action::Disconnect);
+            }
+            ui.hyperlink_to(
+                egui::RichText::new("Manage access").small(),
+                "https://www.twitch.tv/settings/connections",
+            );
+        });
+        if self.busy() && self.foreground {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(if self.cancellation_pending() {
+                    "Cancelling…"
+                } else if self.connecting {
+                    "Choosing channel…"
+                } else {
+                    "Forgetting account…"
+                });
+                if self.connecting
+                    && ui
+                        .add_enabled(!self.cancellation_pending(), egui::Button::new("Cancel"))
+                        .clicked()
+                {
+                    self.cancel_connect();
+                }
+            });
+        }
+        if let Some(notice) = &self.notice {
+            ui.label(egui::RichText::new(notice).small());
+        }
     }
 }
 
@@ -230,28 +249,17 @@ impl TwitchUi {
 mod tests {
     use super::*;
     #[test]
-    fn restored_or_partial_grants_are_removable_without_opening_a_viewer() {
-        for connected in [false, true] {
+    fn restored_or_partial_grants_remain_removable_without_starting_work() {
+        for succeeded in [false, true] {
             let mut ui = TwitchUi::default();
-            ui.accept_completion(connected, true, connected);
-            assert!(ui.can_sign_out());
-            assert!(!ui.take_sign_in_finished());
+            ui.accept_completion(true, succeeded);
+            assert!(ui.can_disconnect());
+            assert!(!ui.busy());
         }
     }
 
     #[test]
-    fn only_successful_explicit_sign_in_opens_a_viewer_once() {
-        let mut ui = TwitchUi::default();
-        ui.connecting = true;
-        ui.accept_completion(false, true, false);
-        assert!(!ui.take_sign_in_finished());
-        ui.accept_completion(true, true, true);
-        assert!(ui.take_sign_in_finished());
-        assert!(!ui.take_sign_in_finished());
-    }
-
-    #[test]
-    fn cancel_suppresses_completed_sign_in_without_erasing_a_saved_grant() {
+    fn cancel_stops_work_without_erasing_a_saved_grant() {
         for saved in [false, true] {
             for succeeded in [false, true] {
                 let mut ui = TwitchUi::default();
@@ -260,13 +268,12 @@ mod tests {
                 ui.work = Some(rx);
                 let cancel = Arc::new(AtomicBool::new(false));
                 ui.cancel = Some(cancel.clone());
-                ui.cancel_sign_in();
+                ui.cancel_connect();
                 assert!(cancel.load(Ordering::Acquire));
                 // Covers a successful result already queued when Cancel wins
                 // the UI race, and a failure after the protected save.
-                ui.accept_completion(saved, saved, succeeded);
-                assert!(!ui.take_sign_in_finished());
-                assert_eq!(ui.can_sign_out(), saved);
+                ui.accept_completion(saved, succeeded);
+                assert_eq!(ui.can_disconnect(), saved);
             }
         }
     }
@@ -275,11 +282,32 @@ mod tests {
     fn failed_disconnect_keeps_its_retry_until_removal_succeeds() {
         let mut ui = TwitchUi::default();
         ui.disconnecting = true;
-        ui.accept_completion(false, false, false);
-        assert!(ui.can_sign_out());
-        ui.accept_completion(false, false, true);
-        assert!(!ui.can_sign_out());
-        assert!(!ui.take_sign_in_finished());
+        ui.accept_completion(false, false);
+        assert!(ui.can_disconnect());
+        ui.accept_completion(false, true);
+        assert!(!ui.can_disconnect());
+    }
+
+    #[test]
+    fn partial_grant_exposes_removal_and_channel_retry_without_sharing() {
+        let ctx = egui::Context::default();
+        let mut panel = TwitchUi::default();
+        panel.accept_completion(true, false);
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            panel.draw_connection_control(ui);
+        });
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"Choose channel"));
+        assert!(labels.contains(&"Forget account"));
+        assert!(!panel.busy());
+        assert!(panel.channel().is_none());
     }
 
     #[test]

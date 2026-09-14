@@ -74,7 +74,7 @@ impl ProviderSessions {
         context.is_some_and(|context| context.window_open())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub fn close_login(&self, provider: &Provider) {
         let context = self.contexts.borrow()[index(provider)].clone();
         if let Some(context) = context {

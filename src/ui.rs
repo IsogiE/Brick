@@ -1072,6 +1072,8 @@ impl BrickApp {
         self.draw_installs_section(ui);
         ui.add_space(18.0);
         self.draw_settings_panel(ui);
+        ui.add_space(12.0);
+        privacy_links(ui);
     }
 
     fn draw_tab_bar(&mut self, ui: &mut egui::Ui) {
@@ -1331,6 +1333,13 @@ impl BrickApp {
                     }
                 }
             },
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                egui::pos2(panel_rect.left(), panel_rect.bottom() + 12.0),
+                egui::vec2(panel_rect.width(), 20.0),
+            )),
+            privacy_links,
         );
     }
 
@@ -1606,34 +1615,9 @@ impl BrickApp {
     }
 
     fn draw_discord_settings_row(&mut self, ui: &mut egui::Ui, user: &AuthorizedUser) {
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), 44.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                let action_width = 94.0;
-                let detail_width = (ui.available_width() - action_width).max(180.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(detail_width, 44.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new("Discord").strong().color(primary_text()));
-                            ui.label(
-                                RichText::new(user.display_name.as_str())
-                                    .small()
-                                    .color(secondary_text()),
-                            );
-                        });
-                    },
-                );
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if secondary_button(ui, "Log out").clicked() {
-                        self.request_sign_out();
-                    }
-                });
-            },
-        );
+        if settings_account_row(ui, "Discord", Some(&user.display_name), "Log out").clicked() {
+            self.request_sign_out();
+        }
     }
 
     fn draw_logout_confirmation(&mut self, ctx: &egui::Context) {
@@ -1925,9 +1909,6 @@ impl eframe::App for BrickApp {
                 }
             });
         self.draw_logout_confirmation(&ctx);
-        if self.streams.take_accounts_home_request() {
-            self.active_tab = MainTab::Home;
-        }
         self.streams.update_account_windows(
             frame,
             &ctx,
@@ -2239,6 +2220,58 @@ fn toggle(ui: &mut egui::Ui, on: bool) -> bool {
             .circle_filled(egui::pos2(x, rect.center().y), 8.5, knob);
     }
     response.clicked()
+}
+
+fn privacy_links(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.hyperlink_to(
+            RichText::new("Privacy").small().color(muted_text()),
+            "https://brick.lusaggo.com/privacy/",
+        );
+        ui.hyperlink_to(
+            RichText::new("Terms").small().color(muted_text()),
+            "https://brick.lusaggo.com/terms/",
+        );
+    });
+}
+
+pub(crate) fn settings_account_row(
+    ui: &mut egui::Ui,
+    provider: &str,
+    name: Option<&str>,
+    action: &str,
+) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), 44.0),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            let response = ui.add(
+                egui::Button::new(RichText::new(action).strong().color(primary_text()))
+                    .corner_radius(8)
+                    .fill(Color32::from_rgb(38, 42, 50))
+                    .min_size(egui::vec2(80.0, 32.0)),
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 44.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(provider).strong().color(primary_text()));
+                        if let Some(name) = name {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(name).small().color(secondary_text()),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    });
+                },
+            );
+            response
+        },
+    )
+    .inner
 }
 
 fn settings_toggle_row(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
@@ -3085,6 +3118,50 @@ pub(crate) mod tests {
                 });
             },
         );
+    }
+
+    #[test]
+    fn settings_accounts_align_actions_with_short_absent_and_long_names() {
+        let long_name = "A very long account name ".repeat(20);
+        for width in [720.0, 980.0, 1600.0] {
+            let ctx = egui::Context::default();
+            let mut previous = None;
+            for name in [None, Some("Isogi"), Some(long_name.as_str())] {
+                for label in ["Sign in", "Sign out"] {
+                    let mut buttons = Vec::new();
+                    let _ = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 560.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            ui.set_width(width - 80.0);
+                            ui.columns(2, |columns| {
+                                for (column, provider) in
+                                    columns.iter_mut().zip(["YouTube", "Twitch"])
+                                {
+                                    let available = column.max_rect();
+                                    let button =
+                                        settings_account_row(column, provider, name, label);
+                                    assert_eq!(button.rect.right(), available.right());
+                                    assert_eq!(button.rect.size(), egui::vec2(80.0, 32.0));
+                                    assert!(column.min_rect().right() <= available.right());
+                                    buttons.push(button.rect);
+                                }
+                            });
+                        },
+                    );
+                    assert_eq!(buttons[0].top(), buttons[1].top());
+                    if let Some(previous) = &previous {
+                        assert_eq!(&buttons, previous);
+                    }
+                    previous = Some(buttons);
+                }
+            }
+        }
     }
 
     #[test]
