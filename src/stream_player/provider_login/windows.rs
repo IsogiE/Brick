@@ -29,9 +29,9 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, GetAncestor, GetClassLongPtrW,
-        GetClientRect, GetWindowRect, IsIconic, IsWindowVisible, LoadCursorW, RegisterClassExW,
-        SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, GA_ROOT, GCLP_HICON,
-        GCLP_HICONSM, ICON_BIG, ICON_SMALL, IDC_ARROW, SW_HIDE, SW_RESTORE, SW_SHOW, WM_CLOSE,
+        GetClientRect, GetWindowRect, IsIconic, LoadCursorW, RegisterClassExW, SendMessageW,
+        SetForegroundWindow, SetWindowTextW, ShowWindow, GA_ROOT, GCLP_HICON, GCLP_HICONSM,
+        ICON_BIG, ICON_SMALL, IDC_ARROW, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, WM_CLOSE,
         WM_GETICON, WM_NCDESTROY, WM_SETICON, WNDCLASSEXW, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
         WS_POPUP,
     },
@@ -545,6 +545,7 @@ impl Drop for NativeWindow {
 }
 
 pub(super) struct Window {
+    pub completion: Rc<super::LoginCompletion>,
     // Drop the WebView before its native parent.
     view: WebView,
     _registration: Registration,
@@ -712,6 +713,9 @@ impl Window {
             return Err("The provider sign-in window could not size its browser.".into());
         }
         let nav_provider = provider.clone();
+        let completion = Rc::new(super::LoginCompletion::default());
+        let navigation_completion = completion.clone();
+        let navigation_window = Rc::downgrade(&native.0);
         let title_provider = provider.clone();
         let title_window = Rc::downgrade(&native.0);
         let view = WebViewBuilder::new()
@@ -730,7 +734,31 @@ impl Window {
                 )
                 .into(),
             })
-            .with_navigation_handler(move |url| permits(&nav_provider, &url))
+            .with_navigation_handler(move |url| {
+                let allowed = permits(&nav_provider, &url);
+                if allowed {
+                    // Wry's navigation handler is top-level NavigationStarting,
+                    // before ContentLoading/paint. Frame policy is separate.
+                    navigation_completion.started();
+                    let home = returned(&nav_provider, &url);
+                    let reveal = if home {
+                        navigation_completion.hide_return();
+                        false
+                    } else {
+                        navigation_completion.reveal()
+                    };
+                    if let Some(window) = navigation_window.upgrade().filter(|w| !w.closed.get()) {
+                        unsafe {
+                            if home {
+                                ShowWindow(window.handle.get(), SW_HIDE);
+                            } else if reveal {
+                                ShowWindow(window.handle.get(), SW_SHOWNOACTIVATE);
+                            }
+                        }
+                    }
+                }
+                allowed
+            })
             .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
             .with_download_started_handler(|_, _| false)
             .with_on_page_load_handler(move |_, url| {
@@ -750,7 +778,27 @@ impl Window {
         // scripts, native messaging, preferences, capture or host objects.
         protect_settings(&view)?;
         super::super::protect_windows_permissions(&view)?;
+        // NavigationCompleted can arrive for a cancelled older document after
+        // the next navigation has started. It must not reveal or finish that
+        // newer return, even if Source already reports the new page's URL.
+        let navigation_id = Rc::new(Cell::new(None));
+        let started_id = navigation_id.clone();
+        let started = NavigationStartingEventHandler::create(Box::new(move |_, args| {
+            if let Some(args) = args {
+                let mut id = 0;
+                unsafe { args.NavigationId(&mut id)? };
+                started_id.set(Some(id));
+            }
+            Ok(())
+        }));
+        let mut started_token = 0;
+        unsafe {
+            view.webview()
+                .add_NavigationStarting(&started, &mut started_token)
+        }
+        .map_err(|_| "The provider sign-in browser could not watch navigation.")?;
         let return_provider = provider.clone();
+        let return_completion = completion.clone();
         let return_window = Rc::downgrade(&native.0);
         let finished = ctx.clone();
         let completed = NavigationCompletedEventHandler::create(Box::new(move |view, args| {
@@ -758,24 +806,28 @@ impl Window {
                 return Ok(());
             };
             unsafe {
+                let mut id = 0;
+                args.NavigationId(&mut id)?;
+                if navigation_id.get() != Some(id) {
+                    return Ok(());
+                }
                 let mut success = windows::core::BOOL::default();
                 args.IsSuccess(&mut success)?;
                 if !success.as_bool() {
+                    if return_completion.reveal() {
+                        if let Some(window) = return_window.upgrade().filter(|w| !w.closed.get()) {
+                            ShowWindow(window.handle.get(), SW_SHOWNOACTIVATE);
+                        }
+                    }
                     return Ok(());
                 }
                 let mut source = PWSTR::null();
                 view.Source(&mut source)?;
-                if returned(&return_provider, &webview2_com::take_pwstr(source)) {
-                    if let Some(window) = return_window
-                        .upgrade()
-                        .filter(|window| !window.handle.get().is_null() && !window.closed.get())
-                    {
-                        // Teardown follows after the callback; the profile
-                        // keeper retains the session for embedded playback.
-                        ShowWindow(window.handle.get(), SW_HIDE);
-                        finished.request_repaint();
-                    }
-                }
+                return_completion.finished(returned(
+                    &return_provider,
+                    &webview2_com::take_pwstr(source),
+                ));
+                finished.request_repaint();
             }
             Ok(())
         }));
@@ -815,6 +867,7 @@ impl Window {
             SetForegroundWindow(handle);
         }
         Ok(Self {
+            completion,
             view,
             _registration: registration,
             native,
@@ -822,11 +875,15 @@ impl Window {
     }
 
     pub fn open(&self) -> bool {
-        !self.native.0.closed.get()
-            && !self.native.handle().is_null()
-            && unsafe { IsWindowVisible(self.native.handle()) != 0 }
+        !self.native.0.closed.get() && !self.native.handle().is_null()
+    }
+    pub fn reveal(&self) {
+        if self.completion.reveal() && self.open() {
+            unsafe { ShowWindow(self.native.handle(), SW_SHOWNOACTIVATE) };
+        }
     }
     pub fn present(&self) {
+        self.reveal();
         unsafe {
             if IsIconic(self.native.handle()) != 0 {
                 ShowWindow(self.native.handle(), SW_RESTORE);
@@ -874,8 +931,8 @@ mod tests {
         time::{Duration, Instant},
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetForegroundWindow, IsWindow, PeekMessageW, SendMessageW,
-        TranslateMessage, MSG, PM_REMOVE,
+        DispatchMessageW, GetForegroundWindow, IsWindow, IsWindowVisible, PeekMessageW,
+        SendMessageW, TranslateMessage, MSG, PM_REMOVE,
     };
 
     #[test]
@@ -1331,8 +1388,17 @@ mod tests {
             .view
             .load_url(&format!("{origin}/returned"))
             .unwrap();
-        wait_for("provider return hides login", || !returned_login.open());
+        wait_for("provider return stays alive while hidden", || {
+            returned_login.completion.returned.get()
+        });
+        assert_eq!(
+            unsafe { IsWindowVisible(returned_login.native.handle()) },
+            0
+        );
+        assert!(returned_login.open());
         *youtube.window.borrow_mut() = Some(returned_login);
+        assert!(sessions.login_open());
+        youtube.close_window();
         assert!(!sessions.login_open());
         assert!(sessions.session_started(&Provider::Youtube));
         assert_eq!(snapshot(&youtube)["cookie"], true);
@@ -1452,6 +1518,7 @@ mod tests {
         let unrelated = parent_window();
         drop(destroyed);
         assert_ne!(unsafe { IsWindow(unrelated.handle()) }, 0);
+        assert_delayed_login_completion(&origin, &parent, &root);
         stopped.store(true, Ordering::Relaxed);
         worker.join().unwrap();
         assert_cross_site_viewing(&root, &parent);
@@ -1595,6 +1662,100 @@ addEventListener('message',e=>{{if(e.origin==='https://{host}'&&e.source===docum
             );
             signed_out.retire();
             eprintln!("{}: private cross-site login, DPAPI restore, provider/site isolation, SameSite/HttpOnly and sign-out passed", provider.label());
+        }
+    }
+
+    // No credentials or provider traffic: cookie creation is deliberately delayed
+    // until after the return page finishes, reproducing post-verification setup.
+    fn assert_delayed_login_completion(
+        origin: &str,
+        parent: &NativeWindow,
+        root: &std::path::Path,
+    ) {
+        let ctx = egui::Context::default();
+        for provider in [Provider::Youtube, Provider::Twitch] {
+            let sessions = ProviderSessions::default();
+            let context = sessions.context(provider.clone()).unwrap();
+            context
+                .open_with(|| {
+                    Window::new_at_owner(
+                        &context.platform,
+                        &provider,
+                        parent.handle(),
+                        &ctx,
+                        &format!("{origin}/login"),
+                        fixture_origin,
+                        |_, value| value.ends_with("/returned"),
+                    )
+                })
+                .unwrap();
+            {
+                let window = context.window.borrow();
+                let window = window.as_ref().unwrap();
+                wait_for("login loaded before delayed return", || {
+                    page_title(&window.view).is_some_and(|title| title.starts_with('{'))
+                });
+                window.view.load_url(&format!("{origin}/returned")).unwrap();
+                wait_for("delayed return loaded", || window.completion.returned.get());
+                assert!(!(unsafe { IsWindowVisible(window.native.handle()) != 0 }));
+                assert!(window.open(), "hiding must keep the browser alive");
+            }
+            context.poll_session(&ctx);
+            wait_for("unauthenticated return observation", || {
+                !context.polling.get()
+            });
+            context.poll_session(&ctx);
+            assert!(context.window_open());
+            assert!(!sessions.signed_in(&provider));
+            {
+                let window = context.window.borrow();
+                let window = window.as_ref().unwrap();
+                window
+                    .completion
+                    .hidden_since
+                    .set(Some(Instant::now() - Duration::from_secs(31)));
+            }
+            context.poll_session(&ctx);
+            {
+                let window = context.window.borrow();
+                let window = window.as_ref().unwrap();
+                assert!(
+                    unsafe { IsWindowVisible(window.native.handle()) != 0 },
+                    "an unsuccessful return remains accessible"
+                );
+                window.view.load_url(&format!("{origin}/returned")).unwrap();
+                wait_for("return hidden again", || {
+                    window.completion.returned.get()
+                        && window.completion.hidden_since.get().is_some()
+                });
+            }
+            let (domain, names) = match provider {
+                Provider::Youtube => (".youtube.com", vec!["SID", "HSID"]),
+                Provider::Twitch => (".twitch.tv", vec!["auth-token"]),
+            };
+            let cookies: Vec<_> = names
+                .into_iter()
+                .map(|name| super::super::session::Cookie {
+                    name: name.into(),
+                    value: "synthetic-delayed-login".into(),
+                    domain: domain.into(),
+                    path: "/".into(),
+                    expires: Some(super::super::session::now() + 3600),
+                    secure: true,
+                    http_only: true,
+                    same_site: 1,
+                })
+                .collect();
+            context.platform.restore(&cookies).unwrap();
+            let _media = media_view(&context.platform, parent, root);
+            context.next_poll.set(None);
+            wait_for("fresh authentication closes return", || {
+                context.poll_session(&ctx);
+                !context.window_open()
+            });
+            assert!(sessions.signed_in(&provider));
+            sessions.close();
+            eprintln!("{}: hidden return stayed alive until fresh auth cookies; retry timeout and delayed sign-in passed", provider.label());
         }
     }
 }

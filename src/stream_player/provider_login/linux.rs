@@ -188,7 +188,9 @@ impl Context {
 }
 
 pub(super) struct Window {
+    pub completion: Rc<super::LoginCompletion>,
     window: gtk::Window,
+    closed: Rc<Cell<bool>>,
     view: webkit2gtk::WebView,
     _load_status: Rc<LoadStatus>,
 }
@@ -354,13 +356,16 @@ impl Window {
                 view.load_uri(&retry_start);
             }
         });
-        let closed = ctx.clone();
+        let closed = Rc::new(Cell::new(false));
+        let close_state = closed.clone();
+        window.connect_destroy(move |_| close_state.set(true));
+        let close_repaint = ctx.clone();
         window.connect_delete_event(move |window, _| {
             // Owned native widget; all Rust references remain on this UI thread.
             unsafe {
                 window.destroy();
             }
-            closed.request_repaint();
+            close_repaint.request_repaint();
             gtk::glib::Propagation::Stop
         });
         view.connect_permission_request(|_, request| {
@@ -399,10 +404,35 @@ impl Window {
             true
         });
         let title_window = window.downgrade();
+        let completion = Rc::new(super::LoginCompletion::default());
+        let load_completion = completion.clone();
         let title_provider = provider.clone();
         let status = Rc::downgrade(&load_status);
         let finished = ctx.clone();
         view.connect_load_changed(move |view, event| {
+            if event == webkit2gtk::LoadEvent::Started {
+                load_completion.started();
+            }
+            // LoadChanged is for the main document. Hide at start/redirect
+            // (and commit as a fallback) before the home page can paint.
+            if matches!(
+                event,
+                webkit2gtk::LoadEvent::Started
+                    | webkit2gtk::LoadEvent::Redirected
+                    | webkit2gtk::LoadEvent::Committed
+            ) {
+                let home = view
+                    .uri()
+                    .is_some_and(|uri| returned(&title_provider, &uri));
+                if let Some(window) = title_window.upgrade() {
+                    if home {
+                        load_completion.hide_return();
+                        window.hide();
+                    } else if load_completion.reveal() {
+                        window.show();
+                    }
+                }
+            }
             if let Some(status) = status.upgrade() {
                 match event {
                     webkit2gtk::LoadEvent::Started => status.loading(),
@@ -410,18 +440,14 @@ impl Window {
                     _ => (),
                 }
             }
-            if event == webkit2gtk::LoadEvent::Finished
-                && status.upgrade().is_some_and(|status| !status.failed.get())
-                && view
-                    .uri()
-                    .is_some_and(|uri| returned(&title_provider, &uri))
-            {
-                if let Some(window) = title_window.upgrade() {
-                    // Defer controller destruction until Context polls open().
-                    // The shared provider context stays alive for playback.
-                    window.hide();
-                    finished.request_repaint();
-                }
+            if event == webkit2gtk::LoadEvent::Finished {
+                load_completion.finished(
+                    status.upgrade().is_some_and(|status| !status.failed.get())
+                        && view
+                            .uri()
+                            .is_some_and(|uri| returned(&title_provider, &uri)),
+                );
+                finished.request_repaint();
             }
             if event == webkit2gtk::LoadEvent::Committed {
                 if let Some(window) = title_window.upgrade() {
@@ -433,6 +459,8 @@ impl Window {
             }
         });
         let status = Rc::downgrade(&load_status);
+        let failed_window = window.downgrade();
+        let failed_completion = completion.clone();
         view.connect_load_failed(move |_, _, _, error| {
             // Navigating again, closing, or enforcing the origin policy can
             // cancel a load without a connection failure.
@@ -443,6 +471,11 @@ impl Window {
             }
             if let Some(status) = status.upgrade() {
                 status.fail();
+            }
+            if failed_completion.reveal() {
+                if let Some(window) = failed_window.upgrade() {
+                    window.show();
+                }
             }
             // Keep provider URLs and raw transport errors out of HTML or logs.
             // The native strip owns the error and retry UI.
@@ -459,7 +492,9 @@ impl Window {
         window.show_all();
         load_status.loading();
         Ok(Self {
+            completion,
             window,
+            closed,
             view,
             _load_status: load_status,
         })
@@ -496,9 +531,15 @@ impl Window {
     }
 
     pub fn open(&self) -> bool {
-        self.window.is_visible()
+        !self.closed.get()
+    }
+    pub fn reveal(&self) {
+        if self.completion.reveal() && self.open() {
+            self.window.show();
+        }
     }
     pub fn present(&self) {
+        self.reveal();
         self.window.present();
     }
 }
@@ -737,8 +778,12 @@ mod tests {
             let window = window.as_ref().unwrap();
             wait_for(|| !window.view.is_loading());
             window.view.load_uri(&format!("{origin}/returned"));
-            wait_for(|| !window.open());
+            wait_for(|| window.completion.returned.get());
+            assert!(!window.window.is_visible());
+            assert!(window.open());
         }
+        assert!(sessions.login_open());
+        sessions.close_login(&Provider::Youtube);
         assert!(!sessions.login_open());
         assert!(sessions.session_started(&Provider::Youtube));
 
@@ -806,8 +851,93 @@ mod tests {
             .open_with(|| panic!("A retired session cannot reopen"))
             .is_err());
         other_account.close();
+        assert_delayed_login_completion(&origin);
         stopped.store(true, Ordering::Relaxed);
         worker.join().unwrap();
         eprintln!("Native provider sessions: sandbox/private confirmed; shared POV state; no login IPC/scripts/opener; provider/account isolation; disconnect and stale-context retirement passed");
+    }
+
+    // No credentials or provider traffic: cookie creation is deliberately delayed
+    // until after the return page finishes, reproducing post-verification setup.
+    fn assert_delayed_login_completion(origin: &str) {
+        let ctx = egui::Context::default();
+        for provider in [Provider::Youtube, Provider::Twitch] {
+            let sessions = ProviderSessions::default();
+            let context = sessions.context(provider.clone()).unwrap();
+            context
+                .open_with(|| {
+                    Window::new_at(
+                        &context.platform,
+                        &provider,
+                        &format!("{origin}/login"),
+                        fixture_origin,
+                        |_, value| value.ends_with("/returned"),
+                        &ctx,
+                    )
+                })
+                .unwrap();
+            {
+                let window = context.window.borrow();
+                let window = window.as_ref().unwrap();
+                wait_for(|| !window.view.is_loading());
+                window.view.load_uri(&format!("{origin}/returned"));
+                wait_for(|| window.completion.returned.get());
+                assert!(!(window.window.is_visible()));
+                assert!(window.open(), "hiding must keep the browser alive");
+            }
+            context.poll_session(&ctx);
+            wait_for(|| !context.polling.get());
+            context.poll_session(&ctx);
+            assert!(context.window_open());
+            assert!(!sessions.signed_in(&provider));
+            {
+                let window = context.window.borrow();
+                let window = window.as_ref().unwrap();
+                window
+                    .completion
+                    .hidden_since
+                    .set(Some(Instant::now() - Duration::from_secs(31)));
+            }
+            context.poll_session(&ctx);
+            {
+                let window = context.window.borrow();
+                let window = window.as_ref().unwrap();
+                assert!(
+                    window.window.is_visible(),
+                    "an unsuccessful return remains accessible"
+                );
+                window.view.load_uri(&format!("{origin}/returned"));
+                wait_for(|| {
+                    window.completion.returned.get()
+                        && window.completion.hidden_since.get().is_some()
+                });
+            }
+            let (domain, names) = match provider {
+                Provider::Youtube => (".youtube.com", vec!["SID", "HSID"]),
+                Provider::Twitch => (".twitch.tv", vec!["auth-token"]),
+            };
+            let cookies: Vec<_> = names
+                .into_iter()
+                .map(|name| super::super::session::Cookie {
+                    name: name.into(),
+                    value: "synthetic-delayed-login".into(),
+                    domain: domain.into(),
+                    path: "/".into(),
+                    expires: Some(super::super::session::now() + 3600),
+                    secure: true,
+                    http_only: true,
+                    same_site: 1,
+                })
+                .collect();
+            context.platform.restore(&cookies).unwrap();
+            context.next_poll.set(None);
+            wait_for(|| {
+                context.poll_session(&ctx);
+                !context.window_open()
+            });
+            assert!(sessions.signed_in(&provider));
+            sessions.close();
+            eprintln!("{}: hidden return stayed alive until fresh auth cookies; retry timeout and delayed sign-in passed", provider.label());
+        }
     }
 }

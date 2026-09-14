@@ -27,6 +27,60 @@ pub struct ProviderSessions {
     jars: [Rc<session::Jar>; 2],
 }
 
+/// Returning home does not mean the provider has finished setting its cookies.
+/// Observe a fresh browser session after that return before closing its page.
+#[derive(Default)]
+pub(super) struct LoginCompletion {
+    navigation: Cell<u64>,
+    returned: Cell<bool>,
+    observed: Cell<bool>,
+    hidden_since: Cell<Option<std::time::Instant>>,
+}
+
+impl LoginCompletion {
+    fn started(&self) {
+        self.navigation.set(self.navigation.get().wrapping_add(1));
+        self.returned.set(false);
+        self.observed.set(false);
+    }
+
+    fn finished(&self, returned: bool) {
+        self.returned.set(returned);
+    }
+
+    fn probe(self: &Rc<Self>) -> Option<(Rc<Self>, u64)> {
+        self.returned
+            .get()
+            .then(|| (self.clone(), self.navigation.get()))
+    }
+
+    fn observe(&self, navigation: u64, signed_in: bool) {
+        if self.returned.get() && self.navigation.get() == navigation {
+            self.observed.set(signed_in);
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.returned.get() && self.observed.get()
+    }
+
+    fn hide_return(&self) {
+        if self.hidden_since.get().is_none() {
+            self.hidden_since.set(Some(std::time::Instant::now()));
+        }
+    }
+
+    fn reveal(&self) -> bool {
+        self.hidden_since.take().is_some()
+    }
+
+    fn reveal_due(&self, now: std::time::Instant) -> bool {
+        self.hidden_since.get().is_some_and(|since| {
+            now.saturating_duration_since(since) >= std::time::Duration::from_secs(30)
+        })
+    }
+}
+
 impl Default for ProviderSessions {
     fn default() -> Self {
         Self {
@@ -258,8 +312,27 @@ impl Context {
     }
 
     fn poll_session(self: &Rc<Self>, ctx: &egui::Context) {
+        if !self.active() {
+            return;
+        }
+        let completed = self
+            .window
+            .borrow()
+            .as_ref()
+            .is_some_and(|window| window.completion.ready());
+        if completed {
+            // Close on the UI tick, outside the native cookie callback.
+            self.close_window();
+        }
         let now = std::time::Instant::now();
-        if !self.active() || self.polling.get() || self.next_poll.get().is_some_and(|at| at > now) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            if window.completion.reveal_due(now) {
+                // A failed or interrupted return must not leave an invisible
+                // window indefinitely. Keep it available for retry or close.
+                window.reveal();
+            }
+        }
+        if self.polling.get() || self.next_poll.get().is_some_and(|at| at > now) {
             return;
         }
         self.polling.set(true);
@@ -267,11 +340,19 @@ impl Context {
             .set(Some(now + std::time::Duration::from_secs(2)));
         let weak = Rc::downgrade(self);
         let repaint = ctx.clone();
+        let completion = self
+            .window
+            .borrow()
+            .as_ref()
+            .and_then(|window| window.completion.probe());
         self.platform.read_cookies(&self.provider, move |result| {
             if let Some(context) = weak.upgrade().filter(|context| context.active()) {
                 context.polling.set(false);
                 if let Ok(cookies) = result {
                     context.jar.observe(cookies);
+                    if let Some((completion, navigation)) = completion {
+                        completion.observe(navigation, context.jar.signed_in());
+                    }
                     repaint.request_repaint();
                 }
             }
@@ -407,8 +488,8 @@ fn start_url(provider: &Provider) -> &'static str {
     }
 }
 
-/// The fixed login entry points return to the provider's home page. This ends
-/// the login window only; it does not assert account identity or entitlements.
+/// The fixed login entry points return to the provider's home page. This is
+/// only a possible return; fresh cookie observation still gates window closure.
 fn returned_to_provider(provider: &Provider, destination: &str) -> bool {
     if !allowed_document(provider, destination) {
         return false;
@@ -478,6 +559,52 @@ fn title(provider: &Provider, destination: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_return_waits_for_a_fresh_successful_cookie_observation() {
+        let completion = Rc::new(LoginCompletion::default());
+        completion.started();
+        assert!(completion.probe().is_none());
+        completion.finished(true);
+        assert!(!completion.ready());
+        let (probe, navigation) = completion.probe().unwrap();
+        probe.observe(navigation, false);
+        assert!(!completion.ready());
+        probe.observe(navigation, true);
+        assert!(completion.ready());
+    }
+
+    #[test]
+    fn old_navigation_and_old_window_probes_cannot_complete_a_new_login() {
+        let old = Rc::new(LoginCompletion::default());
+        old.started();
+        old.finished(true);
+        let (probe, navigation) = old.probe().unwrap();
+        old.started();
+        old.finished(true);
+        probe.observe(navigation, true);
+        assert!(!old.ready());
+        let replacement = Rc::new(LoginCompletion::default());
+        replacement.started();
+        replacement.finished(true);
+        let (probe, navigation) = old.probe().unwrap();
+        probe.observe(navigation, true);
+        assert!(old.ready());
+        assert!(!replacement.ready());
+    }
+
+    #[test]
+    fn hidden_return_can_be_retried_and_never_hides_indefinitely() {
+        let completion = LoginCompletion::default();
+        completion.hide_return();
+        let since = completion.hidden_since.get().unwrap();
+        assert!(!completion.reveal_due(since));
+        assert!(completion.reveal_due(since + std::time::Duration::from_secs(30)));
+        assert!(!completion.ready());
+        assert!(completion.reveal());
+        assert!(!completion.reveal());
+        assert!(!completion.reveal_due(since + std::time::Duration::from_secs(60)));
+    }
 
     #[test]
     fn only_the_matching_provider_home_page_ends_login() {
