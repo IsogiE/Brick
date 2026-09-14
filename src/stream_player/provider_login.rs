@@ -123,7 +123,7 @@ impl ProviderSessions {
             .is_some_and(|context| context.attempted())
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     pub fn login_open_for(&self, provider: &Provider) -> bool {
         let context = self.contexts.borrow()[index(provider)].clone();
         context.is_some_and(|context| context.window_open())

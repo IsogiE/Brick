@@ -1059,6 +1059,44 @@ mod tests {
         }
         let _stop = Stop(Arc::clone(&stopped));
         let parent = parent_window();
+        let restored = Context::new().unwrap();
+        let saved = ["SID", "HSID"].map(|name| super::super::session::Cookie {
+            name: name.into(),
+            value: "synthetic-provider-session".into(),
+            domain: ".youtube.com".into(),
+            path: "/".into(),
+            expires: Some(super::super::session::now() + 3600),
+            secure: true,
+            http_only: true,
+            same_site: 1,
+        });
+        restored.restore(&saved).unwrap();
+        let restored_view = media_view(&restored, &parent, &root);
+        let read = Rc::new(RefCell::new(None));
+        let completed = read.clone();
+        restored.read_cookies(&Provider::Youtube, move |result| {
+            *completed.borrow_mut() = Some(result)
+        });
+        wait_for("protected cookies restored into InPrivate", || {
+            read.borrow().is_some()
+        });
+        let cookies = read.borrow_mut().take().unwrap().unwrap();
+        assert!(super::super::session::signed_in(
+            &Provider::Youtube,
+            &cookies,
+            super::super::session::now()
+        ));
+        assert!(cookies
+            .iter()
+            .all(|cookie| cookie.secure && cookie.http_only && cookie.same_site == 1));
+        assert!(!super::super::session::signed_in(
+            &Provider::Twitch,
+            &cookies,
+            super::super::session::now()
+        ));
+        drop(restored_view);
+        restored.retire();
+        drop(restored);
         let sessions = ProviderSessions::default();
         let youtube = sessions.context(Provider::Youtube).unwrap();
         assert!(youtube.platform.environment.borrow().is_none());

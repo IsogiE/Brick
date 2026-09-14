@@ -365,19 +365,37 @@ impl Drop for Jar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires disposable /fixture home and its own Secret Service bus"]
+    #[ignore = "requires a disposable profile and protected credential storage"]
     fn protected_viewing_session_survives_restart_and_sign_out_wins_over_saves() {
-        assert_eq!(
-            std::env::var("BRICK_LOCAL_ERASURE_FIXTURE").as_deref(),
-            Ok("1")
-        );
-        assert_eq!(std::env::var("HOME").as_deref(), Ok("/fixture/home"));
-        assert_eq!(
-            std::env::var("DBUS_SESSION_BUS_ADDRESS").as_deref(),
-            Ok("unix:path=/fixture/bus")
-        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                std::env::var("BRICK_LOCAL_ERASURE_FIXTURE").as_deref(),
+                Ok("1")
+            );
+            assert_eq!(std::env::var("HOME").as_deref(), Ok("/fixture/home"));
+            assert_eq!(
+                std::env::var("DBUS_SESSION_BUS_ADDRESS").as_deref(),
+                Ok("unix:path=/fixture/bus")
+            );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let root = std::path::PathBuf::from(
+                std::env::var_os("BRICK_PROVIDER_FIXTURE_DIR").expect("Disposable viewing fixture"),
+            );
+            assert!(root
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("brick-provider-fixture-"));
+            for name in ["USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
+                assert!(
+                    std::path::PathBuf::from(std::env::var_os(name).unwrap()).starts_with(&root)
+                );
+            }
+        }
         let wait = |jar: &Jar| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !jar.ready() && std::time::Instant::now() < deadline {
@@ -428,7 +446,16 @@ mod tests {
             "twitch-{}.dat",
             hex::encode(Sha256::digest(identity.as_bytes()))
         ));
-        assert!(std::fs::read(file).unwrap() == b"BRICK-TWITCH-KEYRING-v1\n");
+        let file_bytes = std::fs::read(file).unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(file_bytes == b"BRICK-TWITCH-KEYRING-v1\n");
+        #[cfg(target_os = "windows")]
+        {
+            assert!(file_bytes.starts_with(b"BRICK-TWITCH-DPAPI-v1\n"));
+            assert!(!file_bytes
+                .windows(b"synthetic-session".len())
+                .any(|window| window == b"synthetic-session"));
+        }
         crate::local_erasure::reset().unwrap();
         assert!(Store::twitch(&identity).unwrap().load().unwrap().is_none());
         assert!(Store::twitch(&identity)
