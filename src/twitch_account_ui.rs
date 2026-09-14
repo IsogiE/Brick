@@ -197,18 +197,26 @@ impl TwitchUi {
     }
 
     pub fn draw_connection_control(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            if let Some(channel) = self.channel() {
-                ui.label(&channel.title);
-            } else if ui
-                .add_enabled(
-                    !self.busy() && Account::configured(),
-                    action_button("Choose channel"),
-                )
-                .clicked()
-            {
-                self.start(ui.ctx(), Action::Connect);
-            }
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - 126.0).max(80.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, 32.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_min_size(egui::vec2(width, 32.0));
+                    if let Some(channel) = self.channel() {
+                        ui.add(egui::Label::new(&channel.title).truncate());
+                    } else if ui
+                        .add_enabled(
+                            !self.busy() && Account::configured(),
+                            action_button("Choose channel"),
+                        )
+                        .clicked()
+                    {
+                        self.start(ui.ctx(), Action::Connect);
+                    }
+                },
+            );
             if self.can_disconnect()
                 && ui
                     .add_enabled(!self.busy(), action_button("Forget account"))
@@ -218,10 +226,6 @@ impl TwitchUi {
                 self.saved_connection = true;
                 self.start(ui.ctx(), Action::Disconnect);
             }
-            ui.hyperlink_to(
-                egui::RichText::new("Manage access").small(),
-                "https://www.twitch.tv/settings/connections",
-            );
         });
         if self.busy() && self.foreground {
             ui.horizontal(|ui| {

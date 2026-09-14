@@ -1378,10 +1378,10 @@ impl StreamsUi {
                             egui::Frame::new()
                                 .fill(Color32::from_rgb(22, 25, 32))
                                 .corner_radius(8)
-                                .inner_margin(12)
+                                .inner_margin(16)
                                 .show(ui, |ui| {
-                                    ui.set_min_width((card_width - 24.0).max(0.0));
-                                    ui.spacing_mut().item_spacing.y = 6.0;
+                                    ui.set_min_width((card_width - 32.0).max(0.0));
+                                    ui.spacing_mut().item_spacing.y = 10.0;
                                     if twitch {
                                         ui.label(
                                             RichText::new("Twitch channel").strong().size(15.0),
@@ -1391,18 +1391,17 @@ impl StreamsUi {
                                             let shared = own.is_some_and(|stream| {
                                                 stream.channel_id == channel.login
                                             });
-                                            if ui
-                                                .add_enabled(
-                                                    self.work.is_none()
-                                                        && !self.twitch.busy()
-                                                        && !shared,
-                                                    action_button(if shared {
-                                                        "Shared with this guild"
-                                                    } else {
-                                                        "Share channel with this guild"
-                                                    }),
-                                                )
-                                                .clicked()
+                                            if !shared
+                                                && ui
+                                                    .add_enabled(
+                                                        self.work.is_none()
+                                                            && !self.twitch.busy()
+                                                            && !shared,
+                                                        action_button(
+                                                            "Share channel with this guild",
+                                                        ),
+                                                    )
+                                                    .clicked()
                                             {
                                                 action = Some(Action::Save(
                                                     Provider::Twitch,
@@ -1441,62 +1440,23 @@ impl StreamsUi {
                                         }
                                     }
                                     if shared_channel.is_some() || own.is_some() {
-                                        ui.horizontal_wrapped(|ui| {
-                                            if shared_channel.is_some() {
-                                                if ui
-                                                    .add_enabled(
-                                                        enabled,
-                                                        action_button("Stop sharing channel"),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    action =
-                                                        Some(Action::Remove(Provider::Youtube));
-                                                }
-                                            } else if own.is_some() {
-                                                let confirming =
-                                                    self.confirm_remove.as_ref() == Some(&provider);
-                                                if ui
-                                                    .add_enabled(
-                                                        enabled,
-                                                        action_button(if confirming {
-                                                            "Confirm removal"
-                                                        } else {
-                                                            "Stop sharing"
-                                                        }),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    if confirming {
-                                                        action =
-                                                            Some(Action::Remove(provider.clone()));
-                                                        self.drafts[index].clear();
-                                                    } else {
-                                                        self.confirm_remove =
-                                                            Some(provider.clone());
-                                                    }
-                                                }
-                                            }
+                                        ui.horizontal(|ui| {
+                                            ui.set_height(32.0);
+                                            ui.label(
+                                                RichText::new("Shared with this guild")
+                                                    .size(12.0)
+                                                    .color(MUTED),
+                                            );
                                             if let Some(own) = own {
                                                 let state = match own.status {
                                                     Status::Live => "Live",
                                                     Status::Checking => "Checking…",
-                                                    Status::Unknown => "Status unavailable",
-                                                    Status::Offline
-                                                        if own.broadcast_state.as_deref()
-                                                            == Some("ended") =>
-                                                    {
-                                                        "Ended"
-                                                    }
-                                                    Status::Offline
-                                                        if own.broadcast_state.as_deref()
-                                                            == Some("upcoming") =>
-                                                    {
-                                                        "Scheduled"
-                                                    }
+                                                    Status::Unknown => "Unavailable",
+                                                    Status::Offline if own.broadcast_state.as_deref() == Some("ended") => "Ended",
+                                                    Status::Offline if own.broadcast_state.as_deref() == Some("upcoming") => "Scheduled",
                                                     Status::Offline => "Offline",
                                                 };
-                                                ui.label(RichText::new(state).small().color(
+                                                ui.label(RichText::new(state).size(12.0).color(
                                                     if own.status == Status::Live {
                                                         LIVE
                                                     } else {
@@ -1505,6 +1465,34 @@ impl StreamsUi {
                                                 ))
                                                 .on_hover_text(submission_status(own));
                                             }
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    let confirming = self.confirm_remove.as_ref()
+                                                        == Some(&provider);
+                                                    if ui
+                                                        .add_enabled(
+                                                            enabled,
+                                                            action_button(if confirming {
+                                                                "Confirm removal"
+                                                            } else {
+                                                                "Stop sharing"
+                                                            }),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        if shared_channel.is_some() || confirming {
+                                                            action = Some(Action::Remove(
+                                                                provider.clone(),
+                                                            ));
+                                                            self.drafts[index].clear();
+                                                        } else {
+                                                            self.confirm_remove =
+                                                                Some(provider.clone());
+                                                        }
+                                                    }
+                                                },
+                                            );
                                         });
                                     }
                                     let channel_first = if twitch {
@@ -1512,9 +1500,27 @@ impl StreamsUi {
                                     } else {
                                         self.youtube.connected() || shared_channel.is_some()
                                     };
+                                    let access_url = if twitch {
+                                        "https://www.twitch.tv/settings/connections"
+                                    } else {
+                                        "https://myaccount.google.com/permissions"
+                                    };
                                     if channel_first {
                                         ui.push_id(("manual-stream-link", index), |ui| {
-                                            ui.collapsing("Use a link instead", |ui| {
+                                            let mut toggle = false;
+                                            let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                                                ui.ctx(), ui.make_persistent_id("links"), false,
+                                            );
+                                            let mut header = state.show_header(ui, |ui| {
+                                                toggle = ui.add(egui::Label::new("Use a link instead").sense(egui::Sense::click())).clicked();
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    ui.hyperlink_to(RichText::new("Manage access").size(12.0), access_url);
+                                                });
+                                            });
+                                            if toggle {
+                                                header.toggle();
+                                            }
+                                            header.body(|ui| {
                                                 action = self
                                                     .draw_manual_stream_link(
                                                         ui,
@@ -1533,6 +1539,10 @@ impl StreamsUi {
                                                 ui, &provider, index, own, enabled, false,
                                             )
                                             .or(action.take());
+                                        ui.hyperlink_to(
+                                            RichText::new("Manage account access").size(12.0),
+                                            access_url,
+                                        );
                                     }
                                     if self.notice_provider.as_ref() == Some(&provider) {
                                         if let Some(error) = &self.notice {
@@ -2780,10 +2790,16 @@ mod tests {
                     "Shared here: guildmate",
                     "Shared here: Fixture YouTube channel",
                     "Stop sharing",
-                    "Stop sharing channel",
                 ] {
                     assert!(labels.iter().any(|value| value == label), "{label}");
                 }
+                assert_eq!(
+                    labels
+                        .iter()
+                        .filter(|value| *value == "Stop sharing")
+                        .count(),
+                    2
+                );
                 assert_eq!(
                     labels
                         .iter()

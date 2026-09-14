@@ -249,17 +249,49 @@ impl YoutubeUi {
             ui.label(RichText::new(format!("Shared here: {}", channel.title)).strong());
         }
         let enabled = available && !self.busy();
-        ui.horizontal_wrapped(|ui| {
-            if (!self.connected || self.channels.is_empty())
-                && ui
-                    .add_enabled(
-                        !self.busy() && Account::configured(),
-                        action_button("Choose channel"),
-                    )
-                    .clicked()
-            {
-                self.start(ui.ctx(), Action::Connect);
-            }
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - 126.0).max(80.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, 32.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_min_size(egui::vec2(width, 32.0));
+                    if self.connected && !self.channels.is_empty() {
+                        let title = self
+                            .channels
+                            .iter()
+                            .find(|channel| channel.channel_id == self.selected)
+                            .map(|channel| channel.title.as_str())
+                            .unwrap_or("Choose your channel");
+                        if self.channels.len() == 1 {
+                            ui.add(egui::Label::new(title).truncate());
+                        } else {
+                            ui.add_enabled_ui(enabled, |ui| {
+                                egui::ComboBox::from_id_salt("youtube-owned-channel")
+                                    .selected_text(title)
+                                    .width(ui.available_width())
+                                    .show_ui(ui, |ui| {
+                                        for channel in &self.channels {
+                                            ui.selectable_value(
+                                                &mut self.selected,
+                                                channel.channel_id.clone(),
+                                                &channel.title,
+                                            );
+                                        }
+                                    });
+                            });
+                        }
+                    } else if ui
+                        .add_enabled(
+                            !self.busy() && Account::configured(),
+                            action_button("Choose channel"),
+                        )
+                        .clicked()
+                    {
+                        self.start(ui.ctx(), Action::Connect);
+                    }
+                },
+            );
             if self.can_disconnect()
                 && ui
                     .add_enabled(!self.busy(), action_button("Forget account"))
@@ -269,45 +301,17 @@ impl YoutubeUi {
                 self.saved_connection = true;
                 self.start(ui.ctx(), Action::Disconnect);
             }
-            ui.hyperlink_to(
-                egui::RichText::new("Manage access").small(),
-                "https://myaccount.google.com/permissions",
-            );
         });
         if self.connected && self.channels.is_empty() {
             if self.notice.is_none() {
                 ui.label("Your connected account has no available YouTube channels.");
             }
-        } else if self.connected {
-            let title = self
-                .channels
-                .iter()
-                .find(|channel| channel.channel_id == self.selected)
-                .map(|channel| channel.title.as_str())
-                .unwrap_or("Choose your channel");
-            ui.add_enabled_ui(enabled, |ui| {
-                egui::ComboBox::from_id_salt("youtube-owned-channel")
-                    .selected_text(title)
-                    .width(260.0)
-                    .show_ui(ui, |ui| {
-                        for channel in &self.channels {
-                            ui.selectable_value(
-                                &mut self.selected,
-                                channel.channel_id.clone(),
-                                &channel.title,
-                            );
-                        }
-                    });
-            });
-            let changed = shared.is_none_or(|channel| channel.channel_id != self.selected);
+        } else if self.connected && shared.is_none_or(|channel| channel.channel_id != self.selected)
+        {
             if ui
                 .add_enabled(
-                    enabled && changed && !self.selected.is_empty(),
-                    action_button(if changed {
-                        "Share channel with this guild"
-                    } else {
-                        "Shared with this guild"
-                    }),
+                    enabled && !self.selected.is_empty(),
+                    action_button("Share channel with this guild"),
                 )
                 .clicked()
             {

@@ -307,6 +307,22 @@ fn start_url(provider: &Provider) -> &'static str {
     }
 }
 
+/// The fixed login entry points return to the provider's home page. This ends
+/// the login window only; it does not assert account identity or entitlements.
+fn returned_to_provider(provider: &Provider, destination: &str) -> bool {
+    if !allowed_document(provider, destination) {
+        return false;
+    }
+    let Ok(url) = Url::parse(destination) else {
+        return false;
+    };
+    url.path() == "/"
+        && match provider {
+            Provider::Youtube => url.host_str() == Some("www.youtube.com"),
+            Provider::Twitch => url.host_str() == Some("www.twitch.tv"),
+        }
+}
+
 /// Account documents never navigate into Brick or arbitrary destinations.
 /// Subresource requests retain the browser's normal origin/TLS protections.
 fn allowed_document(provider: &Provider, destination: &str) -> bool {
@@ -322,20 +338,30 @@ fn allowed_document(provider: &Provider, destination: &str) -> bool {
         return false;
     }
     match provider {
-        Provider::Youtube => matches!(
-            url.host_str(),
-            Some(
-                "accounts.google.com"
-                    | "accounts.youtube.com"
-                    | "www.youtube.com"
-                    | "www.google.com"
-            )
-        ),
+        Provider::Youtube => {
+            matches!(
+                url.host_str(),
+                Some("accounts.youtube.com" | "www.youtube.com" | "www.google.com")
+            ) || url.host_str().is_some_and(google_account_host)
+        }
         Provider::Twitch => matches!(
             url.host_str(),
             Some("www.twitch.tv" | "id.twitch.tv" | "passport.twitch.tv")
         ),
     }
+}
+
+fn google_account_host(host: &str) -> bool {
+    // Google documents regional accounts.google.[country] hosts for sign-in:
+    // https://support.google.com/chrome/a/answer/6334001
+    // Snapshot of https://www.google.com/supported_domains, 2026-09-14.
+    // Match only the accounts host on an enumerated domain, never google.* or
+    // arbitrary subdomains. Redirects still require HTTPS and no credentials.
+    host.strip_prefix("accounts").is_some_and(|domain| {
+        include_str!("provider_login/google-domains.txt")
+            .lines()
+            .any(|known| known == domain)
+    })
 }
 
 fn title(provider: &Provider, destination: &str) -> String {
@@ -350,6 +376,42 @@ fn title(provider: &Provider, destination: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_matching_provider_home_page_ends_login() {
+        for (provider, home) in [
+            (Provider::Youtube, "https://www.youtube.com/"),
+            (Provider::Twitch, "https://www.twitch.tv/"),
+        ] {
+            assert!(returned_to_provider(&provider, home));
+            assert!(!returned_to_provider(&provider, start_url(&provider)));
+            for destination in [
+                "https://accounts.google.com/",
+                "https://accounts.youtube.com/",
+                "https://www.youtube.com/signin",
+                "https://www.twitch.tv/login?error=fixture",
+                "https://www.youtube.com.evil.test/",
+                "https://www.twitch.tv.evil.test/",
+                "https://token@www.youtube.com/",
+                "https://www.twitch.tv:8443/",
+                "http://www.youtube.com/",
+                "about:blank",
+            ] {
+                assert!(
+                    !returned_to_provider(&provider, destination),
+                    "{destination}"
+                );
+            }
+        }
+        assert!(!returned_to_provider(
+            &Provider::Youtube,
+            "https://www.twitch.tv/"
+        ));
+        assert!(!returned_to_provider(
+            &Provider::Twitch,
+            "https://www.youtube.com/"
+        ));
+    }
 
     #[test]
     fn a_closed_account_holder_cannot_create_new_provider_contexts() {
@@ -391,6 +453,54 @@ mod tests {
         assert!(!allowed_document(
             &Provider::Twitch,
             start_url(&Provider::Youtube)
+        ));
+    }
+
+    #[test]
+    fn google_regional_account_redirects_keep_exact_host_boundaries() {
+        for host in [
+            "accounts.google.com",
+            "accounts.google.nl",
+            "accounts.google.co.uk",
+            "accounts.google.com.au",
+        ] {
+            assert!(allowed_document(
+                &Provider::Youtube,
+                &format!("https://{host}/accounts/SetSID?fixture=1")
+            ));
+            assert!(!allowed_document(
+                &Provider::Twitch,
+                &format!("https://{host}/")
+            ));
+        }
+        for host in [
+            "accounts.google.evil",
+            "accounts.google.nl.evil.test",
+            "evil.accounts.google.nl",
+            "accounts.google.com.attacker.test",
+            "accountsgoogle.nl",
+            "www.google.nl",
+            "accounts.google.zip",
+        ] {
+            assert!(
+                !allowed_document(
+                    &Provider::Youtube,
+                    &format!("https://{host}/accounts/SetSID")
+                ),
+                "{host}"
+            );
+        }
+        assert!(!allowed_document(
+            &Provider::Youtube,
+            "http://accounts.google.nl/accounts/SetSID"
+        ));
+        assert!(!allowed_document(
+            &Provider::Youtube,
+            "https://user@accounts.google.nl/accounts/SetSID"
+        ));
+        assert!(!allowed_document(
+            &Provider::Youtube,
+            "https://accounts.google.nl:8443/accounts/SetSID"
         ));
     }
 

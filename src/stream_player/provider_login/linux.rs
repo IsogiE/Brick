@@ -1,4 +1,4 @@
-use super::{allowed_document, start_url, title};
+use super::{allowed_document, returned_to_provider, start_url, title};
 use crate::streams::Provider;
 use eframe::egui;
 use gtk::prelude::*;
@@ -174,16 +174,29 @@ impl Window {
     pub fn from_frame(
         context: &Context,
         provider: &Provider,
-        _frame: &eframe::Frame,
+        frame: &eframe::Frame,
         ctx: &egui::Context,
     ) -> Result<Self, String> {
-        Self::new_at(
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let parent = match frame
+            .window_handle()
+            .map_err(|_| "The provider window could not find Brick.")?
+            .as_raw()
+        {
+            RawWindowHandle::Xlib(handle) => handle.window,
+            RawWindowHandle::Xcb(handle) => u64::from(handle.window.get()),
+            _ => return Err("Provider sign-in needs Brick's X11 window.".into()),
+        };
+        let window = Self::new_at(
             context,
             provider,
             start_url(provider),
             allowed_document,
+            returned_to_provider,
             ctx,
-        )
+        )?;
+        window.attach_parent(parent)?;
+        Ok(window)
     }
 
     pub fn new(
@@ -197,6 +210,7 @@ impl Window {
             provider,
             start_url(provider),
             allowed_document,
+            returned_to_provider,
             ctx,
         )
     }
@@ -206,6 +220,7 @@ impl Window {
         provider: &Provider,
         start: &str,
         permits: fn(&Provider, &str) -> bool,
+        returned: fn(&Provider, &str) -> bool,
         ctx: &egui::Context,
     ) -> Result<Self, String> {
         // Only WebContext is shared. Do not inherit the media view's scripts,
@@ -232,6 +247,7 @@ impl Window {
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
         window.set_default_size(520, 640);
         window.set_position(gtk::WindowPosition::Center);
+        window.set_type_hint(gtk::gdk::WindowTypeHint::Dialog);
         window.set_title(&title(provider, start_url(provider)));
         let contents = gtk::Overlay::new();
         let load_status = Rc::new(LoadStatus::new());
@@ -294,6 +310,7 @@ impl Window {
         let title_window = window.downgrade();
         let title_provider = provider.clone();
         let status = Rc::downgrade(&load_status);
+        let finished = ctx.clone();
         view.connect_load_changed(move |view, event| {
             if let Some(status) = status.upgrade() {
                 match event {
@@ -302,12 +319,25 @@ impl Window {
                     _ => (),
                 }
             }
+            if event == webkit2gtk::LoadEvent::Finished
+                && status.upgrade().is_some_and(|status| !status.failed.get())
+                && view
+                    .uri()
+                    .is_some_and(|uri| returned(&title_provider, &uri))
+            {
+                if let Some(window) = title_window.upgrade() {
+                    // Defer controller destruction until Context polls open().
+                    // The shared provider context stays alive for playback.
+                    window.hide();
+                    finished.request_repaint();
+                }
+            }
             if event == webkit2gtk::LoadEvent::Committed {
                 if let Some(window) = title_window.upgrade() {
-                    window.set_title(&title(
-                        &title_provider,
-                        view.uri().as_deref().unwrap_or_default(),
-                    ));
+                    let next = title(&title_provider, view.uri().as_deref().unwrap_or_default());
+                    if window.title().as_deref() != Some(&next) {
+                        window.set_title(&next);
+                    }
                 }
             }
         });
@@ -342,6 +372,36 @@ impl Window {
             view,
             _load_status: load_status,
         })
+    }
+
+    fn attach_parent(&self, parent: u64) -> Result<(), String> {
+        use gtk::glib::translate::{from_glib_full, ToGlibPtr};
+        use std::ffi::c_ulong;
+        #[link(name = "gdk-3")]
+        unsafe extern "C" {
+            fn gdk_x11_window_foreign_new_for_display(
+                display: *mut gtk::gdk::ffi::GdkDisplay,
+                window: c_ulong,
+            ) -> *mut gtk::gdk::ffi::GdkWindow;
+        }
+        let child = self
+            .window
+            .window()
+            .ok_or("The provider window could not attach to Brick.")?;
+        // The frame supplies a live X11 owner. GDK owns this foreign wrapper;
+        // dropping it does not destroy Brick's eframe window.
+        let native = unsafe {
+            gdk_x11_window_foreign_new_for_display(
+                child.display().to_glib_none().0,
+                parent as c_ulong,
+            )
+        };
+        if native.is_null() {
+            return Err("The provider window could not attach to Brick.".into());
+        }
+        let owner: gtk::gdk::Window = unsafe { from_glib_full(native) };
+        child.set_transient_for(&owner);
+        Ok(())
     }
 
     pub fn open(&self) -> bool {
@@ -475,6 +535,7 @@ mod tests {
                     &Provider::Youtube,
                     &format!("{origin}/login"),
                     fixture_origin,
+                    |_, value| value.ends_with("/returned"),
                     &egui::Context::default(),
                 )
             })
@@ -525,6 +586,26 @@ mod tests {
             .unwrap();
         sessions.close_login(&Provider::Youtube);
         assert!(!sessions.login_open());
+        youtube
+            .open_with(|| {
+                Window::new_at(
+                    &youtube.platform,
+                    &Provider::Youtube,
+                    &format!("{origin}/login"),
+                    fixture_origin,
+                    |_, value| value.ends_with("/returned"),
+                    &egui::Context::default(),
+                )
+            })
+            .unwrap();
+        {
+            let window = youtube.window.borrow();
+            let window = window.as_ref().unwrap();
+            wait_for(|| !window.view.is_loading());
+            window.view.load_uri(&format!("{origin}/returned"));
+            wait_for(|| !window.open());
+        }
+        assert!(!sessions.login_open());
         assert!(sessions.session_started(&Provider::Youtube));
 
         let state = |context: &super::super::Context| {
@@ -564,6 +645,7 @@ mod tests {
             &Provider::Youtube,
             &format!("{origin}/state"),
             fixture_origin,
+            |_, value| value.ends_with("/returned"),
             &egui::Context::default(),
         )
         .unwrap();

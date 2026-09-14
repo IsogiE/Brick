@@ -1,4 +1,4 @@
-use super::{allowed_document, start_url, title};
+use super::{allowed_document, returned_to_provider, start_url, title};
 use crate::streams::Provider;
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle};
@@ -12,7 +12,8 @@ use webview2_com::{
         ICoreWebView2Controller, ICoreWebView2Environment, ICoreWebView2Profile6,
         ICoreWebView2Profile8, ICoreWebView2_13,
     },
-    NavigationStartingEventHandler, NewWindowRequestedEventHandler,
+    NavigationCompletedEventHandler, NavigationStartingEventHandler,
+    NewWindowRequestedEventHandler,
 };
 use windows::core::{Interface, PWSTR};
 use windows::Win32::{
@@ -404,6 +405,7 @@ impl Window {
             ctx,
             start_url(provider),
             allowed_document,
+            returned_to_provider,
         )
     }
 
@@ -420,6 +422,7 @@ impl Window {
             ctx,
             start_url(provider),
             allowed_document,
+            returned_to_provider,
         )
     }
 
@@ -430,11 +433,12 @@ impl Window {
         ctx: &egui::Context,
         start: &str,
         permits: fn(&Provider, &str) -> bool,
+        returned: fn(&Provider, &str) -> bool,
     ) -> Result<Self, String> {
         let mut owner = windows::Win32::Foundation::HWND::default();
         unsafe { player.controller().ParentWindow(&mut owner) }
             .map_err(|_| "The provider sign-in window could not find Brick.")?;
-        Self::new_at_owner(context, provider, owner.0, ctx, start, permits)
+        Self::new_at_owner(context, provider, owner.0, ctx, start, permits, returned)
     }
 
     fn new_at_owner(
@@ -444,6 +448,7 @@ impl Window {
         ctx: &egui::Context,
         start: &str,
         permits: fn(&Provider, &str) -> bool,
+        returned: fn(&Provider, &str) -> bool,
     ) -> Result<Self, String> {
         // This is borrowed from the live Frame or media controller. Only the
         // newly created popup/keeper HWNDs are owned and destroyed by us.
@@ -550,6 +555,41 @@ impl Window {
         // scripts, native messaging, preferences, capture or host objects.
         protect_settings(&view)?;
         super::super::protect_windows_permissions(&view)?;
+        let return_provider = provider.clone();
+        let return_window = Rc::downgrade(&native.0);
+        let finished = ctx.clone();
+        let completed = NavigationCompletedEventHandler::create(Box::new(move |view, args| {
+            let (Some(view), Some(args)) = (view, args) else {
+                return Ok(());
+            };
+            unsafe {
+                let mut success = windows::core::BOOL::default();
+                args.IsSuccess(&mut success)?;
+                if !success.as_bool() {
+                    return Ok(());
+                }
+                let mut source = PWSTR::null();
+                view.Source(&mut source)?;
+                if returned(&return_provider, &webview2_com::take_pwstr(source)) {
+                    if let Some(window) = return_window
+                        .upgrade()
+                        .filter(|window| !window.handle.get().is_null() && !window.closed.get())
+                    {
+                        // Teardown follows after the callback; the profile
+                        // keeper retains the session for embedded playback.
+                        ShowWindow(window.handle.get(), SW_HIDE);
+                        finished.request_repaint();
+                    }
+                }
+            }
+            Ok(())
+        }));
+        let mut completion_token = 0;
+        unsafe {
+            view.webview()
+                .add_NavigationCompleted(&completed, &mut completion_token)
+        }
+        .map_err(|_| "The provider sign-in browser could not watch its return.".into())?;
         let frame_provider = provider.clone();
         let handler = NavigationStartingEventHandler::create(Box::new(move |_, args| {
             if let Some(args) = args {
@@ -902,6 +942,7 @@ mod tests {
             &egui::Context::default(),
             &format!("{origin}/login"),
             fixture_origin,
+            |_, value| value.ends_with("/returned"),
         )
         .unwrap();
         let initial = state(&login.view, "initial sign-in page");
@@ -959,6 +1000,29 @@ mod tests {
         // No visible login or POV remains; only the empty keeper carries state.
         assert_eq!(snapshot(&youtube)["cookie"], true);
         assert_eq!(snapshot(&youtube)["storage"], true);
+        let returned_login = Window::new_at_owner(
+            &youtube.platform,
+            &Provider::Youtube,
+            parent.handle(),
+            &egui::Context::default(),
+            &format!("{origin}/login"),
+            fixture_origin,
+            |_, value| value.ends_with("/returned"),
+        )
+        .unwrap();
+        assert_eq!(
+            state(&returned_login.view, "login before provider return")["cookie"],
+            true
+        );
+        returned_login
+            .view
+            .load_url(&format!("{origin}/returned"))
+            .unwrap();
+        wait_for("provider return hides login", || !returned_login.open());
+        *youtube.window.borrow_mut() = Some(returned_login);
+        assert!(!sessions.login_open());
+        assert!(sessions.session_started(&Provider::Youtube));
+        assert_eq!(snapshot(&youtube)["cookie"], true);
         let twitch = sessions.context(Provider::Twitch).unwrap();
         assert_ne!(youtube.platform.profile_name, twitch.platform.profile_name);
         assert_eq!(snapshot(&twitch)["cookie"], false);
@@ -1015,6 +1079,7 @@ mod tests {
             &egui::Context::default(),
             &format!("{origin}/state"),
             fixture_origin,
+            |_, value| value.ends_with("/returned"),
         )
         .unwrap();
         assert_eq!(
