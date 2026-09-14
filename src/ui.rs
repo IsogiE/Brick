@@ -1090,7 +1090,6 @@ impl BrickApp {
         self.draw_installs_section(ui);
         ui.add_space(18.0);
         self.draw_settings_panel(ui);
-        ui.add_space(12.0);
         if privacy_links(ui) {
             self.erasure.show(ui.ctx());
         }
