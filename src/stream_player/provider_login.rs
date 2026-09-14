@@ -1,4 +1,5 @@
-//! Personal, memory-only provider sessions. No browser cookie import or export.
+//! Personal provider sessions with OS-protected persistence of Brick viewing cookies.
+mod session;
 use crate::streams::Provider;
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -20,13 +21,66 @@ pub(super) use platform::Registration;
 
 /// Owned by one signed-in Brick account. Retire it before changing accounts.
 /// Provider state is personal; guild data and Brick credentials never enter it.
-#[derive(Default)]
 pub struct ProviderSessions {
     contexts: RefCell<[Option<Rc<Context>>; 2]>,
     closed: Cell<bool>,
+    jars: [Rc<session::Jar>; 2],
+}
+
+impl Default for ProviderSessions {
+    fn default() -> Self {
+        Self {
+            contexts: RefCell::new([None, None]),
+            closed: Cell::new(false),
+            jars: [
+                Rc::new(session::Jar::memory(Provider::Twitch)),
+                Rc::new(session::Jar::memory(Provider::Youtube)),
+            ],
+        }
+    }
 }
 
 impl ProviderSessions {
+    pub fn for_account(account: &str) -> Self {
+        Self {
+            jars: [
+                Rc::new(session::Jar::new(Provider::Twitch, account)),
+                Rc::new(session::Jar::new(Provider::Youtube, account)),
+            ],
+            contexts: RefCell::new([None, None]),
+            closed: Cell::new(false),
+        }
+    }
+
+    pub fn signed_in(&self, provider: &Provider) -> bool {
+        self.jars[index(provider)].signed_in()
+    }
+    pub fn ready(&self, provider: &Provider) -> bool {
+        self.jars[index(provider)].ready()
+    }
+    pub fn error(&self) -> Option<String> {
+        self.jars.iter().find_map(|jar| jar.error())
+    }
+    pub fn tick(&self, ctx: &egui::Context) {
+        if self.closed.get() {
+            return;
+        }
+        for jar in &self.jars {
+            jar.tick();
+        }
+        let contexts = self.contexts.borrow().clone();
+        if contexts.iter().any(Option::is_some) {
+            super::pump_events();
+            for context in contexts.iter().flatten() {
+                context.poll_session(ctx);
+            }
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
+        }
+        if self.jars.iter().any(|jar| !jar.ready()) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
     /// Open personal viewing sign-in without loading a guild page or video.
     /// A successful open does not establish whether the provider accepted login.
     pub fn open_login(
@@ -62,12 +116,14 @@ impl ProviderSessions {
         result
     }
 
+    #[cfg(test)]
     pub fn session_started(&self, provider: &Provider) -> bool {
         self.contexts.borrow()[index(provider)]
             .as_ref()
             .is_some_and(|context| context.attempted())
     }
 
+    #[cfg(all(test, target_os = "linux"))]
     pub fn login_open_for(&self, provider: &Provider) -> bool {
         let context = self.contexts.borrow()[index(provider)].clone();
         context.is_some_and(|context| context.window_open())
@@ -96,7 +152,8 @@ impl ProviderSessions {
 
     pub(super) fn release_unused(&self, context: &Rc<Context>) {
         // Anonymous playback keeps the existing prompt resource teardown. A
-        // user-requested login retains its memory-only session for this run.
+        // user-requested login retains its native session for this run. The
+        // separate protected jar can restore a retired playback context.
         if !context.attempted() && Rc::strong_count(context) == 2 {
             let removed = {
                 let mut contexts = self.contexts.borrow_mut();
@@ -116,6 +173,7 @@ impl ProviderSessions {
         }
     }
     pub fn disconnect(&self, provider: &Provider) {
+        self.jars[index(provider)].clear();
         let context = self.contexts.borrow_mut()[index(provider)].take();
         if let Some(context) = context {
             context.retire();
@@ -134,12 +192,24 @@ impl ProviderSessions {
         if self.closed.get() {
             return Err("This provider session has ended.".into());
         }
-        let mut contexts = self.contexts.borrow_mut();
-        let slot = &mut contexts[index(&provider)];
-        if slot.is_none() {
-            *slot = Some(Rc::new(Context::new(provider)?));
+        if !self.ready(&provider) {
+            return Err("Your viewing login is still being restored. Please try again.".into());
         }
-        Ok(Rc::clone(slot.as_ref().expect("Context was initialized")))
+        if let Some(context) = self.contexts.borrow()[index(&provider)].clone() {
+            return Ok(context);
+        }
+        let context = Rc::new(Context::new(
+            provider.clone(),
+            self.jars[index(&provider)].clone(),
+        )?);
+        // Cookie restoration may pump native events; hold no RefCell borrow.
+        context.platform.restore(&context.jar.cookies())?;
+        if self.closed.get() {
+            context.retire();
+            return Err("This provider session has ended.".into());
+        }
+        self.contexts.borrow_mut()[index(&provider)] = Some(context.clone());
+        Ok(context)
     }
 }
 
@@ -163,10 +233,13 @@ pub(super) struct Context {
     login_requested: Cell<bool>,
     window: RefCell<Option<platform::Window>>,
     pub platform: platform::Context,
+    jar: Rc<session::Jar>,
+    polling: Cell<bool>,
+    next_poll: Cell<Option<std::time::Instant>>,
 }
 
 impl Context {
-    fn new(provider: Provider) -> Result<Self, String> {
+    fn new(provider: Provider, jar: Rc<session::Jar>) -> Result<Self, String> {
         Ok(Self {
             provider,
             active: Cell::new(true),
@@ -174,7 +247,31 @@ impl Context {
             login_requested: Cell::new(false),
             window: RefCell::new(None),
             platform: platform::Context::new()?,
+            jar,
+            polling: Cell::new(false),
+            next_poll: Cell::new(None),
         })
+    }
+
+    fn poll_session(self: &Rc<Self>, ctx: &egui::Context) {
+        let now = std::time::Instant::now();
+        if !self.active() || self.polling.get() || self.next_poll.get().is_some_and(|at| at > now) {
+            return;
+        }
+        self.polling.set(true);
+        self.next_poll
+            .set(Some(now + std::time::Duration::from_secs(2)));
+        let weak = Rc::downgrade(self);
+        let repaint = ctx.clone();
+        self.platform.read_cookies(&self.provider, move |result| {
+            if let Some(context) = weak.upgrade().filter(|context| context.active()) {
+                context.polling.set(false);
+                if let Ok(cookies) = result {
+                    context.jar.observe(cookies);
+                    repaint.request_repaint();
+                }
+            }
+        });
     }
 
     pub fn active(&self) -> bool {

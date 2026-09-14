@@ -52,6 +52,7 @@ pub struct StreamsUi {
     pending_provider_login: VecDeque<Provider>,
     provider_sessions: Rc<crate::stream_player::ProviderSessions>,
     provider_user_id: Option<String>,
+    viewing_notice: Option<String>,
     snapshot: Option<Rc<Snapshot>>,
     received_at: Option<Instant>,
     last_attempt: Option<Instant>,
@@ -98,6 +99,7 @@ impl Default for StreamsUi {
             pending_provider_login: VecDeque::new(),
             provider_sessions: Rc::new(Default::default()),
             provider_user_id: None,
+            viewing_notice: None,
             snapshot: None,
             received_at: None,
             last_attempt: None,
@@ -252,6 +254,8 @@ impl StreamsUi {
         if self.provider_user_id.as_deref() != Some(user_id) {
             self.clear();
             self.provider_user_id = Some(user_id.to_owned());
+            self.provider_sessions =
+                Rc::new(crate::stream_player::ProviderSessions::for_account(user_id));
         }
     }
 
@@ -274,6 +278,10 @@ impl StreamsUi {
     }
 
     pub(crate) fn tick_guild_switch(&mut self, ctx: &egui::Context) {
+        self.provider_sessions.tick(ctx);
+        if let Some(error) = self.provider_sessions.error() {
+            self.viewing_notice = Some(error);
+        }
         if self.provider_sessions.login_open() {
             crate::stream_player::pump_events();
             #[cfg(target_os = "linux")]
@@ -660,12 +668,15 @@ impl StreamsUi {
                 );
             }
         });
+        if let Some(error) = &self.viewing_notice {
+            ui.colored_label(Color32::from_rgb(230, 160, 115), error);
+        }
     }
 
     fn draw_account_row(&mut self, ui: &mut egui::Ui, provider: Provider) {
-        let started = self.provider_sessions.session_started(&provider);
-        let open = self.provider_sessions.login_open_for(&provider);
-        match viewing_account_control(ui, &provider, started, open) {
+        let signed_in = self.provider_sessions.signed_in(&provider);
+        let ready = self.provider_sessions.ready(&provider);
+        match viewing_account_control(ui, &provider, signed_in, ready) {
             Some(ViewingAccountAction::Clear) => {
                 self.provider_sessions.disconnect(&provider);
                 self.pending_provider_login
@@ -678,6 +689,7 @@ impl StreamsUi {
     }
 
     fn queue_provider_login(&mut self, provider: Provider) {
+        self.viewing_notice = None;
         if !self.pending_provider_login.contains(&provider) {
             self.pending_provider_login.push_back(provider);
         }
@@ -691,7 +703,11 @@ impl StreamsUi {
         may_open: bool,
     ) {
         if let Some(provider) = self.take_pending_provider_login(authorized, may_open) {
-            record_provider_window_result(self.provider_sessions.open_login(frame, ctx, provider));
+            let result = self.provider_sessions.open_login(frame, ctx, provider);
+            if let Err(error) = &result {
+                self.viewing_notice = Some(error.clone());
+            }
+            record_provider_window_result(result);
             ctx.request_repaint();
         }
     }
@@ -1718,6 +1734,14 @@ impl StreamsUi {
                 return false;
             }
         }
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|stream| !self.provider_sessions.ready(&stream.provider))
+        {
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return false;
+        }
         if let Some(rx) = &self.player_work {
             let result = match rx.try_recv() {
                 Ok(result) => Some(result),
@@ -2125,8 +2149,8 @@ enum ViewingAccountAction {
 fn viewing_account_control(
     ui: &mut egui::Ui,
     provider: &Provider,
-    started: bool,
-    open: bool,
+    signed_in: bool,
+    ready: bool,
 ) -> Option<ViewingAccountAction> {
     let mut action = None;
     ui.push_id(("viewing-account", provider.key()), |ui| {
@@ -2134,27 +2158,13 @@ fn viewing_account_control(
             [56.0, 32.0],
             egui::Label::new(RichText::new(provider.label()).strong()),
         );
-        // Opening or returning from a provider page does not prove login.
-        // Keep reopening sign-in separate from clearing the viewing session.
-        let label = if open {
-            "Continue sign-in"
-        } else if started {
-            "Manage sign-in"
-        } else {
-            "Sign in"
-        };
-        if ui.add(action_button(label)).clicked() {
-            action = Some(ViewingAccountAction::Open);
-        }
-        if started {
-            ui.menu_button("⋯", |ui| {
-                if ui.button("Clear viewing session").clicked() {
-                    action = Some(ViewingAccountAction::Clear);
-                    ui.close();
-                }
-            })
-            .response
-            .on_hover_text("Viewing session options");
+        let label = if signed_in { "Sign out" } else { "Sign in" };
+        if ui.add_enabled(ready, action_button(label)).clicked() {
+            action = Some(if signed_in {
+                ViewingAccountAction::Clear
+            } else {
+                ViewingAccountAction::Open
+            });
         }
     });
     action
@@ -2778,12 +2788,12 @@ mod tests {
     }
 
     #[test]
-    fn viewing_sign_in_attempts_reopen_the_provider_instead_of_signing_out() {
+    fn viewing_buttons_follow_the_session_and_wait_for_protected_storage() {
         for provider in [Provider::Youtube, Provider::Twitch] {
-            for (started, open, label) in [
+            for (signed_in, ready, label) in [
+                (false, true, "Sign in"),
+                (true, true, "Sign out"),
                 (false, false, "Sign in"),
-                (true, true, "Continue sign-in"),
-                (true, false, "Manage sign-in"),
             ] {
                 let ctx = egui::Context::default();
                 let frame = |events| {
@@ -2795,7 +2805,7 @@ mod tests {
                         },
                         |ui| {
                             ui.horizontal(|ui| {
-                                action = viewing_account_control(ui, &provider, started, open);
+                                action = viewing_account_control(ui, &provider, signed_in, ready);
                             });
                         },
                     );
@@ -2807,7 +2817,12 @@ mod tests {
                 let mut button = None;
                 for shape in output.shapes {
                     if let egui::epaint::Shape::Text(text) = shape.shape {
-                        assert_ne!(text.galley.text(), "Sign out");
+                        assert!(![
+                            "Continue sign-in",
+                            "Manage sign-in",
+                            "Clear viewing session"
+                        ]
+                        .contains(&text.galley.text()));
                         if text.galley.text() == label {
                             button = Some(text.pos + text.galley.size() * 0.5);
                         }
@@ -2827,7 +2842,16 @@ mod tests {
                     pressed: false,
                     modifiers: egui::Modifiers::NONE,
                 }]);
-                assert_eq!(action, Some(ViewingAccountAction::Open));
+                assert_eq!(
+                    action,
+                    if !ready {
+                        None
+                    } else if signed_in {
+                        Some(ViewingAccountAction::Clear)
+                    } else {
+                        Some(ViewingAccountAction::Open)
+                    }
+                );
             }
         }
     }

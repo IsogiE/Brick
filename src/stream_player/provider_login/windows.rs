@@ -8,9 +8,11 @@ use std::{
     rc::{Rc, Weak},
 };
 use webview2_com::{
+    GetCookiesCompletedHandler,
     Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2Controller, ICoreWebView2Environment, ICoreWebView2Profile6,
-        ICoreWebView2Profile8, ICoreWebView2_13,
+        ICoreWebView2Controller, ICoreWebView2CookieManager, ICoreWebView2Environment,
+        ICoreWebView2Profile6, ICoreWebView2Profile8, ICoreWebView2_13, ICoreWebView2_2,
+        COREWEBVIEW2_COOKIE_SAME_SITE_KIND,
     },
     NavigationCompletedEventHandler, NavigationStartingEventHandler,
     NewWindowRequestedEventHandler,
@@ -95,6 +97,8 @@ pub(crate) struct Context {
     keeper: RefCell<Option<Keeper>>,
     controllers: RefCell<Vec<Weak<ICoreWebView2Controller>>>,
     retired: Cell<bool>,
+    cookies: RefCell<Option<ICoreWebView2CookieManager>>,
+    restore_cookies: RefCell<Vec<super::session::Cookie>>,
 }
 
 /// Kept beside its WebView. The context holds only weak registrations, so
@@ -113,6 +117,8 @@ impl Context {
             keeper: RefCell::new(None),
             controllers: RefCell::new(Vec::new()),
             retired: Cell::new(false),
+            cookies: RefCell::new(None),
+            restore_cookies: RefCell::new(Vec::new()),
         })
     }
 
@@ -154,6 +160,36 @@ impl Context {
         if self.retired.get() {
             return Err("This provider session has ended.".into());
         }
+        let manager = unsafe {
+            view.webview()
+                .cast::<ICoreWebView2_2>()
+                .and_then(|view| view.CookieManager())
+        }
+        .map_err(|_| "The private viewing session is unavailable.")?;
+        let restored = self.restore_cookies.borrow().clone();
+        for saved in &restored {
+            use windows::core::HSTRING;
+            let result = unsafe {
+                (|| -> windows::core::Result<()> {
+                    let cookie = manager.CreateCookie(
+                        &HSTRING::from(&saved.name),
+                        &HSTRING::from(&saved.value),
+                        &HSTRING::from(&saved.domain),
+                        &HSTRING::from(&saved.path),
+                    )?;
+                    cookie.SetIsSecure(saved.secure)?;
+                    cookie.SetIsHttpOnly(saved.http_only)?;
+                    cookie.SetSameSite(COREWEBVIEW2_COOKIE_SAME_SITE_KIND(i32::from(
+                        saved.same_site,
+                    )))?;
+                    cookie.SetExpires(saved.expires.map(|at| at as f64).unwrap_or(-1.0))?;
+                    manager.AddOrUpdateCookie(&cookie)
+                })()
+            };
+            result.map_err(|_| "The saved viewing login could not be restored.")?;
+        }
+        self.restore_cookies.borrow_mut().clear();
+        *self.cookies.borrow_mut() = Some(manager);
         *self.environment.borrow_mut() = Some(view.environment());
         *self.profile.borrow_mut() = Some(managed);
         let registration = Registration {
@@ -229,6 +265,8 @@ impl Context {
 
     pub fn retire(&self) {
         self.retired.set(true);
+        self.cookies.borrow_mut().take();
+        self.restore_cookies.borrow_mut().clear();
         let controllers = std::mem::take(&mut *self.controllers.borrow_mut());
         let keeper = self.keeper.borrow_mut().take();
         let profile = self.profile.borrow_mut().take();
@@ -246,6 +284,98 @@ impl Context {
             let _ = unsafe { profile.Delete() };
         }
         drop(environment);
+    }
+
+    pub(super) fn restore(&self, cookies: &[super::session::Cookie]) -> Result<(), String> {
+        *self.restore_cookies.borrow_mut() = cookies.to_vec();
+        Ok(())
+    }
+
+    pub(super) fn read_cookies(
+        &self,
+        provider: &Provider,
+        done: impl FnOnce(Result<Vec<super::session::Cookie>, ()>) + 'static,
+    ) {
+        let manager = self.cookies.borrow().clone();
+        let Some(manager) = manager else {
+            done(Err(()));
+            return;
+        };
+        let uri = match provider {
+            Provider::Youtube => windows::core::w!("https://www.youtube.com/"),
+            Provider::Twitch => windows::core::w!("https://www.twitch.tv/"),
+        };
+        let callback = Rc::new(RefCell::new(Some(done)));
+        let completed = callback.clone();
+        let handler = GetCookiesCompletedHandler::create(Box::new(move |error, cookies| {
+            let result = (|| -> windows::core::Result<Vec<super::session::Cookie>> {
+                error?;
+                let Some(cookies) = cookies else {
+                    return Ok(Vec::new());
+                };
+                let mut count = 0;
+                unsafe {
+                    cookies.Count(&mut count)?;
+                }
+                if count > 256 {
+                    return Err(windows::core::Error::from(
+                        windows::Win32::Foundation::E_UNEXPECTED,
+                    ));
+                }
+                let mut saved = Vec::new();
+                for index in 0..count {
+                    unsafe {
+                        let cookie = cookies.GetValueAtIndex(index)?;
+                        let mut text = PWSTR::null();
+                        cookie.Name(&mut text)?;
+                        let name = webview2_com::take_pwstr(text);
+                        cookie.Value(&mut text)?;
+                        let value = webview2_com::take_pwstr(text);
+                        cookie.Domain(&mut text)?;
+                        let domain = webview2_com::take_pwstr(text);
+                        cookie.Path(&mut text)?;
+                        let path = webview2_com::take_pwstr(text);
+                        let mut expires = 0.0;
+                        cookie.Expires(&mut expires)?;
+                        let mut session = windows::core::BOOL::default();
+                        cookie.IsSession(&mut session)?;
+                        let mut secure = windows::core::BOOL::default();
+                        cookie.IsSecure(&mut secure)?;
+                        let mut http_only = windows::core::BOOL::default();
+                        cookie.IsHttpOnly(&mut http_only)?;
+                        let mut same_site = COREWEBVIEW2_COOKIE_SAME_SITE_KIND::default();
+                        cookie.SameSite(&mut same_site)?;
+                        if !expires.is_finite() {
+                            return Err(windows::core::Error::from(
+                                windows::Win32::Foundation::E_UNEXPECTED,
+                            ));
+                        }
+                        saved.push(super::session::Cookie {
+                            name,
+                            value,
+                            domain,
+                            path,
+                            expires: (!session.as_bool()).then_some(expires as i64),
+                            secure: secure.as_bool(),
+                            http_only: http_only.as_bool(),
+                            same_site: u8::try_from(same_site.0).unwrap_or(255),
+                        });
+                    }
+                }
+                Ok(saved)
+            })();
+            let done = completed.borrow_mut().take();
+            if let Some(done) = done {
+                done(result.map_err(|_| ()));
+            }
+            Ok(())
+        }));
+        if unsafe { manager.GetCookies(uri, &handler) }.is_err() {
+            let done = callback.borrow_mut().take();
+            if let Some(done) = done {
+                done(Err(()));
+            }
+        }
     }
 }
 

@@ -7,9 +7,9 @@ use std::{
     rc::Rc,
 };
 use webkit2gtk::{
-    DownloadExt, FileChooserRequestExt, HardwareAccelerationPolicy, NavigationPolicyDecisionExt,
-    PermissionRequestExt, PolicyDecisionExt, SettingsExt, URIRequestExt, WebContextExt, WebViewExt,
-    WebsiteDataManagerExt,
+    CookieManagerExt, DownloadExt, FileChooserRequestExt, HardwareAccelerationPolicy,
+    NavigationPolicyDecisionExt, PermissionRequestExt, PolicyDecisionExt, SettingsExt,
+    URIRequestExt, WebContextExt, WebViewExt, WebsiteDataManagerExt,
 };
 
 pub(super) fn watch_requests(
@@ -60,6 +60,97 @@ pub(crate) struct Context {
 }
 
 impl Context {
+    pub(super) fn restore(&self, cookies: &[super::session::Cookie]) -> Result<(), String> {
+        if cookies.is_empty() {
+            return Ok(());
+        }
+        let manager = self
+            .context
+            .cookie_manager()
+            .ok_or("The viewing session could not be restored.")?;
+        let pending = Rc::new(Cell::new(cookies.len()));
+        let failed = Rc::new(Cell::new(false));
+        let cancellation = webkit2gtk::gio::Cancellable::new();
+        for saved in cookies {
+            let mut cookie =
+                soup::Cookie::new(&saved.name, &saved.value, &saved.domain, &saved.path, -1);
+            cookie.set_secure(saved.secure);
+            cookie.set_http_only(saved.http_only);
+            cookie.set_same_site_policy(match saved.same_site {
+                1 => soup::SameSitePolicy::Lax,
+                2 => soup::SameSitePolicy::Strict,
+                _ => soup::SameSitePolicy::None,
+            });
+            if let Some(expires) = saved.expires {
+                cookie.set_expires(
+                    &gtk::glib::DateTime::from_unix_utc(expires)
+                        .map_err(|_| "The saved viewing session has an invalid expiry.")?,
+                );
+            }
+            let pending = pending.clone();
+            let failed = failed.clone();
+            manager.add_cookie(&mut cookie, Some(&cancellation), move |result| {
+                if result.is_err() {
+                    failed.set(true);
+                }
+                pending.set(pending.get().saturating_sub(1));
+            });
+        }
+        // Populate the private jar before any provider or media navigation.
+        // Only this blank context exists here, and no RefCell borrow is held.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let main = gtk::glib::MainContext::default();
+        while pending.get() != 0 && std::time::Instant::now() < deadline {
+            while main.pending() {
+                main.iteration(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if pending.get() != 0 || failed.get() {
+            cancellation.cancel();
+            return Err("The viewing session could not be restored. Please try again.".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn read_cookies(
+        &self,
+        provider: &Provider,
+        done: impl FnOnce(Result<Vec<super::session::Cookie>, ()>) + 'static,
+    ) {
+        let Some(manager) = self.context.cookie_manager() else {
+            done(Err(()));
+            return;
+        };
+        let uri = match provider {
+            Provider::Youtube => "https://www.youtube.com/",
+            Provider::Twitch => "https://www.twitch.tv/",
+        };
+        manager.cookies(uri, None::<&webkit2gtk::gio::Cancellable>, move |result| {
+            done(result.map_err(|_| ()).map(|cookies| {
+                cookies
+                    .into_iter()
+                    .filter_map(|mut cookie| {
+                        Some(super::session::Cookie {
+                            name: cookie.name()?.into(),
+                            value: cookie.value()?.into(),
+                            domain: cookie.domain()?.into(),
+                            path: cookie.path()?.into(),
+                            expires: cookie.expires().map(|at| at.to_unix()),
+                            secure: cookie.is_secure(),
+                            http_only: cookie.is_http_only(),
+                            same_site: match cookie.same_site_policy() {
+                                soup::SameSitePolicy::Lax => 1,
+                                soup::SameSitePolicy::Strict => 2,
+                                _ => 0,
+                            },
+                        })
+                    })
+                    .collect()
+            }));
+        });
+    }
+
     pub fn new() -> Result<Self, String> {
         let context = webkit2gtk::WebContext::new_ephemeral();
         context.set_sandbox_enabled(true);
@@ -467,6 +558,49 @@ mod tests {
         assert_eq!(std::env::var("BRICK_PROVIDER_FIXTURE").as_deref(), Ok("1"));
         assert!(!std::path::Path::new("/home/lucas").exists());
         gtk::init().unwrap();
+        // Exercise the real private cookie manager without contacting providers.
+        // Only synthetic values exist inside this network-isolated fixture.
+        let restored = Context::new().unwrap();
+        let saved = ["SID", "HSID"].map(|name| super::super::session::Cookie {
+            name: name.into(),
+            value: "synthetic-provider-session".into(),
+            domain: ".youtube.com".into(),
+            path: "/".into(),
+            expires: Some(super::super::session::now() + 3600),
+            secure: true,
+            http_only: true,
+            same_site: 1,
+        });
+        restored.restore(&saved).unwrap();
+        let read = Rc::new(RefCell::new(None));
+        let completed = read.clone();
+        restored.read_cookies(&Provider::Youtube, move |result| {
+            *completed.borrow_mut() = Some(result)
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while read.borrow().is_none() && Instant::now() < deadline {
+            crate::stream_player::pump_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+        let cookies = read
+            .borrow_mut()
+            .take()
+            .expect("Cookie manager completed")
+            .unwrap();
+        assert!(super::super::session::signed_in(
+            &Provider::Youtube,
+            &cookies,
+            super::super::session::now()
+        ));
+        assert!(cookies
+            .iter()
+            .all(|cookie| cookie.secure && cookie.http_only && cookie.same_site == 1));
+        assert!(!super::super::session::signed_in(
+            &Provider::Twitch,
+            &cookies,
+            super::super::session::now()
+        ));
+        drop(restored);
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
         server.set_nonblocking(true).unwrap();
         let origin = format!("http://{}", server.local_addr().unwrap());
