@@ -46,6 +46,15 @@ pub(crate) fn prepare() -> Result<Identity, String> {
             return Err("Sign in to the Discord account that requested deletion.".into());
         }
     }
+    // Do not offer confirmation or journal intent while deletion is unavailable.
+    // A pending confirmed request remains retryable through the existing flow.
+    if !pending() {
+        challenge_at(
+            &deletion_client()?,
+            crate::presence::endpoint_url(PATH)?,
+            &identity,
+        )?;
+    }
     Ok(identity)
 }
 
@@ -178,18 +187,26 @@ impl Receipt {
 /// A fresh server challenge binds acceptance to this verified identity. A
 /// network failure never causes local credentials to be discarded first.
 pub(crate) fn request(identity: &Identity) -> Result<Receipt, String> {
-    let client = Client::builder()
+    let client = deletion_client()?;
+    let endpoint = crate::presence::endpoint_url(PATH)?;
+    request_at(&client, endpoint, identity)
+}
+
+fn deletion_client() -> Result<Client, String> {
+    Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("Brick account deletion")
         .build()
-        .map_err(|_| FAILED)?;
-    let endpoint = crate::presence::endpoint_url(PATH)?;
-    request_at(&client, endpoint, identity)
+        .map_err(|_| FAILED.into())
 }
 
-fn request_at(client: &Client, endpoint: url::Url, identity: &Identity) -> Result<Receipt, String> {
+fn challenge_at(
+    client: &Client,
+    endpoint: url::Url,
+    identity: &Identity,
+) -> Result<Challenge, String> {
     let mut challenge_url = endpoint.clone();
     challenge_url.set_path(&format!("{}/challenge", endpoint.path()));
     let bytes = send(
@@ -201,6 +218,11 @@ fn request_at(client: &Client, endpoint: url::Url, identity: &Identity) -> Resul
     )?;
     let challenge: Challenge = serde_json::from_slice(&bytes).map_err(|_| FAILED)?;
     validate_challenge(&challenge, now())?;
+    Ok(challenge)
+}
+
+fn request_at(client: &Client, endpoint: url::Url, identity: &Identity) -> Result<Receipt, String> {
+    let challenge = challenge_at(client, endpoint.clone(), identity)?;
     let bytes = send(
         client,
         Method::POST,
@@ -230,6 +252,11 @@ fn send(
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err("Sign in with Discord to request deletion.".into());
+    }
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return Err(
+            "Account deletion is currently unavailable. Contact brick@lusaggo.com for help.".into(),
+        );
     }
     if !status.is_success() {
         return Err(FAILED.into());
@@ -267,6 +294,49 @@ fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_preflight_does_not_submit_deletion() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = url::Url::parse(&format!(
+            "http://{}/v1/account/erasure",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 8192);
+            }
+            assert!(request.starts_with(b"POST /v1/account/erasure/challenge HTTP/1.1\r\n"));
+            let mut body = [0; 2];
+            stream.read_exact(&mut body).unwrap();
+            assert_eq!(&body, b"{}");
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let identity =
+            Identity::new("fixture-bearer".into(), "123".into(), "Fixture".into()).unwrap();
+        let error = match challenge_at(&client, endpoint, &identity) {
+            Err(error) => error,
+            Ok(_) => panic!("Unavailable deletion must not pass preflight"),
+        };
+        assert!(error.contains("currently unavailable"));
+        assert!(error.contains("brick@lusaggo.com"));
+        server.join().unwrap();
+    }
 
     #[test]
     fn erasure_requests_are_identity_bound_and_never_send_a_guild_or_target_user() {
