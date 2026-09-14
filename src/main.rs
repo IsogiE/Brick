@@ -123,7 +123,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Brick")
-        .with_inner_size([1440.0, 900.0])
+        .with_inner_size([1440.0, 980.0])
         .with_min_inner_size([980.0, 720.0])
         .with_clamp_size_to_monitor_size(true)
         .with_app_id("dev.isogi.brick");
