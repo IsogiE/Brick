@@ -477,7 +477,13 @@ mod tests {
             assert!(window._load_status.panel.is_visible());
             assert!(window._load_status.retry.is_visible());
             window._load_status.retry.emit_clicked();
-            wait_for(|| !window._load_status.failed.get() && !window.view.is_loading());
+            wait_for(|| {
+                !window._load_status.failed.get()
+                    && !window.view.is_loading()
+                    && window.view.title().is_some_and(|title| {
+                        serde_json::from_str::<serde_json::Value>(&title).is_ok()
+                    })
+            });
             assert_eq!(
                 window.view.uri().as_deref(),
                 Some(format!("{origin}/login").as_str())
