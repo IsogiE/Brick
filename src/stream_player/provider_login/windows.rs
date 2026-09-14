@@ -27,13 +27,15 @@ use windows_sys::Win32::{
     Foundation::{HWND, RECT},
     Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
     System::LibraryLoader::GetModuleHandleW,
+    UI::Input::KeyboardAndMouse::{GetFocus, SetFocus},
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, GetAncestor, GetClassLongPtrW,
-        GetClientRect, GetWindowRect, IsIconic, LoadCursorW, RegisterClassExW, SendMessageW,
+        GetClientRect, GetForegroundWindow, GetWindow, GetWindowRect, IsChild, IsIconic,
+        IsWindowEnabled, IsWindowVisible, LoadCursorW, RegisterClassExW, SendMessageW,
         SetForegroundWindow, SetWindowTextW, ShowWindow, GA_ROOT, GCLP_HICON, GCLP_HICONSM,
-        ICON_BIG, ICON_SMALL, IDC_ARROW, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, WM_CLOSE,
-        WM_GETICON, WM_NCDESTROY, WM_SETICON, WNDCLASSEXW, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
-        WS_POPUP,
+        GW_OWNER, ICON_BIG, ICON_SMALL, IDC_ARROW, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE,
+        WM_CLOSE, WM_GETICON, WM_NCDESTROY, WM_SETICON, WNDCLASSEXW, WS_CLIPCHILDREN,
+        WS_OVERLAPPEDWINDOW, WS_POPUP,
     },
 };
 use wry::{WebView, WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows};
@@ -410,6 +412,44 @@ struct WindowState {
     repaint: Option<egui::Context>,
 }
 
+impl WindowState {
+    fn release_browser_focus(&self) {
+        let handle = self.handle.get();
+        if handle.is_null() {
+            return;
+        }
+        // WebView2 152 can leave its thread's hide-while-typing cursor count
+        // negative if a focused browser disappears before receiving focus loss.
+        // Let the browser unwind that state itself, before hiding/closing it.
+        // https://github.com/MicrosoftEdge/WebView2Feedback/issues/5687
+        unsafe {
+            let focus = GetFocus();
+            if GetForegroundWindow() != handle
+                || focus.is_null()
+                || (focus != handle && IsChild(handle, focus) == 0)
+            {
+                return;
+            }
+            let owner = GetWindow(handle, GW_OWNER);
+            if !owner.is_null() && IsWindowVisible(owner) != 0 && IsWindowEnabled(owner) != 0 {
+                SetFocus(owner);
+            } else {
+                // Do not activate a hidden/disabled owner or another app.
+                SetFocus(std::ptr::null_mut());
+            }
+        }
+    }
+
+    fn hide(&self) {
+        self.release_browser_focus();
+        // Focus callbacks can reenter teardown, so reread the guarded handle.
+        let handle = self.handle.get();
+        if !handle.is_null() {
+            unsafe { ShowWindow(handle, SW_HIDE) };
+        }
+    }
+}
+
 struct NativeWindow(Rc<WindowState>);
 
 fn provider_window_class() -> Result<u16, String> {
@@ -496,7 +536,7 @@ unsafe extern "system" fn window_lifetime(
     let state = unsafe { Rc::from_raw(pointer) };
     if message == WM_CLOSE {
         state.closed.set(true);
-        unsafe { ShowWindow(hwnd.0, SW_HIDE) };
+        state.hide();
         let controller = state.controller.borrow_mut().take();
         if let Some(controller) = controller {
             let _ = unsafe { controller.Close() };
@@ -750,7 +790,7 @@ impl Window {
                     if let Some(window) = navigation_window.upgrade().filter(|w| !w.closed.get()) {
                         unsafe {
                             if home {
-                                ShowWindow(window.handle.get(), SW_HIDE);
+                                window.hide();
                             } else if reveal {
                                 ShowWindow(window.handle.get(), SW_SHOWNOACTIVATE);
                             }
@@ -910,6 +950,7 @@ fn protect_settings(view: &WebView) -> Result<(), String> {
 
 impl Drop for Window {
     fn drop(&mut self) {
+        self.native.0.release_browser_focus();
         let _ = self.view.set_visible(false);
         let _ = unsafe { self.view.webview().Stop() };
     }
@@ -931,8 +972,7 @@ mod tests {
         time::{Duration, Instant},
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetForegroundWindow, IsWindow, IsWindowVisible, PeekMessageW,
-        SendMessageW, TranslateMessage, MSG, PM_REMOVE,
+        DispatchMessageW, IsWindow, PeekMessageW, SendMessageW, TranslateMessage, MSG, PM_REMOVE,
     };
 
     #[test]
@@ -1249,6 +1289,11 @@ mod tests {
                     ""
                 };
                 let body = format!("<!doctype html><script>{script}document.title=JSON.stringify({{cookie:{cookie},auth:{auth},storage:localStorage.getItem('fixture-login')==='fixture-only',ipc:typeof window.ipc!=='undefined',bridge:typeof window.brickMedia!=='undefined',opener:window.opener!==null}});</script>");
+                let body = if request.starts_with("GET /cursor ") {
+                    "<!doctype html><input autofocus style='margin:20px'><script>document.title='cursor-ready';document.querySelector('input').oninput=()=>document.title='cursor-typed';</script>".to_owned()
+                } else {
+                    body
+                };
                 let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\n{set}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             }
         });
@@ -1519,6 +1564,7 @@ mod tests {
         drop(destroyed);
         assert_ne!(unsafe { IsWindow(unrelated.handle()) }, 0);
         assert_delayed_login_completion(&origin, &parent, &root);
+        assert_cursor_restored_before_login_disappears(&origin, &parent);
         stopped.store(true, Ordering::Relaxed);
         worker.join().unwrap();
         assert_cross_site_viewing(&root, &parent);
@@ -1757,5 +1803,190 @@ addEventListener('message',e=>{{if(e.origin==='https://{host}'&&e.source===docum
             sessions.close();
             eprintln!("{}: hidden return stayed alive until fresh auth cookies; retry timeout and delayed sign-in passed", provider.label());
         }
+    }
+
+    fn assert_cursor_restored_before_login_disappears(origin: &str, parent: &NativeWindow) {
+        use windows_sys::Win32::{
+            Foundation::POINT,
+            Graphics::Gdi::ClientToScreen,
+            UI::{
+                Input::KeyboardAndMouse::{
+                    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_A,
+                },
+                WindowsAndMessaging::{
+                    SetCursorPos, ShowCursor, SystemParametersInfoW, SPI_GETMOUSEVANISH,
+                },
+            },
+        };
+        // Only the explicitly isolated native fixture runs this. We read the
+        // desktop setting; neither the app nor this fixture changes it.
+        let mut vanish: i32 = 0;
+        assert_ne!(
+            unsafe {
+                SystemParametersInfoW(SPI_GETMOUSEVANISH, 0, (&mut vanish as *mut i32).cast(), 0)
+            },
+            0
+        );
+        assert_ne!(
+            vanish, 0,
+            "Cursor fixture needs hide-pointer-while-typing enabled"
+        );
+        let count = || unsafe {
+            // Read the UI thread's cursor count with a balanced round trip.
+            // Production never changes ShowCursor's count itself.
+            let prior = ShowCursor(1) - 1;
+            ShowCursor(0);
+            prior
+        };
+        unsafe {
+            ShowWindow(parent.handle(), SW_SHOW);
+        }
+        for provider in [Provider::Youtube, Provider::Twitch] {
+            for mode in ["return", "close", "drop"] {
+                let sessions = ProviderSessions::default();
+                let context = sessions.context(provider.clone()).unwrap();
+                let login = Window::new_at_owner(
+                    &context.platform,
+                    &provider,
+                    parent.handle(),
+                    &egui::Context::default(),
+                    &format!("{origin}/cursor"),
+                    fixture_origin,
+                    |_, value| value.ends_with("/returned"),
+                )
+                .unwrap();
+                wait_for("synthetic typing page ready", || {
+                    page_title(&login.view).as_deref() == Some("cursor-ready")
+                });
+                login.present();
+                login.view.focus().unwrap();
+                let mut point = POINT { x: 40, y: 36 };
+                assert_ne!(
+                    unsafe { ClientToScreen(login.native.handle(), &mut point) },
+                    0
+                );
+                assert_ne!(unsafe { SetCursorPos(point.x, point.y) }, 0);
+                wait_for("pointer restored on entering sign-in", || count() >= 0);
+                // Drain the native move before typing; a move delivered after
+                // the key would correctly cancel hide-while-typing again.
+                let settled = Instant::now() + Duration::from_millis(250);
+                wait_for("synthetic pointer movement settled", || {
+                    Instant::now() >= settled
+                });
+                let baseline = count();
+                let keys = [0, KEYEVENTF_KEYUP].map(|flags| INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VK_A,
+                            dwFlags: flags,
+                            ..Default::default()
+                        },
+                    },
+                });
+                assert_eq!(
+                    unsafe {
+                        SendInput(
+                            keys.len() as u32,
+                            keys.as_ptr(),
+                            std::mem::size_of::<INPUT>() as i32,
+                        )
+                    },
+                    2
+                );
+                wait_for("synthetic typing hides pointer", || {
+                    page_title(&login.view).as_deref() == Some("cursor-typed") && count() < baseline
+                });
+                assert_eq!(count(), baseline - 1);
+                let handle = login.native.handle();
+                *context.window.borrow_mut() = Some(login);
+                match mode {
+                    "return" => {
+                        {
+                            let window = context.window.borrow();
+                            window
+                                .as_ref()
+                                .unwrap()
+                                .view
+                                .load_url(&format!("{origin}/returned"))
+                                .unwrap();
+                        }
+                        wait_for("automatic return hides without cursor leak", || {
+                            context
+                                .window
+                                .borrow()
+                                .as_ref()
+                                .unwrap()
+                                .completion
+                                .returned
+                                .get()
+                        });
+                        assert_eq!(unsafe { IsWindowVisible(handle) }, 0);
+                        assert!(
+                            context.window_open(),
+                            "auth completion still retains hidden browser"
+                        );
+                        assert_eq!(
+                            count(),
+                            baseline,
+                            "automatic return must release typing suppression before hiding"
+                        );
+                        context.close_window();
+                    }
+                    "close" => {
+                        unsafe {
+                            SendMessageW(handle, WM_CLOSE, 0, 0);
+                        }
+                        assert!(!context.window_open());
+                    }
+                    "drop" => context.close_window(),
+                    _ => unreachable!(),
+                }
+                wait_for("native app cursor count restored after login", || {
+                    count() == baseline
+                });
+                // Entering another browser must not increment a stale count.
+                // The next iteration checks the same visible baseline again.
+                assert_eq!(
+                    baseline, 0,
+                    "repeated sign-ins must not accumulate cursor adjustments"
+                );
+                sessions.close();
+                eprintln!(
+                    "{}: {mode} restores cursor after actual synthetic typing",
+                    provider.label()
+                );
+            }
+        }
+        // Hiding an inactive login must not bring Brick in front of another
+        // native window. No synthetic credentials or typing in this case.
+        let context = Context::new(&Provider::Youtube).unwrap();
+        let login = Window::new_at_owner(
+            &context,
+            &Provider::Youtube,
+            parent.handle(),
+            &egui::Context::default(),
+            &format!("{origin}/cursor"),
+            fixture_origin,
+            |_, _| false,
+        )
+        .unwrap();
+        wait_for("inactive cursor fixture page", || {
+            page_title(&login.view).as_deref() == Some("cursor-ready")
+        });
+        let other = parent_window();
+        unsafe {
+            ShowWindow(other.handle(), SW_SHOW);
+            SetForegroundWindow(other.handle());
+            SetFocus(other.handle());
+        }
+        wait_for(
+            "another native window has focus",
+            || unsafe { GetForegroundWindow() } == other.handle(),
+        );
+        login.native.0.hide();
+        drop(login);
+        assert_eq!(unsafe { GetForegroundWindow() }, other.handle());
+        context.retire();
     }
 }
