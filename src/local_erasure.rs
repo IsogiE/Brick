@@ -170,7 +170,7 @@ fn reset_with(plan: &Plan, erase_vault: impl FnOnce() -> Result<(), String>) -> 
     reset_using(plan, &WRITES, erase_vault, || {
         crate::protected_cache::forget_keys();
         crate::replay_library::forget_local_cache();
-        crate::autostart::set_enabled(false)
+        crate::autostart::clear_for_erasure()
     })
 }
 
@@ -459,8 +459,8 @@ mod tests {
     fn windows_device_reset_preserves_junction_targets_and_retries_locked_files() {
         use std::{os::windows::fs::OpenOptionsExt, process::Command};
         use windows_sys::Win32::{
-            Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
-            System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ},
+            Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS},
+            System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_ANY},
         };
 
         // Stop before any registry/profile access unless the reviewed offline
@@ -499,11 +499,12 @@ mod tests {
             );
         }
 
-        fn startup_value(name: &str) -> bool {
-            let key: Vec<_> = r"Software\Microsoft\Windows\CurrentVersion\Run"
-                .encode_utf16()
-                .chain(Some(0))
-                .collect();
+        const STARTUP_KEYS: [&str; 2] = [
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+        ];
+        fn startup_value(key: &str, name: &str) -> bool {
+            let key: Vec<_> = key.encode_utf16().chain(Some(0)).collect();
             let name: Vec<_> = name.encode_utf16().chain(Some(0)).collect();
             let mut size = 0;
             let result = unsafe {
@@ -511,35 +512,40 @@ mod tests {
                     HKEY_CURRENT_USER,
                     key.as_ptr(),
                     name.as_ptr(),
-                    RRF_RT_REG_SZ,
+                    RRF_RT_ANY,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     &mut size,
                 )
             };
-            assert!(matches!(result, ERROR_SUCCESS | ERROR_FILE_NOT_FOUND));
+            assert!(matches!(
+                result,
+                ERROR_SUCCESS | ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND
+            ));
             result == ERROR_SUCCESS
         }
-        assert!(
-            !startup_value("Brick"),
-            "never replace an existing startup entry"
-        );
-        assert!(!startup_value("BrickErasureOtherFixture"));
-        let added = Command::new(r"C:\Windows\System32\reg.exe")
-            .args([
-                "add",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                "/v",
-                "BrickErasureOtherFixture",
-                "/t",
-                "REG_SZ",
-                "/d",
-                "synthetic-nonexistent-command",
-                "/f",
-            ])
-            .output()
-            .unwrap();
-        assert!(added.status.success());
+        for key in STARTUP_KEYS {
+            assert!(
+                !startup_value(key, "Brick"),
+                "never replace an existing startup entry"
+            );
+            assert!(!startup_value(key, "BrickErasureOtherFixture"));
+            let added = Command::new(r"C:\Windows\System32\reg.exe")
+                .args([
+                    "add",
+                    &format!("HKCU\\{key}"),
+                    "/v",
+                    "BrickErasureOtherFixture",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    "synthetic-nonexistent-command",
+                    "/f",
+                ])
+                .output()
+                .unwrap();
+            assert!(added.status.success());
+        }
 
         let other = root.join("OtherApplication");
         let wow = root.join("WorldOfWarcraft");
@@ -582,7 +588,9 @@ mod tests {
         }
         crate::protected_cache::save("fixture-only-guild", b"synthetic cache").unwrap();
         crate::autostart::set_enabled(true).unwrap();
-        assert!(startup_value("Brick"));
+        for key in STARTUP_KEYS {
+            assert!(startup_value(key, "Brick"));
+        }
         let nested = redirected.join("WebView2/redirected");
         make_junction(&nested);
         let legacy = profile.join("Local/Brick/brick.exe.WebView2");
@@ -592,7 +600,9 @@ mod tests {
         assert!(reset().unwrap_err().contains("redirected"));
         assert!(is_pending().unwrap());
         assert!(write_permit().is_err());
-        assert!(!startup_value("Brick"));
+        for key in STARTUP_KEYS {
+            assert!(!startup_value(key, "Brick"));
+        }
         fs::remove_dir(&nested).unwrap();
         let locked_path = plan.marker.parent().unwrap().join("locked-browser-state");
         let locked = fs::OpenOptions::new()
@@ -616,7 +626,10 @@ mod tests {
         for path in &plan.roots {
             assert!(!path.exists() || fs::read_dir(path).unwrap().next().is_none());
         }
-        assert!(startup_value("BrickErasureOtherFixture"));
+        for key in STARTUP_KEYS {
+            assert!(startup_value(key, "BrickErasureOtherFixture"));
+            assert!(!startup_value(key, "Brick"));
+        }
         assert_eq!(fs::read(other.join("keep")).unwrap(), b"other application");
         assert_eq!(fs::read(wow.join("keep")).unwrap(), b"installed addon");
         assert_eq!(fs::read(installed).unwrap(), b"installed Brick executable");
