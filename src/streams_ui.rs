@@ -660,11 +660,11 @@ impl StreamsUi {
     }
 
     pub fn draw_home_accounts(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 24.0;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
             for provider in [Provider::Youtube, Provider::Twitch] {
                 ui.allocate_ui_with_layout(
-                    egui::vec2(168.0, 44.0),
+                    egui::vec2(240.0, 44.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
@@ -677,19 +677,16 @@ impl StreamsUi {
 
     fn draw_account_row(&mut self, ui: &mut egui::Ui, provider: Provider) {
         let started = self.provider_sessions.session_started(&provider);
-        ui.label(RichText::new(provider.label()).strong());
-        if ui
-            .add(action_button(if started { "Sign out" } else { "Sign in" }))
-            .clicked()
-        {
-            if started {
+        let open = self.provider_sessions.login_open_for(&provider);
+        match viewing_account_control(ui, &provider, started, open) {
+            Some(ViewingAccountAction::Clear) => {
                 self.provider_sessions.disconnect(&provider);
                 self.pending_provider_login
                     .retain(|queued| queued != &provider);
                 self.reload_provider(provider.label());
-            } else {
-                self.queue_provider_login(provider);
             }
+            Some(ViewingAccountAction::Open) => self.queue_provider_login(provider),
+            None => (),
         }
     }
 
@@ -1336,6 +1333,8 @@ impl StreamsUi {
         let snapshot = self.snapshot.clone();
         // The modal stays above native stream placeholders and blocks clicks behind it.
         let modal = egui::Modal::new(egui::Id::new("stream-editor"))
+            .area(egui::Modal::default_area(egui::Id::new("stream-editor"))
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 32.0)))
             .frame(
                 egui::Frame::new()
                     .fill(Color32::from_rgb(29, 33, 41))
@@ -1354,7 +1353,8 @@ impl StreamsUi {
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .id_salt("stream-setup-help")
-                    .max_height((ctx.content_rect().height() - 220.0).max(220.0))
+                    .auto_shrink([false, true])
+                    .max_height((ctx.content_rect().height() - 180.0).max(100.0))
                     .show(ui, |ui| {
                         for (index, provider) in [Provider::Twitch, Provider::Youtube]
                             .into_iter()
@@ -1557,9 +1557,11 @@ impl StreamsUi {
                             ui.add_space(4.0);
                         }
                     });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    done |= ui.add(action_button("Done")).clicked();
-                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 32.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| done |= ui.add(action_button("Done")).clicked(),
+                );
             });
         if let Some(action) = action {
             self.notice = None;
@@ -2124,6 +2126,50 @@ fn recording_day_label(day: &str) -> String {
         }
     }
     "Date unavailable".into()
+}
+
+#[derive(Debug, PartialEq)]
+enum ViewingAccountAction {
+    Open,
+    Clear,
+}
+
+fn viewing_account_control(
+    ui: &mut egui::Ui,
+    provider: &Provider,
+    started: bool,
+    open: bool,
+) -> Option<ViewingAccountAction> {
+    let mut action = None;
+    ui.push_id(("viewing-account", provider.key()), |ui| {
+        ui.add_sized(
+            [56.0, 32.0],
+            egui::Label::new(RichText::new(provider.label()).strong()),
+        );
+        // Opening or returning from a provider page does not prove login.
+        // Keep reopening sign-in separate from clearing the viewing session.
+        let label = if open {
+            "Continue sign-in"
+        } else if started {
+            "Manage sign-in"
+        } else {
+            "Sign in"
+        };
+        if ui.add(action_button(label)).clicked() {
+            action = Some(ViewingAccountAction::Open);
+        }
+        if started {
+            ui.menu_button("⋯", |ui| {
+                if ui.button("Clear viewing session").clicked() {
+                    action = Some(ViewingAccountAction::Clear);
+                    ui.close();
+                }
+            })
+            .response
+            .on_hover_text("Viewing session options");
+        }
+    });
+    action
 }
 
 pub(crate) fn action_button(label: &str) -> egui::Button<'_> {
@@ -2740,6 +2786,175 @@ mod tests {
             assert!(submission_status(&current.own_streams[0]).contains(expected));
             assert_eq!(current.unverified_count, unverified);
             assert!(ui.selected.is_none());
+        }
+    }
+
+    #[test]
+    fn viewing_sign_in_attempts_reopen_the_provider_instead_of_signing_out() {
+        for provider in [Provider::Youtube, Provider::Twitch] {
+            for (started, open, label) in [
+                (false, false, "Sign in"),
+                (true, true, "Continue sign-in"),
+                (true, false, "Manage sign-in"),
+            ] {
+                let ctx = egui::Context::default();
+                let frame = |events| {
+                    let mut action = None;
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                action = viewing_account_control(ui, &provider, started, open);
+                            });
+                        },
+                    );
+                    (action, output)
+                };
+                frame(vec![]);
+                let (action, output) = frame(vec![]);
+                assert_eq!(action, None);
+                let mut button = None;
+                for shape in output.shapes {
+                    if let egui::epaint::Shape::Text(text) = shape.shape {
+                        assert_ne!(text.galley.text(), "Sign out");
+                        if text.galley.text() == label {
+                            button = Some(text.pos + text.galley.size() * 0.5);
+                        }
+                    }
+                }
+                let pos = button.expect("The sign-in action remains available");
+                frame(vec![egui::Event::PointerMoved(pos)]);
+                frame(vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }]);
+                let (action, _) = frame(vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }]);
+                assert_eq!(action, Some(ViewingAccountAction::Open));
+            }
+        }
+    }
+
+    #[test]
+    fn stream_editor_shrinks_after_expanding_links_and_keeps_its_header_in_place() {
+        let mut streams = StreamsUi::default();
+        let mut current = snapshot();
+        current.own_streams.push(current.streams[0].clone());
+        current.own_youtube_channel = Some(crate::youtube_account::Channel {
+            channel_id: "UC1234567890123456789012".into(),
+            title: "Fixture YouTube channel".into(),
+            url: "https://www.youtube.com/channel/UC1234567890123456789012".into(),
+        });
+        streams.snapshot = Some(Rc::new(current));
+        streams.edit_open = true;
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+        let mut frame = |size: egui::Vec2, events| {
+            time += 0.1;
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| streams.draw_editor(ui.ctx()),
+            );
+            let rect = ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("stream-editor")))
+                .unwrap();
+            let labels: Vec<_> = output
+                .shapes
+                .into_iter()
+                .filter_map(|shape| {
+                    if let egui::epaint::Shape::Text(text) = shape.shape {
+                        Some((
+                            text.galley.text().to_owned(),
+                            egui::Rect::from_min_size(text.pos, text.galley.size()),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            (rect, labels)
+        };
+        let size = egui::vec2(980.0, 1000.0);
+        for _ in 0..8 {
+            frame(size, vec![]);
+        }
+        let baseline = frame(size, vec![]).0;
+        let mut expanded = [false, false];
+        for index in [0, 1, 0, 1, 1, 0, 1, 0] {
+            let (_, labels) = frame(size, vec![]);
+            let pos = labels
+                .iter()
+                .filter(|(label, _)| label == "Use a link instead")
+                .nth(index)
+                .unwrap()
+                .1
+                .center();
+            frame(size, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                frame(
+                    size,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+            for _ in 0..8 {
+                frame(size, vec![]);
+            }
+            expanded[index] = !expanded[index];
+            let (rect, labels) = frame(size, vec![]);
+            assert_eq!(rect.height() > baseline.height(), expanded.contains(&true));
+            assert_eq!(
+                rect.top(),
+                baseline.top(),
+                "Opening a section must not move its header"
+            );
+            assert_eq!(rect.width(), baseline.width());
+            let done = labels.iter().find(|(label, _)| label == "Done").unwrap().1;
+            assert!(
+                rect.bottom() - done.bottom() < 32.0,
+                "Footer must not consume spare height: {rect:?} {done:?}"
+            );
+        }
+        assert_eq!(
+            frame(size, vec![]).0,
+            baseline,
+            "Collapsing both sections restores the compact size"
+        );
+        for size in [
+            egui::vec2(720.0, 560.0),
+            egui::vec2(980.0, 720.0),
+            egui::vec2(1440.0, 900.0),
+        ] {
+            for _ in 0..8 {
+                frame(size, vec![]);
+            }
+            let (rect, labels) = frame(size, vec![]);
+            assert!(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(rect),
+                "{size:?}: {rect:?}"
+            );
+            assert!((rect.center().x - size.x / 2.0).abs() < 1.0);
+            assert!(labels
+                .iter()
+                .any(|(label, bounds)| label == "Done" && rect.contains_rect(*bounds)));
         }
     }
 
