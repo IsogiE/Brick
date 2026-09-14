@@ -170,7 +170,12 @@ jobs:
           RUSTFLAGS: '-D warnings'
         run: |
           cargo test --locked --bin brick --no-run --message-format=json > "$RUNNER_TEMP/brick-erasure-artifacts.json"
-          python3 scripts/test-local-erasure.py --cargo-artifacts "$RUNNER_TEMP/brick-erasure-artifacts.json"
+          # Create the offline namespace before dropping to the runner user;
+          # nested bwrap need not configure a network interface itself.
+          sudo unshare --net -- runuser -u "$(id -un)" -- \
+            python3 scripts/test-local-erasure.py --isolated-network \
+            --cargo-artifacts "$RUNNER_TEMP/brick-erasure-artifacts.json" \
+            --scratch-parent "$RUNNER_TEMP"
 
       - name: Build release binary
         env:

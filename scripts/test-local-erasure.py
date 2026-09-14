@@ -76,7 +76,18 @@ def main():
     group.add_argument('--test-binary')
     group.add_argument('--cargo-artifacts')
     parser.add_argument('--scratch-parent', default=os.environ.get('RUNNER_TEMP'))
+    parser.add_argument('--isolated-network', action='store_true',
+                        help='Use an existing namespace with only the loopback interface.')
     args = parser.parse_args()
+    if args.isolated_network:
+        # CI creates this namespace before dropping to its ordinary user. Some
+        # nested runner policies prevent bwrap from configuring loopback itself.
+        # Never share an ordinary runner/host network as a fallback.
+        interfaces = [line.split(':', 1)[0].strip()
+                      for line in Path('/proc/self/net/dev').read_text().splitlines()[2:]
+                      if ':' in line]
+        if interfaces != ['lo']:
+            raise RuntimeError('Expected an isolated loopback-only network namespace')
     binary = test_binary(args)
     with tempfile.TemporaryDirectory(prefix='brick-erasure-', dir=args.scratch_parent) as temporary:
         root = Path(temporary)
@@ -94,6 +105,8 @@ def main():
             '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--dir', '/run',
             '--bind', str(root), '/fixture', '--ro-bind', str(binary), '/fixture-test',
         ]
+        if args.isolated_network:
+            command += ['--share-net']
         for name, value in {
             'HOME': '/fixture/home', 'XDG_CONFIG_HOME': '/fixture/config',
             'XDG_DATA_HOME': '/fixture/data', 'XDG_CACHE_HOME': '/fixture/cache',
