@@ -53,6 +53,43 @@ const ALLOWED_FOLDERS: &[&str] = &[
 // into the latest settings after the slow work finishes.
 static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 static LOG_LOCK: Mutex<()> = Mutex::new(());
+// Account erasure drains admitted sync work before touching local state. Keep
+// this separate from SETTINGS_LOCK: downloads must not block ordinary settings.
+static SYNC_WORK: Mutex<()> = Mutex::new(());
+
+fn sync_admission<'a>(
+    gate: &'a Mutex<()>,
+    blocked: impl FnOnce() -> bool,
+) -> Result<MutexGuard<'a, ()>, String> {
+    let guard = gate
+        .lock()
+        .map_err(|_| "Brick sync lock was poisoned.".to_string())?;
+    if blocked() {
+        return Err("Account deletion is pending.".into());
+    }
+    Ok(guard)
+}
+
+fn ensure_sync_allowed() -> Result<(), String> {
+    if crate::account_erasure::requests_blocked() {
+        Err("Account deletion is pending.".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Called on the erasure worker after confirmation has stopped new work.
+/// An admitted installation finishes its current folder replacement; interrupting
+/// it between removal and rename could damage the installed addon.
+pub(crate) fn quiesce_for_erasure() -> Result<(), String> {
+    if !crate::account_erasure::requests_blocked() {
+        return Err("Confirm account deletion before stopping addon updates.".into());
+    }
+    let _guard = SYNC_WORK
+        .lock()
+        .map_err(|_| "Brick sync lock was poisoned.".to_string())?;
+    Ok(())
+}
 
 fn settings_lock() -> Result<MutexGuard<'static, ()>, String> {
     SETTINGS_LOCK
@@ -410,6 +447,7 @@ pub fn record_log(level: LogLevel, message: String) -> Result<(), String> {
 }
 
 fn record_log_to(path: &Path, level: LogLevel, mut message: String) -> Result<(), String> {
+    let permit = crate::local_erasure::write_permit().map_err(|error| error.to_string())?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
@@ -441,6 +479,7 @@ fn record_log_to(path: &Path, level: LogLevel, mut message: String) -> Result<()
     if length.saturating_add(line.len() as u64 + 2) > MAX_LOG_BYTES {
         // Close before atomic replacement so compaction also works on Windows.
         drop(file);
+        drop(permit);
         let mut logs = read_logs_from(path)?;
         logs.push(entry);
         return rewrite_logs(path, &logs);
@@ -464,6 +503,7 @@ pub fn run_sync_with_lock(sync_lock: &Arc<Mutex<()>>) -> Result<SyncSummary, Str
     let _guard = sync_lock
         .lock()
         .map_err(|_| "Brick sync lock was poisoned.".to_string())?;
+    let _admission = sync_admission(&SYNC_WORK, crate::account_erasure::requests_blocked)?;
     run_sync()
 }
 
@@ -471,13 +511,24 @@ pub fn spawn_watcher(sync_lock: Arc<Mutex<()>>) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(SYNC_INTERVAL_SECS));
 
+        if crate::account_erasure::requests_blocked() {
+            return;
+        }
+
         if let Err(error) = run_sync_if_configured(&sync_lock) {
+            if crate::account_erasure::requests_blocked() {
+                return;
+            }
             let _ = record_log(LogLevel::Error, error);
         }
     });
 }
 
 fn run_sync_if_configured(sync_lock: &Arc<Mutex<()>>) -> Result<(), String> {
+    let _guard = sync_lock
+        .lock()
+        .map_err(|_| "Brick sync lock was poisoned.".to_string())?;
+    let _admission = sync_admission(&SYNC_WORK, crate::account_erasure::requests_blocked)?;
     // Recovery and detection must also run while the window is hidden.
     let settings = load_view()?.settings;
     if settings.clients.is_empty() {
@@ -489,10 +540,11 @@ fn run_sync_if_configured(sync_lock: &Arc<Mutex<()>>) -> Result<(), String> {
         Ok(None) | Err(_) => return Ok(()),
     }
 
-    run_sync_with_lock(sync_lock).map(|_| ())
+    run_sync().map(|_| ())
 }
 
 fn run_sync() -> Result<SyncSummary, String> {
+    ensure_sync_allowed()?;
     let mut settings = load_view()?.settings;
     let checked_at = now_stamp();
     if settings.clients.is_empty() {
@@ -506,6 +558,7 @@ fn run_sync() -> Result<SyncSummary, String> {
         return Ok(summary);
     }
 
+    ensure_sync_allowed()?;
     let manifest = match fetch_verified_manifest() {
         Ok(manifest) => manifest,
         Err(error) if error == FEED_UNAVAILABLE_MESSAGE => {
@@ -521,6 +574,7 @@ fn run_sync() -> Result<SyncSummary, String> {
         Err(error) => return Err(error),
     };
     validate_manifest(&manifest)?;
+    ensure_sync_allowed()?;
     let package = if settings
         .clients
         .iter()
@@ -537,6 +591,7 @@ fn run_sync() -> Result<SyncSummary, String> {
     let mut errors = Vec::new();
 
     for client in &mut settings.clients {
+        ensure_sync_allowed()?;
         if !client_supported_by_manifest(client, &manifest) {
             skipped += 1;
             continue;
@@ -571,6 +626,7 @@ fn run_sync() -> Result<SyncSummary, String> {
 
     if !installed_clients.is_empty() {
         let _guard = settings_lock()?;
+        ensure_sync_allowed()?;
         let mut latest = load_settings()?;
         if merge_installed_clients(&mut latest, &installed_clients) {
             save_settings(&latest)?;
@@ -589,9 +645,13 @@ fn run_sync() -> Result<SyncSummary, String> {
     if !errors.is_empty() {
         let joined = errors.join("; ");
         message = format!("{message} {joined}");
-        let _ = record_log(LogLevel::Error, message.clone());
+        if ensure_sync_allowed().is_ok() {
+            let _ = record_log(LogLevel::Error, message.clone());
+        }
     } else if installed > 0 {
-        let _ = record_log(LogLevel::Info, message.clone());
+        if ensure_sync_allowed().is_ok() {
+            let _ = record_log(LogLevel::Info, message.clone());
+        }
     }
 
     Ok(SyncSummary {
@@ -1320,6 +1380,7 @@ fn install_package_for_client(
     manifest: &AddonManifest,
     package: &[u8],
 ) -> Result<(), String> {
+    ensure_sync_allowed()?;
     let addons_dir = addons_dir_for_client(client);
     fs::create_dir_all(&addons_dir)
         .map_err(|error| format!("Failed to create {}: {error}", addons_dir.display()))?;
@@ -1349,6 +1410,9 @@ fn install_package_for_client(
         }
     }
 
+    // Cancellation before destructive replacement leaves the old addon intact.
+    // After this boundary, the admission guard drains the complete replacement.
+    ensure_sync_allowed()?;
     for folder in &manifest.artifact.folders {
         let target = addons_dir.join(folder);
         if target.exists() {
@@ -1595,6 +1659,61 @@ fn now_stamp() -> String {
 mod tests {
     use super::*;
     use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+
+    #[test]
+    fn deletion_drains_active_sync_and_rejects_work_queued_before_confirmation() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let gate = Arc::new(Mutex::new(()));
+        let blocked = Arc::new(AtomicBool::new(false));
+        let (active_tx, active_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let active_gate = gate.clone();
+        let active_blocked = blocked.clone();
+        let active = thread::spawn(move || {
+            let _admission =
+                sync_admission(&active_gate, || active_blocked.load(Ordering::SeqCst)).unwrap();
+            active_tx.send(()).unwrap();
+            finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        active_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            gate.try_lock().is_err(),
+            "active installation must remain drainable"
+        );
+
+        let (queued_tx, queued_rx) = mpsc::channel();
+        let queued_gate = gate.clone();
+        let queued_blocked = blocked.clone();
+        let queued = thread::spawn(move || {
+            queued_tx.send(()).unwrap();
+            // This represents watcher load/autodetect and manual sync alike.
+            let rejected =
+                sync_admission(&queued_gate, || queued_blocked.load(Ordering::SeqCst)).is_err();
+            rejected
+        });
+        queued_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        blocked.store(true, Ordering::SeqCst);
+
+        let (drained_tx, drained_rx) = mpsc::channel();
+        let draining_gate = gate.clone();
+        let drain = thread::spawn(move || {
+            let _guard = draining_gate.lock().unwrap();
+            drained_tx.send(()).unwrap();
+        });
+        assert!(drained_rx.try_recv().is_err());
+        finish_tx.send(()).unwrap();
+        drained_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        active.join().unwrap();
+        assert!(
+            queued.join().unwrap(),
+            "queued work must not inspect or rewrite user settings"
+        );
+        drain.join().unwrap();
+        assert!(sync_admission(&gate, || blocked.load(Ordering::SeqCst)).is_err());
+    }
 
     fn package(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));

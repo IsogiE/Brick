@@ -1,5 +1,8 @@
 //! Optional personal Twitch grant. Guild sharing uses only channel().url.
-use crate::twitch_account::{Account, Channel};
+use crate::{
+    streams_ui::action_button,
+    twitch_account::{Account, Channel},
+};
 use eframe::egui;
 use std::{
     sync::{
@@ -200,7 +203,7 @@ impl TwitchUi {
             } else if ui
                 .add_enabled(
                     !self.busy() && Account::configured(),
-                    egui::Button::new("Choose channel"),
+                    action_button("Choose channel"),
                 )
                 .clicked()
             {
@@ -208,7 +211,7 @@ impl TwitchUi {
             }
             if self.can_disconnect()
                 && ui
-                    .add_enabled(!self.busy(), egui::Button::new("Forget account").small())
+                    .add_enabled(!self.busy(), action_button("Forget account"))
                     .on_hover_text("Remove this device's saved channel connection.")
                     .clicked()
             {
@@ -232,7 +235,7 @@ impl TwitchUi {
                 });
                 if self.connecting
                     && ui
-                        .add_enabled(!self.cancellation_pending(), egui::Button::new("Cancel"))
+                        .add_enabled(!self.cancellation_pending(), action_button("Cancel"))
                         .clicked()
                 {
                     self.cancel_connect();

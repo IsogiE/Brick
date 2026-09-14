@@ -71,6 +71,41 @@ struct TokenResponse {
     scope: Option<String>,
 }
 
+/// Only the explicitly confirmed account-erasure flow calls this. Google
+/// revocation affects this user's grants across the OAuth project's clients;
+/// ordinary browser sign-out and local Forget account must not call it.
+pub(crate) fn revoke_for_erasure(account: &str) -> Result<(), String> {
+    let _guard = STORE_LOCK
+        .lock()
+        .map_err(|_| "Unlock protected storage to finish deletion.")?;
+    let store = Store::youtube(account)?;
+    let Some(bytes) = store.load().map_err(storage_error)? else {
+        return Ok(());
+    };
+    let session: Session = serde_json::from_slice(&bytes)
+        .map_err(|_| "Couldn't read the YouTube connection for deletion.")?;
+    if session.version != 1
+        || session.account != account
+        || !credential(&session.access_token)
+        || session
+            .refresh_token
+            .as_ref()
+            .is_some_and(|token| !credential(token))
+    {
+        return Err("Couldn't verify the YouTube connection for deletion.".into());
+    }
+    let token = session
+        .refresh_token
+        .as_deref()
+        .unwrap_or(&session.access_token);
+    crate::account_erasure::revoke_token(
+        "https://oauth2.googleapis.com/revoke",
+        &[("token", token)],
+        true,
+    )?;
+    store.remove().map_err(storage_error)
+}
+
 /// Moved into exactly one UI worker at a time. No shared mutable token cache;
 /// dropping the owning UI cancels its worker before any subsequent save/share.
 pub struct Account {

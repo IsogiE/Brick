@@ -58,11 +58,20 @@ struct ScopedCache {
     scope: String,
     cache: Cache,
 }
+static CACHE: OnceLock<Mutex<ScopedCache>> = OnceLock::new();
+
+pub(crate) fn forget_local_cache() {
+    if let Some(cache) = CACHE.get() {
+        if let Ok(mut state) = cache.lock() {
+            state.scope.clear();
+            state.cache = Cache::default();
+        }
+    }
+}
 fn local_cache(
     token: &crate::guild::Access,
 ) -> Option<std::sync::MutexGuard<'static, ScopedCache>> {
     token.check().ok()?;
-    static CACHE: OnceLock<Mutex<ScopedCache>> = OnceLock::new();
     let mut state = CACHE
         .get_or_init(|| {
             Mutex::new(ScopedCache {
@@ -72,6 +81,7 @@ fn local_cache(
         })
         .lock()
         .ok()?;
+    token.check().ok()?;
     let scope = token.cache_id();
     if state.scope != scope {
         // Locked vaults and authentication failures are not missing files.

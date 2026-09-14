@@ -16,9 +16,22 @@ const paths = [
 ];
 
 if (purge) {
-  paths.push(join(home, '.config/dev.isogi.brick'));
-  paths.push(join(home, '.local/share/dev.isogi.brick'));
-  paths.push(join(home, '.cache/dev.isogi.brick'));
+  // Only the native app can erase orphaned OS-keyring entries as well as files.
+  // Complete that device-only reset before removing the executable needed to retry.
+  const executable = join(home, '.local/bin/Brick.AppImage');
+  const probe = spawnSync(executable, ['--local-erasure-protocol'], {
+    encoding: 'utf8', timeout: 10000, maxBuffer: 4096
+  });
+  if (probe.status !== 0 || probe.stdout.trim() !== 'BRICK-LOCAL-ERASURE-v1') {
+    throw new Error('Install a current Brick AppImage before purging app data. Nothing was removed.');
+  }
+  console.log('Resetting all Brick accounts on this device. This does not revoke remote access or delete server data.');
+  const reset = spawnSync(executable, ['--purge-local-data'], {
+    stdio: 'inherit', timeout: 120000
+  });
+  if (reset.status !== 0) {
+    throw new Error('Brick local data removal did not finish. The app was kept so you can retry.');
+  }
 }
 
 for (const path of paths) {

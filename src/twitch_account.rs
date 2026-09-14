@@ -57,6 +57,36 @@ struct Token {
     #[serde(default)]
     scope: Vec<String>,
 }
+
+/// Revoke the stored access token and discard this device's refresh token.
+/// Twitch's public revocation endpoint does not promise project-wide grant
+/// removal; the user's Connections page remains authoritative for that.
+pub(crate) fn revoke_for_erasure(account: &str) -> Result<(), String> {
+    let _guard = lock()?;
+    let store = Store::twitch(account)?;
+    let Some(bytes) = store.load().map_err(storage_error)? else {
+        return Ok(());
+    };
+    let session: Session = serde_json::from_slice(&bytes)
+        .map_err(|_| "Couldn't read the Twitch connection for deletion.")?;
+    if session.version != 1
+        || session.account != account
+        || !valid_client_id(&session.client_id)
+        || !credential(&session.access_token)
+    {
+        return Err("Couldn't verify the Twitch connection for deletion.".into());
+    }
+    crate::account_erasure::revoke_token(
+        "https://id.twitch.tv/oauth2/revoke",
+        &[
+            ("client_id", session.client_id.as_str()),
+            ("token", session.access_token.as_str()),
+        ],
+        false,
+    )?;
+    forget_validation(&session);
+    store.remove().map_err(storage_error)
+}
 #[derive(Deserialize)]
 struct Device {
     device_code: String,

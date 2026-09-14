@@ -8,6 +8,15 @@ use uuid::Uuid;
 
 /// Replace a complete file without ever truncating the previous contents.
 pub(crate) fn write(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let permit = crate::local_erasure::write_permit()?;
+    write_permitted(path, contents, &permit)
+}
+
+pub(crate) fn write_permitted(
+    path: &Path,
+    contents: &[u8],
+    _permit: &crate::local_erasure::WritePermit<'_>,
+) -> io::Result<()> {
     write_with(path, |file| {
         file.write_all(contents)?;
         // File is unbuffered. sync_all also surfaces delayed disk-full errors.

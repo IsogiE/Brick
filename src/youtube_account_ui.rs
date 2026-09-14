@@ -1,6 +1,7 @@
 //! Personal YouTube grant with an explicitly selected per-guild channel.
 use crate::{
     streams,
+    streams_ui::action_button,
     youtube_account::{Account, Channel},
 };
 use eframe::egui::{self, RichText};
@@ -57,6 +58,10 @@ impl Drop for YoutubeUi {
 impl YoutubeUi {
     pub fn busy(&self) -> bool {
         self.work.is_some()
+    }
+
+    pub fn connected(&self) -> bool {
+        self.connected
     }
 
     /// Returns true when the guild's live/recording lists should be refreshed.
@@ -238,7 +243,9 @@ impl YoutubeUi {
 
     pub fn draw_channel(&mut self, ui: &mut egui::Ui, shared: Option<&Channel>, available: bool) {
         ui.label(RichText::new("YouTube channel").strong().size(15.0));
-        if let Some(channel) = shared {
+        if let Some(channel) =
+            shared.filter(|channel| !self.connected || self.selected != channel.channel_id)
+        {
             ui.label(RichText::new(format!("Shared here: {}", channel.title)).strong());
         }
         let enabled = available && !self.busy();
@@ -247,7 +254,7 @@ impl YoutubeUi {
                 && ui
                     .add_enabled(
                         !self.busy() && Account::configured(),
-                        egui::Button::new("Choose channel"),
+                        action_button("Choose channel"),
                     )
                     .clicked()
             {
@@ -255,7 +262,7 @@ impl YoutubeUi {
             }
             if self.can_disconnect()
                 && ui
-                    .add_enabled(!self.busy(), egui::Button::new("Forget account").small())
+                    .add_enabled(!self.busy(), action_button("Forget account"))
                     .on_hover_text("Remove this device's saved channel connection.")
                     .clicked()
             {
@@ -268,7 +275,9 @@ impl YoutubeUi {
             );
         });
         if self.connected && self.channels.is_empty() {
-            ui.label("Your connected account has no available YouTube channels.");
+            if self.notice.is_none() {
+                ui.label("Your connected account has no available YouTube channels.");
+            }
         } else if self.connected {
             let title = self
                 .channels
@@ -294,7 +303,11 @@ impl YoutubeUi {
             if ui
                 .add_enabled(
                     enabled && changed && !self.selected.is_empty(),
-                    egui::Button::new("Share channel with this guild"),
+                    action_button(if changed {
+                        "Share channel with this guild"
+                    } else {
+                        "Shared with this guild"
+                    }),
                 )
                 .clicked()
             {
@@ -309,7 +322,6 @@ impl YoutubeUi {
         if let Some(notice) = &self.notice {
             ui.label(RichText::new(notice).small());
         }
-        ui.add_space(8.0);
     }
 
     fn draw_progress(&mut self, ui: &mut egui::Ui) {
@@ -324,7 +336,7 @@ impl YoutubeUi {
                     "Working…"
                 });
                 if ui
-                    .add_enabled(!self.cancellation_pending(), egui::Button::new("Cancel"))
+                    .add_enabled(!self.cancellation_pending(), action_button("Cancel"))
                     .clicked()
                 {
                     self.cancel_work();

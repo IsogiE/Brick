@@ -20,12 +20,12 @@ use windows::Win32::{
     UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
 };
 use windows_sys::Win32::{
-    Foundation::HWND,
+    Foundation::{HWND, RECT},
+    Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, GetAncestor, GetClientRect, GetSystemMetrics,
-        IsWindowVisible, SetForegroundWindow, SetWindowTextW, ShowWindow, GA_ROOT, SM_CXSCREEN,
-        SM_CYSCREEN, SW_HIDE, SW_SHOW, WM_CLOSE, WM_NCDESTROY, WS_CAPTION, WS_CLIPCHILDREN,
-        WS_POPUP, WS_SYSMENU,
+        CreateWindowExW, DestroyWindow, GetAncestor, GetClientRect, GetWindowRect, IsWindowVisible,
+        SetForegroundWindow, SetWindowTextW, ShowWindow, GA_ROOT, SW_HIDE, SW_SHOW, WM_CLOSE,
+        WM_NCDESTROY, WS_CAPTION, WS_CLIPCHILDREN, WS_POPUP, WS_SYSMENU,
     },
 };
 use wry::{WebView, WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows};
@@ -360,6 +360,30 @@ fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
 
+fn centered_popup(owner: RECT, work: RECT, width: i32, height: i32) -> Option<RECT> {
+    // Screen coordinates can be negative on secondary monitors. Calculate in
+    // i64 so centering an off-screen owner cannot overflow before clamping.
+    let left = i64::from(work.left);
+    let top = i64::from(work.top);
+    let right = i64::from(work.right);
+    let bottom = i64::from(work.bottom);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let width = i64::from(width).max(1).min(right - left);
+    let height = i64::from(height).max(1).min(bottom - top);
+    let x =
+        ((i64::from(owner.left) + i64::from(owner.right) - width) / 2).clamp(left, right - width);
+    let y =
+        ((i64::from(owner.top) + i64::from(owner.bottom) - height) / 2).clamp(top, bottom - height);
+    Some(RECT {
+        left: x as i32,
+        top: y as i32,
+        right: (x + width) as i32,
+        bottom: (y + height) as i32,
+    })
+}
+
 impl Window {
     pub fn from_frame(
         context: &Context,
@@ -433,10 +457,32 @@ impl Window {
             .borrow()
             .clone()
             .ok_or("The private provider session could not start.")?;
-        let width = unsafe { GetSystemMetrics(SM_CXSCREEN) }.clamp(320, 580);
-        let height = unsafe { GetSystemMetrics(SM_CYSCREEN) }
-            .saturating_sub(80)
-            .clamp(300, 740);
+        let mut monitor = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mut owner_rect = RECT::default();
+        if unsafe {
+            GetMonitorInfoW(
+                MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            )
+        } == 0
+            || unsafe { GetWindowRect(owner, &mut owner_rect) } == 0
+        {
+            return Err("The provider sign-in window could not find its display.".into());
+        }
+        let scale = ctx
+            .native_pixels_per_point()
+            .filter(|scale| scale.is_finite() && *scale > 0.0)
+            .unwrap_or(1.0);
+        let bounds = centered_popup(
+            owner_rect,
+            monitor.rcWork,
+            (520.0 * scale).round() as i32,
+            (640.0 * scale).round() as i32,
+        )
+        .ok_or("The provider sign-in window could not fit its display.")?;
         let caption = wide(&title(provider, start_url(provider)));
         let class = wide("STATIC");
         // Fixed-size native window. The lifetime subclass keeps HWND ownership
@@ -447,10 +493,10 @@ impl Window {
                 class.as_ptr(),
                 caption.as_ptr(),
                 WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,
-                80,
-                50,
-                width,
-                height,
+                bounds.left,
+                bounds.top,
+                bounds.right - bounds.left,
+                bounds.bottom - bounds.top,
                 owner,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
@@ -471,6 +517,7 @@ impl Window {
         let view = WebViewBuilder::new()
             .with_environment(environment)
             .with_profile_name(&context.profile_name)
+            .with_background_color((21, 24, 29, 255))
             .with_incognito(true)
             .with_devtools(false)
             .with_clipboard(false)
@@ -592,6 +639,45 @@ mod tests {
         DispatchMessageW, GetForegroundWindow, IsWindow, PeekMessageW, SendMessageW,
         TranslateMessage, MSG, PM_REMOVE,
     };
+
+    #[test]
+    fn popup_centers_on_its_owner_on_a_negative_coordinate_monitor() {
+        let owner = RECT {
+            left: -1800,
+            top: 100,
+            right: -1200,
+            bottom: 500,
+        };
+        let work = RECT {
+            left: -1920,
+            top: 40,
+            right: 0,
+            bottom: 1080,
+        };
+        let result = centered_popup(owner, work, 400, 300).unwrap();
+        assert_eq!((result.left, result.top), (-1700, 150));
+        assert_eq!((result.right, result.bottom), (-1300, 450));
+    }
+
+    #[test]
+    fn popup_fits_small_work_area_even_when_owner_is_far_off_screen() {
+        let owner = RECT {
+            left: i32::MAX - 1000,
+            top: i32::MIN,
+            right: i32::MAX,
+            bottom: i32::MIN + 800,
+        };
+        let work = RECT {
+            left: -800,
+            top: -500,
+            right: -100,
+            bottom: -100,
+        };
+        let result = centered_popup(owner, work, 1000, 800).unwrap();
+        assert_eq!((result.left, result.top), (work.left, work.top));
+        assert_eq!((result.right, result.bottom), (work.right, work.bottom));
+        assert!(centered_popup(owner, RECT::default(), 1000, 800).is_none());
+    }
 
     fn pump() {
         let mut message = MSG::default();

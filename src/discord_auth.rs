@@ -267,11 +267,13 @@ pub fn saved_session_status() -> Result<SessionStatus, String> {
 }
 
 pub fn login_with_browser() -> Result<AuthorizedUser, String> {
+    normal_auth_allowed()?;
     let generation = SESSION_GENERATION.load(Ordering::SeqCst);
     let config = auth_config()?;
     let request = login_request(&config)?;
     crate::browser::open(&request.authorize_url)?;
     let code = wait_for_remote_callback(&request.state)?;
+    normal_auth_allowed()?;
     let token = exchange_code(&config, &code, &request.verifier)?;
     let session = verified_session_from_token(&config, token, None)?;
     let _refresh = SESSION_REFRESH_LOCK
@@ -281,7 +283,86 @@ pub fn login_with_browser() -> Result<AuthorizedUser, String> {
     Ok(authorized_user(&session, &config))
 }
 
+/// Privacy requests require ownership of a Discord identity, not guild access.
+/// This deliberately does not publish an authorized guild session or refresh
+/// role caches. An expired/missing saved session uses a separate identify-only
+/// browser grant, which is never installed as a normal Brick login.
+pub(crate) fn erasure_identity() -> Result<crate::account_erasure::Identity, String> {
+    let config = auth_config()?;
+    if let Some(session) = erasure_saved_session()? {
+        if session_matches_config(&session, &config)
+            && !token_expired(session.expires_at_unix, now_unix_secs())
+        {
+            if let Some(identity) = privacy_identity_from_lookup(
+                session.access_token.clone(),
+                fetch_user(&session.access_token),
+            )? {
+                return Ok(identity);
+            }
+        }
+    }
+    let request = login_request_with_scope(&config, "identify")?;
+    crate::browser::open(&request.authorize_url)?;
+    let code = wait_for_remote_callback(&request.state)?;
+    let token = exchange_code(&config, &code, &request.verifier)?;
+    verified_erasure_identity(token.access_token)
+}
+
+fn verified_erasure_identity(token: String) -> Result<crate::account_erasure::Identity, String> {
+    let user =
+        fetch_user(&token).map_err(|_| "Couldn't verify your Discord account. Try again.")?;
+    crate::account_erasure::Identity::new(token, user.id, user.global_name.unwrap_or(user.username))
+}
+
+fn erasure_saved_session() -> Result<Option<AuthSession>, String> {
+    let _guard = SESSION_STORAGE_LOCK
+        .lock()
+        .map_err(|_| "Discord session storage is unavailable.")?;
+    // Privacy authentication never migrates/saves a normal guild session.
+    for path in [session_path()?, legacy_session_path()?] {
+        if path.exists() {
+            return load_session_file(&path).map(|loaded| Some(loaded.session));
+        }
+    }
+    Ok(None)
+}
+
+fn privacy_identity_from_lookup(
+    token: String,
+    result: Result<DiscordUser, RefreshError>,
+) -> Result<Option<crate::account_erasure::Identity>, String> {
+    match result {
+        Ok(user) => crate::account_erasure::Identity::new(
+            token,
+            user.id,
+            user.global_name.unwrap_or(user.username),
+        )
+        .map(Some),
+        Err(error) if !error.retryable => Ok(None),
+        Err(_) => Err("Couldn't verify your Discord account. Try again.".into()),
+    }
+}
+
+fn normal_auth_allowed() -> Result<(), String> {
+    if crate::account_erasure::requests_blocked() {
+        Err("Account deletion is pending.".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Called on the erasure worker after normal authorization has been blocked.
+/// Drain already-admitted saves without waiting for a network request on UI.
+pub(crate) fn drain_pending_session_writes() -> Result<(), String> {
+    let _guard = SESSION_STORAGE_LOCK
+        .lock()
+        .map_err(|_| "Discord session storage is unavailable.")?;
+    SESSION_GENERATION.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
 pub fn refresh_saved_session() -> Result<AuthorizedUser, RefreshError> {
+    normal_auth_allowed()?;
     let config = auth_config()?;
     let session = current_or_refreshed_session(&config, true)?
         .ok_or_else(|| RefreshError::rejected("Please sign in with Discord.".to_string()))?;
@@ -303,6 +384,7 @@ fn current_or_refreshed_session_locked(
     retry_now: bool,
     retry_at: &mut Option<Instant>,
 ) -> Result<Option<AuthSession>, RefreshError> {
+    normal_auth_allowed()?;
     let generation = SESSION_GENERATION.load(Ordering::SeqCst);
     let Some(session) = load_session()? else {
         return Ok(None);
@@ -386,10 +468,18 @@ pub fn clear_session() -> Result<(), String> {
     clear_session_if_current(None)
 }
 
+/// Stop old login/refresh workers without removing the credentials needed to
+/// authenticate a pending privacy request after a crash or provider outage.
+pub(crate) fn suspend_session() {
+    SESSION_GENERATION.fetch_add(1, Ordering::SeqCst);
+    crate::guild::invalidate();
+}
+
 fn clear_session_if_current(generation: Option<u64>) -> Result<(), String> {
     let _guard = SESSION_STORAGE_LOCK
         .lock()
         .map_err(|_| "Discord session storage is unavailable.".to_string())?;
+    normal_auth_allowed()?;
     if generation.is_some_and(|value| SESSION_GENERATION.load(Ordering::SeqCst) != value) {
         return Ok(());
     }
@@ -550,6 +640,10 @@ fn parse_allowed_role_ids(raw: &str) -> HashSet<String> {
 }
 
 fn login_request(config: &AuthConfig) -> Result<LoginRequest, String> {
+    login_request_with_scope(config, "identify guilds guilds.members.read")
+}
+
+fn login_request_with_scope(config: &AuthConfig, scope: &str) -> Result<LoginRequest, String> {
     let state = random_token();
     let verifier = format!("{}{}", random_token(), random_token());
     let challenge = pkce_challenge(&verifier);
@@ -560,7 +654,7 @@ fn login_request(config: &AuthConfig) -> Result<LoginRequest, String> {
         .append_pair("response_type", "code")
         .append_pair("client_id", &config.client_id)
         .append_pair("redirect_uri", &redirect)
-        .append_pair("scope", "identify guilds guilds.members.read")
+        .append_pair("scope", scope)
         .append_pair("state", &state)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256");
@@ -652,6 +746,7 @@ fn refresh_token(
     config: &AuthConfig,
     refresh_token: &str,
 ) -> Result<DiscordTokenResponse, RefreshError> {
+    normal_auth_allowed()?;
     let params = [
         ("client_id", config.client_id.as_str()),
         ("grant_type", "refresh_token"),
@@ -745,7 +840,9 @@ fn verified_session_from_token(
 }
 
 fn verify_session(_config: &AuthConfig, session: AuthSession) -> Result<AuthSession, RefreshError> {
+    normal_auth_allowed()?;
     let user = fetch_user(&session.access_token)?;
+    normal_auth_allowed()?;
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct GuildAccess {
@@ -760,6 +857,7 @@ fn verify_session(_config: &AuthConfig, session: AuthSession) -> Result<AuthSess
         .map_err(|_| "Guild access could not be checked. Brick will retry.".to_string())?;
     let status = response.status();
     let bytes = download::read_response(response, MAX_AUTH_RESPONSE_BYTES, "Guild access lookup")?;
+    normal_auth_allowed()?;
     if !status.is_success() {
         // An unavailable route or infrastructure denial must not erase valid
         // Discord credentials during a server-first rollout or outage.
@@ -1086,6 +1184,7 @@ fn save_session_if_current(session: &AuthSession, generation: u64) -> Result<(),
     let _guard = SESSION_STORAGE_LOCK
         .lock()
         .map_err(|_| "Discord session storage is unavailable.".to_string())?;
+    normal_auth_allowed()?;
     if SESSION_GENERATION.load(Ordering::SeqCst) != generation {
         return Err("The Discord sign-in changed while access was being checked.".to_string());
     }
@@ -1100,6 +1199,7 @@ fn commit_session_if_current(
     let _guard = SESSION_STORAGE_LOCK
         .lock()
         .map_err(|_| "Discord session storage is unavailable.".to_string())?;
+    normal_auth_allowed()?;
     if SESSION_GENERATION.load(Ordering::SeqCst) != generation {
         return Err("The Discord sign-in changed while access was being checked.".into());
     }
@@ -1116,6 +1216,8 @@ fn save_session_unlocked(session: &AuthSession) -> Result<(), String> {
 }
 
 fn save_session_at(path: &Path, legacy_path: &Path, session: &AuthSession) -> Result<(), String> {
+    normal_auth_allowed()?;
+    let permit = crate::local_erasure::write_permit().map_err(|error| error.to_string())?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
@@ -1131,7 +1233,8 @@ fn save_session_at(path: &Path, legacy_path: &Path, session: &AuthSession) -> Re
         .map_err(|error| format!("Failed to serialize Discord session: {error}"))?;
     json.push(b'\n');
     let payload = session_payload_for_write(&path, &json)?;
-    write_private_bytes(&path, &payload)?;
+    crate::atomic_file::write_permitted(path, &payload, &permit)
+        .map_err(|error| format!("Failed to write {}: {error}", path.display()))?;
     remove_session_file(legacy_path)
 }
 
@@ -1164,11 +1267,6 @@ fn remove_session_file(path: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("Failed to remove {}: {error}", path.display())),
     }
-}
-
-fn write_private_bytes(path: &Path, contents: &[u8]) -> Result<(), String> {
-    crate::atomic_file::write(path, contents)
-        .map_err(|error| format!("Failed to write {}: {error}", path.display()))
 }
 
 #[cfg(target_os = "windows")]
@@ -1453,6 +1551,69 @@ mod tests {
             role_label: "Raider or Officer".to_string(),
             allowed_role_ids: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn privacy_auth_reopens_sign_in_only_for_a_confirmed_rejected_credential() {
+        let rejected = super::privacy_identity_from_lookup(
+            "synthetic-token".into(),
+            Err(super::RefreshError::rejected("rejected".into())),
+        )
+        .unwrap();
+        assert!(rejected.is_none());
+        assert!(super::privacy_identity_from_lookup(
+            "synthetic-token".into(),
+            Err("temporary service failure".to_string().into())
+        )
+        .is_err());
+        let verified = super::privacy_identity_from_lookup(
+            "synthetic-token".into(),
+            Ok(super::DiscordUser {
+                id: "123".into(),
+                username: "fixture".into(),
+                global_name: Some("Fixture".into()),
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(verified.user_id, "123");
+        assert_eq!(verified.name, "Fixture");
+    }
+
+    #[test]
+    fn queued_normal_auth_cannot_resume_or_clear_credentials_after_erasure_confirmation() {
+        // A separate test process makes the permanent privacy fence independent
+        // of the parallel suite. No session/vault read is reached by this test.
+        const CHILD: &str = "BRICK_ERASURE_AUTH_QUEUE_FIXTURE";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "discord_auth::tests::queued_normal_auth_cannot_resume_or_clear_credentials_after_erasure_confirmation", "--nocapture"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let refresh = super::SESSION_REFRESH_LOCK.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(()).unwrap();
+            super::current_or_refreshed_session(&test_config(), true)
+                .err()
+                .unwrap()
+                .message
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        crate::account_erasure::block_normal_requests();
+        super::suspend_session();
+        drop(refresh);
+        assert_eq!(worker.join().unwrap(), "Account deletion is pending.");
+        assert_eq!(
+            super::clear_session().unwrap_err(),
+            "Account deletion is pending."
+        );
+        assert_eq!(
+            super::refresh_saved_session().err().unwrap().message,
+            "Account deletion is pending."
+        );
     }
 
     #[test]

@@ -38,7 +38,7 @@ enum Action {
 }
 enum ResultData {
     Snapshot(Snapshot),
-    Saved(Provider),
+    Saved,
     Removed,
     Recordings(streams::Recordings),
     RecordingRemoved(Provider, String),
@@ -82,7 +82,6 @@ pub struct StreamsUi {
     player_error: Option<String>,
     notice: Option<String>,
     notice_provider: Option<Provider>,
-    saved_provider: Option<Provider>,
     edit_open: bool,
     drafts: [String; 2],
     confirm_remove: Option<Provider>,
@@ -130,7 +129,6 @@ impl Default for StreamsUi {
             player_error: None,
             notice: None,
             notice_provider: None,
-            saved_provider: None,
             edit_open: false,
             drafts: [String::new(), String::new()],
             confirm_remove: None,
@@ -401,7 +399,6 @@ impl StreamsUi {
                             )
                         });
                         self.pov_revision = self.pov_revision.wrapping_add(1);
-                        self.saved_provider = None;
                         if let Some(selected) =
                             self.selected.as_ref().filter(|s| s.recording_id.is_none())
                         {
@@ -423,8 +420,7 @@ impl StreamsUi {
                         self.snapshot = Some(Rc::new(snapshot));
                         self.received_at = Some(Instant::now());
                     }
-                    Ok(ResultData::Saved(provider)) => {
-                        self.saved_provider = Some(provider);
+                    Ok(ResultData::Saved) => {
                         self.notice = None;
                         self.start(ctx, Action::Refresh);
                     }
@@ -461,7 +457,6 @@ impl StreamsUi {
                         self.notice = Some("VOD removed from Brick.".into());
                     }
                     Err(error) => {
-                        self.saved_provider = None;
                         if error.access_denied {
                             self.clear();
                             return true;
@@ -646,7 +641,7 @@ impl StreamsUi {
                         )
                         .into());
                     }
-                    streams::save(&token, &url).map(|()| ResultData::Saved(provider))
+                    streams::save(&token, &url).map(|()| ResultData::Saved)
                 }
                 Action::Remove(provider) => {
                     streams::remove(&token, &provider).map(|()| ResultData::Removed)
@@ -665,21 +660,27 @@ impl StreamsUi {
     }
 
     pub fn draw_home_accounts(&mut self, ui: &mut egui::Ui) {
-        ui.columns(2, |columns| {
-            self.draw_account_row(&mut columns[0], Provider::Youtube);
-            self.draw_account_row(&mut columns[1], Provider::Twitch);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 24.0;
+            for provider in [Provider::Youtube, Provider::Twitch] {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(168.0, 44.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        self.draw_account_row(ui, provider);
+                    },
+                );
+            }
         });
     }
 
     fn draw_account_row(&mut self, ui: &mut egui::Ui, provider: Provider) {
         let started = self.provider_sessions.session_started(&provider);
-        if crate::ui::settings_account_row(
-            ui,
-            provider.label(),
-            None,
-            if started { "Sign out" } else { "Sign in" },
-        )
-        .clicked()
+        ui.label(RichText::new(provider.label()).strong());
+        if ui
+            .add(action_button(if started { "Sign out" } else { "Sign in" }))
+            .clicked()
         {
             if started {
                 self.provider_sessions.disconnect(&provider);
@@ -1332,10 +1333,16 @@ impl StreamsUi {
         }
         let mut action = None;
         let mut done = false;
-        // The eframe root and ordinary egui windows share the middle layer.
-        // A modal stays above the stream placeholder and blocks background clicks.
+        let snapshot = self.snapshot.clone();
+        // The modal stays above native stream placeholders and blocks clicks behind it.
         let modal = egui::Modal::new(egui::Id::new("stream-editor"))
-            .frame(egui::Frame::new().fill(Color32::from_rgb(29, 33, 41)).stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(51, 58, 70))).corner_radius(10).inner_margin(18))
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(29, 33, 41))
+                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(51, 58, 70)))
+                    .corner_radius(10)
+                    .inner_margin(18),
+            )
             .show(ctx, |ui| {
                 ui.set_width(470.0_f32.min((ctx.content_rect().width() - 72.0).max(280.0)));
                 ui.horizontal(|ui| {
@@ -1345,86 +1352,204 @@ impl StreamsUi {
                     });
                 });
                 ui.separator();
-                ui.label(RichText::new("Share with this guild.").strong());
-                ui.add_space(10.0);
-                egui::ScrollArea::vertical().id_salt("stream-setup-help").max_height((ctx.content_rect().height() - 220.0).max(220.0)).show(ui, |ui| {
-                    for (index, provider) in [Provider::Twitch, Provider::Youtube].into_iter().enumerate() {
-                        let twitch = provider == Provider::Twitch;
-                        let own = self.snapshot.as_ref().and_then(|s| s.own_streams.iter().find(|stream| stream.provider == provider));
-                        let ended = own.is_some_and(|stream| stream.broadcast_state.as_deref() == Some("ended"));
-                        if !twitch {
-                            egui::Frame::new().fill(Color32::from_rgb(22, 25, 32)).corner_radius(8).inner_margin(14).show(ui, |ui| {
-                                self.youtube.draw_channel(ui, self.snapshot.as_ref().and_then(|snapshot| snapshot.own_youtube_channel.as_ref()), self.work.is_none() && !self.youtube.busy());
-                                if self.snapshot.as_ref().is_some_and(|snapshot| snapshot.own_youtube_channel.is_some())
-                                    && ui.add_enabled(self.work.is_none() && !self.youtube.busy(), action_button("Stop sharing channel")).clicked() {
-                                    action = Some(Action::Remove(Provider::Youtube));
-                                }
+                egui::ScrollArea::vertical()
+                    .id_salt("stream-setup-help")
+                    .max_height((ctx.content_rect().height() - 220.0).max(220.0))
+                    .show(ui, |ui| {
+                        for (index, provider) in [Provider::Twitch, Provider::Youtube]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            let twitch = provider == Provider::Twitch;
+                            let own = snapshot.as_ref().and_then(|snapshot| {
+                                snapshot
+                                    .own_streams
+                                    .iter()
+                                    .find(|stream| stream.provider == provider)
                             });
-                            ui.add_space(8.0);
+                            let shared_channel = (!twitch)
+                                .then(|| {
+                                    snapshot
+                                        .as_ref()
+                                        .and_then(|snapshot| snapshot.own_youtube_channel.as_ref())
+                                })
+                                .flatten();
+                            let card_width = ui.available_width();
+                            egui::Frame::new()
+                                .fill(Color32::from_rgb(22, 25, 32))
+                                .corner_radius(8)
+                                .inner_margin(12)
+                                .show(ui, |ui| {
+                                    ui.set_min_width((card_width - 24.0).max(0.0));
+                                    ui.spacing_mut().item_spacing.y = 6.0;
+                                    if twitch {
+                                        ui.label(
+                                            RichText::new("Twitch channel").strong().size(15.0),
+                                        );
+                                        self.twitch.draw_connection_control(ui);
+                                        if let Some(channel) = self.twitch.channel() {
+                                            let shared = own.is_some_and(|stream| {
+                                                stream.channel_id == channel.login
+                                            });
+                                            if ui
+                                                .add_enabled(
+                                                    self.work.is_none()
+                                                        && !self.twitch.busy()
+                                                        && !shared,
+                                                    action_button(if shared {
+                                                        "Shared with this guild"
+                                                    } else {
+                                                        "Share channel with this guild"
+                                                    }),
+                                                )
+                                                .clicked()
+                                            {
+                                                action = Some(Action::Save(
+                                                    Provider::Twitch,
+                                                    channel.url.clone(),
+                                                ));
+                                            }
+                                        }
+                                    } else {
+                                        self.youtube.draw_channel(
+                                            ui,
+                                            shared_channel,
+                                            self.work.is_none(),
+                                        );
+                                    }
+                                    let enabled = self.work.is_none()
+                                        && if twitch {
+                                            !self.twitch.busy()
+                                        } else {
+                                            !self.youtube.busy()
+                                        };
+                                    if let Some(own) = own {
+                                        if twitch
+                                            && self.twitch.channel().is_none_or(|channel| {
+                                                channel.login != own.channel_id
+                                            })
+                                        {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "Shared here: {}",
+                                                    own.channel_id
+                                                ))
+                                                .strong(),
+                                            );
+                                        } else if !twitch && shared_channel.is_none() {
+                                            ui.hyperlink_to("Shared broadcast", &own.url);
+                                        }
+                                    }
+                                    if shared_channel.is_some() || own.is_some() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            if shared_channel.is_some() {
+                                                if ui
+                                                    .add_enabled(
+                                                        enabled,
+                                                        action_button("Stop sharing channel"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    action =
+                                                        Some(Action::Remove(Provider::Youtube));
+                                                }
+                                            } else if own.is_some() {
+                                                let confirming =
+                                                    self.confirm_remove.as_ref() == Some(&provider);
+                                                if ui
+                                                    .add_enabled(
+                                                        enabled,
+                                                        action_button(if confirming {
+                                                            "Confirm removal"
+                                                        } else {
+                                                            "Stop sharing"
+                                                        }),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    if confirming {
+                                                        action =
+                                                            Some(Action::Remove(provider.clone()));
+                                                        self.drafts[index].clear();
+                                                    } else {
+                                                        self.confirm_remove =
+                                                            Some(provider.clone());
+                                                    }
+                                                }
+                                            }
+                                            if let Some(own) = own {
+                                                let state = match own.status {
+                                                    Status::Live => "Live",
+                                                    Status::Checking => "Checking…",
+                                                    Status::Unknown => "Status unavailable",
+                                                    Status::Offline
+                                                        if own.broadcast_state.as_deref()
+                                                            == Some("ended") =>
+                                                    {
+                                                        "Ended"
+                                                    }
+                                                    Status::Offline
+                                                        if own.broadcast_state.as_deref()
+                                                            == Some("upcoming") =>
+                                                    {
+                                                        "Scheduled"
+                                                    }
+                                                    Status::Offline => "Offline",
+                                                };
+                                                ui.label(RichText::new(state).small().color(
+                                                    if own.status == Status::Live {
+                                                        LIVE
+                                                    } else {
+                                                        MUTED
+                                                    },
+                                                ))
+                                                .on_hover_text(submission_status(own));
+                                            }
+                                        });
+                                    }
+                                    let channel_first = if twitch {
+                                        self.twitch.channel().is_some() || own.is_some()
+                                    } else {
+                                        self.youtube.connected() || shared_channel.is_some()
+                                    };
+                                    if channel_first {
+                                        ui.push_id(("manual-stream-link", index), |ui| {
+                                            ui.collapsing("Use a link instead", |ui| {
+                                                action = self
+                                                    .draw_manual_stream_link(
+                                                        ui,
+                                                        &provider,
+                                                        index,
+                                                        own,
+                                                        enabled,
+                                                        shared_channel.is_some(),
+                                                    )
+                                                    .or(action.take());
+                                            });
+                                        });
+                                    } else {
+                                        action = self
+                                            .draw_manual_stream_link(
+                                                ui, &provider, index, own, enabled, false,
+                                            )
+                                            .or(action.take());
+                                    }
+                                    if self.notice_provider.as_ref() == Some(&provider) {
+                                        if let Some(error) = &self.notice {
+                                            ui.label(
+                                                RichText::new(error)
+                                                    .small()
+                                                    .color(Color32::from_rgb(244, 144, 144)),
+                                            );
+                                        }
+                                    }
+                                });
+                            ui.add_space(4.0);
                         }
-                        egui::Frame::new().fill(Color32::from_rgb(22, 25, 32)).corner_radius(8).inner_margin(14).show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(if twitch { "Twitch channel" } else { "YouTube broadcast link" }).strong().size(15.0));
-                                ui.label(RichText::new(if twitch { "SET UP ONCE" } else { "OPTIONAL" }).size(10.0).color(if twitch { LIVE } else { Color32::from_rgb(231, 190, 108) }));
-                            });
-                            ui.add_space(6.0);
-                            if twitch {
-                                self.twitch.draw_connection_control(ui);
-                                if let Some(channel) = self.twitch.channel() {
-                                    if ui.add_enabled(self.work.is_none() && !self.twitch.busy() && own.is_none_or(|stream| stream.channel_id != channel.login), action_button("Share channel with this guild")).clicked() {
-                                        action = Some(Action::Save(Provider::Twitch, channel.url.clone()));
-                                    }
-                                }
-                            }
-                            ui.label(RichText::new(if twitch {
-                                "Paste your channel link once. Brick will find your future broadcasts automatically."
-                            } else {
-                                "Share one specific broadcast. Saving a link replaces automatic channel sharing for this guild."
-                            }).small().color(MUTED));
-                            ui.add_space(8.0);
-                            let hint = if twitch { "https://twitch.tv/yourchannel" } else { "https://youtube.com/live/your-video-id" };
-                            ui.add_enabled(self.work.is_none() && !self.youtube.busy(), egui::TextEdit::singleline(&mut self.drafts[index]).hint_text(hint).desired_width(f32::INFINITY).char_limit(512));
-                            if self.notice_provider.as_ref() == Some(&provider) {
-                                if let Some(error) = &self.notice {
-                                    ui.label(RichText::new(error).small().color(Color32::from_rgb(244, 144, 144)));
-                                }
-                            }
-                            if !twitch {
-                                ui.collapsing("Where do I find the right link?", |ui| {
-                                    ui.label(RichText::new("1. Open the live or scheduled broadcast on YouTube.\n2. Choose Share, then Copy link.\n3. Paste it above. Connect your channel above for automatic discovery.").small().color(MUTED));
-                                    ui.label(RichText::new("Use the video's link, rather than your YouTube channel page.").small().color(MUTED));
-                                });
-                            }
-                            if self.saved_provider.as_ref() == Some(&provider) {
-                                ui.add_space(6.0);
-                                ui.label(RichText::new("Link saved. Checking live status…").small().color(MUTED));
-                            } else if let Some(own) = own {
-                                ui.add_space(6.0);
-                                ui.label(RichText::new(submission_status(own)).small().color(if own.status == Status::Live { LIVE } else { MUTED }));
-                            }
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                if own.is_some() {
-                                    let confirming = self.confirm_remove.as_ref() == Some(&provider);
-                                    if ui.add_enabled(self.work.is_none() && !self.youtube.busy(), action_button(if confirming { "Confirm removal" } else { "Remove" })).clicked() {
-                                        if confirming { action = Some(Action::Remove(provider.clone())); self.drafts[index].clear(); }
-                                        else { self.confirm_remove = Some(provider.clone()); }
-                                    }
-                                }
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let label = if twitch { "Save channel" } else if ended { "Add next broadcast" } else if own.is_some() { "Replace broadcast" } else { "Add broadcast" };
-                                    let changed = own.is_none_or(|stream| stream.url != self.drafts[index].trim());
-                                    if ui.add_enabled(self.work.is_none() && !self.youtube.busy() && changed && !self.drafts[index].trim().is_empty(), action_button(label)).clicked() {
-                                        action = Some(Action::Save(provider.clone(), self.drafts[index].trim().to_owned()));
-                                    }
-                                });
-                            });
-                        });
-                        ui.add_space(10.0);
-                    }
+                    });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    done |= ui.add(action_button("Done")).clicked();
                 });
-                ui.add_space(8.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { done |= ui.add(action_button("Done")).clicked(); });
             });
         if let Some(action) = action {
             self.notice = None;
@@ -1438,6 +1563,53 @@ impl StreamsUi {
                 self.notice = None;
             }
         }
+    }
+
+    fn draw_manual_stream_link(
+        &mut self,
+        ui: &mut egui::Ui,
+        provider: &Provider,
+        index: usize,
+        own: Option<&Stream>,
+        enabled: bool,
+        replaces_channel: bool,
+    ) -> Option<Action> {
+        let twitch = provider == &Provider::Twitch;
+        if replaces_channel {
+            ui.label(
+                RichText::new("A broadcast link replaces channel sharing for this guild.").small(),
+            );
+        }
+        let hint = if twitch {
+            "https://twitch.tv/yourchannel"
+        } else {
+            "https://youtube.com/live/your-video-id"
+        };
+        ui.add_enabled(
+            enabled,
+            egui::TextEdit::singleline(&mut self.drafts[index])
+                .hint_text(hint)
+                .desired_width(f32::INFINITY)
+                .char_limit(512),
+        );
+        let ended = own.is_some_and(|stream| stream.broadcast_state.as_deref() == Some("ended"));
+        let label = if twitch {
+            "Save channel"
+        } else if ended {
+            "Add next broadcast"
+        } else if own.is_some() || replaces_channel {
+            "Replace broadcast"
+        } else {
+            "Add broadcast"
+        };
+        let changed =
+            replaces_channel || own.is_none_or(|stream| stream.url != self.drafts[index].trim());
+        ui.add_enabled(
+            enabled && changed && !self.drafts[index].trim().is_empty(),
+            action_button(label),
+        )
+        .clicked()
+        .then(|| Action::Save(provider.clone(), self.drafts[index].trim().to_owned()))
     }
 
     pub fn update_player(
@@ -1944,7 +2116,7 @@ fn recording_day_label(day: &str) -> String {
     "Date unavailable".into()
 }
 
-fn action_button(label: &str) -> egui::Button<'_> {
+pub(crate) fn action_button(label: &str) -> egui::Button<'_> {
     egui::Button::new(RichText::new(label).color(Color32::from_rgb(239, 242, 247)))
         .fill(Color32::from_rgb(36, 41, 50))
         .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(51, 58, 70)))
@@ -2523,13 +2695,11 @@ mod tests {
     fn losing_authorization_discards_private_data_and_late_results() {
         let mut ui = StreamsUi::default();
         ui.snapshot = Some(Rc::new(snapshot()));
-        ui.saved_provider = Some(Provider::Twitch);
         ui.drafts[0] = "https://twitch.tv/privateguildmate".into();
         let (tx, rx) = mpsc::channel();
         ui.work = Some(rx);
         ui.tick(&egui::Context::default(), false, false);
         assert!(ui.snapshot.is_none());
-        assert!(ui.saved_provider.is_none());
         assert!(ui.drafts.iter().all(String::is_empty));
         assert!(tx.send(Ok(ResultData::Snapshot(snapshot()))).is_err());
     }
@@ -2537,7 +2707,6 @@ mod tests {
     #[test]
     fn saved_submission_waits_for_verification_without_reporting_failure() {
         let mut ui = StreamsUi::default();
-        ui.saved_provider = Some(Provider::Twitch);
         let ctx = egui::Context::default();
         for (status, unverified, expected) in [
             ("checking", 0, "Checking live status"),
@@ -2556,12 +2725,79 @@ mod tests {
             ui.work = Some(rx);
             tx.send(Ok(ResultData::Snapshot(snapshot))).unwrap();
             ui.tick(&ctx, true, false);
-            assert!(ui.saved_provider.is_none());
             assert!(ui.notice.is_none());
             let current = ui.snapshot.as_ref().unwrap();
             assert!(submission_status(&current.own_streams[0]).contains(expected));
             assert_eq!(current.unverified_count, unverified);
             assert!(ui.selected.is_none());
+        }
+    }
+
+    #[test]
+    fn stream_editor_tucks_links_behind_shared_channels_without_hiding_removal() {
+        for shared in [false, true] {
+            let mut streams = StreamsUi::default();
+            let mut current = snapshot();
+            if shared {
+                current.own_streams.push(current.streams[0].clone());
+                current.own_youtube_channel = Some(crate::youtube_account::Channel {
+                    channel_id: "UC1234567890123456789012".into(),
+                    title: "Fixture YouTube channel".into(),
+                    url: "https://www.youtube.com/channel/UC1234567890123456789012".into(),
+                });
+            }
+            streams.snapshot = Some(Rc::new(current));
+            streams.edit_open = true;
+            streams.drafts = [
+                "twitch-draft-fixture".into(),
+                "youtube-draft-fixture".into(),
+            ];
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(980.0, 1000.0),
+                )),
+                ..Default::default()
+            };
+            let mut labels = Vec::new();
+            for _ in 0..3 {
+                let output = ctx.run_ui(input.clone(), |ui| streams.draw_editor(ui.ctx()));
+                labels = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                        _ => None,
+                    })
+                    .collect();
+            }
+            for draft in &streams.drafts {
+                assert_eq!(labels.contains(draft), !shared);
+            }
+            if shared {
+                for label in [
+                    "Shared here: guildmate",
+                    "Shared here: Fixture YouTube channel",
+                    "Stop sharing",
+                    "Stop sharing channel",
+                ] {
+                    assert!(labels.iter().any(|value| value == label), "{label}");
+                }
+                assert_eq!(
+                    labels
+                        .iter()
+                        .filter(|value| *value == "Use a link instead")
+                        .count(),
+                    2
+                );
+            }
+            assert!(!labels
+                .iter()
+                .any(|label| label == "SET UP ONCE" || label == "OPTIONAL"));
+            assert!(streams.work.is_none());
+            assert!(!streams.youtube.busy());
+            assert!(!streams.twitch.busy());
         }
     }
 

@@ -93,6 +93,7 @@ impl Store {
         if bytes.is_empty() || bytes.len() > 64 * 1024 {
             return Err("Invalid Warcraft Logs credentials.".into());
         }
+        let permit = crate::local_erasure::write_permit().map_err(|error| error.to_string())?;
         #[cfg(target_os = "linux")]
         let payload = {
             self.entry()?
@@ -111,7 +112,7 @@ impl Store {
             let _ = bytes;
             return Err("Protected credential storage is unavailable.".into());
         };
-        crate::atomic_file::write(&self.path, &payload)
+        crate::atomic_file::write_permitted(&self.path, &payload, &permit)
             .map_err(|_| "Couldn't save the protected Warcraft Logs login.".into())
     }
 
@@ -138,6 +139,72 @@ impl Store {
         keyring::Entry::new(&format!("dev.isogi.brick.{}", self.provider.key()), &id)
             .map_err(|_| "Warcraft Logs credential storage is unavailable.".into())
     }
+}
+
+#[cfg(target_os = "linux")]
+const SERVICES: [&str; 4] = [
+    "dev.isogi.brick.discord",
+    "dev.isogi.brick.warcraftlogs",
+    "dev.isogi.brick.youtube",
+    "dev.isogi.brick.twitch",
+];
+
+#[cfg(target_os = "linux")]
+fn owned_attributes(attributes: &std::collections::HashMap<String, String>, service: &str) -> bool {
+    SERVICES.contains(&service)
+        && attributes
+            .get("service")
+            .is_some_and(|value| value == service)
+        && attributes.get("username").is_some_and(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+/// Erase exact Brick service namespaces, including old duplicate/orphan items.
+/// Must be called after the reset fence has closed. Never reads any secret.
+pub(crate) fn remove_all_local() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use dbus_secret_service::{EncryptionType, SecretService};
+        use std::collections::HashMap;
+        let failure =
+            || "Unlock your desktop keyring to finish removing Brick's local data.".to_string();
+        let service = SecretService::connect_with_max_prompt_timeout(EncryptionType::Dh, 15)
+            .map_err(|_| failure())?;
+        let mut items = Vec::new();
+        for namespace in SERVICES {
+            let found = service
+                .search_items(HashMap::from([("service", namespace)]))
+                .map_err(|_| failure())?;
+            for item in found.unlocked.into_iter().chain(found.locked) {
+                let attributes = item.get_attributes().map_err(|_| failure())?;
+                if !owned_attributes(&attributes, namespace) || items.len() >= 10_000 {
+                    return Err(
+                        "Brick's saved credentials need attention before local reset can finish."
+                            .into(),
+                    );
+                }
+                items.push(item);
+            }
+        }
+        for item in items {
+            item.ensure_unlocked().map_err(|_| failure())?;
+            item.delete().map_err(|_| failure())?;
+        }
+        // A reset only succeeds after every supported namespace is empty.
+        for namespace in SERVICES {
+            let found = service
+                .search_items(HashMap::from([("service", namespace)]))
+                .map_err(|_| failure())?;
+            if !found.unlocked.is_empty() || !found.locked.is_empty() {
+                return Err(failure());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -199,6 +266,119 @@ fn crypt(bytes: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn namespace_erasure_matches_all_brick_scopes_without_marker_files() {
+        use std::collections::HashMap;
+        for namespace in SERVICES {
+            for target in [None, Some("default"), Some("older-collection")] {
+                let mut attributes = HashMap::from([
+                    ("service".into(), namespace.into()),
+                    ("username".into(), "a1".repeat(32)),
+                ]);
+                if let Some(target) = target {
+                    attributes.insert("target".into(), target.into());
+                }
+                assert!(owned_attributes(&attributes, namespace));
+                attributes.insert("service".into(), "another-app.discord".into());
+                assert!(!owned_attributes(&attributes, namespace));
+            }
+        }
+        let attributes = HashMap::from([
+            ("service".into(), SERVICES[0].into()),
+            ("username".into(), "other-app".into()),
+        ]);
+        assert!(!owned_attributes(&attributes, SERVICES[0]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires disposable /fixture home and its own Secret Service bus"]
+    fn linux_device_reset_removes_orphan_namespaces_and_fences_late_saves() {
+        use dbus_secret_service::{EncryptionType, SecretService};
+        use std::collections::HashMap;
+        // These exact paths exist only in the dedicated mount/network sandbox.
+        // Never run an enumeration/deletion fixture against an inherited bus.
+        assert_eq!(
+            std::env::var("BRICK_LOCAL_ERASURE_FIXTURE").as_deref(),
+            Ok("1")
+        );
+        assert_eq!(std::env::var("HOME").as_deref(), Ok("/fixture/home"));
+        assert_eq!(
+            std::env::var("DBUS_SESSION_BUS_ADDRESS").as_deref(),
+            Ok("unix:path=/fixture/bus")
+        );
+        let service =
+            SecretService::connect_with_max_prompt_timeout(EncryptionType::Dh, 0).unwrap();
+        let collection = service.get_default_collection().unwrap();
+        for namespace in SERVICES {
+            // Deliberately no marker file and no current account association.
+            collection
+                .create_item(
+                    "orphan fixture",
+                    HashMap::from([
+                        ("service", namespace),
+                        (
+                            "username",
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        ),
+                    ]),
+                    b"synthetic orphan only",
+                    false,
+                    "text/plain",
+                )
+                .unwrap();
+        }
+        collection
+            .create_item(
+                "duplicate legacy fixture",
+                HashMap::from([
+                    ("service", SERVICES[1]),
+                    ("target", "old-target"),
+                    (
+                        "username",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    ),
+                ]),
+                b"synthetic legacy only",
+                false,
+                "text/plain",
+            )
+            .unwrap();
+        collection
+            .create_item(
+                "other application fixture",
+                HashMap::from([
+                    ("service", "fixture.other.application"),
+                    ("username", "other"),
+                ]),
+                b"synthetic foreign only",
+                false,
+                "text/plain",
+            )
+            .unwrap();
+        let store = Store::youtube("fixture-account").unwrap();
+        store.save(b"synthetic personal grant").unwrap();
+        crate::protected_cache::save("fixture-guild", b"synthetic private data").unwrap();
+        let outside = PathBuf::from("/fixture/home/other-application");
+        fs::write(&outside, b"must remain").unwrap();
+        crate::local_erasure::reset().unwrap();
+        assert!(!crate::local_erasure::is_pending().unwrap());
+        assert!(store.save(b"late grant must not return").is_err());
+        assert!(crate::protected_cache::save("fixture-guild", b"late cache").is_err());
+        assert!(!store.path.exists());
+        for namespace in SERVICES {
+            let found = service
+                .search_items(HashMap::from([("service", namespace)]))
+                .unwrap();
+            assert!(found.unlocked.is_empty() && found.locked.is_empty());
+        }
+        let other = service
+            .search_items(HashMap::from([("service", "fixture.other.application")]))
+            .unwrap();
+        assert_eq!(other.unlocked.len(), 1);
+        assert_eq!(fs::read(outside).unwrap(), b"must remain");
+    }
     fn store() -> Store {
         Store {
             path: std::env::temp_dir().join(format!("brick-wcl-store-{}", uuid::Uuid::new_v4())),

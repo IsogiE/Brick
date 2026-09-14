@@ -590,6 +590,7 @@ version = "0.5.6"
 dependencies = [
  "auto-launch",
  "base64 0.23.1",
+ "dbus-secret-service",
  "ed25519-dalek",
  "eframe",
  "fs2",

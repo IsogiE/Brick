@@ -66,6 +66,7 @@ pub struct BrickApp {
     last_app_update_check: Instant,
     last_roster_refresh: Instant,
     roster_notice: Option<String>,
+    erasure: crate::account_erasure_ui::ErasureUi,
 }
 
 #[derive(Debug, Clone)]
@@ -129,7 +130,12 @@ impl BrickApp {
         let brick_texture = load_texture(&cc.egui_ctx);
         let show_request_rx = spawn_show_request_wake(&cc.egui_ctx);
 
-        let (view, status) = match addon::load_view() {
+        let erasure = crate::account_erasure_ui::ErasureUi::new();
+        let (view, status) = match if erasure.blocks_normal_use() {
+            Ok(AppView::default())
+        } else {
+            addon::load_view()
+        } {
             Ok(view) => (view, "Ready".to_string()),
             Err(error) => {
                 let _ = addon::record_log(LogLevel::Error, error.clone());
@@ -137,7 +143,11 @@ impl BrickApp {
             }
         };
 
-        let auth_state = match discord_auth::saved_session_status() {
+        let auth_state = match if erasure.blocks_normal_use() {
+            Ok(SessionStatus::SignedOut)
+        } else {
+            discord_auth::saved_session_status()
+        } {
             Ok(SessionStatus::ConfigMissing(error)) => AuthUiState::ConfigMissing(error),
             Ok(SessionStatus::SignedOut) => AuthUiState::SignedOut,
             Ok(SessionStatus::NeedsRefresh) => AuthUiState::Refreshing,
@@ -190,6 +200,7 @@ impl BrickApp {
                 .checked_sub(Duration::from_secs(ROSTER_REFRESH_INTERVAL_SECS))
                 .unwrap_or(now),
             roster_notice: None,
+            erasure,
         };
 
         if let AuthUiState::Authorized(user) = &app.auth_state {
@@ -1023,6 +1034,13 @@ impl BrickApp {
     }
 
     fn draw_content(&mut self, ui: &mut egui::Ui) {
+        if self.erasure.blocks_normal_use() {
+            if self.erasure.draw_pending(ui) {
+                self.quit_requested = true;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
         if !self.auth_state.is_authorized() {
             self.draw_login_screen(ui);
             return;
@@ -1073,7 +1091,9 @@ impl BrickApp {
         ui.add_space(18.0);
         self.draw_settings_panel(ui);
         ui.add_space(12.0);
-        privacy_links(ui);
+        if privacy_links(ui) {
+            self.erasure.show(ui.ctx());
+        }
     }
 
     fn draw_tab_bar(&mut self, ui: &mut egui::Ui) {
@@ -1334,13 +1354,16 @@ impl BrickApp {
                 }
             },
         );
-        ui.scope_builder(
+        let privacy = ui.scope_builder(
             egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
                 egui::pos2(panel_rect.left(), panel_rect.bottom() + 12.0),
                 egui::vec2(panel_rect.width(), 20.0),
             )),
             privacy_links,
         );
+        if privacy.inner {
+            self.erasure.show(ui.ctx());
+        }
     }
 
     fn draw_header(&mut self, ui: &mut egui::Ui) {
@@ -1833,6 +1856,14 @@ impl eframe::App for BrickApp {
         }
         self.handle_tray(ctx);
         self.handle_show_request(ctx);
+        self.erasure.poll();
+        if self.erasure.blocks_normal_use() {
+            self.poll_app_update(ctx);
+            self.start_periodic_app_update_check();
+            self.handle_close_request(ctx);
+            ctx.request_repaint_after(Duration::from_secs(IDLE_REPAINT_MAX_SECS));
+            return;
+        }
         self.poll_auth();
         self.poll_guilds();
         if self.auth_state.is_authorized()
@@ -1909,11 +1940,30 @@ impl eframe::App for BrickApp {
                 }
             });
         self.draw_logout_confirmation(&ctx);
+        if let Some(identity) = self.erasure.draw_confirmation(&ctx) {
+            // Close provider windows and cancel all account-bound work before
+            // the erasure worker can revoke grants or touch protected storage.
+            discord_auth::suspend_session();
+            self.streams.clear();
+            self.auth_rx = None;
+            self.guild_rx = None;
+            self.roster_rx = None;
+            self.sync_rx = None;
+            self.profile = ProfileUi::default();
+            self.auth_state = AuthUiState::SignedOut;
+            self.presence_state = initial_presence_state();
+            self.roster_notice = None;
+            self.confirm_logout = false;
+            self.view = AppView::default();
+            self.view_error = None;
+            self.status.clear();
+            self.erasure.start(&ctx, identity);
+        }
         self.streams.update_account_windows(
             frame,
             &ctx,
             self.auth_state.is_authorized() && !self.guild_switching && !self.guild_access_lost,
-            self.window_visible && !self.confirm_logout,
+            self.window_visible && !self.confirm_logout && !self.erasure.modal_open(),
         );
         if self.streams.update_player(
             frame,
@@ -1923,7 +1973,8 @@ impl eframe::App for BrickApp {
                 && !self.guild_access_lost
                 && self.window_visible
                 && self.active_tab == MainTab::Streams
-                && !self.confirm_logout,
+                && !self.confirm_logout
+                && !self.erasure.modal_open(),
         ) {
             self.handle_guild_access_loss();
         }
@@ -2033,7 +2084,7 @@ fn draw_icon(ui: &mut egui::Ui, texture: Option<&TextureHandle>, size: f32) {
     }
 }
 
-fn panel_frame() -> egui::Frame {
+pub(crate) fn panel_frame() -> egui::Frame {
     egui::Frame::NONE
         .fill(panel_background())
         .stroke(Stroke::new(1.0_f32, panel_stroke()))
@@ -2086,7 +2137,7 @@ fn login_secondary_button(text: &str) -> egui::Button<'_> {
         .min_size(egui::vec2(236.0, 36.0))
 }
 
-fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+pub(crate) fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).strong().color(primary_text()))
             .corner_radius(egui::CornerRadius::same(8))
@@ -2152,7 +2203,7 @@ fn header_status_text(ui: &mut egui::Ui, text: &str, color: Color32) {
     }
 }
 
-fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+pub(crate) fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(
             RichText::new(text)
@@ -2222,7 +2273,8 @@ fn toggle(ui: &mut egui::Ui, on: bool) -> bool {
     response.clicked()
 }
 
-fn privacy_links(ui: &mut egui::Ui) {
+fn privacy_links(ui: &mut egui::Ui) -> bool {
+    let mut delete = false;
     ui.horizontal(|ui| {
         ui.hyperlink_to(
             RichText::new("Privacy").small().color(muted_text()),
@@ -2232,7 +2284,11 @@ fn privacy_links(ui: &mut egui::Ui) {
             RichText::new("Terms").small().color(muted_text()),
             "https://brick.lusaggo.com/terms/",
         );
+        delete = ui
+            .link(RichText::new("Delete my data").small().color(muted_text()))
+            .clicked();
     });
+    delete
 }
 
 pub(crate) fn settings_account_row(
@@ -2255,17 +2311,19 @@ pub(crate) fn settings_account_row(
                 egui::vec2(ui.available_width(), 44.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(provider).strong().color(primary_text()));
-                        if let Some(name) = name {
+                    if let Some(name) = name {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(provider).strong().color(primary_text()));
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(name).small().color(secondary_text()),
                                 )
                                 .truncate(),
                             );
-                        }
-                    });
+                        });
+                    } else {
+                        ui.label(RichText::new(provider).strong().color(primary_text()));
+                    }
                 },
             );
             response
@@ -2839,6 +2897,7 @@ pub(crate) mod tests {
             last_app_update_check: now,
             last_roster_refresh: now,
             roster_notice: None,
+            erasure: crate::account_erasure_ui::ErasureUi::default(),
         };
         app.streams.bind_provider_account("test");
         app

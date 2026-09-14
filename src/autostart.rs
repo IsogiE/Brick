@@ -5,6 +5,10 @@ use auto_launch::AutoLaunchBuilder;
 const APP_NAME: &str = "Brick";
 
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
+    let _permit = enabled
+        .then(crate::local_erasure::write_permit)
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let launcher = launcher()?;
     if enabled {
         launcher
@@ -18,6 +22,10 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
 }
 
 pub fn reconcile_enabled(enabled: bool) -> Result<(), String> {
+    let _permit = enabled
+        .then(crate::local_erasure::write_permit)
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let launcher = launcher()?;
     let current = launcher.is_enabled().unwrap_or(false);
     if current == enabled {

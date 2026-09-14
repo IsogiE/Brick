@@ -103,7 +103,7 @@ pub(super) struct Window {
 }
 
 struct LoadStatus {
-    panel: gtk::Box,
+    panel: gtk::EventBox,
     spinner: gtk::Spinner,
     label: gtk::Label,
     retry: gtk::Button,
@@ -112,17 +112,32 @@ struct LoadStatus {
 
 impl LoadStatus {
     fn new() -> Self {
-        let panel = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        panel.set_margin_start(12);
-        panel.set_margin_end(12);
-        panel.set_margin_top(12);
-        panel.set_margin_bottom(12);
+        let panel = gtk::EventBox::new();
+        // Native loading chrome only. Provider documents retain their own UI.
+        let style = gtk::CssProvider::new();
+        style
+            .load_from_data(b"* { background-color: #15181d; color: #cbd5e1; }")
+            .expect("Static provider loading style");
+        panel
+            .style_context()
+            .add_provider(&style, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 14);
+        content.set_halign(gtk::Align::Center);
+        content.set_valign(gtk::Align::Center);
+        content.set_margin_start(24);
+        content.set_margin_end(24);
+        content.set_margin_top(24);
+        content.set_margin_bottom(24);
         let spinner = gtk::Spinner::new();
+        spinner.set_size_request(24, 24);
+        spinner.set_halign(gtk::Align::Center);
         let label = gtk::Label::new(Some("Couldn't connect"));
         let retry = gtk::Button::with_label("Try again");
-        panel.pack_start(&spinner, false, false, 0);
-        panel.pack_start(&label, true, true, 0);
-        panel.pack_end(&retry, false, false, 0);
+        retry.set_size_request(120, 36);
+        content.pack_start(&spinner, false, false, 0);
+        content.pack_start(&label, false, false, 0);
+        content.pack_start(&retry, false, false, 0);
+        panel.add(&content);
         Self {
             panel,
             spinner,
@@ -208,13 +223,20 @@ impl Window {
             // buffers with every GPU driver. This changes compositing only.
             settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
         }
+        view.set_background_color(&gtk::gdk::RGBA::new(
+            21.0 / 255.0,
+            24.0 / 255.0,
+            29.0 / 255.0,
+            1.0,
+        ));
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
-        window.set_default_size(560, 700);
+        window.set_default_size(520, 640);
+        window.set_position(gtk::WindowPosition::Center);
         window.set_title(&title(provider, start_url(provider)));
-        let contents = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let contents = gtk::Overlay::new();
         let load_status = Rc::new(LoadStatus::new());
-        contents.pack_start(&load_status.panel, false, false, 0);
-        contents.pack_start(&view, true, true, 0);
+        contents.add(&view);
+        contents.add_overlay(&load_status.panel);
         window.add(&contents);
         let retry_view = view.downgrade();
         let retry_start = start.to_owned();
