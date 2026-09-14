@@ -24,18 +24,20 @@ use windows::Win32::{
     UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
 };
 use windows_sys::Win32::{
-    Foundation::{HWND, RECT},
-    Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
+    Foundation::{HWND, POINT, RECT},
+    Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    },
     System::LibraryLoader::GetModuleHandleW,
     UI::Input::KeyboardAndMouse::{GetFocus, IsWindowEnabled, SetFocus},
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, GetAncestor, GetClassLongPtrW,
-        GetClientRect, GetForegroundWindow, GetWindow, GetWindowRect, IsChild, IsIconic,
-        IsWindowVisible, LoadCursorW, RegisterClassExW, SendMessageW, SetForegroundWindow,
-        SetWindowTextW, ShowWindow, GA_ROOT, GCLP_HICON, GCLP_HICONSM, GW_OWNER, ICON_BIG,
-        ICON_SMALL, IDC_ARROW, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, WM_CLOSE,
-        WM_GETICON, WM_NCDESTROY, WM_SETICON, WNDCLASSEXW, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
-        WS_POPUP,
+        GetClientRect, GetCursorPos, GetForegroundWindow, GetWindow, GetWindowRect, IsChild,
+        IsIconic, IsWindowVisible, LoadCursorW, RegisterClassExW, SendMessageW,
+        SetForegroundWindow, SetWindowTextW, ShowWindow, GA_ROOT, GCLP_HICON, GCLP_HICONSM,
+        GW_OWNER, ICON_BIG, ICON_SMALL, IDC_ARROW, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE,
+        WM_CLOSE, WM_GETICON, WM_MOUSEMOVE, WM_NCDESTROY, WM_SETICON, WNDCLASSEXW, WS_CLIPCHILDREN,
+        WS_OVERLAPPEDWINDOW, WS_POPUP,
     },
 };
 use wry::{WebView, WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows};
@@ -413,18 +415,43 @@ struct WindowState {
 }
 
 impl WindowState {
-    fn release_browser_focus(&self) {
+    fn restore_browser_cursor(&self) {
         let handle = self.handle.get();
         if handle.is_null() {
             return;
         }
-        // WebView2 152 can leave its thread's hide-while-typing cursor count
-        // negative if a focused browser disappears before receiving focus loss.
-        // Let the browser unwind that state itself, before hiding/closing it.
+        // WebView2 152 can leave hide-while-typing active after its window
+        // disappears. Notify the focused browser of the current pointer before
+        // hiding it, so WebView2 releases its own cursor suppression. A focus
+        // change alone does not reliably do this for a native (non-WinForms) owner.
         // https://github.com/MicrosoftEdge/WebView2Feedback/issues/5687
         unsafe {
             let focus = GetFocus();
             if GetForegroundWindow() != handle
+                || focus.is_null()
+                || (focus != handle && IsChild(handle, focus) == 0)
+            {
+                return;
+            }
+            let mut point = POINT::default();
+            if GetCursorPos(&mut point) != 0 && ScreenToClient(focus, &mut point) != 0 {
+                let x = point.x.clamp(i16::MIN.into(), i16::MAX.into()) as u16;
+                let y = point.y.clamp(i16::MIN.into(), i16::MAX.into()) as u16;
+                // Synchronous native delivery acknowledges the state change;
+                // there is no guessed delay, cursor-count adjustment, script,
+                // click/key event, or movement of the actual desktop pointer.
+                SendMessageW(
+                    focus,
+                    WM_MOUSEMOVE,
+                    0,
+                    (u32::from(x) | u32::from(y) << 16) as isize,
+                );
+            }
+            // Native delivery can reenter window callbacks. Only return focus
+            // if this live popup still owns it and is still foreground.
+            let focus = GetFocus();
+            if self.handle.get() != handle
+                || GetForegroundWindow() != handle
                 || focus.is_null()
                 || (focus != handle && IsChild(handle, focus) == 0)
             {
@@ -441,7 +468,7 @@ impl WindowState {
     }
 
     fn hide(&self) {
-        self.release_browser_focus();
+        self.restore_browser_cursor();
         // Focus callbacks can reenter teardown, so reread the guarded handle.
         let handle = self.handle.get();
         if !handle.is_null() {
@@ -950,7 +977,7 @@ fn protect_settings(view: &WebView) -> Result<(), String> {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        self.native.0.release_browser_focus();
+        self.native.0.restore_browser_cursor();
         let _ = self.view.set_visible(false);
         let _ = unsafe { self.view.webview().Stop() };
     }
@@ -1290,7 +1317,7 @@ mod tests {
                 };
                 let body = format!("<!doctype html><script>{script}document.title=JSON.stringify({{cookie:{cookie},auth:{auth},storage:localStorage.getItem('fixture-login')==='fixture-only',ipc:typeof window.ipc!=='undefined',bridge:typeof window.brickMedia!=='undefined',opener:window.opener!==null}});</script>");
                 let body = if request.starts_with("GET /cursor ") {
-                    "<!doctype html><input autofocus style='margin:20px'><script>document.title='cursor-ready';document.querySelector('input').oninput=()=>document.title='cursor-typed';</script>".to_owned()
+                    "<!doctype html><input autofocus style='margin:20px'><script>document.title='cursor-ready';document.querySelector('input').oninput=()=>document.title='cursor-typed';document.onmousemove=()=>document.title='cursor-pointer-ready';</script>".to_owned()
                 } else {
                     body
                 };
@@ -1856,7 +1883,10 @@ addEventListener('message',e=>{{if(e.origin==='https://{host}'&&e.source===docum
                 )
                 .unwrap();
                 wait_for("synthetic typing page ready", || {
-                    page_title(&login.view).as_deref() == Some("cursor-ready")
+                    matches!(
+                        page_title(&login.view).as_deref(),
+                        Some("cursor-ready" | "cursor-pointer-ready")
+                    )
                 });
                 login.present();
                 login.view.focus().unwrap();
@@ -1866,13 +1896,13 @@ addEventListener('message',e=>{{if(e.origin==='https://{host}'&&e.source===docum
                     0
                 );
                 assert_ne!(unsafe { SetCursorPos(point.x, point.y) }, 0);
-                wait_for("pointer restored on entering sign-in", || count() >= 0);
-                // Drain the native move before typing; a move delivered after
-                // the key would correctly cancel hide-while-typing again.
-                let settled = Instant::now() + Duration::from_millis(250);
-                wait_for("synthetic pointer movement settled", || {
-                    Instant::now() >= settled
-                });
+                wait_for(
+                    "browser acknowledged pointer movement before typing",
+                    || {
+                        page_title(&login.view).as_deref() == Some("cursor-pointer-ready")
+                            && count() >= 0
+                    },
+                );
                 let baseline = count();
                 let keys = [0, KEYEVENTF_KEYUP].map(|flags| INPUT {
                     r#type: INPUT_KEYBOARD,
@@ -1972,7 +2002,10 @@ addEventListener('message',e=>{{if(e.origin==='https://{host}'&&e.source===docum
         )
         .unwrap();
         wait_for("inactive cursor fixture page", || {
-            page_title(&login.view).as_deref() == Some("cursor-ready")
+            matches!(
+                page_title(&login.view).as_deref(),
+                Some("cursor-ready" | "cursor-pointer-ready")
+            )
         });
         let other = parent_window();
         unsafe {
