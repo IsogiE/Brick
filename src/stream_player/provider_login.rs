@@ -346,7 +346,9 @@ fn allowed_document(provider: &Provider, destination: &str) -> bool {
         }
         Provider::Twitch => matches!(
             url.host_str(),
-            Some("www.twitch.tv" | "id.twitch.tv" | "passport.twitch.tv")
+            // Twitch's own login scripts load a supporting document here.
+            // It has no Brick bridge and remains isolated from YouTube.
+            Some("www.twitch.tv" | "id.twitch.tv" | "passport.twitch.tv" | "k.twitchcdn.net")
         ),
     }
 }
@@ -502,6 +504,22 @@ mod tests {
             &Provider::Youtube,
             "https://accounts.google.nl:8443/accounts/SetSID"
         ));
+    }
+
+    #[test]
+    fn twitch_login_support_document_does_not_expand_login_entry_points() {
+        let support = "https://k.twitchcdn.net/fixture";
+        assert!(allowed_document(&Provider::Twitch, support));
+        assert!(!allowed_document(&Provider::Youtube, support));
+        assert!(!login_destination(&Provider::Twitch, support));
+        for destination in [
+            "https://k.twitchcdn.net.evil.test/",
+            "https://user@k.twitchcdn.net/",
+            "http://k.twitchcdn.net/",
+            "https://k.twitchcdn.net:8443/",
+        ] {
+            assert!(!allowed_document(&Provider::Twitch, destination));
+        }
     }
 
     #[test]
