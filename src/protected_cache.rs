@@ -17,6 +17,12 @@ const MAX_BYTES: usize = 2 * 1024 * 1024;
 type CachedKey = (String, Arc<aead::LessSafeKey>);
 static KEYS: LazyLock<Mutex<VecDeque<CachedKey>>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
 
+pub(crate) fn forget_keys() {
+    if let Ok(mut keys) = KEYS.lock() {
+        keys.clear();
+    }
+}
+
 fn path(scope: &str) -> Result<PathBuf, String> {
     Ok(crate::addon::config_dir()?.join(format!(
         "guild-cache-{}.dat",

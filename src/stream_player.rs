@@ -4,6 +4,7 @@ use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
     cell::Cell,
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -23,7 +24,9 @@ mod capture;
 mod diagnostics;
 mod fullscreen;
 mod occlusion;
+mod provider_login;
 mod resize;
+pub use provider_login::ProviderSessions;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_profile;
 pub use capture::FrameCapture;
@@ -169,6 +172,10 @@ pub struct StreamPlayer {
     webview: Option<WebView>,
     #[cfg(target_os = "windows")]
     _web_context: wry::WebContext,
+    #[cfg(target_os = "windows")]
+    _provider_registration: Option<provider_login::Registration>,
+    _provider_sessions: Rc<ProviderSessions>,
+    provider_context: Option<Rc<provider_login::Context>>,
     allowed_url: Arc<Mutex<String>>,
     #[cfg(target_os = "windows")]
     bearer_tokens: Arc<Mutex<Vec<String>>>,
@@ -193,7 +200,11 @@ pub struct StreamPlayer {
     preference_handler: Option<(webkit2gtk::UserContentManager, gtk::glib::SignalHandlerId)>,
 }
 
+#[cfg(target_os = "windows")]
+const WINDOWS_BROWSER_ARGS: &str = "--autoplay-policy=no-user-gesture-required --disk-cache-size=134217728 --media-cache-size=134217728";
+
 impl StreamPlayer {
+    #[cfg(test)]
     pub fn new(
         frame: &eframe::Frame,
         ctx: &egui::Context,
@@ -202,6 +213,31 @@ impl StreamPlayer {
         rect: egui::Rect,
         pixels_per_point: f32,
         preferences: Option<Preferences>,
+    ) -> Result<Self, String> {
+        Self::new_with_sessions(
+            frame,
+            ctx,
+            url,
+            token,
+            rect,
+            pixels_per_point,
+            preferences,
+            Rc::new(ProviderSessions::default()),
+        )
+    }
+
+    /// Share personal provider cookies only through this account's explicit
+    /// session holder. The holder contains no Brick credentials or guild data.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_sessions(
+        frame: &eframe::Frame,
+        ctx: &egui::Context,
+        url: &str,
+        token: &str,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        preferences: Option<Preferences>,
+        sessions: Rc<ProviderSessions>,
     ) -> Result<Self, String> {
         let cache_usage = crate::cache_maintenance::PlayerLease::new();
         let created = Instant::now();
@@ -236,17 +272,15 @@ impl StreamPlayer {
                     .to_string(),
             ),
         }
+        let provider_context = sessions.context(
+            provider_login::provider(&player_url).ok_or("The stream provider is invalid.")?,
+        )?;
 
         // Wry creates a WebKit process during construction. Configure its private
         // context before that happens, then use the supported related-view hook
         // to give the media child this sandboxed context.
         #[cfg(target_os = "linux")]
-        let linux_seed = {
-            use webkit2gtk::WebContextExt;
-            let context = webkit2gtk::WebContext::new_ephemeral();
-            context.set_sandbox_enabled(true);
-            webkit2gtk::WebView::with_context(&context)
-        };
+        let linux_seed = { webkit2gtk::WebView::with_context(&provider_context.platform.context) };
 
         // Build an empty, private child first so every navigation guard is installed
         // before the single authenticated navigation starts. No token enters HTML,
@@ -257,6 +291,7 @@ impl StreamPlayer {
         let allowed_url = Arc::new(Mutex::new(player_url.to_string()));
         let wrapper_url = Arc::clone(&allowed_url);
         let browser_ctx = ctx.clone();
+        let popup_provider = provider_context.provider.clone();
         let preferences = Some(PreferenceBridge::new(
             player_url.as_str(),
             preferences.unwrap_or_else(Preferences::in_memory),
@@ -267,6 +302,15 @@ impl StreamPlayer {
         let mut web_context = windows_profile::context()?;
         #[cfg(target_os = "windows")]
         let builder = WebViewBuilder::new_with_web_context(&mut web_context);
+        #[cfg(target_os = "windows")]
+        let builder = {
+            use wry::WebViewBuilderExtWindows;
+            let builder = builder.with_profile_name(&provider_context.platform.profile_name);
+            match provider_context.platform.environment.borrow().as_ref() {
+                Some(environment) => builder.with_environment(environment.clone()),
+                None => builder,
+            }
+        };
         #[cfg(not(target_os = "windows"))]
         let builder = WebViewBuilder::new();
         let builder = builder
@@ -281,7 +325,13 @@ impl StreamPlayer {
             .with_focused(true)
             .with_background_color((18, 20, 25, 255))
             .with_new_window_req_handler(move |destination, _| {
-                open_provider_window(&browser_ctx, &destination)
+                if provider_login::login_destination(&popup_provider, &destination) {
+                    // Wry lacks a user-gesture flag. Native policy queues only
+                    // verified user actions after this denial returns.
+                    NewWindowResponse::Deny
+                } else {
+                    open_provider_window(&browser_ctx, &destination)
+                }
             })
             .with_download_started_handler(|_, _| false)
             .with_on_page_load_handler(move |event, destination| {
@@ -330,9 +380,7 @@ impl StreamPlayer {
             // Override Wry's default flags so WebView2 keeps SmartScreen enabled.
             // Keep reusable HTTP/media caches bounded without disabling caching.
             // InPrivate mode still protects provider state; never clear its UDF.
-            builder.with_additional_browser_args(
-                "--autoplay-policy=no-user-gesture-required --disk-cache-size=134217728 --media-cache-size=134217728",
-            )
+            builder.with_additional_browser_args(WINDOWS_BROWSER_ARGS)
         };
 
         // WebView2 invokes this for top-level navigations; provider iframe requests
@@ -342,11 +390,14 @@ impl StreamPlayer {
         let builder = {
             let allowed = Arc::clone(&allowed_url);
             let ctx = ctx.clone();
+            let provider = provider_context.provider.clone();
             builder.with_navigation_handler(move |destination| {
                 if allowed.lock().is_ok_and(|url| destination == *url) {
                     true
                 } else {
-                    open_provider_link(&ctx, &destination);
+                    if !provider_login::login_destination(&provider, &destination) {
+                        open_provider_link(&ctx, &destination);
+                    }
                     false
                 }
             })
@@ -377,6 +428,10 @@ impl StreamPlayer {
             webview: Some(webview),
             #[cfg(target_os = "windows")]
             _web_context: web_context,
+            #[cfg(target_os = "windows")]
+            _provider_registration: None,
+            _provider_sessions: sessions,
+            provider_context: Some(provider_context),
             allowed_url,
             #[cfg(target_os = "windows")]
             bearer_tokens: Arc::new(Mutex::new(vec![token.to_owned()])),
@@ -404,14 +459,29 @@ impl StreamPlayer {
             #[cfg(target_os = "linux")]
             preference_handler: None,
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         let mut player = player;
         let webview = player
             .webview
             .as_ref()
             .expect("The player has just been created");
+        provider_login::watch_requests(
+            webview,
+            player
+                .provider_context
+                .as_ref()
+                .expect("The player owns its provider context"),
+            ctx,
+        )?;
         #[cfg(target_os = "linux")]
         {
+            use wry::WebViewExtUnix;
+            player
+                .provider_context
+                .as_ref()
+                .expect("The player owns its provider context")
+                .platform
+                .register(&webview.webview());
             protect_linux_navigation(webview, Arc::clone(&player.allowed_url), ctx)?;
             watch_linux_failures(
                 webview,
@@ -424,6 +494,14 @@ impl StreamPlayer {
         }
         #[cfg(target_os = "windows")]
         {
+            player._provider_registration = Some(
+                player
+                    .provider_context
+                    .as_ref()
+                    .expect("The player owns its provider context")
+                    .platform
+                    .register(webview)?,
+            );
             protect_windows_permissions(webview)?;
             protect_windows_requests(
                 webview,
@@ -452,6 +530,40 @@ impl StreamPlayer {
         Ok(player)
     }
 
+    pub fn open_provider_login(&self, ctx: &egui::Context) -> Result<(), String> {
+        let view = self
+            .webview
+            .as_ref()
+            .ok_or("The stream player has closed.")?;
+        self.provider_context
+            .as_ref()
+            .ok_or("This player has no provider session.")?
+            .open(view, ctx)
+    }
+
+    pub fn take_provider_login_request(&self) -> bool {
+        self.provider_context
+            .as_ref()
+            .is_some_and(|context| context.take_login_request())
+    }
+
+    pub fn provider_name(&self) -> &'static str {
+        self.provider_context
+            .as_ref()
+            .map_or("Video service", |context| context.provider.label())
+    }
+
+    pub fn can_reuse_for_url(&self, value: &str) -> bool {
+        self.provider_context.as_ref().is_some_and(|context| {
+            context.active()
+                && self.can_reuse_for_replay()
+                && validated_player_url(value)
+                    .ok()
+                    .and_then(|url| provider_login::provider(&url))
+                    .is_some_and(|provider| provider == context.provider)
+        })
+    }
+
     /// Keep one media process when moving between provider POVs. Every new
     /// wrapper still receives its own authenticated, strictly validated request.
     pub fn can_reuse_for_replay(&self) -> bool {
@@ -470,7 +582,7 @@ impl StreamPlayer {
         token: &str,
     ) -> Result<(), String> {
         let url = validated_player_url(value)?;
-        if !self.can_reuse_for_replay() {
+        if !self.can_reuse_for_url(value) {
             return Err("This recording needs a new player.".into());
         }
         let target = url
@@ -799,6 +911,13 @@ impl StreamPlayer {
     /// A command timeout is recoverable and must not destroy a loaded player.
     /// Only failures of the native wrapper itself replace the media view.
     pub fn failure(&self) -> Option<String> {
+        if self
+            .provider_context
+            .as_ref()
+            .is_some_and(|context| !context.active())
+        {
+            return Some("This provider session has ended.".into());
+        }
         if let Some(message) = self.failure.lock().ok().and_then(|failure| failure.clone()) {
             return Some(message);
         }
@@ -1129,6 +1248,9 @@ impl Drop for StreamPlayer {
         if let Some(preferences) = &self.preferences {
             preferences.close();
         }
+        if let Some(context) = &self.provider_context {
+            self._provider_sessions.release_unused(context);
+        }
         #[cfg(target_os = "linux")]
         if let Some((manager, handler)) = self.preference_handler.take() {
             use gtk::prelude::*;
@@ -1151,9 +1273,8 @@ impl Drop for StreamPlayer {
             let view = webview.webview();
             view.stop_loading();
             view.set_is_muted(true);
-            // Each player has its own private context and no other windows.
-            // End its renderer now instead of retaining a background media process.
-            view.terminate_web_process();
+            // Another POV or login may share this personal provider context.
+            // Closing this child must not terminate their shared web process.
             view.hide();
             let display = view.display();
             drop(view);
@@ -2335,11 +2456,11 @@ mod tests {
         });
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
         window.set_default_size(640, 480);
+        let sessions = Rc::new(ProviderSessions::default());
 
         for cycle in 0..3 {
-            let context = webkit2gtk::WebContext::new_ephemeral();
-            context.set_sandbox_enabled(true);
-            let seed = webkit2gtk::WebView::with_context(&context);
+            let context = sessions.context(crate::streams::Provider::Twitch).unwrap();
+            let seed = webkit2gtk::WebView::with_context(&context.platform.context);
             let bridge = PreferenceBridge::new(&wrapper, Preferences::load());
             let (relay, capture) = bridge.scripts(&format!("http://127.0.0.1:{port}"));
             // Only this ignored test substitutes a localhost provider. No real
@@ -2361,16 +2482,18 @@ mod tests {
                 seed.destroy();
             }
             drop(seed);
-            drop(context);
             remove_unused_linux_ipc(&webview.webview()).unwrap();
             let handler = attach_linux_preferences(&webview, bridge.clone()).unwrap();
             let view = webview.webview();
+            context.platform.register(&view);
             let weak = view.downgrade();
             let weak_context = view.context().unwrap().downgrade();
             assert!(view.context().unwrap().is_sandbox_enabled());
             let player = StreamPlayer {
                 _cache_usage: crate::cache_maintenance::PlayerLease::new(),
                 webview: Some(webview),
+                _provider_sessions: Rc::clone(&sessions),
+                provider_context: Some(context),
                 allowed_url: Arc::new(Mutex::new(wrapper.clone())),
                 #[cfg(target_os = "windows")]
                 bearer_tokens: Arc::new(Mutex::new(Vec::new())),
@@ -2420,6 +2543,7 @@ mod tests {
             );
             drop(view);
             drop(player);
+            assert!(!sessions.session_started(&crate::streams::Provider::Twitch));
             for _ in 0..400 {
                 pump_events();
                 if weak.upgrade().is_none()
@@ -2457,8 +2581,12 @@ mod tests {
         let mut player = StreamPlayer {
             _cache_usage: crate::cache_maintenance::PlayerLease::new(),
             webview: None,
+            _provider_sessions: Rc::new(ProviderSessions::default()),
+            provider_context: None,
             #[cfg(target_os = "windows")]
             _web_context: wry::WebContext::default(),
+            #[cfg(target_os = "windows")]
+            _provider_registration: None,
             allowed_url: Arc::new(Mutex::new(String::new())),
             #[cfg(target_os = "windows")]
             bearer_tokens: Arc::new(Mutex::new(Vec::new())),

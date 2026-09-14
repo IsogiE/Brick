@@ -295,6 +295,40 @@ impl ReviewUi {
             .map(|client| client.recording_match_status().0)
     }
 
+    pub(crate) fn publish_recording_match(
+        &self,
+        ctx: &egui::Context,
+        epoch: u64,
+        lease: String,
+        has_raid: bool,
+        cancel: Arc<AtomicBool>,
+    ) -> mpsc::Receiver<Result<(), String>> {
+        let client = self.client.clone();
+        let ctx = ctx.clone();
+        let (tx, rx) = mpsc::channel();
+        crate::guild::spawn(move || {
+            let result = (|| {
+                let token =
+                    while_current(&cancel, discord_auth::current_or_refreshed_access_token)??
+                        .ok_or("Sign in to Discord again.")?;
+                let lock = client.lock().map_err(|_| "Warcraft Logs is unavailable.")?;
+                let client = lock.as_ref().ok_or("Warcraft Logs is unavailable.")?;
+                if !client.connected() || client.recording_match_status().0 != epoch {
+                    return Err("The recording check is no longer current.".into());
+                }
+                // Hold the shared account lock through submission. A WCL account
+                // switch cannot publish a result from the previous account.
+                while_current(&cancel, || {
+                    crate::streams::submit_recording_check(&token, &lease, has_raid)
+                })?
+                .map_err(|error| error.message)
+            })();
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        rx
+    }
+
     pub(crate) fn recording_match(&self, stream: &Stream) -> Option<(u64, Result<bool, ()>)> {
         if self.work.is_some() || self.key != pov_key(stream) || self.last_attempt.is_none() {
             return None;

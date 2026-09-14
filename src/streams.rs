@@ -70,6 +70,62 @@ pub struct Snapshot {
     pub own_streams: Vec<Stream>,
     #[serde(default)]
     pub unverified_count: usize,
+    #[serde(default)]
+    pub own_youtube_channel: Option<crate::youtube_account::Channel>,
+}
+
+pub fn share_youtube_channel(access: &crate::guild::Access, channel: &str) -> Result<(), Error> {
+    if !crate::youtube_account::valid_channel_id(channel) {
+        return Err("Invalid YouTube channel.".to_string().into());
+    }
+    request(
+        Method::PUT,
+        "/v1/streams/youtube-channel",
+        access,
+        Some(serde_json::json!({"channelId":channel})),
+    )?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryLease {
+    pub allowed: bool,
+    pub retry_after_seconds: u64,
+}
+
+pub fn youtube_discovery_lease(
+    access: &crate::guild::Access,
+    channel: &str,
+) -> Result<DiscoveryLease, Error> {
+    let bytes = request(
+        Method::POST,
+        "/v1/streams/youtube-channel/discovery-lease",
+        access,
+        Some(serde_json::json!({"channelId":channel})),
+    )?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| "Couldn't schedule YouTube discovery.".to_string().into())
+}
+
+pub fn publish_youtube_broadcasts(
+    access: &crate::guild::Access,
+    channel: &str,
+    ids: &[String],
+) -> Result<(), Error> {
+    if !crate::youtube_account::valid_channel_id(channel) || ids.len() > 50 {
+        return Err("Invalid YouTube discovery.".to_string().into());
+    }
+    for id in ids {
+        validate_recording_id(&Provider::Youtube, id)?;
+    }
+    request(
+        Method::POST,
+        "/v1/streams/youtube-channel/broadcasts",
+        access,
+        Some(serde_json::json!({"channelId":channel,"videoIds":ids})),
+    )?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -119,6 +175,14 @@ pub struct Recordings {
     pub vods: Vec<Vod>,
     #[serde(default)]
     pub can_delete_recordings: bool,
+    #[serde(default)]
+    pub log_checks: Vec<RecordingCheck>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct RecordingCheck {
+    pub vod: Vod,
+    pub lease: String,
 }
 
 pub fn fetch_recordings(access_token: &crate::guild::Access) -> Result<Recordings, Error> {
@@ -126,7 +190,26 @@ pub fn fetch_recordings(access_token: &crate::guild::Access) -> Result<Recording
     let mut recordings: Recordings = serde_json::from_slice(&body)
         .map_err(|_| Error::from("The recording history could not be read.".to_string()))?;
     recordings.vods.retain(valid_vod_url);
-    for vod in &mut recordings.vods {
+    if recordings.log_checks.len() > 32
+        || recordings.log_checks.iter().any(|check| {
+            !valid_vod_url(&check.vod)
+                || check.lease.is_empty()
+                || check.lease.len() > 1024
+                || !check
+                    .lease
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        })
+    {
+        return Err("The recording checks could not be verified."
+            .to_string()
+            .into());
+    }
+    for vod in recordings
+        .vods
+        .iter_mut()
+        .chain(recordings.log_checks.iter_mut().map(|check| &mut check.vod))
+    {
         let url = url::Url::parse(&vod.url).expect("Validated recording URL");
         let id = match vod.provider {
             Provider::Twitch => url.path().trim_start_matches("/videos/").to_owned(),
@@ -145,6 +228,20 @@ pub fn fetch_recordings(access_token: &crate::guild::Access) -> Result<Recording
         vod.id = id;
     }
     Ok(recordings)
+}
+
+pub(crate) fn submit_recording_check(
+    access: &crate::guild::Access,
+    lease: &str,
+    has_raid: bool,
+) -> Result<(), Error> {
+    request(
+        Method::POST,
+        "/v1/streams/vods/log-checks",
+        access,
+        Some(serde_json::json!({"checks":[{"lease":lease,"hasRaid":has_raid}]})),
+    )?;
+    Ok(())
 }
 
 pub fn remove_recording(

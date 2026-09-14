@@ -75,7 +75,9 @@ pub fn invalidate() {
 }
 
 pub fn ensure_current(expected: u64) -> Result<(), String> {
-    if generation() == expected {
+    if crate::account_erasure::requests_blocked() {
+        Err("Account deletion is pending.".into())
+    } else if generation() == expected {
         Ok(())
     } else {
         Err("The selected guild or account changed.".into())

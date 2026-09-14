@@ -38,7 +38,7 @@ jobs:
           # Brick does not use the runner's optional Chrome package repository.
           sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/google-chrome*.sources
           sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav gnome-keyring xvfb squashfs-tools
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav gnome-keyring xvfb squashfs-tools bubblewrap
 
       - name: Check formatting
         if: runner.os == 'Linux'
@@ -163,6 +163,19 @@ jobs:
           cargo test --locked linux_keyring_roundtrip -- --ignored --test-threads=1
           KEYRING_TEST
           DBUS_SESSION_BUS_ADDRESS="unix:path=$test_dir/no-such-bus" cargo test --locked linux_keyring_failure -- --ignored --test-threads=1
+
+      - name: Test isolated Linux device reset
+        if: runner.os == 'Linux'
+        env:
+          RUSTFLAGS: '-D warnings'
+        run: |
+          cargo test --locked --bin brick --no-run --message-format=json > "$RUNNER_TEMP/brick-erasure-artifacts.json"
+          # Namespace setup needs privilege under the runner's user-map policy.
+          # The helper maps to a non-root fixture user and drops all capabilities.
+          sudo unshare --net -- \
+            python3 scripts/test-local-erasure.py --isolated-network --privileged-setup \
+            --cargo-artifacts "$RUNNER_TEMP/brick-erasure-artifacts.json" \
+            --scratch-parent "$RUNNER_TEMP"
 
       - name: Build release binary
         env:

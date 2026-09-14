@@ -66,6 +66,7 @@ pub struct BrickApp {
     last_app_update_check: Instant,
     last_roster_refresh: Instant,
     roster_notice: Option<String>,
+    erasure: crate::account_erasure_ui::ErasureUi,
 }
 
 #[derive(Debug, Clone)]
@@ -129,7 +130,12 @@ impl BrickApp {
         let brick_texture = load_texture(&cc.egui_ctx);
         let show_request_rx = spawn_show_request_wake(&cc.egui_ctx);
 
-        let (view, status) = match addon::load_view() {
+        let erasure = crate::account_erasure_ui::ErasureUi::new();
+        let (view, status) = match if erasure.blocks_normal_use() {
+            Ok(AppView::default())
+        } else {
+            addon::load_view()
+        } {
             Ok(view) => (view, "Ready".to_string()),
             Err(error) => {
                 let _ = addon::record_log(LogLevel::Error, error.clone());
@@ -137,7 +143,11 @@ impl BrickApp {
             }
         };
 
-        let auth_state = match discord_auth::saved_session_status() {
+        let auth_state = match if erasure.blocks_normal_use() {
+            Ok(SessionStatus::SignedOut)
+        } else {
+            discord_auth::saved_session_status()
+        } {
             Ok(SessionStatus::ConfigMissing(error)) => AuthUiState::ConfigMissing(error),
             Ok(SessionStatus::SignedOut) => AuthUiState::SignedOut,
             Ok(SessionStatus::NeedsRefresh) => AuthUiState::Refreshing,
@@ -190,8 +200,12 @@ impl BrickApp {
                 .checked_sub(Duration::from_secs(ROSTER_REFRESH_INTERVAL_SECS))
                 .unwrap_or(now),
             roster_notice: None,
+            erasure,
         };
 
+        if let AuthUiState::Authorized(user) = &app.auth_state {
+            app.streams.bind_provider_account(&user.user_id);
+        }
         if matches!(app.auth_state, AuthUiState::Refreshing) {
             app.start_auth_refresh();
         }
@@ -386,7 +400,7 @@ impl BrickApp {
             return;
         }
 
-        self.auth_state = AuthUiState::Refreshing;
+        self.prepare_auth_refresh();
         let (tx, rx) = mpsc::channel();
         let ctx = self.egui_ctx.clone();
         thread::spawn(move || {
@@ -398,6 +412,39 @@ impl BrickApp {
         self.status = "Checking Discord session.".to_string();
     }
 
+    fn prepare_auth_refresh(&mut self) {
+        // Retain personal provider state only for the known account. No guild
+        // player, worker or discovery result remains authorized during renewal.
+        crate::guild::invalidate();
+        self.guild_rx = None;
+        self.guild_switching = false;
+        if let AuthUiState::Authorized(user) = &self.auth_state {
+            self.streams.bind_provider_account(&user.user_id);
+            self.reset_guild_panel_for_switch();
+        } else if matches!(self.auth_state, AuthUiState::Retrying) {
+            self.reset_guild_panel_for_switch();
+        } else {
+            self.reset_guild_panel();
+        }
+        self.auth_state = AuthUiState::Refreshing;
+    }
+
+    fn tick_streams(&mut self, ctx: &egui::Context) -> bool {
+        let renewing = (matches!(self.auth_state, AuthUiState::Refreshing)
+            && self.auth_rx.is_some())
+            || matches!(self.auth_state, AuthUiState::Retrying);
+        if renewing || (self.auth_state.is_authorized() && self.guild_switching) {
+            self.streams.tick_guild_switch(ctx);
+            false
+        } else {
+            self.streams.tick(
+                ctx,
+                self.auth_state.is_authorized() && !self.guild_access_lost,
+                self.window_visible && self.active_tab == MainTab::Streams,
+            )
+        }
+    }
+
     fn poll_auth(&mut self) {
         let Some(rx) = self.auth_rx.as_ref() else {
             return;
@@ -406,6 +453,7 @@ impl BrickApp {
         match rx.try_recv() {
             Ok(Ok(user)) => {
                 self.reset_changed_guild(&user);
+                self.guild_access_lost = false;
                 self.auth_state = AuthUiState::Authorized(user);
                 self.auth_rx = None;
                 self.status = "Discord access verified.".to_string();
@@ -417,7 +465,11 @@ impl BrickApp {
             }
             Ok(Err(error)) => {
                 crate::guild::invalidate();
-                self.reset_guild_panel();
+                if error.retryable {
+                    self.reset_guild_panel_for_switch();
+                } else {
+                    self.reset_guild_panel();
+                }
                 self.auth_state = if error.retryable {
                     AuthUiState::Retrying
                 } else {
@@ -429,6 +481,8 @@ impl BrickApp {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 let error = "Discord login stopped unexpectedly.".to_string();
+                crate::guild::invalidate();
+                self.reset_guild_panel();
                 self.auth_state = AuthUiState::Denied(error.clone());
                 self.auth_rx = None;
                 self.status = error;
@@ -462,6 +516,15 @@ impl BrickApp {
 
     fn reset_guild_panel(&mut self) {
         self.streams.clear();
+        self.reset_guild_panel_fields();
+    }
+
+    fn reset_guild_panel_for_switch(&mut self) {
+        self.streams.clear_for_guild_switch();
+        self.reset_guild_panel_fields();
+    }
+
+    fn reset_guild_panel_fields(&mut self) {
         self.profile = ProfileUi::default();
         self.roster_rx = None;
         self.presence_state = initial_presence_state();
@@ -476,8 +539,14 @@ impl BrickApp {
             if previous.guild_id != next.guild_id || previous.user_id != next.user_id)
         {
             crate::guild::invalidate();
-            self.reset_guild_panel();
+            if matches!(&self.auth_state, AuthUiState::Authorized(previous) if previous.user_id == next.user_id)
+            {
+                self.reset_guild_panel_for_switch();
+            } else {
+                self.reset_guild_panel();
+            }
         }
+        self.streams.bind_provider_account(&next.user_id);
         crate::guild::activate(&next.guild_id, &next.user_id);
     }
 
@@ -497,7 +566,7 @@ impl BrickApp {
         self.guild_switching = selected.is_some();
         if self.guild_switching {
             crate::guild::invalidate();
-            self.reset_guild_panel();
+            self.reset_guild_panel_for_switch();
         }
         self.last_guild_check = Instant::now();
         let (tx, rx) = mpsc::channel();
@@ -965,6 +1034,13 @@ impl BrickApp {
     }
 
     fn draw_content(&mut self, ui: &mut egui::Ui) {
+        if self.erasure.blocks_normal_use() {
+            if self.erasure.draw_pending(ui) {
+                self.quit_requested = true;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
         if !self.auth_state.is_authorized() {
             self.draw_login_screen(ui);
             return;
@@ -1014,6 +1090,9 @@ impl BrickApp {
         self.draw_installs_section(ui);
         ui.add_space(18.0);
         self.draw_settings_panel(ui);
+        if privacy_links(ui) {
+            self.erasure.show(ui.ctx());
+        }
     }
 
     fn draw_tab_bar(&mut self, ui: &mut egui::Ui) {
@@ -1274,6 +1353,16 @@ impl BrickApp {
                 }
             },
         );
+        let privacy = ui.scope_builder(
+            egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                egui::pos2(panel_rect.left(), panel_rect.bottom() + 12.0),
+                egui::vec2(panel_rect.width(), 20.0),
+            )),
+            privacy_links,
+        );
+        if privacy.inner {
+            self.erasure.show(ui.ctx());
+        }
     }
 
     fn draw_header(&mut self, ui: &mut egui::Ui) {
@@ -1544,34 +1633,9 @@ impl BrickApp {
     }
 
     fn draw_discord_settings_row(&mut self, ui: &mut egui::Ui, user: &AuthorizedUser) {
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), 44.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                let action_width = 94.0;
-                let detail_width = (ui.available_width() - action_width).max(180.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(detail_width, 44.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new("Discord").strong().color(primary_text()));
-                            ui.label(
-                                RichText::new(user.display_name.as_str())
-                                    .small()
-                                    .color(secondary_text()),
-                            );
-                        });
-                    },
-                );
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if secondary_button(ui, "Log out").clicked() {
-                        self.request_sign_out();
-                    }
-                });
-            },
-        );
+        if settings_account_row(ui, "Discord", Some(&user.display_name), "Log out").clicked() {
+            self.request_sign_out();
+        }
     }
 
     fn draw_logout_confirmation(&mut self, ctx: &egui::Context) {
@@ -1787,6 +1851,14 @@ impl eframe::App for BrickApp {
         }
         self.handle_tray(ctx);
         self.handle_show_request(ctx);
+        self.erasure.poll();
+        if self.erasure.blocks_normal_use() {
+            self.poll_app_update(ctx);
+            self.start_periodic_app_update_check();
+            self.handle_close_request(ctx);
+            ctx.request_repaint_after(Duration::from_secs(IDLE_REPAINT_MAX_SECS));
+            return;
+        }
         self.poll_auth();
         self.poll_guilds();
         if self.auth_state.is_authorized()
@@ -1798,11 +1870,7 @@ impl eframe::App for BrickApp {
         self.poll_app_update(ctx);
         self.start_periodic_app_update_check();
         self.handle_close_request(ctx);
-        if self.streams.tick(
-            ctx,
-            self.auth_state.is_authorized() && !self.guild_switching && !self.guild_access_lost,
-            self.window_visible && self.active_tab == MainTab::Streams,
-        ) {
+        if self.tick_streams(ctx) {
             self.handle_guild_access_loss();
         }
         if self.auth_state.is_authorized() && !self.guild_switching && !self.guild_access_lost {
@@ -1867,6 +1935,31 @@ impl eframe::App for BrickApp {
                 }
             });
         self.draw_logout_confirmation(&ctx);
+        if let Some(identity) = self.erasure.draw_confirmation(&ctx) {
+            // Close provider windows and cancel all account-bound work before
+            // the erasure worker can revoke grants or touch protected storage.
+            discord_auth::suspend_session();
+            self.streams.clear();
+            self.auth_rx = None;
+            self.guild_rx = None;
+            self.roster_rx = None;
+            self.sync_rx = None;
+            self.profile = ProfileUi::default();
+            self.auth_state = AuthUiState::SignedOut;
+            self.presence_state = initial_presence_state();
+            self.roster_notice = None;
+            self.confirm_logout = false;
+            self.view = AppView::default();
+            self.view_error = None;
+            self.status.clear();
+            self.erasure.start(&ctx, identity);
+        }
+        self.streams.update_account_windows(
+            frame,
+            &ctx,
+            self.auth_state.is_authorized() && !self.guild_switching && !self.guild_access_lost,
+            self.window_visible && !self.confirm_logout && !self.erasure.modal_open(),
+        );
         if self.streams.update_player(
             frame,
             &ctx,
@@ -1875,7 +1968,8 @@ impl eframe::App for BrickApp {
                 && !self.guild_access_lost
                 && self.window_visible
                 && self.active_tab == MainTab::Streams
-                && !self.confirm_logout,
+                && !self.confirm_logout
+                && !self.erasure.modal_open(),
         ) {
             self.handle_guild_access_loss();
         }
@@ -1985,7 +2079,7 @@ fn draw_icon(ui: &mut egui::Ui, texture: Option<&TextureHandle>, size: f32) {
     }
 }
 
-fn panel_frame() -> egui::Frame {
+pub(crate) fn panel_frame() -> egui::Frame {
     egui::Frame::NONE
         .fill(panel_background())
         .stroke(Stroke::new(1.0_f32, panel_stroke()))
@@ -2038,7 +2132,7 @@ fn login_secondary_button(text: &str) -> egui::Button<'_> {
         .min_size(egui::vec2(236.0, 36.0))
 }
 
-fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+pub(crate) fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).strong().color(primary_text()))
             .corner_radius(egui::CornerRadius::same(8))
@@ -2104,7 +2198,7 @@ fn header_status_text(ui: &mut egui::Ui, text: &str, color: Color32) {
     }
 }
 
-fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+pub(crate) fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(
             RichText::new(text)
@@ -2172,6 +2266,65 @@ fn toggle(ui: &mut egui::Ui, on: bool) -> bool {
             .circle_filled(egui::pos2(x, rect.center().y), 8.5, knob);
     }
     response.clicked()
+}
+
+fn privacy_links(ui: &mut egui::Ui) -> bool {
+    let mut delete = false;
+    ui.horizontal(|ui| {
+        ui.hyperlink_to(
+            RichText::new("Privacy").small().color(muted_text()),
+            "https://brick.lusaggo.com/privacy/",
+        );
+        ui.hyperlink_to(
+            RichText::new("Terms").small().color(muted_text()),
+            "https://brick.lusaggo.com/terms/",
+        );
+        delete = ui
+            .link(RichText::new("Delete my data").small().color(muted_text()))
+            .clicked();
+    });
+    delete
+}
+
+pub(crate) fn settings_account_row(
+    ui: &mut egui::Ui,
+    provider: &str,
+    name: Option<&str>,
+    action: &str,
+) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), 44.0),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            let response = ui.add(
+                egui::Button::new(RichText::new(action).strong().color(primary_text()))
+                    .corner_radius(8)
+                    .fill(Color32::from_rgb(38, 42, 50))
+                    .min_size(egui::vec2(80.0, 32.0)),
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 44.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    if let Some(name) = name {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(provider).strong().color(primary_text()));
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(name).small().color(secondary_text()),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    } else {
+                        ui.label(RichText::new(provider).strong().color(primary_text()));
+                    }
+                },
+            );
+            response
+        },
+    )
+    .inner
 }
 
 fn settings_toggle_row(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
@@ -2686,13 +2839,16 @@ fn info_accent() -> Color32 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    pub(crate) fn apply_style(ctx: &egui::Context) {
+        super::configure_style(ctx);
+    }
     use super::*;
     use eframe::App as _;
 
     // No disk, network, tray, or saved user session is needed to exercise scheduling.
     fn app() -> BrickApp {
         let now = Instant::now();
-        BrickApp {
+        let mut app = BrickApp {
             view: AppView::default(),
             status: "Ready".into(),
             view_error: None,
@@ -2739,7 +2895,126 @@ pub(crate) mod tests {
             last_app_update_check: now,
             last_roster_refresh: now,
             roster_notice: None,
+            erasure: crate::account_erasure_ui::ErasureUi::default(),
+        };
+        app.streams.bind_provider_account("test");
+        app
+    }
+
+    #[test]
+    fn routine_auth_renewal_preserves_only_the_same_accounts_viewing_session() {
+        let mut app = app();
+        let AuthUiState::Authorized(user) = &app.auth_state else {
+            unreachable!()
+        };
+        let user = user.clone();
+        let sessions = app.streams.personal_provider_sessions();
+        let old_access = crate::guild::Access::new(
+            "fixture".into(),
+            user.guild_id.clone(),
+            user.user_id.clone(),
+            crate::guild::generation(),
+        );
+        let (guild_tx, guild_rx) = mpsc::channel();
+        app.guild_rx = Some(guild_rx);
+        app.prepare_auth_refresh();
+        assert!(!app.auth_state.is_authorized());
+        assert!(old_access.check().is_err());
+        assert!(guild_tx.send(Ok(user.clone())).is_err());
+        let (_auth_tx, auth_rx) = mpsc::channel();
+        app.auth_rx = Some(auth_rx);
+        let ctx = egui::Context::default();
+        assert!(!app.tick_streams(&ctx));
+        assert!(!sessions.ended_for_test());
+        assert!(std::rc::Rc::ptr_eq(
+            &sessions,
+            &app.streams.personal_provider_sessions()
+        ));
+        // Successful restore checks the retained account even though the auth
+        // enum no longer contains its previous Authorized value.
+        app.reset_changed_guild(&user);
+        app.auth_state = AuthUiState::Authorized(user.clone());
+        assert!(std::rc::Rc::ptr_eq(
+            &sessions,
+            &app.streams.personal_provider_sessions()
+        ));
+        app.prepare_auth_refresh();
+        let mut other = user;
+        other.user_id = "different-account".into();
+        app.reset_changed_guild(&other);
+        assert!(sessions.ended_for_test());
+        assert!(!std::rc::Rc::ptr_eq(
+            &sessions,
+            &app.streams.personal_provider_sessions()
+        ));
+    }
+
+    #[test]
+    fn auth_renewal_retains_personal_state_only_across_retryable_failures() {
+        for outcome in [Some(false), Some(true), None] {
+            let mut app = app();
+            let sessions = app.streams.personal_provider_sessions();
+            app.prepare_auth_refresh();
+            let (tx, rx) = mpsc::channel();
+            app.auth_rx = Some(rx);
+            if let Some(retryable) = outcome {
+                tx.send(Err(RefreshError {
+                    message: "Synthetic renewal failure".into(),
+                    retryable,
+                }))
+                .unwrap();
+            }
+            drop(tx);
+            app.poll_auth();
+            assert!(!app.auth_state.is_authorized());
+            if outcome == Some(true) {
+                let ctx = egui::Context::default();
+                assert!(!app.tick_streams(&ctx));
+                assert!(matches!(app.auth_state, AuthUiState::Retrying));
+                assert!(!sessions.ended_for_test());
+                assert!(std::rc::Rc::ptr_eq(
+                    &sessions,
+                    &app.streams.personal_provider_sessions()
+                ));
+                app.prepare_auth_refresh();
+                assert!(!sessions.ended_for_test());
+                assert!(std::rc::Rc::ptr_eq(
+                    &sessions,
+                    &app.streams.personal_provider_sessions()
+                ));
+            } else {
+                assert!(sessions.ended_for_test());
+                assert!(!std::rc::Rc::ptr_eq(
+                    &sessions,
+                    &app.streams.personal_provider_sessions()
+                ));
+            }
         }
+    }
+
+    #[test]
+    fn guild_change_preserves_viewing_identity_but_account_change_ends_it() {
+        let mut app = app();
+        let sessions = app.streams.personal_provider_sessions();
+        let AuthUiState::Authorized(user) = &app.auth_state else {
+            unreachable!();
+        };
+        let mut next = user.clone();
+        next.guild_id = crate::guild::ASCENDANCE.into();
+        app.reset_changed_guild(&next);
+        assert!(std::rc::Rc::ptr_eq(
+            &sessions,
+            &app.streams.personal_provider_sessions()
+        ));
+        assert!(!sessions.ended_for_test());
+        app.auth_state = AuthUiState::Authorized(next.clone());
+        next.user_id = "another-account".into();
+        app.reset_changed_guild(&next);
+        assert!(sessions.ended_for_test());
+        assert!(!std::rc::Rc::ptr_eq(
+            &sessions,
+            &app.streams.personal_provider_sessions()
+        ));
     }
 
     #[test]
@@ -2900,6 +3175,50 @@ pub(crate) mod tests {
                 });
             },
         );
+    }
+
+    #[test]
+    fn settings_accounts_align_actions_with_short_absent_and_long_names() {
+        let long_name = "A very long account name ".repeat(20);
+        for width in [720.0, 980.0, 1600.0] {
+            let ctx = egui::Context::default();
+            let mut previous = None;
+            for name in [None, Some("Isogi"), Some(long_name.as_str())] {
+                for label in ["Sign in", "Sign out"] {
+                    let mut buttons = Vec::new();
+                    let _ = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 560.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            ui.set_width(width - 80.0);
+                            ui.columns(2, |columns| {
+                                for (column, provider) in
+                                    columns.iter_mut().zip(["YouTube", "Twitch"])
+                                {
+                                    let available = column.max_rect();
+                                    let button =
+                                        settings_account_row(column, provider, name, label);
+                                    assert_eq!(button.rect.right(), available.right());
+                                    assert_eq!(button.rect.size(), egui::vec2(80.0, 32.0));
+                                    assert!(column.min_rect().right() <= available.right());
+                                    buttons.push(button.rect);
+                                }
+                            });
+                        },
+                    );
+                    assert_eq!(buttons[0].top(), buttons[1].top());
+                    if let Some(previous) = &previous {
+                        assert_eq!(&buttons, previous);
+                    }
+                    previous = Some(buttons);
+                }
+            }
+        }
     }
 
     #[test]
