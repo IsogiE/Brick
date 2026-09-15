@@ -377,13 +377,14 @@ impl Account {
         Ok(())
     }
 
-    /// A server-issued quota lease reserves these three API calls across all
+    /// A server-issued quota lease reserves one live check or three discovery calls across all
     /// guilds before the UI invokes discovery. Never page through old history.
     pub fn broadcasts(
         &mut self,
         channel: &str,
         access: &Access,
         cancel: &AtomicBool,
+        live_only: bool,
     ) -> Result<Vec<String>, String> {
         if !self
             .channels
@@ -393,7 +394,12 @@ impl Account {
             return Err("Choose one of your connected YouTube channels.".into());
         }
         let mut ids = Vec::new();
-        for status in ["active", "upcoming", "completed"] {
+        let statuses: &[&str] = if live_only {
+            &["active"]
+        } else {
+            &["active", "upcoming", "completed"]
+        };
+        for &status in statuses {
             let body = self.get(
                 "liveBroadcasts",
                 &[
