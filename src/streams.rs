@@ -97,12 +97,14 @@ pub struct DiscoveryLease {
 pub fn youtube_discovery_lease(
     access: &crate::guild::Access,
     channel: &str,
+    live_only: bool,
+    manual: bool,
 ) -> Result<DiscoveryLease, Error> {
     let bytes = request(
         Method::POST,
         "/v1/streams/youtube-channel/discovery-lease",
         access,
-        Some(serde_json::json!({"channelId":channel})),
+        Some(serde_json::json!({"channelId":channel,"liveOnly":live_only,"manual":manual})),
     )?;
     serde_json::from_slice(&bytes)
         .map_err(|_| "Couldn't schedule YouTube discovery.".to_string().into())
@@ -374,6 +376,15 @@ impl From<String> for Error {
 
 pub fn fetch(access_token: &crate::guild::Access) -> Result<Snapshot, Error> {
     let body = request(Method::GET, "/v1/streams", access_token, None)?;
+    serde_json::from_slice(&body).map_err(|_| {
+        "The stream service returned an invalid response."
+            .to_string()
+            .into()
+    })
+}
+
+pub fn refresh_now(access_token: &crate::guild::Access) -> Result<Snapshot, Error> {
+    let body = request(Method::POST, "/v1/streams/refresh", access_token, None)?;
     serde_json::from_slice(&body).map_err(|_| {
         "The stream service returned an invalid response."
             .to_string()

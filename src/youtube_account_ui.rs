@@ -18,14 +18,15 @@ enum Action {
     Connect,
     Disconnect,
     Share(String),
-    Discover(String),
+    Discover(String, bool, bool),
 }
 
 enum Completed {
     Ready,
     Disconnected,
     Shared,
-    Discovered(Duration, bool),
+    Discovered(Duration, bool, bool, Vec<String>),
+    Deferred(Duration, bool),
 }
 type WorkResult = (Account, Result<Completed, String>);
 
@@ -39,6 +40,9 @@ pub struct YoutubeUi {
     channels: Vec<Channel>,
     selected: String,
     next_discovery: Option<Instant>,
+    next_archives: Option<Instant>,
+    refresh_requested: Option<Instant>,
+    last_live_ids: Vec<String>,
     notice: Option<String>,
     foreground: bool,
     changed: bool,
@@ -64,6 +68,21 @@ impl YoutubeUi {
         self.connected
     }
 
+    pub fn refresh_now(&mut self) {
+        self.refresh_requested = Some(Instant::now());
+    }
+
+    fn manual_due(&self, now: Instant) -> bool {
+        self.refresh_requested.is_some_and(|at| now >= at)
+    }
+
+    fn defer_discovery(&mut self, delay: Duration, manual: bool, now: Instant) {
+        self.next_discovery = Some(now + delay);
+        if manual {
+            self.refresh_requested = Some(now + delay);
+        }
+    }
+
     /// Returns true when the guild's live/recording lists should be refreshed.
     pub fn tick(&mut self, ctx: &egui::Context, shared: Option<&Channel>) -> bool {
         if let Some(rx) = &self.work {
@@ -84,6 +103,8 @@ impl YoutubeUi {
                     Ok(Completed::Ready) => {
                         self.notice = None;
                         self.next_discovery = None;
+                        self.next_archives = None;
+                        self.last_live_ids.clear();
                         if self.channels.len() == 1 {
                             self.selected = self.channels[0].channel_id.clone();
                         } else if !self
@@ -101,10 +122,22 @@ impl YoutubeUi {
                     Ok(Completed::Shared) => {
                         self.notice = None;
                         self.next_discovery = None;
+                        self.next_archives = None;
+                        self.last_live_ids.clear();
                         self.changed = true;
                     }
-                    Ok(Completed::Discovered(delay, changed)) => {
+                    Ok(Completed::Deferred(delay, manual)) => {
+                        self.defer_discovery(delay, manual, Instant::now());
+                    }
+                    Ok(Completed::Discovered(delay, changed, live_only, ids)) => {
+                        self.notice = None;
                         self.next_discovery = Some(Instant::now() + delay);
+                        if live_only {
+                            self.last_live_ids = ids;
+                        } else {
+                            self.next_archives =
+                                Some(Instant::now() + Duration::from_secs(15 * 60));
+                        }
                         self.changed |= changed;
                     }
                     Err(error) => {
@@ -128,14 +161,23 @@ impl YoutubeUi {
             self.start(ctx, Action::Restore);
         } else if self.work.is_none()
             && self.connected
-            && self.next_discovery.is_none_or(|at| Instant::now() >= at)
+            && (self.manual_due(Instant::now())
+                || self.next_discovery.is_none_or(|at| Instant::now() >= at))
         {
             if let Some(channel) = shared.filter(|channel| {
                 self.channels
                     .iter()
                     .any(|owned| owned.channel_id == channel.channel_id)
             }) {
-                self.start(ctx, Action::Discover(channel.channel_id.clone()));
+                let manual = self.manual_due(Instant::now());
+                if manual {
+                    self.refresh_requested = None;
+                }
+                let live_only = manual || self.next_archives.is_some_and(|at| Instant::now() < at);
+                self.start(
+                    ctx,
+                    Action::Discover(channel.channel_id.clone(), live_only, manual),
+                );
             }
         }
         std::mem::take(&mut self.changed)
@@ -154,7 +196,7 @@ impl YoutubeUi {
         };
         self.connecting = matches!(action, Action::Connect);
         self.disconnecting = matches!(action, Action::Disconnect);
-        self.foreground = !matches!(action, Action::Restore | Action::Discover(_));
+        self.foreground = !matches!(action, Action::Restore | Action::Discover(_, _, false));
         if self.foreground {
             self.notice = None;
         }
@@ -162,6 +204,7 @@ impl YoutubeUi {
         self.cancel = Some(cancel.clone());
         let ctx = ctx.clone();
         let (tx, rx) = mpsc::channel();
+        let previous_live_ids = self.last_live_ids.clone();
         crate::guild::spawn(move || {
             let mut account = account;
             let result =
@@ -186,25 +229,33 @@ impl YoutubeUi {
                             .map_err(|error| error.message)?;
                         Ok(Completed::Shared)
                     }
-                    Action::Discover(channel) => {
-                        let lease = streams::youtube_discovery_lease(&access, &channel)
-                            .map_err(|error| error.message)?;
-                        let delay = Duration::from_secs(
-                            lease.retry_after_seconds.clamp(15 * 60, 24 * 60 * 60),
-                        );
+                    Action::Discover(channel, live_only, manual) => {
+                        let lease =
+                            streams::youtube_discovery_lease(&access, &channel, live_only, manual)
+                                .map_err(|error| error.message)?;
+                        let delay =
+                            Duration::from_secs(lease.retry_after_seconds.clamp(5, 24 * 60 * 60));
                         if !lease.allowed {
-                            return Ok(Completed::Discovered(delay, false));
+                            // Keep previous observations and do not mark an archive check complete.
+                            return Ok(Completed::Deferred(delay, manual));
                         }
-                        let ids = account.broadcasts(&channel, &access, &cancel)?;
+                        let mut ids = account.broadcasts(&channel, &access, &cancel, live_only)?;
+                        ids.sort();
                         if cancel.load(Ordering::Acquire) {
                             return Err("YouTube connection cancelled.".into());
                         }
                         access.check()?;
-                        if !ids.is_empty() {
+                        let changed = !live_only || ids != previous_live_ids;
+                        if !ids.is_empty() && (changed || manual) {
                             streams::publish_youtube_broadcasts(&access, &channel, &ids)
                                 .map_err(|error| error.message)?;
                         }
-                        Ok(Completed::Discovered(delay, !ids.is_empty()))
+                        let next = if live_only {
+                            delay
+                        } else {
+                            Duration::from_secs(30)
+                        };
+                        Ok(Completed::Discovered(next, changed, live_only, ids))
                     }
                 });
             let _ = tx.send((account, result));
@@ -353,6 +404,29 @@ impl YoutubeUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn throttled_refresh_waits_then_retries_as_a_manual_check() {
+        let mut panel = YoutubeUi::default();
+        let now = Instant::now();
+        panel.last_live_ids = vec!["liveABC_123".into()];
+        panel.next_archives = None;
+        panel.refresh_now();
+        panel.defer_discovery(Duration::from_secs(4), true, now);
+        assert!(!panel.manual_due(now + Duration::from_secs(3)));
+        assert!(panel.manual_due(now + Duration::from_secs(4)));
+        assert!(panel.next_archives.is_none());
+        assert_eq!(panel.last_live_ids, ["liveABC_123"]);
+    }
+
+    #[test]
+    fn background_deferral_preserves_a_refresh_queued_during_work() {
+        let mut panel = YoutubeUi::default();
+        panel.refresh_now();
+        let now = Instant::now();
+        panel.defer_discovery(Duration::from_secs(30), false, now);
+        assert!(panel.manual_due(now));
+    }
 
     #[test]
     fn restored_or_partial_grants_remain_removable_without_starting_work() {

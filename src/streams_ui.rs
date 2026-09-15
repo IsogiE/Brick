@@ -23,7 +23,7 @@ fn record_provider_window_result(result: Result<(), String>) {
     }
 }
 
-const REFRESH: Duration = Duration::from_secs(30);
+const REFRESH: Duration = Duration::from_secs(5);
 const MAX_STALE: Duration = Duration::from_secs(90);
 const MUTED: Color32 = Color32::from_rgb(159, 169, 184);
 const LIVE: Color32 = Color32::from_rgb(69, 211, 127);
@@ -31,6 +31,7 @@ const MEMBER_ROW_HEIGHT: f32 = 30.0;
 
 enum Action {
     Refresh,
+    RefreshNow,
     Save(Provider, String),
     Remove(Provider),
     Recordings,
@@ -60,6 +61,7 @@ pub struct StreamsUi {
     received_at: Option<Instant>,
     last_attempt: Option<Instant>,
     work: Option<mpsc::Receiver<WorkResult>>,
+    refreshing_now: bool,
     selected: Option<Stream>,
     focused: Option<(String, String)>,
     recordings_open: bool,
@@ -112,6 +114,7 @@ impl Default for StreamsUi {
             received_at: None,
             last_attempt: None,
             work: None,
+            refreshing_now: false,
             selected: None,
             focused: None,
             recordings_open: false,
@@ -492,7 +495,8 @@ impl StreamsUi {
                         // Read failures recover on the normal cadence. Keep action errors
                         // for the form that caused them, without calling attention to Refresh.
                         if !self.loading_recording_checks {
-                            self.notice = if self.notice_provider.is_some()
+                            self.notice = if self.refreshing_now
+                                || self.notice_provider.is_some()
                                 || self.confirm_remove_recording.is_some()
                             {
                                 Some(error.message)
@@ -627,6 +631,7 @@ impl StreamsUi {
         if self.work.is_some() {
             return;
         }
+        self.refreshing_now = matches!(action, Action::RefreshNow);
         self.loading_recording_checks = matches!(action, Action::RecordingChecks);
         if !self.loading_recording_checks {
             self.notice = None;
@@ -648,6 +653,7 @@ impl StreamsUi {
         crate::guild::spawn(move || {
             let result = access_token().and_then(|token| match action {
                 Action::Refresh => streams::fetch(&token).map(ResultData::Snapshot),
+                Action::RefreshNow => streams::refresh_now(&token).map(ResultData::Snapshot),
                 Action::Save(provider, url) => {
                     let parsed = url::Url::parse(&url).ok();
                     let matches =
@@ -1265,13 +1271,14 @@ impl StreamsUi {
                         interactive_button("Refresh"),
                     );
                     if refresh.clicked() {
+                        self.youtube.refresh_now();
                         self.notice = None;
                         self.start(
                             ui.ctx(),
                             if self.recordings_open {
                                 Action::Recordings
                             } else {
-                                Action::Refresh
+                                Action::RefreshNow
                             },
                         );
                     }

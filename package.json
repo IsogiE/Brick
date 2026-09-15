@@ -2,7 +2,7 @@
   "name": "brick",
   "private": true,
   "license": "MIT",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "type": "module",
   "scripts": {
     "dev": "cargo run",
