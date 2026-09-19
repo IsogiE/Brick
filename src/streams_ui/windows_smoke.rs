@@ -211,6 +211,22 @@ fn rapid_navigation_and_browser_crash_recover_without_orphans() {
         std::env::var("BRICK_WINDOWS_RECOVERY_FIXTURE").as_deref(),
         Ok("1")
     );
+    use std::io::Read as _;
+    let path = std::env::var_os("BRICK_REPLAY_FIXTURE").expect("Provide replay metadata");
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .unwrap()
+        .take(65537)
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert!(bytes.len() <= 65536);
+    let replay: crate::warcraftlogs::Replay = serde_json::from_slice(&bytes).unwrap();
+    assert!(replay.provider == Provider::Youtube && replay.available_seconds > 100);
+    let mut url = url::Url::parse("http://127.0.0.1:18083/v1/streams/player/101/youtube").unwrap();
+    url.query_pairs_mut()
+        .append_pair("at", "10")
+        .append_pair("broadcast", &replay.broadcast_id);
+    let url: String = url.into();
     let result = Arc::new(Mutex::new(None));
     let app_result = result.clone();
     let options = eframe::NativeOptions {
@@ -237,7 +253,7 @@ fn rapid_navigation_and_browser_crash_recover_without_orphans() {
                 cycles: 0,
                 retired: Vec::new(),
                 baseline: None,
-                url: "http://127.0.0.1:18083/v1/streams/player/101/youtube?at=10".into(),
+                url,
             }))
         }),
     )
