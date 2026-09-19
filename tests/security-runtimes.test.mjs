@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { checkRuntimeMetadata } from '../scripts/check-security-runtimes.mjs';
+import { checkRuntimeMetadata, readBoundedMetadata } from '../scripts/check-security-runtimes.mjs';
 const advisory = 'Reviewed advisory fixture';
 const fixture = () => ({
   workflow: 'pkg-config --atleast-version=2.52.6 webkit2gtk-4.1',
@@ -34,4 +34,14 @@ for (const mutation of [
 test('a patch release cannot be approved as a feature deferral', () => {
   const f=fixture(); f.releases+=' webkitgtk-2.54.1.tar.xz'; f.review.upstreamVersion='2.54.1';
   assert.throws(()=>checkRuntimeMetadata(f),/first feature release/);
+});
+
+test('metadata hashes are independent of UTF-8 network chunk boundaries', async () => {
+  const value='Security advisory: 杉山 壮太'; const bytes=Buffer.from(value);
+  async function* body() { for (const byte of bytes) yield Uint8Array.of(byte); }
+  assert.equal(await readBoundedMetadata(body()),value);
+});
+test('metadata body size is bounded in bytes', async () => {
+  async function* body() { yield Buffer.alloc(2*1024*1024); yield Buffer.from('x'); }
+  await assert.rejects(readBoundedMetadata(body()),/size limit/);
 });

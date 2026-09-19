@@ -8,12 +8,18 @@ import assert from 'node:assert/strict';
 async function text(url) {
   const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(20_000) });
   if (!response.ok) throw new Error(`Runtime release metadata unavailable: ${response.status}`);
-  let value = '';
-  for await (const part of response.body) {
-    value += Buffer.from(part).toString('utf8');
-    if (Buffer.byteLength(value) > 2 * 1024 * 1024) throw new Error('Runtime metadata exceeded its size limit.');
+  return readBoundedMetadata(response.body);
+}
+export async function readBoundedMetadata(body) {
+  const parts = [];
+  let size = 0;
+  for await (const part of body) {
+    size += part.byteLength;
+    if (size > 2 * 1024 * 1024) throw new Error('Runtime metadata exceeded its size limit.');
+    parts.push(Buffer.from(part));
   }
-  return value;
+  // Decode once: arbitrary network chunks can split an advisory's UTF-8 text.
+  return Buffer.concat(parts).toString('utf8');
 }
 function compare(a, b) {
   const x = a.split('.').map(Number), y = b.split('.').map(Number);
