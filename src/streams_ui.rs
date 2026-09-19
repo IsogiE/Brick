@@ -4193,3 +4193,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, target_os = "windows"))]
+#[path = "streams_ui/windows_smoke.rs"]
+mod windows_smoke;

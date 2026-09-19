@@ -206,6 +206,35 @@ pub struct StreamPlayer {
 const WINDOWS_BROWSER_ARGS: &str = "--autoplay-policy=no-user-gesture-required --disk-cache-size=134217728 --media-cache-size=134217728";
 
 impl StreamPlayer {
+    #[cfg(all(test, target_os = "windows"))]
+    pub(crate) fn diagnostic_terminate_browser(&self) -> Result<(), String> {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE},
+        };
+        use wry::WebViewExtWindows as _;
+        let view = self.webview.as_ref().ok_or("No native fixture player")?;
+        let mut pid = 0;
+        // The controller provides the browser owned by this exact test player.
+        unsafe { view.webview().BrowserProcessId(&mut pid) }
+            .map_err(|_| "Cannot identify the fixture browser")?;
+        if pid == 0 || pid == std::process::id() {
+            return Err("Invalid fixture browser PID".into());
+        }
+        unsafe {
+            let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if process.is_null() {
+                return Err("Cannot open the fixture browser".into());
+            }
+            let terminated = TerminateProcess(process, 1);
+            CloseHandle(process);
+            if terminated == 0 {
+                return Err("Cannot terminate the fixture browser".into());
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn new(
         frame: &eframe::Frame,
