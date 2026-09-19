@@ -39,7 +39,7 @@ winit = { version = "=0.30.13", default-features = false, features = ["x11", "wa
 x11rb = "0.14"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-tray-icon = { version = "0.24", default-features = false }
+tray-icon = { version = "0.25", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 webview2-com = "=0.39.1"
