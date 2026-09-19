@@ -110,6 +110,7 @@ pub(crate) struct Context {
     keeper: RefCell<Option<Keeper>>,
     controllers: RefCell<Vec<Weak<ICoreWebView2Controller>>>,
     retired: Cell<bool>,
+    pub(super) browser_failed: Rc<Cell<bool>>,
     cookies: RefCell<Option<ICoreWebView2CookieManager>>,
     restore_cookies: RefCell<Vec<super::session::Cookie>>,
 }
@@ -137,6 +138,7 @@ impl Context {
             keeper: RefCell::new(None),
             controllers: RefCell::new(Vec::new()),
             retired: Cell::new(false),
+            browser_failed: Rc::new(Cell::new(false)),
             cookies: RefCell::new(None),
             restore_cookies: RefCell::new(Vec::new()),
         })
@@ -220,6 +222,28 @@ impl Context {
         *self.cookies.borrow_mut() = Some(manager);
         *self.environment.borrow_mut() = Some(view.environment());
         *self.profile.borrow_mut() = Some(managed);
+        // The hidden keeper and sign-in windows must also invalidate a dead
+        // environment when no media player exists to receive the crash event.
+        let failed = self.browser_failed.clone();
+        let handler = webview2_com::ProcessFailedEventHandler::create(Box::new(move |_, args| {
+            if let Some(args) = args {
+                use webview2_com::Microsoft::Web::WebView2::Win32::{
+                    COREWEBVIEW2_PROCESS_FAILED_KIND,
+                    COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
+                };
+                let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+                unsafe {
+                    args.ProcessFailedKind(&mut kind)?;
+                }
+                if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED {
+                    failed.set(true);
+                }
+            }
+            Ok(())
+        }));
+        let mut event = 0;
+        unsafe { view.webview().add_ProcessFailed(&handler, &mut event) }
+            .map_err(|_| "The provider session could not monitor its browser.")?;
         let registration = Registration {
             _controller: Rc::new(view.controller()),
         };

@@ -126,6 +126,13 @@ impl ProviderSessions {
         if contexts.iter().any(Option::is_some) {
             super::pump_events();
             for context in contexts.iter().flatten() {
+                #[cfg(target_os = "windows")]
+                if context.platform.browser_failed.get() {
+                    // Retire native handles outside COM callbacks; retain the protected jar.
+                    self.contexts.borrow_mut()[index(&context.provider)] = None;
+                    context.retire();
+                    continue;
+                }
                 context.poll_session(ctx);
             }
             ctx.request_repaint_after(std::time::Duration::from_secs(2));
@@ -293,6 +300,11 @@ pub(super) struct Context {
 }
 
 impl Context {
+    #[cfg(target_os = "windows")]
+    pub(super) fn browser_failed(&self) {
+        self.platform.browser_failed.set(true);
+    }
+
     fn new(provider: Provider, jar: Rc<session::Jar>) -> Result<Self, String> {
         #[cfg(target_os = "windows")]
         let platform = platform::Context::new(&provider)?;

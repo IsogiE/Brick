@@ -26,6 +26,8 @@ mod fullscreen;
 mod occlusion;
 mod provider_login;
 mod resize;
+#[cfg(target_os = "windows")]
+mod windows_lifecycle;
 pub use provider_login::ProviderSessions;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_profile;
@@ -204,6 +206,35 @@ pub struct StreamPlayer {
 const WINDOWS_BROWSER_ARGS: &str = "--autoplay-policy=no-user-gesture-required --disk-cache-size=134217728 --media-cache-size=134217728";
 
 impl StreamPlayer {
+    #[cfg(all(test, target_os = "windows"))]
+    pub(crate) fn diagnostic_terminate_browser(&self) -> Result<(), String> {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE},
+        };
+        use wry::WebViewExtWindows as _;
+        let view = self.webview.as_ref().ok_or("No native fixture player")?;
+        let mut pid = 0;
+        // The controller provides the browser owned by this exact test player.
+        unsafe { view.webview().BrowserProcessId(&mut pid) }
+            .map_err(|_| "Cannot identify the fixture browser")?;
+        if pid == 0 || pid == std::process::id() {
+            return Err("Invalid fixture browser PID".into());
+        }
+        unsafe {
+            let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if process.is_null() {
+                return Err("Cannot open the fixture browser".into());
+            }
+            let terminated = TerminateProcess(process, 1);
+            CloseHandle(process);
+            if terminated == 0 {
+                return Err("Cannot terminate the fixture browser".into());
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn new(
         frame: &eframe::Frame,
@@ -320,9 +351,10 @@ impl StreamPlayer {
             .with_devtools(false)
             .with_clipboard(false)
             .with_hotkeys_zoom(false)
-            // Opening a stream is a native user action. Give the embedded
-            // player's keyboard controls focus when its child is created.
-            .with_focused(true)
+            // Reveal the child only after its native guards and navigation are
+            // installed, so failed initialization cannot cover the app.
+            .with_visible(false)
+            .with_focused(false)
             .with_background_color((18, 20, 25, 255))
             .with_new_window_req_handler(move |destination, _| {
                 if provider_login::login_destination(&popup_provider, &destination) {
@@ -409,6 +441,9 @@ impl StreamPlayer {
             builder.with_related_view(linux_seed.clone())
         };
 
+        #[cfg(target_os = "windows")]
+        let built = windows_lifecycle::build_child(builder, frame);
+        #[cfg(not(target_os = "windows"))]
         let built = builder.build_as_child(frame);
         #[cfg(target_os = "linux")]
         {
@@ -436,7 +471,7 @@ impl StreamPlayer {
             #[cfg(target_os = "windows")]
             bearer_tokens: Arc::new(Mutex::new(vec![token.to_owned()])),
             bounds,
-            visible: Cell::new(true),
+            visible: Cell::new(false),
             occlusion: occlusion::Controller::default(),
             loaded,
             created,
@@ -502,6 +537,12 @@ impl StreamPlayer {
                     .platform
                     .register(webview)?,
             );
+            windows_lifecycle::watch_failures(
+                webview,
+                Arc::clone(&player.failure),
+                Rc::downgrade(player.provider_context.as_ref().unwrap()),
+                ctx,
+            )?;
             protect_windows_permissions(webview)?;
             protect_windows_requests(
                 webview,
@@ -511,6 +552,12 @@ impl StreamPlayer {
         }
         player.fullscreen.attach(webview)?;
 
+        // Wry uses WebKit's load_request / WebView2 NavigateWithWebResourceRequest:
+        // these headers belong to this request, not subsequent iframe resources.
+        webview
+            .load_url_with_headers(player_url.as_str(), headers)
+            .map_err(|_| "The stream player could not load this stream.".to_string())?;
+        player.set_visible(true);
         #[cfg(target_os = "linux")]
         if ctx.input(|input| input.viewport().focused.unwrap_or(false)) {
             // Wry's focused option focuses the GTK widget, but its X11 media
@@ -522,11 +569,9 @@ impl StreamPlayer {
                 .map_err(|_| "The stream player could not receive focus.".to_string())?;
         }
 
-        // Wry uses WebKit's load_request / WebView2 NavigateWithWebResourceRequest:
-        // these headers belong to this request, not subsequent iframe resources.
-        webview
-            .load_url_with_headers(player_url.as_str(), headers)
-            .map_err(|_| "The stream player could not load this stream.".to_string())?;
+        if ctx.input(|input| input.viewport().focused.unwrap_or(false)) {
+            let _ = webview.focus();
+        }
         Ok(player)
     }
 
@@ -712,6 +757,8 @@ impl StreamPlayer {
         if let Some(webview) = &self.webview {
             if resize::set_visible(webview, visible, self.bounds).is_ok() {
                 self.visible.set(visible);
+            } else if let Ok(mut failure) = self.failure.lock() {
+                *failure = Some("The stream player stopped responding.".into());
             }
         }
     }
@@ -811,7 +858,10 @@ impl StreamPlayer {
                 schedule_state_poll(ctx, wait);
                 return;
             }
-            StatePoll::Pending => return,
+            StatePoll::Pending => {
+                schedule_state_poll(ctx, state_poll_interval(visible));
+                return;
+            }
             StatePoll::Started => (),
         }
         // Windows need not repaint at the video frame rate. Schedule the next
@@ -849,6 +899,9 @@ impl StreamPlayer {
             .is_err()
         {
             self.state_pending.store(false, Ordering::Relaxed);
+            if let Ok(mut failure) = self.failure.lock() {
+                *failure = Some("The stream player stopped responding.".into());
+            }
         }
     }
     pub fn command(&mut self, command: PlaybackCommand) -> Result<(), String> {
@@ -929,6 +982,16 @@ impl StreamPlayer {
             // A hung renderer must not strand the controls forever. Let the
             // existing bounded wrapper recovery handle failure; never queue
             // another evaluation behind its unfinished request.
+            return Some("The stream player stopped responding.".into());
+        }
+        if self.loaded.load(Ordering::Relaxed)
+            && self
+                .playback_state()
+                .polled_at
+                .unwrap_or(self.created)
+                .elapsed()
+                >= STATE_POLL_TIMEOUT
+        {
             return Some("The stream player stopped responding.".into());
         }
         if !self.loaded.load(Ordering::Relaxed) && self.created.elapsed() >= WRAPPER_LOAD_TIMEOUT {

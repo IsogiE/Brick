@@ -65,12 +65,6 @@ jobs:
       env:
         BRICK_TWITCH_CLIENT_ID: ${{ vars.BRICK_TWITCH_CLIENT_ID }}
       run: node -e "if (!/^[a-zA-Z0-9]{10,128}$/.test(process.env.BRICK_TWITCH_CLIENT_ID || '')) throw new Error('A Public Twitch desktop client ID is required.');"
-    - name: Verify YouTube connection config
-      env:
-        BRICK_YOUTUBE_CLIENT_ID: ${{ vars.BRICK_YOUTUBE_CLIENT_ID }}
-        BRICK_YOUTUBE_CLIENT_SECRET: ${{ secrets.BRICK_YOUTUBE_CLIENT_SECRET }}
-      run: |
-        node -e "if (!/^[a-zA-Z0-9_-]{3,160}[.]apps[.]googleusercontent[.]com$/.test(process.env.BRICK_YOUTUBE_CLIENT_ID || '')) throw new Error('A Google desktop OAuth client ID is required.'); const companion = process.env.BRICK_YOUTUBE_CLIENT_SECRET || ''; if (!/^[\x21-\x7e]{1,1024}$/.test(companion)) throw new Error('The Google desktop OAuth companion configuration is required.');"
     - name: Verify Discord login config
       env:
         BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
@@ -85,8 +79,6 @@ jobs:
       env:
         BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
         BRICK_TWITCH_CLIENT_ID: ${{ vars.BRICK_TWITCH_CLIENT_ID }}
-        BRICK_YOUTUBE_CLIENT_ID: ${{ vars.BRICK_YOUTUBE_CLIENT_ID }}
-        BRICK_YOUTUBE_CLIENT_SECRET: ${{ secrets.BRICK_YOUTUBE_CLIENT_SECRET }}
         BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
         BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
         NO_STRIP: 1
@@ -149,12 +141,6 @@ jobs:
       env:
         BRICK_TWITCH_CLIENT_ID: ${{ vars.BRICK_TWITCH_CLIENT_ID }}
       run: node -e "if (!/^[a-zA-Z0-9]{10,128}$/.test(process.env.BRICK_TWITCH_CLIENT_ID || '')) throw new Error('A Public Twitch desktop client ID is required.');"
-    - name: Verify YouTube connection config
-      env:
-        BRICK_YOUTUBE_CLIENT_ID: ${{ vars.BRICK_YOUTUBE_CLIENT_ID }}
-        BRICK_YOUTUBE_CLIENT_SECRET: ${{ secrets.BRICK_YOUTUBE_CLIENT_SECRET }}
-      run: |
-        node -e "if (!/^[a-zA-Z0-9_-]{3,160}[.]apps[.]googleusercontent[.]com$/.test(process.env.BRICK_YOUTUBE_CLIENT_ID || '')) throw new Error('A Google desktop OAuth client ID is required.'); const companion = process.env.BRICK_YOUTUBE_CLIENT_SECRET || ''; if (!/^[\x21-\x7e]{1,1024}$/.test(companion)) throw new Error('The Google desktop OAuth companion configuration is required.');"
     - name: Verify Discord login config
       env:
         BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
@@ -187,8 +173,6 @@ jobs:
       env:
         BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
         BRICK_TWITCH_CLIENT_ID: ${{ vars.BRICK_TWITCH_CLIENT_ID }}
-        BRICK_YOUTUBE_CLIENT_ID: ${{ vars.BRICK_YOUTUBE_CLIENT_ID }}
-        BRICK_YOUTUBE_CLIENT_SECRET: ${{ secrets.BRICK_YOUTUBE_CLIENT_SECRET }}
         BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
         BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
         RUSTFLAGS: -D warnings -C target-feature=+crt-static
@@ -232,8 +216,6 @@ jobs:
         BRICK_CERTUM_THUMBPRINT: ${{ vars.BRICK_CERTUM_THUMBPRINT }}
         BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
         BRICK_TWITCH_CLIENT_ID: ${{ vars.BRICK_TWITCH_CLIENT_ID }}
-        BRICK_YOUTUBE_CLIENT_ID: ${{ vars.BRICK_YOUTUBE_CLIENT_ID }}
-        BRICK_YOUTUBE_CLIENT_SECRET: ${{ secrets.BRICK_YOUTUBE_CLIENT_SECRET }}
         BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
         BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
         NO_STRIP: 1

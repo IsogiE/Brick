@@ -116,6 +116,15 @@ impl Store {
             .map_err(|_| "Couldn't save the protected Warcraft Logs login.".into())
     }
 
+    /// A migration must not prompt for a keyring when no saved login exists.
+    pub fn remove_if_present(&self) -> Result<(), String> {
+        match fs::symlink_metadata(&self.path) {
+            Ok(_) => self.remove(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err("Could not check the saved login.".into()),
+        }
+    }
+
     pub fn remove(&self) -> Result<(), String> {
         #[cfg(target_os = "linux")]
         match self.entry()?.delete_credential() {
