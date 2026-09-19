@@ -83,6 +83,7 @@ pub struct StreamsUi {
     player_switch_pending: bool,
     preferences: Option<Preferences>,
     player_work: Option<mpsc::Receiver<PlayerResult>>,
+    player_preparing_since: Option<Instant>,
     player_attempted: bool,
     player_retries: u8,
     player_retry_at: Option<Instant>,
@@ -136,6 +137,7 @@ impl Default for StreamsUi {
             player_switch_pending: false,
             preferences: None,
             player_work: None,
+            player_preparing_since: None,
             player_attempted: false,
             player_retries: 0,
             player_retry_at: None,
@@ -312,6 +314,7 @@ impl StreamsUi {
         self.player = None;
         self.player_switch_pending = false;
         self.player_work = None;
+        self.player_preparing_since = None;
         self.player_attempted = false;
         self.player_retries = 0;
         self.player_retry_at = None;
@@ -332,8 +335,16 @@ impl StreamsUi {
     }
 
     fn recover_player(&mut self, error: String) {
+        if !self.player_switch_pending {
+            if let Some(player) = &self.player {
+                self.review
+                    .prepare_player_recovery(&player.playback_state());
+            }
+        }
+        self.review.cancel_marker(self.player.as_ref());
         self.player = None;
         self.player_work = None;
+        self.player_preparing_since = None;
         self.player_switch_pending = false;
         self.player_attempted = true;
         if self.player_retries == 0 {
@@ -344,6 +355,11 @@ impl StreamsUi {
             self.player_retry_at = None;
             self.player_error = Some(error);
         }
+    }
+
+    fn preparation_expired(&mut self, now: Instant) -> bool {
+        let started = self.player_preparing_since.get_or_insert(now);
+        now.saturating_duration_since(*started) >= Duration::from_secs(30)
     }
 
     fn finish_recording_review(&mut self) {
@@ -557,6 +573,7 @@ impl StreamsUi {
             if self.review.active() && self.comparison.is_some() {
                 self.player = None;
                 self.player_work = None;
+                self.player_preparing_since = None;
                 self.player_attempted = false;
                 self.player_switch_pending = false;
                 if let Some(comparison) = &mut self.comparison {
@@ -568,8 +585,8 @@ impl StreamsUi {
         }
         self.finish_recording_review();
         if let Some(player) = &mut self.player {
+            player.poll_playback(ctx);
             if self.review.active() {
-                player.poll_playback(ctx);
                 if !self.player_switch_pending {
                     // Follow native VOD controls before any pull-boundary check,
                     // including fullscreen frames where the timeline is hidden.
@@ -615,7 +632,7 @@ impl StreamsUi {
         if self.player.is_some() || self.provider_sessions.login_open() {
             return Duration::from_millis(33);
         }
-        if self.player.is_some() && self.review.active() {
+        if self.player.is_some() || self.player_work.is_some() || self.player_retry_at.is_some() {
             return Duration::from_millis(500);
         }
         if active && presence::configured() && self.work.is_none() {
@@ -814,6 +831,7 @@ impl StreamsUi {
             self.review.cancel_marker(self.player.as_ref());
             self.player = None;
             self.player_work = None;
+            self.player_preparing_since = None;
             self.player_attempted = false;
             self.player_switch_pending = false;
             self.player_error = None;
@@ -976,10 +994,12 @@ impl StreamsUi {
                         }
                         self.player_switch_pending = true;
                         self.player_work = None;
+                        self.player_preparing_since = None;
                         self.player_attempted = false;
                     } else {
                         self.player = None;
                         self.player_work = None;
+                        self.player_preparing_since = None;
                         self.player_attempted = false;
                         self.player_switch_pending = false;
                     }
@@ -1271,7 +1291,6 @@ impl StreamsUi {
                         interactive_button("Refresh"),
                     );
                     if refresh.clicked() {
-                        self.youtube.refresh_now();
                         self.notice = None;
                         self.start(
                             ui.ctx(),
@@ -1596,7 +1615,7 @@ impl StreamsUi {
                                     let channel_first = if twitch {
                                         self.twitch.channel().is_some() || own.is_some()
                                     } else {
-                                        self.youtube.connected() || shared_channel.is_some()
+                                        shared_channel.is_some()
                                     };
                                     let access_url = if twitch {
                                         "https://www.twitch.tv/settings/connections"
@@ -1798,6 +1817,7 @@ impl StreamsUi {
                 self.player = None;
                 self.player_attempted = false;
                 self.player_work = None;
+                self.player_preparing_since = None;
             } else {
                 self.stop_player();
             }
@@ -1820,13 +1840,19 @@ impl StreamsUi {
         }
         if let Some(player) = &mut self.player {
             if let Err(error) = player.set_bounds(rect, ctx.pixels_per_point()) {
-                self.player_error = Some(error);
-                self.player = None;
-                self.player_switch_pending = false;
+                self.recover_player(error);
             }
             if !self.player_switch_pending {
                 return false;
             }
+        }
+        if (self.player_work.is_some() || !self.player_attempted)
+            && self.preparation_expired(Instant::now())
+        {
+            self.recover_player(
+                "The stream player took too long to open. Please try again.".into(),
+            );
+            return false;
         }
         if self
             .selected
@@ -1848,6 +1874,7 @@ impl StreamsUi {
             };
             if let Some(result) = result {
                 self.player_work = None;
+                self.player_preparing_since = None;
                 match result {
                     Ok((url, token, preferences)) => {
                         // Preparation may finish after another pull was selected.
@@ -1871,8 +1898,7 @@ impl StreamsUi {
                                         player.set_visible(true);
                                     }
                                     Err(error) => {
-                                        self.player_error = Some(error);
-                                        self.player = None;
+                                        self.recover_player(error);
                                     }
                                 }
                                 self.player_switch_pending = false;
@@ -1893,7 +1919,7 @@ impl StreamsUi {
                                 self.player = Some(player);
                                 self.player_switch_pending = false;
                             }
-                            Err(error) => self.player_error = Some(error),
+                            Err(error) => self.recover_player(error),
                         }
                     }
                     Err(error) => {
@@ -1901,7 +1927,7 @@ impl StreamsUi {
                             self.clear();
                             return true;
                         }
-                        self.player_error = Some(error.message);
+                        self.recover_player(error.message);
                     }
                 }
             }
@@ -2577,6 +2603,50 @@ mod tests {
             ui.selected.as_ref().unwrap().recording_id.as_deref(),
             Some("987")
         );
+    }
+
+    #[test]
+    fn failed_preparation_retries_once_then_leaves_a_dismissible_error() {
+        let mut ui = StreamsUi::default();
+        let (tx, rx) = mpsc::channel();
+        ui.player_work = Some(rx);
+        ui.player_switch_pending = true;
+        let now = Instant::now();
+        assert!(!ui.preparation_expired(now));
+        assert!(ui.preparation_expired(now + Duration::from_secs(30)));
+        ui.recover_player("Failed to start".into());
+        assert!(tx.send(Err("stale completion".to_string().into())).is_err());
+        assert!(!ui.player_switch_pending);
+        assert!(ui.player_retry_at.is_some());
+        assert!(ui.player_preparing_since.is_none());
+        assert!(ui.player_error.is_none());
+        ui.recover_player("Failed again".into());
+        assert!(ui.player_retry_at.is_none());
+        assert_eq!(ui.player_error.as_deref(), Some("Failed again"));
+        ui.stop_player();
+        assert_eq!(ui.player_retries, 0);
+        assert!(ui.player_work.is_none());
+    }
+
+    #[test]
+    fn rapid_recording_switches_discard_every_previous_preparation() {
+        let mut ui = StreamsUi::default();
+        for id in 1..33 {
+            let (tx, rx) = mpsc::channel();
+            ui.player_work = Some(rx);
+            ui.player_switch_pending = true;
+            ui.player_preparing_since = Some(Instant::now());
+            ui.open_recording(&recording(&id.to_string(), "2"));
+            assert!(tx.send(Err("old recording".to_string().into())).is_err());
+            assert!(ui.player_preparing_since.is_none());
+            assert!(!ui.player_switch_pending);
+            assert_eq!(
+                ui.selected.as_ref().unwrap().recording_id.as_deref(),
+                Some(id.to_string().as_str())
+            );
+        }
+        ui.stop_player();
+        assert!(ui.player_rect.is_none());
     }
 
     #[test]

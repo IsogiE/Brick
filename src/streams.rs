@@ -75,57 +75,14 @@ pub struct Snapshot {
 }
 
 pub fn share_youtube_channel(access: &crate::guild::Access, channel: &str) -> Result<(), Error> {
-    if !crate::youtube_account::valid_channel_id(channel) {
+    if channel.trim().is_empty() || channel.len() > 512 || channel.chars().any(char::is_control) {
         return Err("Invalid YouTube channel.".to_string().into());
     }
     request(
         Method::PUT,
         "/v1/streams/youtube-channel",
         access,
-        Some(serde_json::json!({"channelId":channel})),
-    )?;
-    Ok(())
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscoveryLease {
-    pub allowed: bool,
-    pub retry_after_seconds: u64,
-}
-
-pub fn youtube_discovery_lease(
-    access: &crate::guild::Access,
-    channel: &str,
-    live_only: bool,
-    manual: bool,
-) -> Result<DiscoveryLease, Error> {
-    let bytes = request(
-        Method::POST,
-        "/v1/streams/youtube-channel/discovery-lease",
-        access,
-        Some(serde_json::json!({"channelId":channel,"liveOnly":live_only,"manual":manual})),
-    )?;
-    serde_json::from_slice(&bytes)
-        .map_err(|_| "Couldn't schedule YouTube discovery.".to_string().into())
-}
-
-pub fn publish_youtube_broadcasts(
-    access: &crate::guild::Access,
-    channel: &str,
-    ids: &[String],
-) -> Result<(), Error> {
-    if !crate::youtube_account::valid_channel_id(channel) || ids.len() > 50 {
-        return Err("Invalid YouTube discovery.".to_string().into());
-    }
-    for id in ids {
-        validate_recording_id(&Provider::Youtube, id)?;
-    }
-    request(
-        Method::POST,
-        "/v1/streams/youtube-channel/broadcasts",
-        access,
-        Some(serde_json::json!({"channelId":channel,"videoIds":ids})),
+        Some(serde_json::json!({"channel":channel.trim()})),
     )?;
     Ok(())
 }

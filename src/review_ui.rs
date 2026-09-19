@@ -1711,6 +1711,26 @@ impl ReviewUi {
         action
     }
 
+    pub(crate) fn prepare_player_recovery(&mut self, state: &PlaybackState) {
+        if self.active && self.pending_focus.is_none() {
+            let last_sample = state.ready
+                && state
+                    .observation_window()
+                    .is_some_and(|[start, _]| start >= self.range_epoch);
+            // A watchdog fires after freshness expires. Retain the last actual
+            // position for this document, without treating it as a fresh ACK.
+            if last_sample && !state.is_fresh() && self.marker_sync.intent().is_none() {
+                if let Some(playback) = &mut self.playback {
+                    playback.seconds = state.seeking.unwrap_or(state.seconds);
+                    playback.autoplay = state.playback_intent.unwrap_or(state.playing);
+                }
+            } else {
+                self.capture_pov_position(state);
+                self.restore_pov_position();
+            }
+        }
+    }
+
     fn capture_pov_position(&mut self, state: &PlaybackState) {
         // While a POV is loading or cannot show the requested moment, retain
         // the existing intent for the next switch instead of inventing a time.
@@ -4014,6 +4034,34 @@ mod tests {
         assert!(ui.seek_absolute(pull.start_ms - 30_000_000).is_none());
         assert!(ui.seek_absolute(pull.start_ms + 30_000_000).is_none());
         assert_eq!(ui.playback().unwrap().seconds, before);
+    }
+
+    #[test]
+    fn crashed_replay_recovers_last_position_and_newer_pause_or_seek_intent() {
+        for pending in [false, true] {
+            let (review, pull, _) = fixture();
+            let mut ui = ReviewUi::default();
+            ui.review = Some(review);
+            ui.active = true;
+            ui.select(pull);
+            ui.range_epoch = Instant::now() - Duration::from_secs(45);
+            let mut state = PlaybackState::default();
+            state.ready = true;
+            state.seconds = 150.0;
+            state.playing = true;
+            state.mark_polled_at(Instant::now() - Duration::from_secs(35));
+            if pending {
+                state.seeking = Some(160.0);
+                state.playback_intent = Some(false);
+            }
+            ui.prepare_player_recovery(&state);
+            assert_eq!(
+                ui.playback().unwrap().seconds,
+                if pending { 160.0 } else { 150.0 }
+            );
+            assert_eq!(ui.playback().unwrap().autoplay, !pending);
+            assert!(ui.pending_focus.is_none());
+        }
     }
 
     #[test]
