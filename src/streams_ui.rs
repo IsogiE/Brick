@@ -2406,6 +2406,8 @@ mod tests {
         let sessions = host.personal_provider_sessions();
         host.selected = Some(recording("987", "1").as_stream());
         host.notice = Some("Previous guild notice".into());
+        host.review.open_recording();
+        assert!(host.review.active());
         host.queue_provider_login(super::Provider::Youtube);
         let (tx, rx) = std::sync::mpsc::channel();
         host.work = Some(rx);
@@ -2417,6 +2419,8 @@ mod tests {
         assert!(!sessions.ended_for_test());
         assert_eq!(host.provider_user_id.as_deref(), Some("fixture-account"));
         assert!(host.selected.is_none());
+        assert!(!host.review.active());
+        assert!(host.review.comparison_metadata().is_none());
         assert!(host.notice.is_none());
         assert!(host.pending_provider_login.is_empty());
         assert!(host.work.is_none());
@@ -2431,6 +2435,30 @@ mod tests {
             &sessions,
             &host.personal_provider_sessions()
         ));
+    }
+
+    #[test]
+    fn replay_selection_survives_same_account_renewal_and_clears_for_another_account() {
+        let mut host = StreamsUi::default();
+        host.bind_provider_account("first-account");
+        let sessions = host.personal_provider_sessions();
+        host.selected = Some(recording("987", "1").as_stream());
+        host.review.open_recording();
+        let (tx, rx) = std::sync::mpsc::channel();
+        host.work = Some(rx);
+        host.bind_provider_account("first-account");
+        assert!(host.selected.is_some());
+        assert!(host.review.active());
+        assert!(host.work.is_some());
+        host.bind_provider_account("second-account");
+        assert!(host.selected.is_none());
+        assert!(!host.review.active());
+        assert!(host.review.comparison_metadata().is_none());
+        assert!(host.work.is_none());
+        assert!(sessions.ended_for_test());
+        assert!(tx
+            .send(Err("Stale account result".to_string().into()))
+            .is_err());
     }
 
     #[test]
