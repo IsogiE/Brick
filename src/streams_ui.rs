@@ -2373,6 +2373,9 @@ pub(crate) fn player_url_for_playback(
         if !playback.autoplay {
             url.query_pairs_mut().append_pair("paused", "1");
         }
+        if playback.content_timing {
+            url.query_pairs_mut().append_pair("timing", "content");
+        }
     }
     url.into()
 }
@@ -2925,6 +2928,7 @@ mod tests {
             autoplay: false,
             broadcast_id: "321".into(),
             public_url: String::new(),
+            content_timing: false,
         };
         let parsed = url::Url::parse(&player_url_for_playback(url, Some(&playback))).unwrap();
         let query: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
@@ -2937,6 +2941,40 @@ mod tests {
     }
 
     #[test]
+    fn content_player_timing_is_explicit_and_removed_when_playback_changes() {
+        let base = "https://brick.example/v1/streams/player/1/youtube?recording=abcDEF_12-3";
+        let mut playback = crate::review_ui::Playback {
+            seconds: 12.25,
+            autoplay: false,
+            broadcast_id: "abcDEF_12-3".into(),
+            public_url: String::new(),
+            content_timing: true,
+        };
+        let content = player_url_for_playback(base, Some(&playback));
+        let parsed = url::Url::parse(&content).unwrap();
+        assert_eq!(
+            parsed
+                .query_pairs()
+                .filter(|(key, _)| key == "timing")
+                .count(),
+            1
+        );
+        assert_eq!(
+            parsed
+                .query_pairs()
+                .find(|(key, _)| key == "timing")
+                .unwrap()
+                .1,
+            "content"
+        );
+        playback.content_timing = false;
+        let legacy = url::Url::parse(&player_url_for_playback(&content, Some(&playback))).unwrap();
+        assert!(!legacy.query_pairs().any(|(key, _)| key == "timing"));
+        let plain = url::Url::parse(&player_url_for_playback(&content, None)).unwrap();
+        assert_eq!(plain.query(), Some("recording=abcDEF_12-3"));
+    }
+
+    #[test]
     fn player_preparation_uses_the_latest_pull_position_and_pause_intent() {
         let earlier =
             "https://brick.example/v1/streams/player/101/youtube?at=30&broadcast=abcDEF_12-3";
@@ -2945,6 +2983,7 @@ mod tests {
             autoplay: false,
             broadcast_id: "abcDEF_12-3".into(),
             public_url: String::new(),
+            content_timing: false,
         };
         let url = url::Url::parse(&player_url_for_playback(earlier, Some(&latest))).unwrap();
         assert_eq!(

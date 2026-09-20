@@ -306,6 +306,7 @@ mod tests {
             broadcast_id: "broadcast".into(),
             started_at: "2026-09-09T15:57:38Z".into(),
             available_seconds: 7200,
+            timeline_revision: None,
         };
         pull.start_ms = replay.start_ms().unwrap() + 123_375;
         pull.end_ms = pull.start_ms + 300_000;
@@ -320,6 +321,8 @@ mod tests {
                 replay,
                 pulls: vec![pull.clone()],
                 marker_timing: Default::default(),
+                content_capability: None,
+                content_timing: Default::default(),
             },
             pull,
             key,
