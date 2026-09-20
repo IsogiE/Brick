@@ -141,8 +141,11 @@ impl Driver {
         };
         pump_events();
         player.poll_playback(ctx);
-        if player.failure().is_some() || player.diagnostic_player_id() != self.player_id {
-            return Err("Content player failed or was replaced".into());
+        if let Some(message) = player.failure() {
+            return Err(format!("Content player failed: {message}"));
+        }
+        if player.diagnostic_player_id() != self.player_id {
+            return Err("Content player was replaced".into());
         }
         let state = player.playback_state();
         match self.phase {
@@ -294,7 +297,10 @@ impl eframe::App for Driver {
                 self.player = Some(Box::new(player));
                 self.player_creations += 1;
             }
-            Err(_) => self.finish(&ctx, Err("Content native player could not open".into())),
+            Err(error) => self.finish(
+                &ctx,
+                Err(format!("Content native player could not open: {error}")),
+            ),
         }
     }
 }

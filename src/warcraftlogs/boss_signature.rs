@@ -211,6 +211,8 @@ where
     G: Fn() -> Result<(), String>,
 {
     validate_pull(pull)?;
+    #[cfg(test)]
+    let mut lethal_health_rows = 0usize;
     let mut reader = Reader {
         fetch,
         current,
@@ -316,10 +318,18 @@ where
                     match (row.get("hitPoints"), row.get("maxHitPoints")) {
                         (None, None) | (Some(Value::Null), Some(Value::Null)) => continue,
                         (Some(hp), Some(max_hp)) => {
-                            let hp = safe_integer(hp)
+                            let max_hp = health_integer(max_hp, "max_hit_points")
                                 .inspect_err(|_| invalid_page(health, reader.pages, row_index))?;
-                            let max_hp = safe_integer(max_hp)
-                                .inspect_err(|_| invalid_page(health, reader.pages, row_index))?;
+                            let (hp, _lethal) =
+                                projected_health(row, hp, max_hp).inspect_err(|_| {
+                                    invalid_page(health, reader.pages, row_index);
+                                    #[cfg(test)]
+                                    private_invalid_health_facts(row, start, end);
+                                })?;
+                            #[cfg(test)]
+                            {
+                                lethal_health_rows += usize::from(_lethal);
+                            }
                             if max_hp == 0 || hp > max_hp {
                                 invalid_page(health, reader.pages, row_index);
                                 return Err(invalid_error(if max_hp == 0 {
@@ -437,6 +447,10 @@ where
         .map(|(id, name)| NamedId { id, name })
         .collect();
     signature.complete = true;
+    #[cfg(test)]
+    if std::env::var("BRICK_BOSS_SIGNATURE_ALLOW_LIVE").as_deref() == Ok("1") {
+        eprintln!("boss_signature_projection lethal_health_rows={lethal_health_rows}");
+    }
     bounded_json(&signature, limits.bytes, "signature_bytes")?;
     (reader.current)()?;
     Ok(signature)
@@ -577,6 +591,127 @@ fn safe_integer(value: &Value) -> Result<u64, String> {
         .filter(|n| *n <= MAX_SAFE_INTEGER)
         .ok_or_else(|| invalid_error("safe_integer"))
 }
+fn projected_health(row: &Value, hp: &Value, max_hp: u64) -> Result<(u64, bool), String> {
+    // WCL can expose below-zero target HP on a lethal damage event. Positive
+    // overkill establishes lethality; preserve that observation as physical
+    // zero HP, not a missing row. Unexplained negatives remain invalid.
+    // https://www.warcraftlogs.com/help/pins (resources and overkill fields)
+    if let Some(negative) = hp.as_i64().filter(|n| *n < 0) {
+        let magnitude = negative.unsigned_abs();
+        let amount = row["amount"]
+            .as_u64()
+            .filter(|n| *n > 0 && *n <= MAX_SAFE_INTEGER);
+        let overkill = row["overkill"]
+            .as_u64()
+            .filter(|n| *n > 0 && *n <= MAX_SAFE_INTEGER);
+        if magnitude <= MAX_SAFE_INTEGER
+            && max_hp > 0
+            && max_hp <= MAX_SAFE_INTEGER
+            && row["type"] == "damage"
+            && row["resourceActor"].as_u64() == Some(2)
+            && amount.is_some_and(|n| magnitude <= n)
+            && overkill.is_some()
+        {
+            return Ok((0, true));
+        }
+    }
+    health_integer(hp, "hit_points").map(|hp| (hp, false))
+}
+
+fn health_integer(value: &Value, _field: &str) -> Result<u64, String> {
+    safe_integer(value).inspect_err(|_| {
+        #[cfg(test)]
+        if std::env::var("BRICK_BOSS_SIGNATURE_ALLOW_LIVE").as_deref() == Ok("1") {
+            eprintln!(
+                "boss_signature_numeric field={_field} reason={}",
+                numeric_failure_kind(value)
+            );
+        }
+    })
+}
+
+// Explicit private fixture only: these numeric facts distinguish provider health
+// representations without writing the raw event, identities or credentials.
+#[cfg(test)]
+fn invalid_health_facts(row: &Value, start: i64, end: i64) -> Value {
+    let number = |key: &str| row.get(key).filter(|v| v.is_number()).cloned();
+    json!({
+        "kind": "invalid-boss-health-1",
+        "eventKind": match row["type"].as_str() { Some("damage") => "damage", Some("heal") => "heal", _ => "other" },
+        "hitPoints": number("hitPoints"),
+        "maxHitPoints": number("maxHitPoints"),
+        "amount": number("amount"),
+        "overkill": number("overkill"),
+        "absorbed": number("absorbed"),
+        "resourceActor": number("resourceActor"),
+        "fightRelativeMs": row["timestamp"].as_i64().and_then(|t| t.checked_sub(start)),
+        "timeToFightEndMs": row["timestamp"].as_i64().and_then(|t| end.checked_sub(t)),
+        "sourceIsTarget": row.get("sourceID").zip(row.get("targetID")).map(|(a,b)| a==b)
+    })
+}
+
+#[cfg(test)]
+fn private_invalid_health_facts(row: &Value, start: i64, end: i64) {
+    if std::env::var("BRICK_BOSS_SIGNATURE_ALLOW_LIVE").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(directory) =
+        std::env::var_os("BRICK_BOSS_SIGNATURE_ARTIFACT_DIR").map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    if !directory.is_absolute()
+        || !directory.is_dir()
+        || directory.canonicalize().ok().as_ref() != Some(&directory)
+    {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(&directory).map_or(true, |m| m.permissions().mode() & 0o077 != 0) {
+            return;
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(file) = options.open(directory.join("invalid-health-facts.json")) {
+        let _ = serde_json::to_writer(file, &invalid_health_facts(row, start, end));
+    }
+}
+
+#[cfg(test)]
+fn numeric_failure_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+        Value::Number(n) => {
+            if n.as_i64().is_some_and(|n| n < 0) {
+                return "negative_integer";
+            }
+            if n.as_u64().is_some_and(|n| n > MAX_SAFE_INTEGER) {
+                return "integer_js_unsafe";
+            }
+            match n.as_f64() {
+                Some(n) if !n.is_finite() => "nonfinite_number",
+                Some(n) if n < 0.0 => "negative_float",
+                Some(n) if n.fract() != 0.0 => "fractional_float",
+                Some(n) if n > MAX_SAFE_INTEGER as f64 => "float_js_unsafe",
+                Some(_) if n.is_f64() => "integral_float",
+                _ => "integer",
+            }
+        }
+    }
+}
+
 fn positive_id(value: &Value) -> Result<u64, String> {
     value
         .as_u64()
@@ -965,6 +1100,92 @@ mod tests {
     }
 
     #[test]
+    fn lethal_negative_target_health_preserves_all_pages_and_observations() {
+        let mut first = health(1200, 0);
+        first["hitPoints"] = json!(-17789);
+        first["amount"] = json!(17790);
+        first["overkill"] = json!(24401);
+        let mut later = health(10999, 0);
+        later["hitPoints"] = json!(-1298);
+        later["amount"] = json!(1299);
+        later["overkill"] = json!(14455);
+        let rows = vec![
+            metadata(),
+            pages()[1].clone(),
+            page(vec![health(1100, 900), first], json!(1201)),
+            page(
+                vec![health(5000, 200), later, health(11000, 0)],
+                Value::Null,
+            ),
+            metadata(),
+        ];
+        let signature = run(rows, Limits::default()).unwrap();
+        assert!(signature.complete && signature.coverage.health.complete);
+        assert_eq!(signature.coverage.health.pages, 2);
+        assert_eq!(signature.health.len(), 5);
+        assert_eq!(
+            signature
+                .health
+                .iter()
+                .map(|h| h.hit_points)
+                .collect::<Vec<_>>(),
+            vec![900, 0, 200, 0, 0]
+        );
+        assert_eq!(signature.health[1].seconds, 0.2);
+        assert_eq!(signature.health[3].seconds, 9.999);
+        assert_eq!(signature.health[1].actor_id, 10);
+        assert_eq!(signature.health[1].instance, Some(1));
+        // No near-end threshold: the first confirmed lethal instance is early.
+    }
+
+    #[test]
+    fn negative_health_requires_consistent_safe_lethal_target_damage() {
+        let mut base = health(1200, 0);
+        base["hitPoints"] = json!(-12);
+        base["amount"] = json!(20);
+        base["overkill"] = json!(30);
+        assert_eq!(
+            projected_health(&base, &base["hitPoints"], 1000).unwrap(),
+            (0, true)
+        );
+        for (field, value) in [
+            ("overkill", Value::Null),
+            ("overkill", json!(0)),
+            ("overkill", json!(-1)),
+            ("overkill", json!(1.5)),
+            ("overkill", json!(MAX_SAFE_INTEGER + 1)),
+            ("amount", json!(0)),
+            ("amount", json!(11)),
+            ("amount", json!(-20)),
+            ("amount", json!(20.0)),
+            ("amount", json!(MAX_SAFE_INTEGER + 1)),
+            ("type", json!("heal")),
+            ("type", json!("unknown")),
+            ("resourceActor", json!(1)),
+            ("resourceActor", Value::Null),
+            ("hitPoints", json!(-12.0)),
+            ("hitPoints", json!(-(MAX_SAFE_INTEGER as i64) - 1)),
+            ("hitPoints", json!(i64::MIN)),
+        ] {
+            let mut row = base.clone();
+            row[field] = value;
+            assert!(
+                projected_health(&row, &row["hitPoints"], 1000).is_err(),
+                "{field}"
+            );
+        }
+        for max_hp in [0, MAX_SAFE_INTEGER + 1] {
+            assert!(projected_health(&base, &base["hitPoints"], max_hp).is_err());
+        }
+        let mut missing = base.clone();
+        missing.as_object_mut().unwrap().remove("overkill");
+        assert!(projected_health(&missing, &missing["hitPoints"], 1000).is_err());
+        let mut rows = pages();
+        rows[2]["reportData"]["report"]["events"]["data"][0] = missing;
+        assert_eq!(run(rows, Limits::default()).unwrap_err(), INVALID);
+    }
+
+    #[test]
     fn malformed_resources_are_not_silently_dropped() {
         for (field, value) in [
             ("hitPoints", json!(-1)),
@@ -1214,6 +1435,75 @@ mod tests {
     }
 
     #[test]
+    fn private_exact_fight_rejects_ambiguity_but_not_unrelated_difficulty_zero() {
+        let base = pull();
+        let mut report = json!({"code":base.report,"startTime":base.report_start_ms,"fights":[
+            {"id":base.id,"encounterID":base.encounter,"difficulty":base.difficulty,"name":"Boss","startTime":base.start_ms-base.report_start_ms,"endTime":base.end_ms-base.report_start_ms},
+            {"id":73,"encounterID":3429,"difficulty":0,"name":"Other fight","startTime":20000,"endTime":30000}
+        ]});
+        assert!(!super::super::complete_fight_list(&report));
+        let selected = exact_fixture_pull(&report, &base.report, base.id).unwrap();
+        assert_eq!(
+            (selected.id, selected.start_ms, selected.end_ms),
+            (base.id, base.start_ms, base.end_ms)
+        );
+        assert!(exact_fixture_pull(&report, &base.report, 73).is_err());
+        assert!(exact_fixture_pull(&report, &base.report, 999).is_err());
+        let duplicate = report["fights"][0].clone();
+        report["fights"].as_array_mut().unwrap().push(duplicate);
+        assert!(exact_fixture_pull(&report, &base.report, base.id).is_err());
+        report["fights"].as_array_mut().unwrap().pop();
+        report["fights"][0]["endTime"] = Value::Null;
+        assert!(exact_fixture_pull(&report, &base.report, base.id).is_err());
+    }
+
+    #[test]
+    fn private_health_facts_keep_only_bounded_numeric_context() {
+        let row = json!({"type":"damage","timestamp":12345,"sourceID":17,"targetID":2,
+            "hitPoints":-12,"maxHitPoints":1000,"amount":20,"overkill":12,
+            "resourceActor":2,"report":"private-report","name":"private-name", "token":"secret"});
+        let facts = invalid_health_facts(&row, 10000, 13000);
+        assert_eq!(facts["hitPoints"], -12);
+        assert_eq!(facts["fightRelativeMs"], 2345);
+        assert_eq!(facts["timeToFightEndMs"], 655);
+        assert_eq!(facts["sourceIsTarget"], false);
+        for key in [
+            "timestamp",
+            "sourceID",
+            "targetID",
+            "report",
+            "name",
+            "token",
+        ] {
+            assert!(facts.get(key).is_none());
+        }
+        assert!(!facts.to_string().contains("private"));
+        assert_eq!(
+            invalid_health_facts(&json!({"hitPoints":"secret", "type":"private"}), 0, 1)
+                ["hitPoints"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn health_numeric_diagnostics_classify_without_accepting_invalid_values() {
+        for (value, kind) in [
+            (Value::Null, "null"),
+            (json!("12"), "string"),
+            (json!(-1), "negative_integer"),
+            (json!(-1.5), "negative_float"),
+            (json!(1.5), "fractional_float"),
+            (json!(1.0), "integral_float"),
+            (json!(9_007_199_254_740_992u64), "integer_js_unsafe"),
+            (json!(true), "boolean"),
+        ] {
+            assert_eq!(numeric_failure_kind(&value), kind);
+            assert!(health_integer(&value, "hit_points").is_err());
+        }
+        assert_eq!(health_integer(&json!(0), "hit_points").unwrap(), 0);
+    }
+
+    #[test]
     fn account_guild_and_generation_are_bound_to_authorized_config() {
         let access = crate::guild::Access::new(
             "private-secret".into(),
@@ -1249,6 +1539,28 @@ mod tests {
         assert_eq!(client.requests.config, 0);
         assert_eq!(client.requests.graphql, 0);
     }
+}
+
+#[cfg(test)]
+fn exact_fixture_pull(report: &Value, code: &str, pull_id: u64) -> Result<Pull, String> {
+    let rows = report["fights"]
+        .as_array()
+        .filter(|rows| rows.len() <= 5000)
+        .ok_or(INVALID)?;
+    if rows
+        .iter()
+        .filter(|row| row["id"].as_u64() == Some(pull_id))
+        .count()
+        != 1
+    {
+        return Err(INVALID.into());
+    }
+    let pull = super::map_explicit_report_pulls(report, code)?
+        .into_iter()
+        .find(|pull| pull.id == pull_id)
+        .ok_or(INVALID)?;
+    validate_pull(&pull)?;
+    Ok(pull)
 }
 
 #[cfg(test)]
@@ -1328,15 +1640,8 @@ mod private_fixture {
             report["code"].as_str() == Some(fixture.report.as_str()),
             "Report identity changed"
         );
-        assert!(
-            super::super::complete_fight_list(report),
-            "Incomplete fight metadata"
-        );
-        let pull = super::super::map_report_pulls(report, None)
-            .expect("Invalid fight metadata")
-            .into_iter()
-            .find(|p| p.id == fixture.pull_id)
-            .expect("Exact fight absent");
+        let pull = exact_fixture_pull(report, &fixture.report, fixture.pull_id)
+            .expect("Exact fight metadata invalid or ambiguous");
         let signature = client
             .boss_signature(&access, &pull)
             .expect("Complete boss signature export failed");

@@ -1015,10 +1015,10 @@ impl Client {
         self.recording_match_complete = false;
         let data = self.query("query($code:String!){reportData{report(code:$code){code startTime fights{id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime}}}}",json!({"code":code}))?;
         let report = &data["reportData"]["report"];
-        if report["code"].as_str() != Some(code) || !complete_fight_list(report) {
-            return Err("This Warcraft Logs report could not be loaded completely.".into());
-        }
-        let pulls = map_report_pulls(report, None)?;
+        let pulls = map_explicit_report_pulls(report, code)?;
+        // Explicit report selection may include unrelated unsupported/partial
+        // encounters. Valid selected pulls remain usable; this never establishes
+        // a complete no-match or permits automatic recording removal.
         check_cancelled(&self.cancel)?;
         Ok(Review {
             replay,
@@ -1409,6 +1409,16 @@ fn complete_fight_list(report: &Value) -> bool {
     })
 }
 
+fn map_explicit_report_pulls(report: &Value, code: &str) -> Result<Vec<Pull>, String> {
+    if report["code"].as_str() != Some(code) {
+        return Err("This Warcraft Logs report identity changed.".into());
+    }
+    // The ordinary positive-match path already tolerates unrelated malformed
+    // rows. Preserve that behavior for a user-selected report, without weakening
+    // complete_fight_list, which protects negative/no-log cleanup decisions.
+    map_report_pulls(report, None)
+}
+
 pub fn map_pulls(report: &Value, replay: &Replay) -> Result<Vec<Pull>, String> {
     if replay.available_seconds > 7 * 86400 {
         return Err("Invalid replay duration.".into());
@@ -1777,6 +1787,23 @@ mod tests {
             json!([{"encounterID":0,"difficulty":null},{"encounterID":1,"difficulty":10}]);
         assert!(complete_fight_list(&report));
         assert!(!complete_fight_list(&Value::Null));
+    }
+
+    #[test]
+    fn explicit_report_keeps_valid_pulls_without_claiming_complete_unrelated_rows() {
+        let report = json!({"code":"abcdefghABCDEFGH","startTime":1_700_000_000_000i64,"fights":[
+            {"id":1,"encounterID":123,"difficulty":5,"name":"Raid boss","startTime":1000,"endTime":21000},
+            {"id":73,"encounterID":3429,"difficulty":0,"name":"Other encounter","startTime":22000,"endTime":23000},
+            {"id":74,"encounterID":3492,"difficulty":5,"name":"Incomplete unrelated fight","startTime":24000,"endTime":null}
+        ]});
+        assert!(!complete_fight_list(&report));
+        let pulls = map_explicit_report_pulls(&report, "abcdefghABCDEFGH").unwrap();
+        assert!(pulls
+            .iter()
+            .any(|pull| pull.id == 1 && pull.difficulty == 5));
+        assert!(!pulls.iter().any(|pull| pull.id == 74));
+        assert!(map_explicit_report_pulls(&report, "otherreportABCDE").is_err());
+        assert!(!complete_fight_list(&report));
     }
 
     #[test]
