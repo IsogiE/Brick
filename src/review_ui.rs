@@ -313,12 +313,21 @@ impl ReviewUi {
         }
         self.cancel_read();
         self.alignment_priority = Some(selected.clone());
+        self.refresh_preferred_alignment();
+    }
+
+    fn refresh_preferred_alignment(&mut self) {
+        let Some(selected) = self.preferred_alignment_pull() else {
+            return;
+        };
         let known = self.review.as_ref().is_some_and(|review| {
             review
                 .matching_pull(selected)
                 .is_some_and(|pull| review.marker_alignment(pull).is_some())
         });
         if !known {
+            // All navigation paths use the same bounded metadata worker after
+            // event loading. Provider gestures retain their current position.
             self.last_attempt = None;
         }
     }
@@ -434,6 +443,7 @@ impl ReviewUi {
             self.cancel_read();
             self.marker_sync.reset(None);
             self.pull = selected;
+            self.refresh_preferred_alignment();
             self.events.clear();
             self.requested_events.clear();
             self.loaded_events.clear();
@@ -1200,17 +1210,12 @@ impl ReviewUi {
             broadcast_id: review.replay.broadcast_id.clone(),
             public_url: review.replay.public_url(seconds as u64),
         };
-        let needs_alignment = review.marker_alignment(&pull).is_none();
         self.cancel_read();
-        if needs_alignment {
-            // Reuse the existing single worker after event loading. Rapid
-            // navigation coalesces into a lookup for only the latest selection.
-            self.last_attempt = None;
-        }
         self.pending_focus = None;
         self.playback = Some(playback);
         self.aligning = false;
         self.pull = Some(pull);
+        self.refresh_preferred_alignment();
         self.events.clear();
         self.requested_events.clear();
         self.loaded_events.clear();
@@ -1820,17 +1825,10 @@ impl ReviewUi {
         let Some((wanted, at_ms, autoplay)) = self.pending_focus.clone() else {
             return false;
         };
-        let found = self.review.as_ref().and_then(|review| {
-            review
-                .pulls
-                .iter()
-                .find(|pull| {
-                    pull.encounter == wanted.encounter
-                        && pull.difficulty == wanted.difficulty
-                        && (pull.start_ms - wanted.start_ms).abs() < 3000
-                })
-                .cloned()
-        });
+        let found = self
+            .review
+            .as_ref()
+            .and_then(|review| review.matching_pull(&wanted).cloned());
         if let Some(pull) = found {
             self.select(pull);
             if self.seek_absolute_with_playback(at_ms, autoplay).is_some() {
@@ -2280,6 +2278,7 @@ impl ReviewUi {
             self.cancel_read();
             self.marker_sync.reset(None);
             self.pull = selected;
+            self.refresh_preferred_alignment();
             self.events.clear();
             self.requested_events.clear();
             self.loaded_events.clear();
@@ -7123,5 +7122,147 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn provider_seek_to_uncalibrated_early_pull_requests_selected_alignment() {
+        let (mut ui, _, first, _) = provider_review_fixture();
+        let mut pulls: Vec<_> = (0..80)
+            .map(|i| {
+                let mut p = first.clone();
+                p.id += i;
+                p.encounter = 3134;
+                p.start_ms += i as i64 * 300_000;
+                p.end_ms += i as i64 * 300_000;
+                p
+            })
+            .collect();
+        ui.review.as_mut().unwrap().replay.available_seconds = 60_000;
+        let early = pulls[5].clone();
+        let late = pulls[79].clone();
+        ui.review.as_mut().unwrap().pulls = std::mem::take(&mut pulls);
+        ui.select(late.clone());
+        ui.range_epoch = provider_test_now();
+        ui.loaded_events = vec![EventKind::Deaths, EventKind::Defensives];
+        ui.last_attempt = Some(Instant::now());
+        let current = ui.review.as_ref().unwrap().pull_video_start(&late) + 10.0;
+        let target = ui.review.as_ref().unwrap().pull_video_start(&early) + 17.375;
+        ui.observe_provider_playback(&provider_sample(current, false, 0));
+        ui.observe_provider_playback(&provider_sample(target, false, 1));
+        assert_eq!(ui.pull.as_ref().unwrap().id, early.id);
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, target);
+        ui.loaded_events = vec![EventKind::Deaths, EventKind::Defensives];
+        assert!(
+            matches!(ui.next_action(), Some(Action::Refresh)),
+            "Provider navigation left the watched early pull waiting for the normal 60-second poll"
+        );
+    }
+    #[test]
+    fn comparison_provider_selection_requests_primary_alignment() {
+        let (mut ui, _, first, second) = provider_review_fixture();
+        ui.set_comparing(true);
+        ui.last_attempt = Some(Instant::now());
+        let target = ui.review.as_ref().unwrap().pull_video_start(&second) + 17.375;
+        ui.follow_comparison_position(Some(second.clone()), target, false);
+        assert_ne!(ui.pull.as_ref().unwrap().id, first.id);
+        ui.loaded_events = vec![EventKind::Deaths, EventKind::Defensives];
+        assert!(
+            matches!(ui.next_action(), Some(Action::Refresh)),
+            "Comparison provider navigation skips primary alignment refresh"
+        );
+    }
+    #[test]
+    fn pending_pov_restores_match_accepted_at_three_second_boundary() {
+        let (mut review, wanted, _) = fixture();
+        let mut destination = wanted.clone();
+        destination.report = "DifferentReport1".into();
+        destination.id = 1001;
+        destination.start_ms += 3_000;
+        destination.end_ms += 3_000;
+        review.pulls = vec![destination.clone()];
+        assert_eq!(review.matching_pull(&wanted).unwrap().id, destination.id);
+        let mut ui = ReviewUi::default();
+        ui.review = Some(review);
+        ui.pending_focus = Some((wanted.clone(), wanted.start_ms + 100_000, false));
+        assert!(ui.restore_pov_position());
+        assert!(
+            ui.pending_focus.is_none(),
+            "Lookup/comparison accept <=3,000ms, but POV restoration rejects exactly 3,000ms"
+        );
+        assert_eq!(ui.pull.as_ref().unwrap().id, destination.id);
+    }
+    #[test]
+    fn pending_pov_prefers_exact_report_fight_identity() {
+        let (mut review, wanted, _) = fixture();
+        let mut other = wanted.clone();
+        other.report = "AnotherReport123".into();
+        other.id = 2;
+        other.start_ms -= 2_000;
+        other.end_ms -= 6_000;
+        // The production report deduplicator keeps these overlapping reports:
+        // start differs <3s, but end differs >3s (e.g. one logger stopped early).
+        assert!((other.end_ms - wanted.end_ms).abs() >= 3_000);
+        review.pulls = vec![other, wanted.clone()];
+        assert_eq!(review.matching_pull(&wanted).unwrap().id, wanted.id);
+        let mut ui = ReviewUi::default();
+        ui.review = Some(review);
+        ui.pending_focus = Some((wanted.clone(), wanted.start_ms + 100_000, false));
+        ui.restore_pov_position();
+        assert_eq!(
+            ui.pull.as_ref().unwrap().id,
+            wanted.id,
+            "POV restoration must use the exact report selected for alignment lookup"
+        );
+    }
+    #[test]
+    fn late_alignment_preserves_newer_seek_then_applies_on_next_explicit_seek() {
+        let (mut review, pull, _) = fixture();
+        let mut ui = ReviewUi::default();
+        ui.review = Some(review.clone());
+        ui.select(pull.clone());
+        let before = ui.review.as_ref().unwrap().pull_video_start(&pull);
+        let moment = pull.start_ms + 101_375;
+        ui.seek_absolute_with_playback(moment, false).unwrap();
+        review.marker_timing.insert(
+            (pull.report.clone(), pull.id),
+            crate::replay_sync::Alignment {
+                unix_seconds: pull.start_ms / 1000,
+                video_seconds: before + 11.0,
+                uncertainty_seconds: 0.1,
+            },
+        );
+        assert!(!ui.accept_review(review));
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, before + 101.375);
+        assert!(!ui.playback.as_ref().unwrap().autoplay);
+        assert_eq!(ui.review.as_ref().unwrap().pull_video_start(&pull), before);
+        assert!(
+            matches!(ui.seek_absolute_with_playback(moment,false),Some(PlaybackCommand::SeekPaused(seconds)) if (seconds-(before+112.375)).abs()<0.00001)
+        );
+    }
+
+    #[test]
+    fn pending_pov_keeps_intent_when_overlapping_report_matches_are_ambiguous() {
+        let (mut review, wanted, _) = fixture();
+        let mut first = wanted.clone();
+        first.report = "AnotherReport123".into();
+        first.id = 1001;
+        first.start_ms -= 1_000;
+        first.end_ms -= 6_000;
+        let mut second = wanted.clone();
+        second.report = "DifferentReport1".into();
+        second.id = 2001;
+        second.start_ms += 1_000;
+        second.end_ms += 6_000;
+        // The real report deduplicator keeps these differently bounded fights.
+        assert!((first.end_ms - second.end_ms).abs() >= 3_000);
+        review.pulls = vec![first, second];
+        assert!(review.matching_pull(&wanted).is_none());
+        let mut ui = ReviewUi::default();
+        ui.review = Some(review);
+        let moment = wanted.start_ms + 100_000;
+        ui.pending_focus = Some((wanted.clone(), moment, false));
+        assert!(ui.restore_pov_position());
+        assert!(ui.pull.is_none());
+        assert!(ui.playback.is_none());
+        assert_eq!(ui.pending_focus.as_ref().unwrap().1, moment);
     }
 }
