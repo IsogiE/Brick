@@ -158,6 +158,25 @@ pub struct Review {
 }
 
 impl Review {
+    pub(crate) fn matching_pull(&self, selected: &Pull) -> Option<&Pull> {
+        if let Some(exact) = self
+            .pulls
+            .iter()
+            .find(|pull| pull.report == selected.report && pull.id == selected.id)
+        {
+            return Some(exact);
+        }
+        let mut candidates = self.pulls.iter().filter(|pull| {
+            pull.encounter == selected.encounter
+                && pull.difficulty == selected.difficulty
+                && pull.start_ms.abs_diff(selected.start_ms) <= 3_000
+        });
+        let first = candidates.next()?;
+        // Separate reports can contain nearby or overlapping entries. Never
+        // choose a comparison or alignment target by their incidental order.
+        candidates.next().is_none().then_some(first)
+    }
+
     pub fn marker_alignment(&self, pull: &Pull) -> Option<crate::replay_sync::Alignment> {
         self.marker_timing
             .get(&(pull.report.clone(), pull.id))
@@ -851,8 +870,9 @@ impl Client {
         &mut self,
         discord_token: &crate::guild::Access,
         stream: &Stream,
+        preferred_pull: Option<&Pull>,
     ) -> Result<Review, String> {
-        self.load_review(discord_token, stream, true)
+        self.load_review(discord_token, stream, true, preferred_pull)
     }
 
     pub(crate) fn match_recording(
@@ -860,7 +880,7 @@ impl Client {
         discord_token: &crate::guild::Access,
         stream: &Stream,
     ) -> Result<Review, String> {
-        self.load_review(discord_token, stream, false)
+        self.load_review(discord_token, stream, false, None)
     }
 
     fn load_review(
@@ -868,6 +888,7 @@ impl Client {
         discord_token: &crate::guild::Access,
         stream: &Stream,
         playback: bool,
+        preferred_pull: Option<&Pull>,
     ) -> Result<Review, String> {
         self.configure(discord_token, true)?;
         if playback {
@@ -893,7 +914,7 @@ impl Client {
         let mut review = self.review_replay(replay)?;
         if playback {
             while_current(&self.cancel, || {
-                crate::replay_library::lookup(discord_token, &mut review)
+                crate::replay_library::lookup(discord_token, &mut review, preferred_pull)
             })?;
         }
         Ok(review)
@@ -1585,6 +1606,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cross_report_pull_matching_requires_a_unique_fight_but_keeps_exact_identity() {
+        let selected = crate::replay_marker::tests::pull();
+        let mut first = selected.clone();
+        first.report = "DifferentReport1".into();
+        first.id += 100;
+        first.start_ms += 1_250;
+        first.end_ms += 1_250;
+        let mut second = first.clone();
+        second.id += 1;
+        second.start_ms = selected.start_ms - 1_000;
+        second.end_ms = selected.end_ms - 1_000;
+        let mut review = Review {
+            replay: replay(),
+            pulls: vec![first.clone(), second],
+            marker_timing: HashMap::new(),
+        };
+        assert!(review.matching_pull(&selected).is_none());
+        assert_eq!(review.matching_pull(&first).unwrap().id, first.id);
+        review.pulls[1].difficulty += 1;
+        assert_eq!(review.matching_pull(&selected).unwrap().id, first.id);
+        review.pulls[0].start_ms = selected.start_ms + 3_001;
+        assert!(review.matching_pull(&selected).is_none());
+    }
+
+    #[test]
     fn incomplete_boss_rows_cannot_establish_no_match_but_trash_and_dungeons_are_not_raids() {
         let mut report = json!({"fights":[{"id":1,"encounterID":1,"difficulty":5,"name":"Boss","startTime":0,"endTime":1000}]});
         assert!(complete_fight_list(&report));
@@ -1850,7 +1896,7 @@ mod tests {
         let mut client = Client::new().unwrap();
         let started = Instant::now();
         let review = client
-            .review(&token, stream)
+            .review(&token, stream, None)
             .expect("Review metadata unavailable");
         eprintln!(
             "wcl_timing stage=metadata ms={} pulls={}",

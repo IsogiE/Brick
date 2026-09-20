@@ -484,6 +484,9 @@ impl Comparison {
         primary: Option<&mut StreamPlayer>,
         review: &mut ReviewUi,
     ) {
+        if let Some(pull) = review.preferred_alignment_pull() {
+            self.metadata.prioritize_alignment(pull);
+        }
         self.metadata.tick(ctx, Some(&self.selected));
         if self.metadata.comparison_metadata().is_none() {
             if let Some(error) = self.metadata.comparison_notice() {
@@ -1039,17 +1042,7 @@ fn provider_target(
 }
 
 fn matching_pull<'a>(review: &'a Review, selected: &Pull) -> Option<&'a Pull> {
-    review
-        .pulls
-        .iter()
-        .find(|pull| pull.report == selected.report && pull.id == selected.id)
-        .or_else(|| {
-            review.pulls.iter().find(|pull| {
-                pull.encounter == selected.encounter
-                    && pull.difficulty == selected.difficulty
-                    && (pull.start_ms - selected.start_ms).abs() <= 3_000
-            })
-        })
+    review.matching_pull(selected)
 }
 
 fn covers_moment(review: &Review, selected: &Pull, at_ms: i64) -> bool {

@@ -120,7 +120,7 @@ fn save_local(state: &ScopedCache) {
 
 /// One bounded lookup alongside metadata loading. An older/offline server is
 /// optional: it cannot prevent reviewing a VOD or starting a local scan.
-pub fn lookup(token: &crate::guild::Access, review: &mut Review) {
+pub fn lookup(token: &crate::guild::Access, review: &mut Review, preferred: Option<&Pull>) {
     if let Some(state) = local_cache(token) {
         for pull in &review.pulls {
             if let Some(alignment) = state
@@ -134,20 +134,11 @@ pub fn lookup(token: &crate::guild::Access, review: &mut Review) {
             }
         }
     }
-    let keys: Vec<_> = review
-        .pulls
-        .iter()
-        .rev()
-        .filter_map(|pull| key(&review.replay, pull))
-        .take(64)
-        .collect();
-    if keys.is_empty() {
+    if !lookup_shared(review, preferred, |keys| {
+        request(token, "lookup", json!({ "keys": keys }))
+    }) {
         return;
     }
-    let Some(response) = request(token, "lookup", json!({ "keys": keys })) else {
-        return;
-    };
-    apply_response(review, &keys, &response);
     if !review.marker_timing.is_empty() {
         if let Some(mut state) = local_cache(token) {
             for pull in &review.pulls {
@@ -161,6 +152,44 @@ pub fn lookup(token: &crate::guild::Access, review: &mut Review) {
         }
     }
 }
+pub(crate) fn lookup_shared(
+    review: &mut Review,
+    preferred: Option<&Pull>,
+    request: impl FnOnce(&[Value]) -> Option<Value>,
+) -> bool {
+    let keys = lookup_keys(review, preferred);
+    if keys.is_empty() {
+        return false;
+    }
+    let Some(response) = request(&keys) else {
+        return false;
+    };
+    apply_response(review, &keys, &response);
+    true
+}
+
+fn lookup_keys(review: &Review, preferred: Option<&Pull>) -> Vec<Value> {
+    // Opening a recording selects its first pull. Always look up that pull (or
+    // the user's current selection) before warming the newest pulls, otherwise
+    // early fights in a long recording can stay on metadata timing forever.
+    let preferred = match preferred {
+        Some(selected) => review.matching_pull(selected),
+        None => review.pulls.first(),
+    };
+    let mut keys = Vec::with_capacity(64);
+    for pull in preferred.into_iter().chain(review.pulls.iter().rev()) {
+        if let Some(key) = key(&review.replay, pull) {
+            if !keys.contains(&key) {
+                keys.push(key);
+                if keys.len() == 64 {
+                    break;
+                }
+            }
+        }
+    }
+    keys
+}
+
 fn apply_response(review: &mut Review, requested: &[Value], response: &Value) {
     let Some(results) = response["results"]
         .as_array()
@@ -297,6 +326,56 @@ mod tests {
             alignment,
         )
     }
+    #[test]
+    fn long_recording_lookup_prioritizes_the_selected_or_first_pull_and_warms_newest() {
+        let (mut review, first, _, _) = fixture();
+        review.pulls = (0..80)
+            .map(|index| {
+                let mut pull = first.clone();
+                pull.id += index;
+                pull.start_ms += index as i64 * 60_000;
+                pull.end_ms += index as i64 * 60_000;
+                pull
+            })
+            .collect();
+        for preferred in [None, Some(&review.pulls[5]), review.pulls.last()] {
+            let keys = lookup_keys(&review, preferred);
+            let selected = preferred.unwrap_or(&review.pulls[0]);
+            assert_eq!(keys.len(), 64);
+            assert_eq!(keys.first(), key(&review.replay, selected).as_ref());
+            assert!(keys.contains(&key(&review.replay, review.pulls.last().unwrap()).unwrap()));
+            for (index, item) in keys.iter().enumerate() {
+                assert!(
+                    !keys[..index].contains(item),
+                    "Do not duplicate the selected key"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lookup_priority_uses_current_pull_bounds_and_never_adds_a_foreign_pull() {
+        let (mut review, first, _, _) = fixture();
+        let mut next = first.clone();
+        next.id += 1;
+        review.pulls.push(next);
+        let mut outdated = first.clone();
+        outdated.end_ms -= 1000;
+        let keys = lookup_keys(&review, Some(&outdated));
+        assert_eq!(keys.first(), key(&review.replay, &first).as_ref());
+        assert!(!keys.contains(&key(&review.replay, &outdated).unwrap()));
+        let mut foreign = first;
+        foreign.report = "DifferentReport1".into();
+        let keys = lookup_keys(&review, Some(&foreign));
+        assert_eq!(keys.len(), 2);
+        // Both entries are physically nearby: warm newest without treating
+        // either as the selected fight when its other report is ambiguous.
+        assert_eq!(keys.first(), key(&review.replay, &review.pulls[1]).as_ref());
+        assert!(!keys.contains(&key(&review.replay, &foreign).unwrap()));
+        review.pulls.clear();
+        assert!(lookup_keys(&review, Some(&foreign)).is_empty());
+    }
+
     #[test]
     fn shared_results_require_exact_keys_quorum_and_plausible_measurements() {
         let (mut review, pull, key, alignment) = fixture();
