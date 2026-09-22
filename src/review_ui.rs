@@ -1,3 +1,5 @@
+#[path = "content_review.rs"]
+mod content_review;
 use crate::{
     defensives::{self, DefensiveGroup},
     discord_auth,
@@ -40,6 +42,7 @@ pub struct Playback {
     pub autoplay: bool,
     pub broadcast_id: String,
     pub public_url: String,
+    pub content_timing: bool,
 }
 
 #[derive(Clone)]
@@ -49,12 +52,20 @@ enum Action {
     Disconnect,
     Events(Pull, EventKind),
     SaveCooldowns(defensives::Preferences),
+    Report(String),
+    ContentSubmit(
+        Pull,
+        crate::warcraftlogs::Replay,
+        crate::content_alignment::Key,
+    ),
+    ContentPoll(crate::content_alignment::Ticket),
 }
 enum Data {
     Review(Review, defensives::Preferences, (u64, bool)),
     Authentication,
     Events(String, EventKind, Vec<RaidEvent>, defensives::Preferences),
     Cooldowns(defensives::Preferences),
+    Content(crate::content_alignment::Ticket),
 }
 type Outcome = (u64, String, Result<Data, String>, bool);
 
@@ -161,6 +172,7 @@ pub struct ReviewUi {
     client: Arc<Mutex<Option<Client>>>,
     marker_cache: Arc<Mutex<crate::replay_sync::Cache>>,
     marker_sync: crate::replay_sync::Sync,
+    content: content_review::State,
     metadata_only: bool,
     alignment_priority: Option<Pull>,
     recording_housekeeping: bool,
@@ -217,6 +229,7 @@ impl Default for ReviewUi {
             client: Arc::new(Mutex::new(None)),
             marker_cache: Arc::new(Mutex::new(crate::replay_sync::Cache::default())),
             marker_sync: crate::replay_sync::Sync::default(),
+            content: Default::default(),
             metadata_only: false,
             alignment_priority: None,
             recording_housekeeping: false,
@@ -323,7 +336,7 @@ impl ReviewUi {
         let known = self.review.as_ref().is_some_and(|review| {
             review
                 .matching_pull(selected)
-                .is_some_and(|pull| review.marker_alignment(pull).is_some())
+                .is_some_and(|pull| review.has_precise_timing(pull))
         });
         if !known {
             // All navigation paths use the same bounded metadata worker after
@@ -491,9 +504,10 @@ impl ReviewUi {
                 && (pov_key(candidate) == self.key
                     || video_id == Some(review.replay.video_id.as_str()))
         });
-        if let Some(review) = known.filter(|r| r.marker_alignment(pull).is_some()) {
-            let seconds = review.pull_video_start(pull) + (at_ms - pull.start_ms) as f64 / 1000.0;
-            return seconds >= 0.0 && seconds < review.replay.available_seconds as f64;
+        if let Some(review) = known.filter(|r| r.has_precise_timing(pull)) {
+            return review
+                .video_seconds(pull, (at_ms - pull.start_ms) as f64 / 1000.0)
+                .is_some();
         }
         // RFC3339 decoding happens once when metadata arrives, never while
         // painting or filtering the candidate list.
@@ -523,6 +537,7 @@ impl ReviewUi {
 
     pub(crate) fn open_recording(&mut self) {
         self.cancel_read();
+        self.content = Default::default();
         self.review = None;
         self.recording_match_status = None;
         self.replay_coverage = None;
@@ -574,6 +589,16 @@ impl ReviewUi {
         selected: Option<&Pull>,
         desired: Option<(i64, bool)>,
     ) -> Option<PlaybackCommand> {
+        if self
+            .review
+            .as_ref()
+            .is_some_and(|review| review.content_required())
+        {
+            if self.marker_sync.busy() {
+                self.marker_sync.reset(Some(player));
+            }
+            return None;
+        }
         if self.popup_open || self.pending_focus.is_some() || (!self.metadata_only && !self.active)
         {
             return None;
@@ -660,6 +685,7 @@ impl ReviewUi {
         let key = stream.map(pov_key).unwrap_or_default();
         let mut changed = false;
         if self.key != key {
+            self.content = Default::default();
             self.marker_sync.reset(None);
             self.cancel_read();
             self.key = key;
@@ -696,7 +722,7 @@ impl ReviewUi {
                         && key == self.key
                         && !self.cancel.load(Ordering::Relaxed)
                     {
-                        if matches!(action, Some(Action::Refresh)) {
+                        if matches!(action, Some(Action::Refresh | Action::Report(..))) {
                             self.last_attempt = Some(Instant::now());
                         }
                         self.connected = connected;
@@ -716,6 +742,7 @@ impl ReviewUi {
                                 }
                             }
                             Ok(Data::Authentication) => {
+                                self.content = Default::default();
                                 self.marker_sync.reset(None);
                                 if let Ok(mut cache) = self.marker_cache.lock() {
                                     *cache = Default::default();
@@ -731,6 +758,9 @@ impl ReviewUi {
                                 self.selected_event = None;
                                 self.notice = None;
                                 self.last_attempt = None;
+                            }
+                            Ok(Data::Content(ticket)) => {
+                                changed |= self.accept_content(ticket);
                             }
                             Ok(Data::Cooldowns(preferences)) => {
                                 self.accept_cooldown_preferences(preferences);
@@ -753,7 +783,12 @@ impl ReviewUi {
                                 }
                             }
                             Err(error) => {
-                                if let Some(Action::Events(pull, kind)) = action {
+                                if matches!(
+                                    action,
+                                    Some(Action::ContentSubmit(..) | Action::ContentPoll(..))
+                                ) {
+                                    self.content_failed(error);
+                                } else if let Some(Action::Events(pull, kind)) = action {
                                     if self
                                         .pull
                                         .as_ref()
@@ -769,6 +804,7 @@ impl ReviewUi {
                             }
                         }
                         if !connected {
+                            self.content = Default::default();
                             self.review = None;
                             self.recording_match_status = None;
                             self.replay_coverage = None;
@@ -792,7 +828,14 @@ impl ReviewUi {
                     if !self.cancel.load(Ordering::Relaxed) {
                         self.connection_checked = true;
                         let message = "Warcraft Logs stopped loading. Brick will retry shortly.";
-                        if let Some(Action::Events(pull, kind)) = action {
+                        if matches!(
+                            action,
+                            Some(Action::ContentSubmit(..) | Action::ContentPoll(..))
+                        ) {
+                            self.content_failed(
+                                "Video alignment stopped loading. Check again shortly.".into(),
+                            );
+                        } else if let Some(Action::Events(pull, kind)) = action {
                             if self
                                 .pull
                                 .as_ref()
@@ -807,6 +850,10 @@ impl ReviewUi {
                 }
                 Err(mpsc::TryRecvError::Empty) => (),
             }
+        }
+        changed |= self.sync_content_selection();
+        if self.content_waiting() || self.content_poll_pending() {
+            ctx.request_repaint_after(Duration::from_secs(1));
         }
         // Explicit local preference saves take priority over polling/retries and
         // still finish if the user has left this workspace while a read completed.
@@ -882,8 +929,16 @@ impl ReviewUi {
     // Keep the worker until it finishes its bounded current request. Derive the
     // next read from the current UI selection instead of queuing obsolete pulls.
     fn cancel_read(&mut self) {
-        if !matches!(self.work_action, Some(Action::Refresh | Action::Events(..)))
-            || self.cancel.swap(true, Ordering::Relaxed)
+        if !matches!(
+            self.work_action,
+            Some(
+                Action::Refresh
+                    | Action::Report(..)
+                    | Action::Events(..)
+                    | Action::ContentSubmit(..)
+                    | Action::ContentPoll(..)
+            )
+        ) || self.cancel.swap(true, Ordering::Relaxed)
         {
             return;
         }
@@ -917,6 +972,8 @@ impl ReviewUi {
             });
         if let Some((pull, kind)) = self.pull.clone().zip(missing).filter(|_| self.active) {
             Some(Action::Events(pull, kind))
+        } else if let Some(action) = self.next_content_action() {
+            Some(action)
         } else if self
             .last_attempt
             .is_none_or(|at| at.elapsed() >= self.refresh_interval())
@@ -928,18 +985,40 @@ impl ReviewUi {
     }
 
     fn accept_review(&mut self, mut review: Review) -> bool {
-        if let Ok(mut cache) = self.marker_cache.lock() {
+        if let Some(old) = &self.review {
             for pull in &review.pulls {
-                if let Some(alignment) = review.marker_alignment(pull) {
-                    cache.insert(
-                        crate::replay_sync::Key::new(&review.replay, pull),
-                        alignment,
-                    );
-                }
-                if let Some(alignment) = cache.get(&review.replay, pull) {
+                if let Some(alignment) = old.content_alignment(pull).filter(|alignment| {
+                    if self
+                        .recording_match_status
+                        .is_some_and(|status| status.0 != alignment.key.auth_epoch)
+                    {
+                        return false;
+                    }
                     review
-                        .marker_timing
-                        .insert((pull.report.clone(), pull.id), alignment);
+                        .content_capability
+                        .as_ref()
+                        .is_some_and(|cap| alignment.matches(&review.replay, pull, cap))
+                }) {
+                    review
+                        .content_timing
+                        .insert((pull.report.clone(), pull.id), alignment.clone());
+                }
+            }
+        }
+        if !review.content_required() {
+            if let Ok(mut cache) = self.marker_cache.lock() {
+                for pull in &review.pulls {
+                    if let Some(alignment) = review.marker_alignment(pull) {
+                        cache.insert(
+                            crate::replay_sync::Key::new(&review.replay, pull),
+                            alignment,
+                        );
+                    }
+                    if let Some(alignment) = cache.get(&review.replay, pull) {
+                        review
+                            .marker_timing
+                            .insert((pull.report.clone(), pull.id), alignment);
+                    }
                 }
             }
         }
@@ -1045,6 +1124,8 @@ impl ReviewUi {
         let client = self.client.clone();
         let housekeeping = self.recording_housekeeping;
         let preferred_pull = self.preferred_alignment_pull().cloned();
+        let manual_report = self.content.manual_report.clone();
+        self.mark_content_started(&action);
         let stream = stream.cloned();
         let ctx = ctx.clone();
         let key = self.key.clone();
@@ -1055,7 +1136,7 @@ impl ReviewUi {
         let (tx, rx) = mpsc::channel();
         self.work = Some(rx);
         self.work_action = Some(action.clone());
-        if matches!(action, Action::Refresh) {
+        if matches!(action, Action::Refresh | Action::Report(..)) {
             self.last_attempt = Some(Instant::now());
         }
         if let Action::Events(_, kind) = &action {
@@ -1080,6 +1161,7 @@ impl ReviewUi {
                 }
                 let client = lock.as_mut().unwrap();
                 client.set_request_cancellation(cancel.clone());
+                connected = client.connected();
                 let result = match action {
                     Action::Connect => client
                         .login(&token, &ctx, &cancel)
@@ -1089,6 +1171,8 @@ impl ReviewUi {
                         let stream = stream.as_ref().ok_or("Choose a VOD first.")?;
                         let review = if housekeeping {
                             client.match_recording(&token, stream)
+                        } else if let Some(code) = manual_report.as_deref() {
+                            client.review_report(&token, stream, code)
                         } else {
                             client.review(&token, stream, preferred_pull.as_ref())
                         };
@@ -1110,6 +1194,37 @@ impl ReviewUi {
                             )
                         })
                     }
+                    Action::Report(code) => {
+                        let stream = stream.as_ref().ok_or("Choose a VOD first.")?;
+                        client.review_report(&token, stream, &code).map(|review| {
+                            Data::Review(
+                                review,
+                                client.cooldown_preferences(),
+                                client.recording_match_status(),
+                            )
+                        })
+                    }
+                    Action::ContentSubmit(pull, _replay, key) => (|| {
+                        if client.recording_match_status().0 != key.auth_epoch
+                            || client
+                                .content_capability()
+                                .as_ref()
+                                .is_none_or(|cap| cap.algorithm_revision != key.algorithm_revision)
+                        {
+                            return Err("The Warcraft Logs account or alignment service changed. Reload this view.".into());
+                        }
+                        let signature = client.boss_signature(&token, &pull)?;
+                        crate::content_alignment::submit(&token, key, &signature, &cancel)
+                            .map(Data::Content)
+                    })(),
+                    Action::ContentPoll(ticket) => (|| {
+                        if client.recording_match_status().0 != ticket.key.auth_epoch {
+                            return Err(
+                                "The Warcraft Logs account changed. Reload this view.".into()
+                            );
+                        }
+                        crate::content_alignment::poll(&token, &ticket, &cancel).map(Data::Content)
+                    })(),
                     Action::SaveCooldowns(preferences) => client
                         .save_cooldown_preferences(&token, preferences)
                         .map(Data::Cooldowns),
@@ -1203,17 +1318,26 @@ impl ReviewUi {
         let Some(review) = &self.review else {
             return;
         };
-        let seconds = pull_video_start(review, &pull).max(0.0);
-        let playback = Playback {
-            seconds,
-            autoplay: true,
-            broadcast_id: review.replay.broadcast_id.clone(),
-            public_url: review.replay.public_url(seconds as u64),
+        let seconds = if review.content_required() {
+            review
+                .content_alignment(&pull)
+                .map(|alignment| alignment.first_video_seconds())
+        } else {
+            Some(pull_video_start(review, &pull).max(0.0))
         };
+        let playback = seconds
+            .filter(|seconds| seconds.is_finite())
+            .map(|seconds| Playback {
+                seconds,
+                autoplay: true,
+                broadcast_id: review.replay.broadcast_id.clone(),
+                public_url: review.replay.public_url(seconds as u64),
+                content_timing: review.content_required(),
+            });
         self.cancel_read();
         self.pending_focus = None;
-        self.playback = Some(playback);
-        self.aligning = false;
+        self.aligning = playback.is_none();
+        self.playback = playback;
         self.pull = Some(pull);
         self.refresh_preferred_alignment();
         self.events.clear();
@@ -1251,13 +1375,7 @@ impl ReviewUi {
         }
         let review = self.review.as_ref()?;
         let pull = self.pull.as_ref()?;
-        let seconds = review.pull_video_start(pull) + (at_ms - pull.start_ms) as f64 / 1000.0;
-        if !seconds.is_finite()
-            || seconds < 0.0
-            || seconds >= review.replay.available_seconds as f64
-        {
-            return None;
-        }
+        let seconds = review.video_seconds(pull, (at_ms - pull.start_ms) as f64 / 1000.0)?;
         let playback = self.playback.as_mut()?;
         playback.seconds = seconds;
         playback.autoplay = autoplay;
@@ -1333,6 +1451,7 @@ impl ReviewUi {
 
     fn close_review(&mut self) {
         self.cancel_read();
+        self.content = Default::default();
         self.active = false;
         self.open_first_pull = false;
         self.playback = None;
@@ -1630,6 +1749,7 @@ impl ReviewUi {
             });
         });
         self.popup_open = egui::Popup::is_any_open(ui.ctx());
+        self.draw_content_controls(ui, stream);
         ui.add_space(7.0);
         if let Some(notice) = &self.notice {
             ui.add(egui::Label::new(RichText::new(notice).small().color(MUTED)).truncate());
@@ -1674,7 +1794,9 @@ impl ReviewUi {
                 ui.painter().text(
                     video.center(),
                     egui::Align2::CENTER_CENTER,
-                    if self.playback.is_some() {
+                    if self.content_waiting() {
+                        "Video alignment is not ready"
+                    } else if self.playback.is_some() {
                         "Opening replay…"
                     } else if self.pending_focus.is_some() && self.review.is_some() {
                         "This POV does not contain the selected moment"
@@ -1859,6 +1981,9 @@ impl ReviewUi {
         };
         let duration = (pull.end_ms - pull.start_ms) as f64 / 1000.0;
         let video_start = pull_video_start(self.review.as_ref()?, &pull);
+        if !video_start.is_finite() {
+            return None;
+        }
         let confirmed_position = self.confirmed_video_position(state);
         if let Some(seconds) = confirmed_position {
             self.timeline_position = Some(seconds);
@@ -2325,8 +2450,13 @@ impl ReviewUi {
             return None;
         }
         let pull = self.pull.as_ref()?;
-        let end = pull_video_start(self.review.as_ref()?, pull)
-            + (pull.end_ms - pull.start_ms) as f64 / 1000.0;
+        let review = self.review.as_ref()?;
+        let end = if review.content_required() {
+            let alignment = review.content_alignment(pull)?;
+            alignment.result.video_seconds + alignment.result.coverage.fight_end_seconds
+        } else {
+            pull_video_start(review, pull) + (pull.end_ms - pull.start_ms) as f64 / 1000.0
+        };
         if state.seconds < end - 1.0 {
             // Re-arm on a real return into the pull, avoiding jitter at its end.
             self.range_pause_sent = false;
@@ -3535,6 +3665,7 @@ mod tests {
             broadcast_id: "abcDEF_12-3".into(),
             started_at: "2026-09-01T12:00:00Z".into(),
             available_seconds: 25_000,
+            timeline_revision: None,
         };
         let start = replay.start_ms().unwrap() + 19_800_375;
         let pull = Pull {
@@ -3571,6 +3702,8 @@ mod tests {
         (
             Review {
                 marker_timing: HashMap::new(),
+                content_capability: None,
+                content_timing: Default::default(),
                 replay,
                 pulls: vec![pull.clone()],
             },

@@ -1,4 +1,5 @@
 //! Private reports are fetched directly with the viewer's WCL authorization.
+pub(crate) mod boss_signature;
 use crate::{
     credential_store::Store,
     defensives::{self, DefensiveGroup},
@@ -53,6 +54,8 @@ pub struct Config {
     pub user_id: String,
     #[serde(default = "advance_guild_id")]
     pub discord_guild_id: String,
+    #[serde(default)]
+    pub content_alignment: Option<crate::content_alignment::Capability>,
 }
 
 fn advance_guild_id() -> String {
@@ -65,8 +68,15 @@ pub struct Replay {
     pub provider: streams::Provider,
     pub video_id: String,
     pub broadcast_id: String,
+    #[serde(default, deserialize_with = "nullable_start")]
     pub started_at: String,
+    #[serde(default)]
+    pub timeline_revision: Option<String>,
     pub available_seconds: u64,
+}
+
+fn nullable_start<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl Replay {
@@ -155,6 +165,8 @@ pub struct Review {
     pub replay: Replay,
     pub pulls: Vec<Pull>,
     pub marker_timing: HashMap<(String, u64), crate::replay_sync::Alignment>,
+    pub content_capability: Option<crate::content_alignment::Capability>,
+    pub content_timing: HashMap<(String, u64), crate::content_alignment::Alignment>,
 }
 
 impl Review {
@@ -182,11 +194,40 @@ impl Review {
             .get(&(pull.report.clone(), pull.id))
             .copied()
     }
+    pub fn content_alignment(&self, pull: &Pull) -> Option<&crate::content_alignment::Alignment> {
+        let capability = self.content_capability.as_ref()?;
+        self.content_timing
+            .get(&(pull.report.clone(), pull.id))
+            .filter(|alignment| alignment.matches(&self.replay, pull, capability))
+    }
+    pub fn content_required(&self) -> bool {
+        self.content_capability.is_some() || self.replay.start_ms().is_err()
+    }
+    pub fn has_precise_timing(&self, pull: &Pull) -> bool {
+        if self.content_required() {
+            self.content_alignment(pull).is_some()
+        } else {
+            self.marker_alignment(pull).is_some()
+        }
+    }
     pub fn pull_video_start(&self, pull: &Pull) -> f64 {
+        if self.content_required() {
+            return self
+                .content_alignment(pull)
+                .map_or(f64::NAN, |a| a.result.video_seconds);
+        }
         self.marker_alignment(pull).map_or_else(
             || (pull.start_ms - self.replay.start_ms().unwrap_or(pull.start_ms)) as f64 / 1000.0,
             |alignment| alignment.video_seconds,
         )
+    }
+    pub fn video_seconds(&self, pull: &Pull, elapsed: f64) -> Option<f64> {
+        if self.content_required() {
+            return self.content_alignment(pull)?.seek(elapsed);
+        }
+        let seconds = self.pull_video_start(pull) + elapsed;
+        (seconds.is_finite() && seconds >= 0.0 && seconds < self.replay.available_seconds as f64)
+            .then_some(seconds)
     }
 }
 
@@ -220,6 +261,9 @@ fn event_request_timeout(deadline: Instant, now: Instant) -> Result<Duration, St
 }
 const MAX_CACHED_EVENTS: usize = 40_000;
 const MAX_PULL_EVENTS: usize = 20_000;
+// WCL may return more rows than the requested limit (for example 2002 for
+// limit:2000). Keep a separate safety cap and inspect the entire returned page.
+const MAX_EVENT_PAGE_ROWS: usize = 10_000;
 const MAX_COVERAGE_IDS: usize = 512 + defensives::MAX_OVERRIDES;
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -872,7 +916,7 @@ impl Client {
         stream: &Stream,
         preferred_pull: Option<&Pull>,
     ) -> Result<Review, String> {
-        self.load_review(discord_token, stream, true, preferred_pull)
+        self.load_review(discord_token, stream, true, preferred_pull, None)
     }
 
     pub(crate) fn match_recording(
@@ -880,7 +924,7 @@ impl Client {
         discord_token: &crate::guild::Access,
         stream: &Stream,
     ) -> Result<Review, String> {
-        self.load_review(discord_token, stream, false, None)
+        self.load_review(discord_token, stream, false, None, None)
     }
 
     fn load_review(
@@ -889,13 +933,18 @@ impl Client {
         stream: &Stream,
         playback: bool,
         preferred_pull: Option<&Pull>,
+        report_override: Option<&str>,
     ) -> Result<Review, String> {
         self.configure(discord_token, true)?;
         if playback {
             self.load_cooldown_preferences(discord_token)?;
         }
         self.access_token()?;
-        let path = streams::review_path(stream).map_err(|error| error.message)?;
+        let capability = self.recording_content_capability(stream);
+        let mut path = streams::review_path(stream).map_err(|error| error.message)?;
+        if capability.is_some() {
+            path.push_str("?timing=content");
+        }
         let bytes = while_current(&self.cancel, || {
             streams::request(Method::GET, &path, discord_token, None)
         })?
@@ -911,13 +960,73 @@ impl Client {
         {
             return Err("The replay does not match this stream.".into());
         }
-        let mut review = self.review_replay(replay)?;
-        if playback {
+        if capability.is_some()
+            && replay.timeline_revision.as_ref().is_none_or(|revision| {
+                revision.len() != 64
+                    || !revision
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        {
+            return Err("The recording timeline is unavailable. Try again shortly.".into());
+        }
+        let mut review = if let Some(code) = report_override {
+            self.review_explicit_report(replay, code)?
+        } else {
+            self.review_replay(replay)?
+        };
+        review.content_capability = capability;
+        if playback && !review.content_required() {
             while_current(&self.cancel, || {
                 crate::replay_library::lookup(discord_token, &mut review, preferred_pull)
             })?;
         }
         Ok(review)
+    }
+
+    fn recording_content_capability(
+        &self,
+        stream: &Stream,
+    ) -> Option<crate::content_alignment::Capability> {
+        // Growing live replays keep their existing route and clock contract.
+        stream.recording_id.as_ref()?;
+        self.content_capability()
+    }
+
+    pub(crate) fn content_capability(&self) -> Option<crate::content_alignment::Capability> {
+        self.config
+            .as_ref()?
+            .content_alignment
+            .clone()
+            .filter(|capability| capability.valid())
+    }
+    pub(crate) fn review_report(
+        &mut self,
+        access: &crate::guild::Access,
+        stream: &Stream,
+        code: &str,
+    ) -> Result<Review, String> {
+        if !report_code(code) {
+            return Err("Enter a Warcraft Logs report link or code.".into());
+        }
+        self.load_review(access, stream, true, None, Some(code))
+    }
+    fn review_explicit_report(&mut self, replay: Replay, code: &str) -> Result<Review, String> {
+        self.recording_match_complete = false;
+        let data = self.query("query($code:String!){reportData{report(code:$code){code startTime fights{id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime}}}}",json!({"code":code}))?;
+        let report = &data["reportData"]["report"];
+        let pulls = map_explicit_report_pulls(report, code)?;
+        // Explicit report selection may include unrelated unsupported/partial
+        // encounters. Valid selected pulls remain usable; this never establishes
+        // a complete no-match or permits automatic recording removal.
+        check_cancelled(&self.cancel)?;
+        Ok(Review {
+            replay,
+            pulls,
+            marker_timing: HashMap::new(),
+            content_capability: None,
+            content_timing: HashMap::new(),
+        })
     }
 
     pub fn cooldown_preferences(&self) -> defensives::Preferences {
@@ -1138,10 +1247,18 @@ impl Client {
     fn review_replay(&mut self, replay: Replay) -> Result<Review, String> {
         self.recording_match_complete = false;
         check_cancelled(&self.cancel)?;
-        let start = replay.start_ms()?;
         if replay.available_seconds == 0 || replay.available_seconds > 7 * 86400 {
             return Err("The replay isn't available yet.".into());
         }
+        let Ok(start) = replay.start_ms() else {
+            return Ok(Review {
+                replay,
+                pulls: Vec::new(),
+                marker_timing: HashMap::new(),
+                content_capability: None,
+                content_timing: HashMap::new(),
+            });
+        };
         let end = start
             .checked_add(replay.available_seconds as i64 * 1000)
             .ok_or("The recording's date range is unavailable.")?;
@@ -1258,6 +1375,8 @@ impl Client {
         self.recording_match_complete = complete;
         Ok(Review {
             marker_timing: HashMap::new(),
+            content_capability: None,
+            content_timing: HashMap::new(),
             replay,
             pulls: unique,
         })
@@ -1290,19 +1409,32 @@ fn complete_fight_list(report: &Value) -> bool {
     })
 }
 
+fn map_explicit_report_pulls(report: &Value, code: &str) -> Result<Vec<Pull>, String> {
+    if report["code"].as_str() != Some(code) {
+        return Err("This Warcraft Logs report identity changed.".into());
+    }
+    // The ordinary positive-match path already tolerates unrelated malformed
+    // rows. Preserve that behavior for a user-selected report, without weakening
+    // complete_fight_list, which protects negative/no-log cleanup decisions.
+    map_report_pulls(report, None)
+}
+
 pub fn map_pulls(report: &Value, replay: &Replay) -> Result<Vec<Pull>, String> {
     if replay.available_seconds > 7 * 86400 {
         return Err("Invalid replay duration.".into());
     }
+    let start = replay.start_ms()?;
+    let end = start
+        .checked_add(replay.available_seconds as i64 * 1000)
+        .ok_or("Invalid replay duration.")?;
+    map_report_pulls(report, Some((start, end)))
+}
+fn map_report_pulls(report: &Value, range: Option<(i64, i64)>) -> Result<Vec<Pull>, String> {
     let code = report["code"]
         .as_str()
         .filter(|s| report_code(s))
         .ok_or("Invalid Warcraft Logs report.")?;
     let start = number_ms(&report["startTime"]).ok_or("Invalid Warcraft Logs report timing.")?;
-    let replay_start = replay.start_ms()?;
-    let end = replay_start
-        .checked_add(replay.available_seconds as i64 * 1000)
-        .ok_or("Invalid replay duration.")?;
     let fights = report["fights"]
         .as_array()
         .filter(|f| f.len() <= 5000)
@@ -1327,7 +1459,7 @@ pub fn map_pulls(report: &Value, replay: &Replay) -> Result<Vec<Pull>, String> {
             continue;
         };
         // Never clamp an uncovered pull to the start of a different recording.
-        if pull_start < replay_start || pull_start >= end {
+        if range.is_some_and(|(replay_start, end)| pull_start < replay_start || pull_start >= end) {
             continue;
         }
         let Some(name) = fight["name"]
@@ -1355,7 +1487,9 @@ pub fn map_pulls(report: &Value, replay: &Replay) -> Result<Vec<Pull>, String> {
             start_ms: pull_start,
             end_ms: pull_end,
             #[cfg(test)]
-            seconds: ((pull_start - replay_start) / 1000) as u64,
+            seconds: range.map_or(0, |(replay_start, _)| {
+                ((pull_start - replay_start) / 1000) as u64
+            }),
         });
     }
     Ok(pulls)
@@ -1388,7 +1522,7 @@ fn map_event_page(
 ) -> Result<Vec<RaidEvent>, String> {
     let entries = events
         .as_array()
-        .filter(|events| events.len() <= 2000)
+        .filter(|events| events.len() <= MAX_EVENT_PAGE_ROWS)
         .ok_or("Invalid Warcraft Logs events.")?;
     let actors = &master.actors;
     let abilities = &master.abilities;
@@ -1621,6 +1755,8 @@ mod tests {
             replay: replay(),
             pulls: vec![first.clone(), second],
             marker_timing: HashMap::new(),
+            content_capability: None,
+            content_timing: HashMap::new(),
         };
         assert!(review.matching_pull(&selected).is_none());
         assert_eq!(review.matching_pull(&first).unwrap().id, first.id);
@@ -1651,6 +1787,23 @@ mod tests {
             json!([{"encounterID":0,"difficulty":null},{"encounterID":1,"difficulty":10}]);
         assert!(complete_fight_list(&report));
         assert!(!complete_fight_list(&Value::Null));
+    }
+
+    #[test]
+    fn explicit_report_keeps_valid_pulls_without_claiming_complete_unrelated_rows() {
+        let report = json!({"code":"abcdefghABCDEFGH","startTime":1_700_000_000_000i64,"fights":[
+            {"id":1,"encounterID":123,"difficulty":5,"name":"Raid boss","startTime":1000,"endTime":21000},
+            {"id":73,"encounterID":3429,"difficulty":0,"name":"Other encounter","startTime":22000,"endTime":23000},
+            {"id":74,"encounterID":3492,"difficulty":5,"name":"Incomplete unrelated fight","startTime":24000,"endTime":null}
+        ]});
+        assert!(!complete_fight_list(&report));
+        let pulls = map_explicit_report_pulls(&report, "abcdefghABCDEFGH").unwrap();
+        assert!(pulls
+            .iter()
+            .any(|pull| pull.id == 1 && pull.difficulty == 5));
+        assert!(!pulls.iter().any(|pull| pull.id == 74));
+        assert!(map_explicit_report_pulls(&report, "otherreportABCDE").is_err());
+        assert!(!complete_fight_list(&report));
     }
 
     #[test]
@@ -1767,6 +1920,7 @@ mod tests {
             broadcast_id: "abcDEF_12-3".into(),
             started_at: "2026-09-08T12:00:00Z".into(),
             available_seconds: 8 * 3600,
+            timeline_revision: None,
         }
     }
 
@@ -2144,6 +2298,63 @@ mod tests {
     }
 
     #[test]
+    fn event_pages_beyond_requested_size_preserve_valid_rows_and_filter_the_tail() {
+        let video = replay();
+        let report = json!({"code":"abcdefghABCDEFGH","startTime":video.start_ms().unwrap(),"fights":[
+            {"id":1,"encounterID":123,"difficulty":5,"name":"Boss","kill":false,"startTime":0,"endTime":120000}
+        ]});
+        let pull = map_pulls(&report, &video).unwrap().remove(0);
+        let master = json!({"actors":[
+            {"id":1,"type":"Player","name":"Player","subType":"Priest"},
+            {"id":2,"type":"NPC","name":"Enemy","subType":"Boss"}
+        ],"abilities":[]});
+        let mut rows: Vec<Value> = (0..2002)
+            .map(|i| {
+                json!({
+                    "type":"death","timestamp":1000+i,"targetID":1
+                })
+            })
+            .collect();
+        rows.extend([
+            json!({"type":"death","timestamp":4000,"targetID":2}),
+            json!({"type":"death","timestamp":120001,"targetID":1}),
+            json!({"type":"death","timestamp":"bad","targetID":1}),
+            json!({"type":"cast","timestamp":4000,"targetID":1}),
+        ]);
+        let mapped = map_events(
+            &json!(rows),
+            &master,
+            &pull,
+            EventKind::Deaths,
+            &defensives::Preferences::default(),
+        )
+        .unwrap();
+        assert_eq!(mapped.len(), 2002);
+        assert_eq!(mapped.last().unwrap().at_ms, pull.report_start_ms + 3001);
+        assert!(mapped.iter().all(|event| event.actor == "Player"));
+        assert!(EVENT_QUERY.contains("limit:2000"));
+    }
+
+    #[test]
+    fn event_page_response_cap_fails_instead_of_truncating() {
+        let video = replay();
+        let report = json!({"code":"abcdefghABCDEFGH","startTime":video.start_ms().unwrap(),"fights":[
+            {"id":1,"encounterID":123,"difficulty":5,"name":"Boss","kill":false,"startTime":0,"endTime":120000}
+        ]});
+        let pull = map_pulls(&report, &video).unwrap().remove(0);
+        let master = json!({"actors":[{"id":1,"type":"Player","name":"Player","subType":"Priest"}],"abilities":[]});
+        let event = json!({"type":"death","timestamp":1000,"targetID":1});
+        assert!(map_events(
+            &json!(vec![event; MAX_EVENT_PAGE_ROWS + 1]),
+            &master,
+            &pull,
+            EventKind::Deaths,
+            &defensives::Preferences::default()
+        )
+        .is_err());
+    }
+
+    #[test]
     fn cooldown_buff_fallbacks_do_not_duplicate_casts_or_cross_player_identities() {
         let video = replay();
         let report = json!({"code":"abcdefghABCDEFGH","startTime":video.start_ms().unwrap(),"fights":[
@@ -2370,6 +2581,7 @@ mod tests {
             client_id: "fixture".into(),
             guild_id: 1,
             discord_guild_id: crate::guild::ADVANCE.into(),
+            content_alignment: None,
             user_id: "123".into(),
         });
         client.config_stamp = Some(ConfigStamp {
@@ -2558,5 +2770,51 @@ mod tests {
             challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
+    }
+}
+
+#[cfg(test)]
+mod content_metadata_tests {
+    use super::*;
+    #[test]
+    fn upload_metadata_preserves_absent_provider_utc_and_requires_explicit_report_discovery() {
+        let replay:Replay=serde_json::from_value(json!({"provider":"youtube","videoId":"abcDEF_12-3","broadcastId":"abcDEF_12-3","startedAt":null,"availableSeconds":600,"timelineRevision":"b".repeat(64)})).unwrap();
+        assert!(replay.start_ms().is_err());
+        let mut client = Client::new().unwrap();
+        let review = client.review_replay(replay).unwrap();
+        assert!(review.pulls.is_empty());
+        assert!(!client.recording_match_complete);
+        assert_eq!(client.requests.graphql, 0);
+    }
+    #[test]
+    fn advertised_content_jobs_do_not_change_live_replay_contracts() {
+        let mut client = Client::new().unwrap();
+        client.config = Some(serde_json::from_value(json!({
+            "clientId":"public-client","guildId":1,"userId":"123",
+            "contentAlignment":{"schema":"brick-boss-signature-1","algorithmRevision":"a".repeat(64)}
+        })).unwrap());
+        let mut stream: Stream = serde_json::from_value(json!({
+            "userId":"123","name":"User","provider":"youtube","channelId":"channel",
+            "url":"https://youtube.com/watch?v=abcDEF_12-3","status":"live"
+        }))
+        .unwrap();
+        assert!(client.recording_content_capability(&stream).is_none());
+        stream.recording_id = Some("abcDEF_12-3".into());
+        assert!(client.recording_content_capability(&stream).is_some());
+        client.config.as_mut().unwrap().content_alignment = None;
+        assert!(client.recording_content_capability(&stream).is_none());
+    }
+    #[test]
+    fn explicitly_selected_report_keeps_all_fights_without_a_fabricated_recording_date() {
+        let report = json!({"code":"AbCdEfGhIjKlMnOp","startTime":1_700_000_000_000i64,"fights":[
+            {"id":21,"encounterID":100,"difficulty":5,"name":"Boss","startTime":1000,"endTime":10000},
+            {"id":36,"encounterID":100,"difficulty":5,"name":"Boss","startTime":1_000_000,"endTime":1_010_000}]});
+        let pulls = map_report_pulls(&report, None).unwrap();
+        assert_eq!(pulls.len(), 2);
+        assert_eq!(pulls[1].start_ms, 1_700_001_000_000);
+        assert_eq!(pulls[0].report_start_ms, 1_700_000_000_000);
+        let narrowed =
+            map_report_pulls(&report, Some((1_700_000_000_000, 1_700_000_020_000))).unwrap();
+        assert_eq!(narrowed.len(), 1);
     }
 }

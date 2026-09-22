@@ -13,6 +13,7 @@ mod atomic_file;
 mod autostart;
 mod browser;
 mod cache_maintenance;
+mod content_alignment;
 mod credential_store;
 mod defensives;
 mod discord_auth;

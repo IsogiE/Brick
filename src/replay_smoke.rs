@@ -2,7 +2,7 @@
 //! No Warcraft Logs session, Discord account, or persistent app profile is used.
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-mod native {
+pub(crate) mod native {
     use crate::{
         stream_player::{pump_events, PlaybackCommand, PlaybackState, StreamPlayer},
         streams::Provider,
@@ -23,7 +23,7 @@ mod native {
     // A virtual display without a window manager never activates newly mapped
     // windows for us. Activate this test's native window, as opening Brick does;
     // this deliberately sends no input to the embedded player.
-    fn activate_native_window(frame: &eframe::Frame) -> Result<(), String> {
+    pub(crate) fn activate_native_window(frame: &eframe::Frame) -> Result<(), String> {
         let handle = frame
             .window_handle()
             .map_err(|_| "The smoke window has no native handle")?;

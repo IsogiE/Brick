@@ -425,6 +425,7 @@ mod tests {
             broadcast_id: "broadcast".into(),
             started_at: "2026-09-09T10:00:00Z".into(),
             available_seconds: 7200,
+            timeline_revision: None,
         }
     }
     #[test]

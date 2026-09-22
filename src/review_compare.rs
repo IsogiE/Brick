@@ -17,6 +17,7 @@ pub struct RecordingClock {
     reference_ms: i64,
     reference_seconds: f64,
     available_seconds: f64,
+    relative_coverage: Option<(f64, f64)>,
 }
 
 impl RecordingClock {
@@ -38,12 +39,33 @@ impl RecordingClock {
             reference_ms,
             reference_seconds,
             available_seconds,
+            relative_coverage: None,
         })
     }
 
+    pub fn with_relative_coverage(mut self, first: f64, last: f64) -> Result<Self, Error> {
+        if !first.is_finite()
+            || !last.is_finite()
+            || first < 0.0
+            || last <= first
+            || self.reference_seconds + first < 0.0
+            || self.reference_seconds + last > self.available_seconds
+        {
+            return Err(Error::InvalidRange);
+        }
+        self.relative_coverage = Some((first, last));
+        Ok(self)
+    }
+
     pub fn video_seconds(self, at_ms: i64) -> Option<f64> {
-        let seconds =
-            self.reference_seconds + at_ms.checked_sub(self.reference_ms)? as f64 / 1000.0;
+        let elapsed = at_ms.checked_sub(self.reference_ms)? as f64 / 1000.0;
+        if self
+            .relative_coverage
+            .is_some_and(|(first, last)| elapsed < first || elapsed > last)
+        {
+            return None;
+        }
+        let seconds = self.reference_seconds + elapsed;
         (seconds.is_finite() && seconds >= 0.0 && seconds < self.available_seconds)
             .then_some(seconds)
     }
@@ -52,8 +74,15 @@ impl RecordingClock {
         if !seconds.is_finite() || !(0.0..=self.available_seconds).contains(&seconds) {
             return None;
         }
+        let elapsed = seconds - self.reference_seconds;
+        if self
+            .relative_coverage
+            .is_some_and(|(first, last)| elapsed < first || elapsed > last)
+        {
+            return None;
+        }
         self.reference_ms
-            .checked_add(((seconds - self.reference_seconds) * 1000.0).round() as i64)
+            .checked_add((elapsed * 1000.0).round() as i64)
     }
 }
 
@@ -1938,5 +1967,30 @@ mod tests {
         let commands = c.leave();
         assert!(commands.primary.is_none());
         assert!(matches!(commands.secondary, Some(PlaybackCommand::Pause)));
+    }
+}
+
+#[cfg(test)]
+mod content_coverage_tests {
+    use super::*;
+    #[test]
+    fn clipped_content_clock_maps_only_explicitly_covered_fight_time() {
+        let start = 1_700_000_000_000;
+        let clock = RecordingClock::new(start, -12.5, 600.0)
+            .unwrap()
+            .with_relative_coverage(12.5, 180.0)
+            .unwrap();
+        assert_eq!(clock.video_seconds(start), None);
+        assert_eq!(clock.video_seconds(start + 12_500), Some(0.0));
+        assert_eq!(clock.encounter_ms(0.0), Some(start + 12_500));
+        assert_eq!(clock.encounter_ms(167.501), None);
+        assert!(RecordingClock::new(start, -12.5, 600.0)
+            .unwrap()
+            .with_relative_coverage(0.0, 180.0)
+            .is_err());
+        assert!(RecordingClock::new(start, 590.0, 600.0)
+            .unwrap()
+            .with_relative_coverage(0.0, 11.0)
+            .is_err());
     }
 }

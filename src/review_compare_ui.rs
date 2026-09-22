@@ -864,6 +864,7 @@ impl Comparison {
                                 autoplay: false,
                                 broadcast_id: metadata.replay.broadcast_id.clone(),
                                 public_url: metadata.replay.public_url(target.floor() as u64),
+                                content_timing: metadata.content_required(),
                             };
                             let url =
                                 crate::streams_ui::player_url_for_playback(&url, Some(&playback));
@@ -966,7 +967,8 @@ fn apply_commands(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ClockVersion {
-    recording_start_ms: i64,
+    recording_start_ms: Option<i64>,
+    content_version: Option<[u8; 32]>,
     pull_start_ms: i64,
     available_seconds: u64,
     marker_start: Option<u64>,
@@ -975,7 +977,12 @@ struct ClockVersion {
 impl ClockVersion {
     fn new(review: &Review, pull: &Pull) -> Result<Self, String> {
         Ok(Self {
-            recording_start_ms: review.replay.start_ms()?,
+            recording_start_ms: if review.content_required() {
+                None
+            } else {
+                Some(review.replay.start_ms()?)
+            },
+            content_version: review.content_alignment(pull).map(|a| a.version()),
             pull_start_ms: pull.start_ms,
             available_seconds: review.replay.available_seconds,
             marker_start: review
@@ -1004,6 +1011,23 @@ fn replace_changed_clocks(
 }
 
 pub(crate) fn recording_clock(review: &Review, pull: &Pull) -> Result<RecordingClock, String> {
+    if review.content_required() {
+        let alignment = review
+            .content_alignment(pull)
+            .ok_or("Video alignment is not ready for this POV.")?;
+        return RecordingClock::new(
+            pull.start_ms,
+            alignment.result.video_seconds,
+            alignment.timeline.duration_seconds,
+        )
+        .and_then(|clock| {
+            clock.with_relative_coverage(
+                alignment.result.coverage.fight_start_seconds,
+                alignment.result.coverage.fight_end_seconds,
+            )
+        })
+        .map_err(|e| e.to_string());
+    }
     let seconds = review.pull_video_start(pull);
     RecordingClock::new(
         pull.start_ms,
@@ -1100,6 +1124,7 @@ mod tests {
             broadcast_id: "abcDEF_12-3".into(),
             started_at: "2026-09-01T12:00:00Z".into(),
             available_seconds: 5000,
+            timeline_revision: None,
         };
         let start = replay.start_ms().unwrap() + 100_375;
         let pull = Pull {
@@ -1125,6 +1150,8 @@ mod tests {
             }
             Review {
                 marker_timing: std::collections::HashMap::new(),
+                content_capability: None,
+                content_timing: Default::default(),
                 replay,
                 pulls: vec![pull.clone()],
             }

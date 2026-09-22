@@ -1433,6 +1433,8 @@ fn valid_playback_query(url: &Url) -> bool {
     }
     let pairs: Vec<_> = url.query_pairs().collect();
     let recording_count = pairs.iter().filter(|(key, _)| key == "recording").count();
+    let timing_count = pairs.iter().filter(|(key, _)| key == "timing").count();
+    let valid_timing = timing_count <= 1 && (timing_count == 0 || recording_count == 1);
     let valid_recording = recording_count <= 1
         && pairs
             .iter()
@@ -1449,13 +1451,14 @@ fn valid_playback_query(url: &Url) -> bool {
                 }
                 _ => false,
             });
-    if !valid_recording {
+    if !valid_recording || !valid_timing {
         return false;
     }
     if recording_count == 1 && pairs.len() == 1 {
         return true;
     }
-    (pairs.len() == 2 + recording_count || pairs.len() == 3 + recording_count)
+    (pairs.len() == 2 + recording_count + timing_count
+        || pairs.len() == 3 + recording_count + timing_count)
         && pairs.iter().filter(|(k, _)| k == "at").count() == 1
         && pairs.iter().filter(|(k, _)| k == "broadcast").count() == 1
         && pairs.iter().filter(|(k, _)| k == "paused").count() <= 1
@@ -1477,6 +1480,7 @@ fn valid_playback_query(url: &Url) -> bool {
             }
             "paused" => value == "1",
             "recording" => true, // Provider-specific value and uniqueness checked above.
+            "timing" => value == "content",
             "broadcast" => {
                 !value.is_empty()
                     && value.len() <= 30
@@ -2822,6 +2826,35 @@ mod tests {
                 validate_player_address(&format!("{path}?{query}"), base).is_err(),
                 "{query}"
             );
+        }
+    }
+
+    #[test]
+    fn content_timing_navigation_requires_one_recording_and_complete_bounded_seek() {
+        let base = "https://brick.example";
+        for (provider, recording) in [("twitch", "123456789"), ("youtube", "abcDEF_12-3")] {
+            let path = format!("{base}/v2/guilds/123/v1/streams/player/456/{provider}");
+            for query in [
+                format!("recording={recording}&at=15.250&broadcast={recording}&timing=content"),
+                format!(
+                    "timing=content&recording={recording}&at=26.375&broadcast={recording}&paused=1"
+                ),
+            ] {
+                assert!(validate_player_address(&format!("{path}?{query}"), base).is_ok());
+            }
+            for query in [
+                "at=15.25&broadcast=example&timing=content".into(),
+                format!("recording={recording}&timing=content"),
+                format!("recording={recording}&at=15.25&timing=content"),
+                format!("recording={recording}&at=15.25&broadcast=example&timing=unix"),
+                format!("recording={recording}&at=15.25&broadcast=example&timing="),
+                format!("recording={recording}&at=15.25&broadcast=example&timing=content&timing=content"),
+                format!("recording={recording}&at=15.25&broadcast=example&timing=content&recording={recording}"),
+                format!("recording={recording}&at=15.25&broadcast=example&timing=content&token=secret"),
+                format!("recording={recording}&at=604801&broadcast=example&timing=content"),
+            ] {
+                assert!(validate_player_address(&format!("{path}?{query}"), base).is_err(), "{query}");
+            }
         }
     }
 
