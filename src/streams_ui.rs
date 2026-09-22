@@ -532,11 +532,7 @@ impl StreamsUi {
             };
             if active && (self.recordings_open || self.review.active()) && self.recordings_due() {
                 self.start(ctx, Action::Recordings);
-            } else if active
-                && self.recordings.is_some()
-                && !self.review.active()
-                && self.recording_checks.needs_catalog()
-            {
+            } else if !(active && self.review.active()) && self.recording_checks.needs_catalog() {
                 self.start(ctx, Action::RecordingChecks);
             } else if self.last_attempt.is_none_or(|at| at.elapsed() >= refresh) {
                 self.start(ctx, Action::Refresh);
@@ -560,7 +556,7 @@ impl StreamsUi {
         self.recording_checks.tick(
             ctx,
             self.snapshot.as_deref(),
-            active && self.recordings.is_some() && !self.review.active(),
+            !(active && self.review.active()),
             &mut self.recording_peer,
         );
         if self.review.tick(

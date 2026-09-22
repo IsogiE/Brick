@@ -34,8 +34,11 @@ pub(crate) struct Filter {
 
 impl Filter {
     pub(crate) fn catalog_received(&mut self, checks: Vec<RecordingCheck>) {
-        self.queued = checks.into_iter().take(32).collect();
-        self.next_catalog = Some(Instant::now() + REFRESH);
+        // Fetch a fresh ticket batch after four checks. Holding all 32 tickets
+        // across pauses can outlive the server's ten-minute ticket lifetime.
+        let more = checks.len() > BATCH;
+        self.queued = checks.into_iter().take(BATCH).collect();
+        self.next_catalog = Some(Instant::now() + if more { PAUSE } else { REFRESH });
     }
 
     pub(crate) fn catalog_started(&mut self) {
@@ -219,7 +222,8 @@ mod tests {
                 })
                 .collect(),
         );
-        assert_eq!(filter.queued.len(), 32);
+        assert_eq!(filter.queued.len(), BATCH);
+        assert!(filter.next_catalog.unwrap() < Instant::now() + RETRY);
         assert!(!filter.needs_catalog());
         let (sender, receiver) = mpsc::channel();
         filter.submission = Some(receiver);
