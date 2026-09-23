@@ -34,6 +34,7 @@ struct Recording {
 struct Document {
     version: u8,
     session: String,
+    context: String,
     // A pull is stored once even when several streamers cover the same raid.
     reports: BTreeMap<String, BTreeMap<u64, Pull>>,
     recordings: Vec<Recording>,
@@ -55,9 +56,10 @@ impl Cache {
             return None;
         }
         let scope = format!(
-            "wcl-review-v1:{}:{}:{}:{}",
-            config.client_id, config.discord_guild_id, config.guild_id, config.user_id
+            "wcl-review-v1:{}:{}",
+            config.discord_guild_id, config.user_id
         );
+        let context = format!("{}:{}", config.client_id, config.guild_id);
         let saved = crate::protected_cache::load(&scope)
             .ok()?
             .unwrap_or_default();
@@ -69,7 +71,7 @@ impl Cache {
         };
         // Reconnecting WCL may select another WCL account under the same Discord
         // account. Reuse the one filename but never reuse that account's reports.
-        document = for_session(document, &session.cache_id);
+        document = for_session(document, &session.cache_id, &context);
         prune(&mut document, super::now_secs());
         let mut cache = Self {
             scope,
@@ -300,13 +302,14 @@ impl Cache {
     }
 }
 
-fn for_session(document: Document, session: &str) -> Document {
-    if document.session == session {
+fn for_session(document: Document, session: &str, context: &str) -> Document {
+    if document.session == session && document.context == context {
         document
     } else {
         Document {
             version: 1,
             session: session.to_owned(),
+            context: context.to_owned(),
             ..Default::default()
         }
     }
@@ -343,6 +346,7 @@ fn decode(bytes: &[u8]) -> Option<Document> {
     let d: Document = serde_json::from_slice(bytes).ok()?;
     if d.version != 1
         || d.session.len() != 64
+        || d.context.len() > 160
         || d.recordings.len() > MAX_RECORDINGS
         || d.reports.len() > MAX_REPORTS
         || d.reports.values().map(BTreeMap::len).sum::<usize>() > MAX_PULLS
@@ -402,6 +406,7 @@ mod tests {
         let document = Document {
             version: 1,
             session: "a".repeat(64),
+            context: "fixture:123".into(),
             ..Default::default()
         };
         let saved = serde_json::to_vec(&document).unwrap();
@@ -622,9 +627,10 @@ mod tests {
         let same = for_session(
             decode(&serde_json::to_vec(&cache.document).unwrap()).unwrap(),
             &"a".repeat(64),
+            "fixture:123",
         );
         assert_eq!(same.recordings.len(), 1);
-        let other = for_session(same, &"b".repeat(64));
+        let other = for_session(same, &"b".repeat(64), "fixture:123");
         assert!(other.recordings.is_empty());
         assert!(other.reports.is_empty());
     }
@@ -712,6 +718,11 @@ mod tests {
         let empty = Cache::load(&config, &saved, &access).unwrap();
         assert!(empty.document.recordings.is_empty());
         assert_eq!(empty.scope, scope);
+        let mut relinked = config.clone();
+        relinked.guild_id += 1;
+        let changed = Cache::load(&relinked, &saved, &access).unwrap();
+        assert_eq!(changed.scope, scope);
+        assert!(changed.document.recordings.is_empty());
         let mut damaged = std::fs::read(&path).unwrap();
         *damaged.last_mut().unwrap() ^= 1;
         std::fs::write(&path, &damaged).unwrap();
