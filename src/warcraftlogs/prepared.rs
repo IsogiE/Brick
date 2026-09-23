@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 const TTL: Duration = Duration::from_secs(60);
 const LIVE_TTL: Duration = Duration::from_secs(10);
-const RETENTION: Duration = Duration::from_secs(15 * 60);
+const RETENTION: Duration = super::persistent::AGE;
 const CAPACITY: usize = 8;
 const PULL_CAPACITY: usize = 4096;
 
@@ -104,7 +104,11 @@ impl Cache {
     /// Refresh callers still use `get`, so a displayed snapshot cannot suppress
     /// polling for new pulls. Account reset and broadcast identity apply to both.
     pub fn for_display(&self, stream: &Stream) -> Option<Entry> {
-        self.retained(stream).cloned()
+        let mut entry = self.retained(stream)?.clone();
+        entry
+            .clocks
+            .retain(|(key, clock)| clock.alignment(key).is_some());
+        Some(entry)
     }
 
     fn find(&self, stream: &Stream) -> Option<&Entry> {
@@ -115,6 +119,10 @@ impl Cache {
                 } else {
                     TTL
                 }
+                && entry
+                    .clocks
+                    .iter()
+                    .all(|(key, clock)| clock.alignment(key).is_some())
         })
     }
 
@@ -136,11 +144,52 @@ impl Cache {
                 && entry.source_identity == identity
                 && entry.generation == crate::guild::generation()
                 && entry.at.elapsed() < RETENTION
-                && entry
-                    .clocks
-                    .iter()
-                    .all(|(key, clock)| clock.alignment(key).is_some())
         })
+    }
+
+    pub(super) fn restore_snapshot(
+        &mut self,
+        path: String,
+        source_identity: String,
+        review: Review,
+        status: (u64, bool),
+        clocks: Vec<(Key, RecordingClock)>,
+        age: Duration,
+    ) {
+        let generation = crate::guild::request_generation();
+        if self.suspended
+            || age >= RETENTION
+            || review.pulls.len() > PULL_CAPACITY
+            || crate::guild::ensure_current(generation).is_err()
+        {
+            return;
+        }
+        let Some(at) = Instant::now().checked_sub(age) else {
+            return;
+        };
+        self.entries.retain(|entry| {
+            entry.path != path && entry.generation == generation && entry.at.elapsed() < RETENTION
+        });
+        while self.entries.len() >= CAPACITY
+            || self
+                .entries
+                .iter()
+                .map(|e| e.review.pulls.len())
+                .sum::<usize>()
+                + review.pulls.len()
+                > PULL_CAPACITY
+        {
+            self.entries.remove(0);
+        }
+        self.entries.push(Entry {
+            review,
+            status,
+            clocks,
+            at,
+            path,
+            generation,
+            source_identity,
+        });
     }
 
     pub fn record_clock(&mut self, key: &Key, clock: &RecordingClock) {

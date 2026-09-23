@@ -4085,7 +4085,8 @@ mod tests {
             .lock()
             .unwrap()
             .insert(&stream, review, (epoch, true), expired);
-        assert!(!ui.restore_prepared_recording(&stream));
+        assert!(ui.restore_prepared_recording(&stream));
+        assert_eq!(ui.review.as_ref().unwrap().pulls.len(), 2);
     }
 
     #[test]

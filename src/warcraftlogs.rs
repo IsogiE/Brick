@@ -1,5 +1,6 @@
 //! Private reports are fetched directly with the viewer's WCL authorization.
 pub(crate) mod boss_signature;
+mod persistent;
 pub(crate) mod prepared;
 use crate::{
     credential_store::Store,
@@ -63,7 +64,7 @@ fn advance_guild_id() -> String {
     crate::guild::ADVANCE.into()
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Replay {
     pub provider: streams::Provider,
@@ -108,7 +109,7 @@ impl Replay {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pull {
     pub report: String,
     pub id: u64,
@@ -123,6 +124,7 @@ pub struct Pull {
     pub start_ms: i64,
     pub end_ms: i64,
     #[cfg(test)]
+    #[serde(skip)]
     pub seconds: u64,
 }
 
@@ -272,8 +274,10 @@ impl Review {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Session {
+    #[serde(default)]
+    cache_id: String,
     client_id: String,
     user_id: String,
     access_token: String,
@@ -520,6 +524,7 @@ pub struct Client {
     session: Option<Session>,
     recording_auth_epoch: u64,
     pub(crate) prepared: Arc<Mutex<prepared::Cache>>,
+    review_cache: Option<persistent::Cache>,
     recording_match_complete: bool,
     cooldowns: Option<defensives::Preferences>,
     cooldown_catalog: defensives::CatalogCache,
@@ -575,6 +580,7 @@ impl Client {
             session: None,
             recording_auth_epoch: 0,
             prepared: Default::default(),
+            review_cache: None,
             recording_match_complete: false,
             cooldowns: None,
             cooldown_catalog: Default::default(),
@@ -600,6 +606,9 @@ impl Client {
         restore: bool,
     ) -> Result<(), String> {
         check_cancelled(&self.cancel)?;
+        if !restore {
+            self.invalidate_review_cache();
+        }
         if restore
             && self.config.is_some()
             && self.config_stamp.as_ref().is_some_and(|stamp| {
@@ -622,6 +631,7 @@ impl Client {
         })?
         .map_err(|e| {
             if e.access_denied {
+                self.invalidate_review_cache();
                 self.set_session(None);
                 self.reports.clear();
                 self.events.clear();
@@ -664,13 +674,22 @@ impl Client {
             } else {
                 None
             } {
-                let session: Session = serde_json::from_slice(&bytes)
+                let mut session: Session = serde_json::from_slice(&bytes)
                     .map_err(|_| "Please reconnect Warcraft Logs.")?;
                 if session.client_id == config.client_id
                     && session.user_id == config.user_id
                     && credential(&session.access_token)
                     && session.refresh_token.as_ref().is_none_or(|t| credential(t))
                 {
+                    if session.cache_id.is_empty() {
+                        session.cache_id = random();
+                        while_current(&self.cancel, || {
+                            store(&config)?.save(
+                                &serde_json::to_vec(&session)
+                                    .map_err(|_| "Couldn't save Warcraft Logs sign-in.")?,
+                            )
+                        })??;
+                    }
                     self.set_session(Some(session));
                 }
             }
@@ -685,7 +704,25 @@ impl Client {
         Ok(())
     }
 
+    fn invalidate_review_cache(&mut self) {
+        // A confirmed denial or explicit reconnect must not revive old private
+        // reports after restart. Rotate the persisted authorization identity,
+        // retaining token expiry/credentials, and empty the current snapshot.
+        if let Some(session) = &mut self.session {
+            session.cache_id = random();
+            if let Some(config) = &self.config {
+                if let (Ok(store), Ok(bytes)) = (store(config), serde_json::to_vec(session)) {
+                    let _ = store.save(&bytes);
+                }
+            }
+        }
+        if let Some(cache) = &mut self.review_cache {
+            cache.invalidate();
+        }
+    }
+
     fn set_session(&mut self, session: Option<Session>) {
+        self.review_cache = None;
         if let Ok(mut cache) = self.prepared.lock() {
             cache.set_connected(session.is_some());
         }
@@ -824,7 +861,13 @@ impl Client {
 
     fn save_token(&mut self, token: Token, previous_refresh: Option<String>) -> Result<(), String> {
         let config = self.config.as_ref().unwrap();
+        let cache_id = previous_refresh
+            .as_ref()
+            .and_then(|_| self.session.as_ref().map(|s| s.cache_id.clone()))
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(random);
         let session = Session {
+            cache_id,
             client_id: config.client_id.clone(),
             user_id: config.user_id.clone(),
             access_token: token.access_token,
@@ -924,6 +967,7 @@ impl Client {
             return Err("Warcraft Logs is busy. Brick will retry shortly.".into());
         }
         if status == 401 || status == 403 {
+            self.invalidate_review_cache();
             self.set_session(None);
             self.reports.clear();
             self.events.clear();
@@ -994,6 +1038,7 @@ impl Client {
         }
         self.access_token()?;
         if playback && report_override.is_none() {
+            self.restore_review_cache(discord_token, stream);
             let cached = self
                 .prepared
                 .lock()
@@ -1060,6 +1105,15 @@ impl Client {
             check_cancelled(&self.cancel)?;
             // Explicit report choices must not replace the automatic directory.
             if report_override.is_none() {
+                if let Some(cache) = &mut self.review_cache {
+                    cache.update(
+                        discord_token,
+                        stream,
+                        &review,
+                        self.recording_match_complete,
+                        &clocks,
+                    );
+                }
                 if let Ok(mut cache) = self.prepared.lock() {
                     cache.insert(
                         stream,
@@ -1071,6 +1125,32 @@ impl Client {
             }
         }
         Ok(review)
+    }
+
+    fn restore_review_cache(&mut self, access: &crate::guild::Access, stream: &Stream) {
+        let capability = self.content_capability();
+        if self.review_cache.is_none() {
+            if let Some((config, session)) = self.config.as_ref().zip(self.session.as_ref()) {
+                self.review_cache = persistent::Cache::load(config, session, access);
+                if let Some(disk) = &self.review_cache {
+                    if let Ok(mut cache) = self.prepared.lock() {
+                        disk.hydrate(&mut cache, capability.as_ref(), self.recording_auth_epoch);
+                    }
+                }
+            }
+        }
+        if let Some(disk) = &self.review_cache {
+            if let Ok(mut cache) = self.prepared.lock() {
+                if cache.for_display(stream).is_none() {
+                    disk.restore_stream(
+                        stream,
+                        &mut cache,
+                        capability.as_ref(),
+                        self.recording_auth_epoch,
+                    );
+                }
+            }
+        }
     }
 
     fn recording_content_capability(
@@ -2698,6 +2778,7 @@ mod tests {
             at: Instant::now(),
         });
         client.session = Some(Session {
+            cache_id: random(),
             client_id: "fixture".into(),
             user_id: "123".into(),
             access_token: "fixture-never-sent".into(),
