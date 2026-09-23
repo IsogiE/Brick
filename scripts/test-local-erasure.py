@@ -111,6 +111,10 @@ def main():
     binary = test_binary(args)
     with tempfile.TemporaryDirectory(prefix='brick-erasure-', dir=args.scratch_parent) as temporary:
         root = Path(temporary)
+        if args.privileged_setup:
+            # bwrap resolves sources after dropping to the fixture identity.
+            # Keep the directory private and transfer only this owned fixture.
+            os.chown(root, fixture_uid, fixture_gid)
         (root / 'bootstrap.py').write_text(BOOTSTRAP)
         (root / 'passwd').write_text(
             f'fixture:x:{fixture_uid}:{fixture_gid}:Fixture:/fixture/home:/bin/sh\n')
