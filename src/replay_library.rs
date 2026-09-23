@@ -306,6 +306,7 @@ mod tests {
             broadcast_id: "broadcast".into(),
             started_at: "2026-09-09T15:57:38Z".into(),
             available_seconds: 7200,
+            growing: false,
             timeline_revision: None,
         };
         pull.start_ms = replay.start_ms().unwrap() + 123_375;

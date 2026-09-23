@@ -26,8 +26,8 @@ impl Preparation {
             // cancel it only to queue a duplicate behind the shared WCL client.
             if let Some(stream) = self.current.as_ref().filter(|stream| {
                 selected.is_some_and(|selected| {
-                    crate::streams::review_path(selected).ok()
-                        == crate::streams::review_path(stream).ok()
+                    crate::warcraftlogs::prepared::source_identity(selected)
+                        == crate::warcraftlogs::prepared::source_identity(stream)
                 })
             }) {
                 if peer.metadata_busy() {
@@ -41,8 +41,8 @@ impl Preparation {
         }
         if let Some(stream) = &self.current {
             if candidates.iter().any(|candidate| {
-                crate::streams::review_path(candidate).ok()
-                    == crate::streams::review_path(stream).ok()
+                crate::warcraftlogs::prepared::source_identity(candidate)
+                    == crate::warcraftlogs::prepared::source_identity(stream)
             }) {
                 peer.tick(ctx, Some(stream));
                 if peer.metadata_busy() {
@@ -55,9 +55,10 @@ impl Preparation {
                 }
             }
             if let Some(stream) = &self.current {
-                if let Ok(path) = crate::streams::review_path(stream) {
+                if let Some(path) = crate::warcraftlogs::prepared::source_identity(stream) {
                     let visible = candidates.iter().take(visible_count).any(|candidate| {
-                        crate::streams::review_path(candidate).ok().as_ref() == Some(&path)
+                        crate::warcraftlogs::prepared::source_identity(candidate).as_ref()
+                            == Some(&path)
                     });
                     if let Some(attempt) = self
                         .attempted
@@ -82,7 +83,7 @@ impl Preparation {
                 .iter()
                 .take(8)
                 .find(|stream| {
-                    let Ok(path) = crate::streams::review_path(stream) else {
+                    let Some(path) = crate::warcraftlogs::prepared::source_identity(stream) else {
                         return false;
                     };
                     let needed = if aligning {
@@ -103,7 +104,7 @@ impl Preparation {
                 self.attempted.remove(0);
             }
             self.attempted.push((
-                crate::streams::review_path(stream).unwrap(),
+                crate::warcraftlogs::prepared::source_identity(stream).unwrap(),
                 aligning,
                 now,
                 Duration::from_secs(5 * 60),

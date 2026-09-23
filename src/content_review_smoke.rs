@@ -452,16 +452,24 @@ fn content_job_to_native_player_uses_relative_timing_without_marker() {
         provider: Provider::Youtube,
         channel_id: fixture.replay.video_id.clone(),
         url: fixture.replay.public_url(0),
-        status: crate::streams::Status::Offline,
+        status: if fixture.replay.growing {
+            crate::streams::Status::Live
+        } else {
+            crate::streams::Status::Offline
+        },
         broadcast_state: None,
-        recording_id: Some(fixture.replay.video_id.clone()),
-        replay_start_ms: None,
+        recording_id: (!fixture.replay.growing).then(|| fixture.replay.video_id.clone()),
+        replay_start_ms: fixture.replay.growing.then_some(pull.report_start_ms),
         replay_end_ms: None,
     };
-    let base_url = format!(
-        "{ENDPOINT}/v1/streams/player/101/youtube?recording={}",
-        fixture.replay.video_id
-    );
+    let base_url = if fixture.replay.growing {
+        format!("{ENDPOINT}/v1/streams/player/101/youtube")
+    } else {
+        format!(
+            "{ENDPOINT}/v1/streams/player/101/youtube?recording={}",
+            fixture.replay.video_id
+        )
+    };
     let mut viewer = ReviewUi::default();
     viewer.active = true;
     viewer.connected = true;

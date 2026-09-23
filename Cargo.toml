@@ -1,6 +1,6 @@
 [package]
 name = "brick"
-version = "0.6.4"
+version = "0.6.5"
 description = "Advance"
 authors = ["Advance Raid Tools"]
 license = "MIT"

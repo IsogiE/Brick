@@ -1244,6 +1244,11 @@ impl ReviewUi {
         }
         let housekeeping = self.recording_housekeeping;
         let preferred_pull = self.preferred_alignment_pull().cloned();
+        let recovery_pulls = self
+            .review
+            .as_ref()
+            .map(|review| review.pulls.clone())
+            .unwrap_or_default();
         let manual_report = self.content.manual_report.clone();
         let marker_fallback = self
             .review
@@ -1376,6 +1381,21 @@ impl ReviewUi {
                             || lookup.pending
                         {
                             return Ok(Data::RecordingClock(key, lookup));
+                        }
+                        if let Some(anchor) = lookup.recovery_pull_id.and_then(|id| {
+                            recovery_pulls.iter().find(|p| {
+                                p.id == id
+                                    && p.report == key.report
+                                    && p.report_start_ms == key.report_start_ms
+                            })
+                        }) {
+                            let signature = client.boss_signature(&token, anchor)?;
+                            let recovered = crate::content_alignment::recover_recording_clock(
+                                &token, &key, &signature, &cancel,
+                            )?;
+                            if recovered.clock.is_some() || recovered.pending {
+                                return Ok(Data::RecordingClock(key, recovered));
+                            }
                         }
                         let signature = client.boss_signature(&token, &pull)?;
                         let ticket =
@@ -3868,6 +3888,7 @@ mod tests {
             broadcast_id: "abcDEF_12-3".into(),
             started_at: "2026-09-01T12:00:00Z".into(),
             available_seconds: 25_000,
+            growing: false,
             timeline_revision: None,
         };
         let start = replay.start_ms().unwrap() + 19_800_375;

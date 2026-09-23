@@ -578,6 +578,17 @@ impl StreamsUi {
                     .collect()
             })
             .unwrap_or_default();
+        if !self.recordings_open {
+            if let Some(snapshot) = &self.snapshot {
+                preparation_candidates.extend(
+                    snapshot
+                        .streams
+                        .iter()
+                        .filter(|stream| stream.status == Status::Live)
+                        .cloned(),
+                );
+            }
+        }
         let visible_count = preparation_candidates.len();
         if !active || self.recordings_open || self.selected.is_none() {
             for stream in &self.preparation_catalog {
