@@ -89,7 +89,12 @@ def main():
     if args.privileged_setup:
         if os.geteuid() != 0 or not args.isolated_network:
             raise RuntimeError('Privileged setup requires root in an isolated network namespace')
-        fixture_uid = fixture_gid = 1000
+        # Hosted runners need not use UID 1000. Bind sources under the invoking
+        # user's private work directory must remain traversable during setup.
+        fixture_uid = int(os.environ['SUDO_UID'])
+        fixture_gid = int(os.environ['SUDO_GID'])
+        if fixture_uid <= 0 or fixture_gid <= 0:
+            raise RuntimeError('Privileged setup requires an unprivileged invoking user')
     else:
         if os.geteuid() == 0:
             raise RuntimeError('Root invocation requires explicit privileged fixture setup')
