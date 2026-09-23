@@ -160,6 +160,20 @@ impl ReviewUi {
         });
         if let Some(key) = key {
             self.expire_recording_clock(&key);
+            // New pulls can arrive after this recording's clock was cached.
+            // Resolve them before select() chooses a playback position.
+            let alignment = self.content.clocks.iter().find_map(|(saved, clock, _)| {
+                saved
+                    .same_recording_report(&key)
+                    .then(|| clock.alignment(&key))
+                    .flatten()
+            });
+            if let Some((review, alignment)) = self.review.as_mut().zip(alignment) {
+                review
+                    .content_timing
+                    .entry((pull.report.clone(), pull.id))
+                    .or_insert(alignment);
+            }
         }
     }
 
@@ -593,6 +607,15 @@ mod tests {
         assert_eq!(ui.playback.as_ref().unwrap().seconds, 75.25);
         assert!(ui.next_content_action().is_none());
         assert!(!ui.content_waiting());
+        let mut discovered = ui.pull.clone().unwrap();
+        discovered.id += 1;
+        discovered.start_ms += 60_000;
+        discovered.end_ms += 60_000;
+        ui.review.as_mut().unwrap().pulls.push(discovered.clone());
+        ui.select(discovered);
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, 135.25);
+        ui.sync_content_selection();
+        assert!(ui.next_content_action().is_none());
     }
     #[test]
     fn existing_shared_job_is_polled_while_estimated_playback_remains_usable() {
