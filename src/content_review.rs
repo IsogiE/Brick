@@ -1,6 +1,6 @@
 //! Viewer state for one scoped, asynchronous content alignment request.
 use super::*;
-use crate::content_alignment::{Key, Status, Ticket};
+use crate::content_alignment::{Key, RecordingClock, RecordingLookup, Status, Ticket};
 
 // Keep following long-running jobs on the small production worker.
 const MAX_CONTENT_POLLS: u16 = 1440;
@@ -12,6 +12,8 @@ pub(super) struct State {
     key: Option<Key>,
     ticket: Option<Ticket>,
     saved: Vec<Ticket>,
+    clocks: Vec<(Key, RecordingClock, Instant)>,
+    shared_pending: bool,
     started: Option<Instant>,
     next_poll: Option<Instant>,
     polls: u16,
@@ -64,7 +66,7 @@ impl ReviewUi {
             ))
         });
         if self.content.key == desired {
-            return self.restore_content_ticket();
+            return self.restore_recording_clock() || self.restore_content_ticket();
         }
         if matches!(
             self.work_action,
@@ -81,6 +83,10 @@ impl ReviewUi {
             }
             self.content.saved.push(ticket);
         }
+        if let Some(key) = &desired {
+            self.expire_recording_clock(key);
+        }
+        self.content.shared_pending = false;
         self.content.key = desired.clone();
         self.content.ticket = desired
             .as_ref()
@@ -90,7 +96,142 @@ impl ReviewUi {
         self.content.polls = 0;
         self.content.failure = None;
         self.content.paused = false;
-        self.restore_content_ticket()
+        self.restore_recording_clock() || self.restore_content_ticket()
+    }
+
+    fn expire_recording_clock(&mut self, key: &Key) {
+        let stale = self.content.clocks.iter().any(|(saved, _, checked)| {
+            saved.same_recording_report(key) && checked.elapsed() >= Duration::from_secs(60)
+        });
+        if stale {
+            self.content
+                .clocks
+                .retain(|(saved, _, _)| !saved.same_recording_report(key));
+            if let Some(review) = self.review.as_mut() {
+                review.content_timing.retain(|_, alignment| {
+                    !alignment.key.same_recording_report(key)
+                        || alignment.signature_revision != alignment.result.evidence_hash
+                });
+            }
+        }
+    }
+
+    pub(super) fn check_recording_clock_selection(&mut self, pull: &Pull) {
+        let key = self.review.as_ref().and_then(|review| {
+            review.content_capability.as_ref().map(|cap| {
+                Key::new(
+                    &review.replay,
+                    pull,
+                    cap,
+                    self.recording_match_status.map_or(0, |s| s.0),
+                )
+            })
+        });
+        if let Some(key) = key {
+            self.expire_recording_clock(&key);
+        }
+    }
+
+    fn restore_recording_clock(&mut self) -> bool {
+        let Some(key) = self.content.key.clone() else {
+            return false;
+        };
+        if self.review.as_ref().is_some_and(|review| {
+            review.pulls.iter().any(|pull| {
+                pull.report == key.report
+                    && pull.id == key.pull_id
+                    && review.content_alignment(pull).is_some()
+            })
+        }) {
+            return false;
+        }
+        let clock = self
+            .content
+            .clocks
+            .iter()
+            .find(|(saved, clock, _)| {
+                saved.same_recording_report(&key) && clock.alignment(&key).is_some()
+            })
+            .map(|(_, clock, _)| clock.clone());
+        let Some(clock) = clock else {
+            return false;
+        };
+        self.apply_recording_clock(&key, &clock)
+    }
+
+    fn apply_recording_clock(&mut self, key: &Key, clock: &RecordingClock) -> bool {
+        if self.content.key.as_ref() != Some(key)
+            || self
+                .recording_match_status
+                .is_some_and(|status| status.0 != key.auth_epoch)
+            || self
+                .recording_auth_epoch()
+                .is_some_and(|epoch| epoch != key.auth_epoch)
+            || crate::guild::ensure_current(key.guild_generation).is_err()
+        {
+            return false;
+        }
+        let Some(review) = self.review.as_mut() else {
+            return false;
+        };
+        let Some(cap) = review.content_capability.as_ref() else {
+            return false;
+        };
+        for pull in &review.pulls {
+            let wanted = Key::new(&review.replay, pull, cap, key.auth_epoch);
+            if wanted.same_recording_report(key) && review.content_alignment(pull).is_none() {
+                if let Some(alignment) = clock.alignment(&wanted) {
+                    review
+                        .content_timing
+                        .insert((pull.report.clone(), pull.id), alignment);
+                }
+            }
+        }
+        if self.active && self.playback.is_none() {
+            if let Some(pull) = self
+                .pull
+                .clone()
+                .filter(|pull| review.content_alignment(pull).is_some())
+            {
+                self.select(pull);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(super) fn accept_recording_clock(&mut self, key: Key, lookup: RecordingLookup) -> bool {
+        if self.content.key.as_ref() != Some(&key)
+            || self
+                .recording_match_status
+                .is_some_and(|status| status.0 != key.auth_epoch)
+            || self
+                .recording_auth_epoch()
+                .is_some_and(|epoch| epoch != key.auth_epoch)
+            || crate::guild::ensure_current(key.guild_generation).is_err()
+        {
+            return false;
+        }
+        self.content.failure = None;
+        self.content.shared_pending = lookup.pending;
+        self.content.next_poll = Some(Instant::now() + Duration::from_secs(5));
+        self.content.paused = self.content.polls >= MAX_CONTENT_POLLS;
+        let Some(clock) = lookup.clock else {
+            return false;
+        };
+        self.content.shared_pending = false;
+        self.content.clocks.retain(|(saved, _, _)| {
+            !saved.same_recording_report(&key)
+                && saved.guild_generation == key.guild_generation
+                && saved.auth_epoch == key.auth_epoch
+        });
+        if self.content.clocks.len() >= 32 {
+            self.content.clocks.remove(0);
+        }
+        self.content
+            .clocks
+            .push((key.clone(), clock.clone(), Instant::now()));
+        self.apply_recording_clock(&key, &clock)
     }
 
     fn restore_content_ticket(&mut self) -> bool {
@@ -125,6 +266,9 @@ impl ReviewUi {
             .iter()
             .find(|p| p.report == key.report && p.id == key.pull_id)?;
         if review.content_alignment(pull).is_some() {
+            return None;
+        }
+        if self.content.next_poll.is_some_and(|at| Instant::now() < at) {
             return None;
         }
         if let Some(ticket) = &self.content.ticket {
@@ -262,7 +406,8 @@ impl ReviewUi {
     pub(super) fn content_poll_pending(&self) -> bool {
         !self.content.paused
             && self.content.failure.is_none()
-            && self.content.ticket.as_ref().is_some_and(|t| t.pending())
+            && (self.content.shared_pending
+                || self.content.ticket.as_ref().is_some_and(|t| t.pending()))
     }
 
     pub(super) fn content_waiting(&self) -> bool {
@@ -283,31 +428,38 @@ impl ReviewUi {
             .as_ref()
             .is_some_and(|review| review.content_required());
         let mut load = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Warcraft Logs report").small().color(MUTED));
-            let edit = ui.add(
-                egui::TextEdit::singleline(&mut self.content.report_input)
-                    .hint_text("Report link or code")
-                    .char_limit(512)
-                    .desired_width(250.0),
-            );
-            if ui
-                .add_enabled(self.work.is_none(), egui::Button::new("Load report"))
-                .clicked()
-                || (edit.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    && self.work.is_none())
-            {
-                match report_code_input(&self.content.report_input) {
-                    Some(code) => load = Some(code),
-                    None => {
-                        self.content.failure = Some(
-                            "Enter a Warcraft Logs report link or its 16-character code.".into(),
-                        )
+        if self
+            .review
+            .as_ref()
+            .is_none_or(|review| review.pulls.is_empty())
+        {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Warcraft Logs report").small().color(MUTED));
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.content.report_input)
+                        .hint_text("Report link or code")
+                        .char_limit(512)
+                        .desired_width(250.0),
+                );
+                if ui
+                    .add_enabled(self.work.is_none(), egui::Button::new("Load report"))
+                    .clicked()
+                    || (edit.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        && self.work.is_none())
+                {
+                    match report_code_input(&self.content.report_input) {
+                        Some(code) => load = Some(code),
+                        None => {
+                            self.content.failure = Some(
+                                "Enter a Warcraft Logs report link or its 16-character code."
+                                    .into(),
+                            )
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
         if let Some(code) = load {
             self.cancel_read();
             self.content.manual_report = Some(code.clone());
@@ -351,11 +503,15 @@ impl ReviewUi {
                 } else {
                     ("Checking backup video timing…", false)
                 }
+            } else if self.review.as_ref().zip(self.pull.as_ref()).is_some_and(|(review,pull)| review.content_alignment(pull).is_some()) {
+                ("Video aligned", false)
             } else if self.content.paused {
                 (
                     "This video is still processing. Check again when ready.",
                     true,
                 )
+            } else if self.content.shared_pending {
+                ("This recording is being aligned. You can browse other recordings while it finishes.", false)
             } else if let Some(ticket) = &self.content.ticket {
                 match ticket.job.status {
                     Status::Complete if ticket.alignment().is_some() => ("Video aligned", false),
@@ -367,7 +523,8 @@ impl ReviewUi {
                         "This video could not be aligned. Choose another recording or report.",
                         false,
                     ),
-                    _ => ("Aligning video…", false),
+                    Status::Pending => ("Waiting for video alignment…", false),
+                    _ => ("Aligning this recording for everyone. You can browse other recordings while it finishes.", false),
                 }
             } else if self.content.key.is_some() {
                 ("Preparing video alignment…", false)
@@ -434,6 +591,96 @@ mod tests {
         ui.select(pull);
         ui.sync_content_selection();
         (ui, ticket)
+    }
+    #[test]
+    fn shared_recording_clock_unlocks_all_linked_pulls_without_another_submission() {
+        let (mut ui, ticket) = viewer();
+        let mut later = ui.pull.clone().unwrap();
+        later.id += 1;
+        later.start_ms += 60_000;
+        later.end_ms += 60_000;
+        ui.review.as_mut().unwrap().pulls.push(later.clone());
+        assert!(ui.accept_recording_clock(
+            ticket.key,
+            RecordingLookup {
+                clock: Some(crate::content_alignment::test_recording_clock()),
+                pending: false,
+                conflict: false
+            }
+        ));
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, 15.25);
+        ui.select(later);
+        ui.sync_content_selection();
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, 75.25);
+        assert!(ui.next_content_action().is_none());
+        assert!(!ui.content_waiting());
+    }
+    #[test]
+    fn existing_shared_job_is_polled_without_busy_loop_or_fabricated_playback() {
+        let (mut ui, ticket) = viewer();
+        assert!(!ui.accept_recording_clock(
+            ticket.key,
+            RecordingLookup {
+                clock: None,
+                pending: true,
+                conflict: false
+            }
+        ));
+        assert!(ui.playback.is_none());
+        assert!(ui.content_poll_pending());
+        assert!(ui.next_content_action().is_none());
+        ui.content.next_poll = Some(Instant::now() - Duration::from_secs(1));
+        assert!(matches!(
+            ui.next_content_action(),
+            Some(Action::ContentSubmit(..))
+        ));
+    }
+    #[test]
+    fn recording_lookup_has_priority_over_unloaded_event_lists() {
+        let (ui, _) = viewer();
+        assert!(matches!(ui.next_action(), Some(Action::ContentSubmit(..))));
+    }
+    #[test]
+    fn stale_shared_clock_is_rechecked_on_selection_without_interrupting_current_playback() {
+        let (mut ui, ticket) = viewer();
+        ui.accept_recording_clock(
+            ticket.key,
+            RecordingLookup {
+                clock: Some(crate::content_alignment::test_recording_clock()),
+                pending: false,
+                conflict: false,
+            },
+        );
+        ui.content.clocks[0].2 = Instant::now() - Duration::from_secs(61);
+        ui.sync_content_selection();
+        assert!(ui.playback.is_some());
+        let mut later = ui.pull.clone().unwrap();
+        later.id += 1;
+        later.start_ms += 60_000;
+        later.end_ms += 60_000;
+        ui.review.as_mut().unwrap().pulls.push(later.clone());
+        ui.select(later);
+        ui.sync_content_selection();
+        assert!(ui.content.clocks.is_empty());
+        assert!(matches!(
+            ui.next_content_action(),
+            Some(Action::ContentSubmit(..))
+        ));
+    }
+    #[test]
+    fn shared_clock_cannot_publish_into_a_changed_account_or_selection() {
+        let (mut ui, ticket) = viewer();
+        ui.recording_match_status = Some((ticket.key.auth_epoch + 1, false));
+        assert!(!ui.accept_recording_clock(
+            ticket.key,
+            RecordingLookup {
+                clock: Some(crate::content_alignment::test_recording_clock()),
+                pending: false,
+                conflict: false
+            }
+        ));
+        assert!(ui.playback.is_none());
+        assert!(ui.content.clocks.is_empty());
     }
     #[test]
     fn selection_waits_without_marker_seek_then_uses_only_valid_content_result() {

@@ -206,6 +206,148 @@ impl Alignment {
     }
 }
 
+/// A shared fixed clock for a continuous recording and one exact WCL report.
+/// The server retains private source inputs; viewers receive only timing.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RecordingClock {
+    pub report_start_ms: i64,
+    pub report_seconds: f64,
+    pub video_seconds: f64,
+    pub uncertainty_seconds: f64,
+    pub evidence_hash: String,
+    pub algorithm_revision: String,
+    pub timeline: Timeline,
+    pub timeline_hash: String,
+    pub expires_at: i64,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordingLookup {
+    pub clock: Option<RecordingClock>,
+    pub pending: bool,
+    pub conflict: bool,
+}
+impl Key {
+    pub fn same_recording_report(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.video_id == other.video_id
+            && self.broadcast_id == other.broadcast_id
+            && self.started_at == other.started_at
+            && self.timeline_revision == other.timeline_revision
+            && self.available_seconds == other.available_seconds
+            && self.report == other.report
+            && self.report_start_ms == other.report_start_ms
+            && self.algorithm_revision == other.algorithm_revision
+            && self.guild_generation == other.guild_generation
+            && self.auth_epoch == other.auth_epoch
+    }
+}
+impl RecordingClock {
+    pub fn alignment(&self, key: &Key) -> Option<Alignment> {
+        let raw_start = if key.started_at.is_empty() {
+            None
+        } else {
+            Some(
+                (time::OffsetDateTime::parse(
+                    &key.started_at,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .ok()?
+                .unix_timestamp_nanos()
+                    / 1_000_000) as i64,
+            )
+        };
+        if self.timeline.raw_started_at_ms != raw_start
+            || !finite(self.timeline.duration_seconds, 0.001, 604800.0)
+            || self.report_start_ms != key.report_start_ms
+            || self.algorithm_revision != key.algorithm_revision
+            || self.timeline.provider != key.provider
+            || self.timeline.video_id != key.video_id
+            || key.timeline_revision.as_deref() != Some(self.timeline.revision.as_str())
+            || self.timeline.duration_seconds != key.available_seconds as f64
+            || !digest(&self.timeline_hash)
+            || !digest(&self.evidence_hash)
+            || !finite(self.report_seconds, 0.0, 7.0 * 86400.0)
+            || !finite(self.video_seconds, -3600.0, self.timeline.duration_seconds)
+            || !finite(self.uncertainty_seconds, 0.0, 0.999999)
+            || self.expires_at <= now_ms()
+            || key.end_ms <= key.start_ms
+        {
+            return None;
+        }
+        let origin = self.video_seconds
+            + key.start_ms.checked_sub(key.report_start_ms)? as f64 / 1000.0
+            - self.report_seconds;
+        let start = (-origin).max(0.0);
+        let end = key.duration().min(self.timeline.duration_seconds - origin);
+        if !origin.is_finite() || end <= start {
+            return None;
+        }
+        Some(Alignment {
+            key: key.clone(),
+            timeline: self.timeline.clone(),
+            timeline_hash: self.timeline_hash.clone(),
+            // This is a recording-clock measurement, not another submitted signature.
+            signature_revision: self.evidence_hash.clone(),
+            expires_at: self.expires_at,
+            result: ResultData {
+                video_seconds: origin,
+                seek_video_seconds: origin.max(0.0),
+                clipped_start: origin < 0.0,
+                uncertainty_seconds: self.uncertainty_seconds,
+                coverage: Coverage {
+                    fight_start_seconds: start,
+                    fight_end_seconds: end,
+                },
+                evidence_hash: self.evidence_hash.clone(),
+                method_version: self.algorithm_revision.clone(),
+            },
+        })
+    }
+}
+pub(crate) fn recording_lookup(
+    access: &guild::Access,
+    key: &Key,
+    cancel: &AtomicBool,
+) -> Result<RecordingLookup, String> {
+    current(access, key, cancel)?;
+    let bytes = streams::request(
+        Method::POST,
+        &format!("{PATH}/recording"),
+        access,
+        Some(
+            serde_json::json!({"provider":key.provider,"videoId":key.video_id,
+            "report":key.report,"reportStartMs":key.report_start_ms}),
+        ),
+    )
+    .map_err(|e| e.message)?;
+    if bytes.len() > 32 * 1024 {
+        return Err(INVALID.into());
+    }
+    let result: RecordingLookup = serde_json::from_slice(&bytes).map_err(|_| INVALID)?;
+    current(access, key, cancel)?;
+    if result.conflict && (result.clock.is_some() || result.pending) {
+        return Err(INVALID.into());
+    }
+    if let Some(clock) = &result.clock {
+        // A non-overlapping pull is a cache miss, but malformed identity is not.
+        if !finite(clock.report_seconds, 0.0, 7.0 * 86400.0) {
+            return Err(INVALID.into());
+        }
+        let mut probe = key.clone();
+        probe.start_ms = key
+            .report_start_ms
+            .checked_add((clock.report_seconds * 1000.0).round() as i64)
+            .ok_or(INVALID)?;
+        probe.end_ms = probe.start_ms.saturating_add(3_600_000);
+        if clock.alignment(&probe).is_none() {
+            return Err(INVALID.into());
+        }
+    }
+    Ok(result)
+}
+
 fn digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -560,8 +702,81 @@ pub(crate) fn test_ticket() -> (Replay, Pull, Capability, Ticket) {
 }
 
 #[cfg(test)]
+pub(crate) fn test_recording_clock() -> RecordingClock {
+    let (_, _, _, ticket) = test_ticket();
+    let scope = ticket.job.scope.unwrap();
+    let result = ticket.job.result.unwrap();
+    RecordingClock {
+        report_start_ms: ticket.key.report_start_ms,
+        report_seconds: (ticket.key.start_ms - ticket.key.report_start_ms) as f64 / 1000.0,
+        video_seconds: result.video_seconds,
+        uncertainty_seconds: result.uncertainty_seconds,
+        evidence_hash: result.evidence_hash,
+        algorithm_revision: ticket.key.algorithm_revision,
+        timeline: scope.timeline,
+        timeline_hash: scope.timeline_hash,
+        expires_at: ticket.job.expires_at,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recording_clock_maps_later_pulls_and_clips_to_real_video_bounds() {
+        let (_, _, _, ticket) = test_ticket();
+        let clock = test_recording_clock();
+        let mut later = ticket.key.clone();
+        later.pull_id += 1;
+        later.start_ms += 60_000;
+        later.end_ms += 60_000;
+        assert!(ticket.key.same_recording_report(&later));
+        assert_eq!(clock.alignment(&later).unwrap().seek(11.125), Some(86.375));
+        later.start_ms += 500_000;
+        later.end_ms += 500_000;
+        let end = clock.alignment(&later).unwrap();
+        assert_eq!(end.seek(20.0), Some(595.25));
+        assert_eq!(end.seek(30.0), None);
+        later.start_ms += 600_000;
+        later.end_ms += 600_000;
+        assert!(clock.alignment(&later).is_none());
+        let mut clipped = clock.clone();
+        clipped.video_seconds = -12.5;
+        let alignment = clipped.alignment(&ticket.key).unwrap();
+        assert_eq!(alignment.seek(12.0), None);
+        assert_eq!(alignment.seek(12.5), Some(0.0));
+    }
+    #[test]
+    fn recording_clock_scope_and_invalid_results_never_cross_recordings_or_accounts() {
+        let (_, _, _, ticket) = test_ticket();
+        for change in 0..8 {
+            let mut key = ticket.key.clone();
+            match change {
+                0 => key.video_id = "different12".into(),
+                1 => key.report = "OtherReport12345".into(),
+                2 => key.report_start_ms += 1,
+                3 => key.timeline_revision = Some("0".repeat(64)),
+                4 => key.algorithm_revision = "0".repeat(64),
+                5 => key.guild_generation += 1,
+                6 => key.auth_epoch += 1,
+                _ => key.available_seconds += 1,
+            }
+            assert!(!key.same_recording_report(&ticket.key));
+        }
+        for change in 0..7 {
+            let mut clock = test_recording_clock();
+            match change {
+                0 => clock.video_seconds = f64::NAN,
+                1 => clock.uncertainty_seconds = 1.0,
+                2 => clock.expires_at = 0,
+                3 => clock.timeline.video_id = "different12".into(),
+                4 => clock.report_start_ms += 1,
+                5 => clock.report_seconds = f64::INFINITY,
+                _ => clock.timeline.duration_seconds += 1.0,
+            }
+            assert!(clock.alignment(&ticket.key).is_none());
+        }
+    }
     fn valid(ticket: &Ticket) -> bool {
         ticket
             .job
