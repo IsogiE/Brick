@@ -2399,7 +2399,7 @@ mod tests {
         assert_eq!(pulls[0].seconds, 0);
     }
     #[test]
-    #[ignore = "opt-in live timing: protected sessions, selected live POV, timings/counts only"]
+    #[ignore = "opt-in live timing: protected sessions, selected live POV, timings only"]
     fn live_event_query_timing() {
         assert_eq!(std::env::var("BRICK_WCL_TIMING").as_deref(), Ok("1"));
         let token = crate::discord_auth::current_or_refreshed_access_token()
@@ -2421,14 +2421,15 @@ mod tests {
             })
             .expect("Requested live POV unavailable");
         let mut client = Client::new().unwrap();
+        // Diagnostic output is limited to local timing and fixed stage/status labels.
+        // Keep authenticated response data and derived counts out of stderr.
         let started = Instant::now();
         let review = client
             .review(&token, stream, None)
             .expect("Review metadata unavailable");
         eprintln!(
-            "wcl_timing stage=metadata ms={} pulls={}",
-            started.elapsed().as_millis(),
-            review.pulls.len()
+            "wcl_timing stage=metadata ms={}",
+            started.elapsed().as_millis()
         );
         let pull = review.pulls.first().expect("No raid pull available");
         let filter = client.cooldown_preferences().filter_expression().unwrap();
@@ -2444,15 +2445,10 @@ mod tests {
             let result = client.query(query, json!({"code":pull.report,"fight":pull.id,"type":kind,
                 "start":pull.start_ms-pull.report_start_ms,"end":pull.end_ms-pull.report_start_ms,"filter":filter}));
             match result {
-                Ok(value) => {
-                    let page = &value["reportData"]["report"]["events"];
-                    eprintln!(
-                        "wcl_timing stage={label} ms={} entries={} next_page={}",
-                        started.elapsed().as_millis(),
-                        page["data"].as_array().map_or(0, Vec::len),
-                        !page["nextPageTimestamp"].is_null()
-                    );
-                }
+                Ok(_) => eprintln!(
+                    "wcl_timing stage={label} ms={} status=ok",
+                    started.elapsed().as_millis()
+                ),
                 Err(_) => eprintln!(
                     "wcl_timing stage={label} ms={} status=failed",
                     started.elapsed().as_millis()
@@ -2462,13 +2458,14 @@ mod tests {
         let measure = |client: &mut Client, label: &str, kind| {
             let before = client.requests;
             let started = Instant::now();
-            let events = client
+            client
                 .events(&token, pull, kind)
                 .expect("Event query failed");
             let after = client.requests;
-            eprintln!("wcl_timing stage={label} us={} visible={} config_requests={} catalogue_requests={} graphql_requests={} master_requests={}",
-                started.elapsed().as_micros(), events.len(), after.config-before.config,
-                after.catalogue-before.catalogue, after.graphql-before.graphql, after.master-before.master);
+            eprintln!(
+                "wcl_timing stage={label} us={}",
+                started.elapsed().as_micros()
+            );
             after.graphql - before.graphql
         };
         assert_eq!(measure(&mut client, "cold_deaths", EventKind::Deaths), 1);
@@ -2541,7 +2538,6 @@ mod tests {
             0
         );
         client.cooldowns = Some(saved);
-        eprintln!("wcl_timing total_graphql_requests={} total_config_requests={} total_catalogue_requests={}", client.requests.graphql, client.requests.config, client.requests.catalogue);
     }
 
     #[test]
