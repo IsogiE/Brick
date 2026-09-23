@@ -66,6 +66,10 @@ enum Data {
     Events(String, EventKind, Vec<RaidEvent>, defensives::Preferences),
     Cooldowns(defensives::Preferences),
     Content(crate::content_alignment::Ticket),
+    RecordingClock(
+        crate::content_alignment::Key,
+        crate::content_alignment::RecordingLookup,
+    ),
 }
 type Outcome = (u64, String, Result<Data, String>, bool);
 
@@ -759,6 +763,9 @@ impl ReviewUi {
                                 self.notice = None;
                                 self.last_attempt = None;
                             }
+                            Ok(Data::RecordingClock(key, lookup)) => {
+                                changed |= self.accept_recording_clock(key, lookup);
+                            }
                             Ok(Data::Content(ticket)) => {
                                 changed |= self.accept_content(ticket);
                             }
@@ -961,6 +968,10 @@ impl ReviewUi {
         if self.work.is_some() {
             return None;
         }
+        // Cached playback should not wait for unrelated event-list downloads.
+        if let Some(action) = self.next_content_action() {
+            return Some(action);
+        }
         let missing = [EventKind::Deaths, EventKind::Defensives]
             .into_iter()
             .find(|kind| {
@@ -972,8 +983,6 @@ impl ReviewUi {
             });
         if let Some((pull, kind)) = self.pull.clone().zip(missing).filter(|_| self.active) {
             Some(Action::Events(pull, kind))
-        } else if let Some(action) = self.next_content_action() {
-            Some(action)
         } else if self
             .last_attempt
             .is_none_or(|at| at.elapsed() >= self.refresh_interval())
@@ -1257,9 +1266,30 @@ impl ReviewUi {
                         {
                             return Err("The Warcraft Logs account or alignment service changed. Reload this view.".into());
                         }
+                        let lookup =
+                            crate::content_alignment::recording_lookup(&token, &key, &cancel)?;
+                        if lookup
+                            .clock
+                            .as_ref()
+                            .is_some_and(|clock| clock.alignment(&key).is_some())
+                            || lookup.pending
+                        {
+                            return Ok(Data::RecordingClock(key, lookup));
+                        }
                         let signature = client.boss_signature(&token, &pull)?;
-                        crate::content_alignment::submit(&token, key, &signature, &cancel)
-                            .map(Data::Content)
+                        let ticket =
+                            crate::content_alignment::submit(&token, key, &signature, &cancel)?;
+                        if ticket.alignment().is_some() {
+                            let lookup = crate::content_alignment::recording_lookup(
+                                &token,
+                                &ticket.key,
+                                &cancel,
+                            )?;
+                            if lookup.clock.is_some() {
+                                return Ok(Data::RecordingClock(ticket.key, lookup));
+                            }
+                        }
+                        Ok(Data::Content(ticket))
                     })(),
                     Action::ContentPoll(ticket) => (|| {
                         if client.recording_match_status().0 != ticket.key.auth_epoch {
@@ -1267,7 +1297,30 @@ impl ReviewUi {
                                 "The Warcraft Logs account changed. Reload this view.".into()
                             );
                         }
-                        crate::content_alignment::poll(&token, &ticket, &cancel).map(Data::Content)
+                        let lookup = crate::content_alignment::recording_lookup(
+                            &token,
+                            &ticket.key,
+                            &cancel,
+                        )?;
+                        if lookup
+                            .clock
+                            .as_ref()
+                            .is_some_and(|clock| clock.alignment(&ticket.key).is_some())
+                        {
+                            return Ok(Data::RecordingClock(ticket.key, lookup));
+                        }
+                        let ticket = crate::content_alignment::poll(&token, &ticket, &cancel)?;
+                        if ticket.alignment().is_some() {
+                            let lookup = crate::content_alignment::recording_lookup(
+                                &token,
+                                &ticket.key,
+                                &cancel,
+                            )?;
+                            if lookup.clock.is_some() {
+                                return Ok(Data::RecordingClock(ticket.key, lookup));
+                            }
+                        }
+                        Ok(Data::Content(ticket))
                     })(),
                     Action::SaveCooldowns(preferences) => client
                         .save_cooldown_preferences(&token, preferences)
@@ -1349,6 +1402,7 @@ impl ReviewUi {
     }
 
     fn select(&mut self, pull: Pull) {
+        self.check_recording_clock_selection(&pull);
         self.marker_sync.reset(None);
         if let Some(review) = &mut self.review {
             if let Ok(cache) = self.marker_cache.lock() {

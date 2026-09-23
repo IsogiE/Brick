@@ -108,11 +108,44 @@ impl Driver {
                     }
                     self.viewer.select(first);
                     self.viewer.sync_content_selection();
-                    if !self.viewer.accept_content(ticket) || self.viewer.content_waiting() {
+                    let clock = content_alignment::recording_lookup(
+                        &self.access,
+                        &ticket.key,
+                        &AtomicBool::new(false),
+                    )?;
+                    if !self.viewer.accept_recording_clock(ticket.key, clock)
+                        || self.viewer.content_waiting()
+                    {
                         return Err(
                             "Current completed job did not unlock the selected fight".into()
                         );
                     }
+                    let first = self.viewer.pull.clone().unwrap();
+                    let mut later = first.clone();
+                    later.id += 2;
+                    later.start_ms += 60_000;
+                    later.end_ms += 60_000;
+                    self.viewer
+                        .review
+                        .as_mut()
+                        .unwrap()
+                        .pulls
+                        .push(later.clone());
+                    self.viewer.select(later);
+                    self.viewer.sync_content_selection();
+                    if self
+                        .viewer
+                        .playback
+                        .as_ref()
+                        .is_none_or(|p| (p.seconds - self.origin - 60.0).abs() > 1e-8)
+                        || self.viewer.next_content_action().is_some()
+                    {
+                        return Err(
+                            "Changing pulls did not reuse the shared recording clock".into()
+                        );
+                    }
+                    self.viewer.select(first);
+                    self.viewer.sync_content_selection();
                     let playback = self.viewer.playback.as_ref().unwrap();
                     if !playback.content_timing
                         || playback.seconds != self.origin
