@@ -1,5 +1,6 @@
 //! Private reports are fetched directly with the viewer's WCL authorization.
 pub(crate) mod boss_signature;
+pub(crate) mod prepared;
 use crate::{
     credential_store::Store,
     defensives::{self, DefensiveGroup},
@@ -15,7 +16,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -499,6 +500,7 @@ pub struct Client {
     masters: MasterCache,
     session: Option<Session>,
     recording_auth_epoch: u64,
+    pub(crate) prepared: Arc<Mutex<prepared::Cache>>,
     recording_match_complete: bool,
     cooldowns: Option<defensives::Preferences>,
     cooldown_catalog: defensives::CatalogCache,
@@ -552,6 +554,7 @@ impl Client {
             masters: HashMap::new(),
             session: None,
             recording_auth_epoch: 0,
+            prepared: Default::default(),
             recording_match_complete: false,
             cooldowns: None,
             cooldown_catalog: Default::default(),
@@ -662,6 +665,9 @@ impl Client {
     }
 
     fn set_session(&mut self, session: Option<Session>) {
+        if let Ok(mut cache) = self.prepared.lock() {
+            cache.set_connected(session.is_some());
+        }
         if self.session.is_some() || session.is_some() {
             self.recording_auth_epoch = self.recording_auth_epoch.wrapping_add(1);
         }
@@ -671,6 +677,11 @@ impl Client {
 
     pub(crate) fn recording_match_status(&self) -> (u64, bool) {
         (self.recording_auth_epoch, self.recording_match_complete)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_prepared_for_test(&mut self) {
+        self.set_session(None);
     }
 
     pub fn connected(&self) -> bool {
@@ -958,9 +969,21 @@ impl Client {
     ) -> Result<Review, String> {
         self.configure(discord_token, true)?;
         if playback {
-            self.load_cooldown_preferences(discord_token)?;
+            self.restore_cooldown_preferences()?;
         }
         self.access_token()?;
+        if playback && report_override.is_none() {
+            let cached = self
+                .prepared
+                .lock()
+                .ok()
+                .and_then(|cache| cache.get(stream));
+            if let Some(entry) = cached.filter(|entry| entry.status.0 == self.recording_auth_epoch)
+            {
+                self.recording_match_complete = entry.status.1;
+                return Ok(entry.review);
+            }
+        }
         let capability = self.recording_content_capability(stream);
         let mut path = streams::review_path(stream).map_err(|error| error.message)?;
         if capability.is_some() {
@@ -1001,6 +1024,30 @@ impl Client {
             while_current(&self.cancel, || {
                 crate::replay_library::lookup(discord_token, &mut review, preferred_pull)
             })?;
+        }
+        if playback && review.content_required() {
+            let clocks = prepared::clocks(
+                &mut review,
+                preferred_pull,
+                self.recording_auth_epoch,
+                |key| {
+                    crate::content_alignment::recording_lookup(discord_token, key, &self.cancel)
+                        .ok()
+                        .and_then(|lookup| lookup.clock)
+                },
+            );
+            check_cancelled(&self.cancel)?;
+            // Explicit report choices must not replace the automatic directory.
+            if report_override.is_none() {
+                if let Ok(mut cache) = self.prepared.lock() {
+                    cache.insert(
+                        stream,
+                        review.clone(),
+                        self.recording_match_status(),
+                        clocks,
+                    );
+                }
+            }
         }
         Ok(review)
     }
@@ -1092,6 +1139,16 @@ impl Client {
             defensives::Catalog::parse(&bytes)
         });
         check_cancelled(&self.cancel)?;
+        self.restore_cooldown_preferences()?;
+        self.cooldowns.as_mut().unwrap().catalog = self.cooldown_catalog.snapshot();
+        if let Ok(mut cache) = self.prepared.lock() {
+            cache.preferences = self.cooldown_preferences();
+        }
+        Ok(())
+    }
+
+    // Local rules are needed immediately; catalogue refresh belongs to events.
+    fn restore_cooldown_preferences(&mut self) -> Result<(), String> {
         if self.cooldowns.is_none() {
             let account = &self
                 .config
@@ -1102,7 +1159,9 @@ impl Client {
                 defensives::Preferences::load(account)
             })??);
         }
-        self.cooldowns.as_mut().unwrap().catalog = self.cooldown_catalog.snapshot();
+        if let Ok(mut cache) = self.prepared.lock() {
+            cache.preferences = self.cooldown_preferences();
+        }
         Ok(())
     }
 
@@ -1142,6 +1201,9 @@ impl Client {
         while_current(&self.cancel, || preferences.save(account))??;
         // Raw cached coverage survives visibility, category and tracking edits.
         self.cooldowns = Some(preferences.clone());
+        if let Ok(mut cache) = self.prepared.lock() {
+            cache.preferences = preferences.clone();
+        }
         Ok(preferences)
     }
 
@@ -1153,9 +1215,7 @@ impl Client {
     ) -> Result<Vec<RaidEvent>, String> {
         self.configure(discord_token, true)?;
         self.access_token()?;
-        if self.cooldowns.is_none() {
-            self.load_cooldown_preferences(discord_token)?;
-        }
+        self.load_cooldown_preferences(discord_token)?;
         let preferences = self.cooldown_preferences();
         let wanted = if kind == EventKind::Defensives {
             EventCoverage::requested(&preferences)

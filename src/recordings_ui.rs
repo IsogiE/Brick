@@ -49,6 +49,7 @@ struct Member {
 #[derive(Default)]
 pub struct Library {
     source: Weak<Vec<Vod>>,
+    preparation: Vec<usize>,
     entries: Vec<Entry>,
     members: Vec<Member>,
     months: Vec<(String, String)>,
@@ -76,6 +77,10 @@ pub struct Library {
 }
 
 impl Library {
+    pub(crate) fn preparation_candidates(&self) -> &[usize] {
+        &self.preparation
+    }
+
     fn prepare(&mut self, source: &Rc<Vec<Vod>>) {
         let identity = Rc::downgrade(source);
         if Weak::ptr_eq(&self.source, &identity) {
@@ -251,6 +256,7 @@ impl Library {
         busy: bool,
     ) -> Option<Action> {
         self.prepare(source);
+        self.preparation.clear();
         #[cfg(test)]
         {
             self.row_rects.clear();
@@ -499,6 +505,12 @@ impl Library {
                             continue;
                         }
                         let vod = &source[entry.index];
+                        if ui.rect_contains_pointer(rect) {
+                            self.preparation.insert(0, entry.index);
+                        } else if self.preparation.len() < 8 {
+                            self.preparation.push(entry.index);
+                        }
+                        self.preparation.truncate(8);
                         #[cfg(test)]
                         self.row_rects.push(rect);
                         {
@@ -1216,6 +1228,8 @@ mod tests {
                         "{size:?} {dpi}: {bounds:?}"
                     );
                     assert!(library.row_rects.len() <= (size.y / 50.0).ceil() as usize + 2);
+                    assert!(library.preparation_candidates().len() <= 8);
+                    assert!(library.preparation_candidates().len() <= library.row_rects.len());
                     assert!(!library.row_rects.is_empty());
                     for rows in library.row_rects.windows(2) {
                         assert!(

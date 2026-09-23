@@ -21,6 +21,26 @@ pub(super) struct State {
     paused: bool,
 }
 
+impl State {
+    #[cfg(test)]
+    pub(super) fn prepared_clocks(&self) -> Vec<(Key, RecordingClock)> {
+        self.clocks
+            .iter()
+            .map(|(key, clock, _)| (key.clone(), clock.clone()))
+            .collect()
+    }
+    pub(super) fn seed_clocks(&mut self, clocks: Vec<(Key, RecordingClock)>, at: Instant) {
+        for (key, clock) in clocks {
+            self.clocks
+                .retain(|(saved, _, _)| !saved.same_recording_report(&key));
+            if self.clocks.len() >= 32 {
+                self.clocks.remove(0);
+            }
+            self.clocks.push((key, clock, at));
+        }
+    }
+}
+
 impl ReviewUi {
     pub(super) fn sync_content_selection(&mut self) -> bool {
         self.content.saved.retain(|ticket| !ticket.expired());
@@ -231,6 +251,9 @@ impl ReviewUi {
         self.content
             .clocks
             .push((key.clone(), clock.clone(), Instant::now()));
+        if let Ok(mut cache) = self.prepared.lock() {
+            cache.record_clock(&key, &clock);
+        }
         self.apply_recording_clock(&key, &clock)
     }
 

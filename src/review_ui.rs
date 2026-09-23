@@ -174,6 +174,7 @@ impl CooldownEditor {
 
 pub struct ReviewUi {
     client: Arc<Mutex<Option<Client>>>,
+    prepared: Arc<Mutex<crate::warcraftlogs::prepared::Cache>>,
     marker_cache: Arc<Mutex<crate::replay_sync::Cache>>,
     marker_sync: crate::replay_sync::Sync,
     content: content_review::State,
@@ -231,6 +232,7 @@ impl Default for ReviewUi {
     fn default() -> Self {
         Self {
             client: Arc::new(Mutex::new(None)),
+            prepared: Default::default(),
             marker_cache: Arc::new(Mutex::new(crate::replay_sync::Cache::default())),
             marker_sync: crate::replay_sync::Sync::default(),
             content: Default::default(),
@@ -301,6 +303,7 @@ impl ReviewUi {
     pub(crate) fn metadata_peer(&self) -> Self {
         let mut peer = Self::default();
         peer.client = self.client.clone();
+        peer.prepared = self.prepared.clone();
         peer.marker_cache = self.marker_cache.clone();
         peer.metadata_only = true;
         peer.alignment_priority = self.preferred_alignment_pull().cloned();
@@ -663,6 +666,36 @@ impl ReviewUi {
         self.tick_mode(ctx, Some(stream), true);
     }
 
+    pub(crate) fn prepared_recording(&self, stream: &Stream) -> bool {
+        self.prepared
+            .lock()
+            .ok()
+            .is_some_and(|cache| cache.contains(stream))
+    }
+
+    fn restore_prepared_recording(&mut self, stream: &Stream) -> bool {
+        if self.recording_housekeeping || self.content.manual_report.is_some() {
+            return false;
+        }
+        let entry = self.prepared.lock().ok().and_then(|cache| {
+            cache
+                .get(stream)
+                .map(|entry| (entry, cache.preferences.clone()))
+        });
+        let Some((entry, preferences)) = entry else {
+            return false;
+        };
+        self.recording_match_status = Some(entry.status);
+        self.connected = true;
+        self.connection_checked = true;
+        self.last_attempt = Some(entry.at);
+        self.content.seed_clocks(entry.clocks, entry.at);
+        self.accept_cooldown_preferences(preferences);
+        self.accept_review(entry.review);
+        self.restore_pov_position();
+        true
+    }
+
     pub(crate) fn metadata_busy(&self) -> bool {
         self.work.is_some()
     }
@@ -741,6 +774,14 @@ impl ReviewUi {
                                     self.notice = None;
                                 } else {
                                     self.accept_cooldown_preferences(preferences);
+                                    if let Some(entry) = stream.and_then(|stream| {
+                                        self.prepared
+                                            .lock()
+                                            .ok()
+                                            .and_then(|cache| cache.get(stream))
+                                    }) {
+                                        self.content.seed_clocks(entry.clocks, entry.at);
+                                    }
                                     changed |= self.accept_review(review);
                                     changed |= self.restore_pov_position();
                                 }
@@ -856,6 +897,11 @@ impl ReviewUi {
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => (),
+            }
+        }
+        if self.review.is_none() {
+            if let Some(stream) = stream {
+                changed |= self.restore_prepared_recording(stream);
             }
         }
         changed |= self.sync_content_selection();
@@ -1143,6 +1189,12 @@ impl ReviewUi {
             None
         };
         let client = self.client.clone();
+        let prepared = self.prepared.clone();
+        if matches!(action, Action::Connect | Action::Disconnect) {
+            if let Ok(mut cache) = prepared.lock() {
+                cache.set_connected(false);
+            }
+        }
         let housekeeping = self.recording_housekeeping;
         let preferred_pull = self.preferred_alignment_pull().cloned();
         let manual_report = self.content.manual_report.clone();
@@ -1183,7 +1235,9 @@ impl ReviewUi {
                 // request. No cancelled peer may initialize or use the client.
                 while_current(&cancel, || ())?;
                 if lock.is_none() {
-                    *lock = Some(Client::new()?);
+                    let mut client = Client::new()?;
+                    client.prepared = prepared;
+                    *lock = Some(client);
                 }
                 let client = lock.as_mut().unwrap();
                 client.set_request_cancellation(cancel.clone());
@@ -3814,6 +3868,111 @@ mod tests {
             pull,
             stream,
         )
+    }
+
+    fn prepared_fixture(
+        provider: Provider,
+    ) -> (
+        Review,
+        Stream,
+        Vec<(
+            crate::content_alignment::Key,
+            crate::content_alignment::RecordingClock,
+        )>,
+    ) {
+        let (mut replay, pull, cap, ticket) = crate::content_alignment::test_ticket();
+        let mut clock = crate::content_alignment::test_recording_clock();
+        if provider == Provider::Twitch {
+            replay.provider = Provider::Twitch;
+            replay.video_id = "1234567890".into();
+            replay.broadcast_id = "12345".into();
+            clock.timeline.provider = Provider::Twitch;
+            clock.timeline.video_id = replay.video_id.clone();
+        }
+        let mut later = pull.clone();
+        later.id += 1;
+        later.start_ms += 60_000;
+        later.end_ms += 60_000;
+        let mut review = Review {
+            replay,
+            pulls: vec![pull, later],
+            marker_timing: Default::default(),
+            marker_fallback: Default::default(),
+            content_capability: Some(cap),
+            content_timing: Default::default(),
+        };
+        let mut calls = 0;
+        let clocks =
+            crate::warcraftlogs::prepared::clocks(&mut review, None, ticket.key.auth_epoch, |_| {
+                calls += 1;
+                Some(clock.clone())
+            });
+        assert_eq!(calls, 1);
+        assert_eq!(review.content_timing.len(), 2);
+        let (_, _, mut stream) = fixture();
+        stream.provider = provider;
+        stream.recording_id = Some(review.replay.video_id.clone());
+        stream.channel_id = review.replay.video_id.clone();
+        stream.status = Status::Offline;
+        (review, stream, clocks)
+    }
+
+    #[test]
+    fn prepared_vods_open_and_switch_pulls_while_wcl_worker_is_busy() {
+        for provider in [Provider::Youtube, Provider::Twitch] {
+            let (review, stream, clocks) = prepared_fixture(provider);
+            let epoch = clocks[0].0.auth_epoch;
+            let expected = review
+                .content_alignment(&review.pulls[0])
+                .unwrap()
+                .result
+                .seek_video_seconds;
+            let later = review.pulls[1].clone();
+            let mut ui = ReviewUi::default();
+            ui.prepared
+                .lock()
+                .unwrap()
+                .insert(&stream, review, (epoch, true), clocks);
+            let shared_client = ui.client.clone();
+            let _busy = shared_client.lock().unwrap();
+            ui.open_recording();
+            assert!(ui.restore_prepared_recording(&stream));
+            ui.sync_content_selection();
+            assert_eq!(ui.playback.as_ref().unwrap().seconds, expected);
+            assert!(!ui.content_waiting());
+            assert!(ui.next_content_action().is_none());
+            assert!(ui.work.is_none());
+            ui.select(later);
+            ui.sync_content_selection();
+            assert!(ui.playback.is_some());
+            assert!(ui.next_content_action().is_none());
+        }
+    }
+
+    #[test]
+    fn prepared_vods_respect_expiry_account_reset_and_recording_identity() {
+        let (review, stream, clocks) = prepared_fixture(Provider::Youtube);
+        let epoch = clocks[0].0.auth_epoch;
+        let mut ui = ReviewUi::default();
+        ui.prepared
+            .lock()
+            .unwrap()
+            .insert(&stream, review.clone(), (epoch, true), clocks.clone());
+        let mut other = stream.clone();
+        other.recording_id = Some("zyxDEF_12-3".into());
+        assert!(!ui.restore_prepared_recording(&other));
+        let mut client = Client::new().unwrap();
+        client.prepared = ui.prepared.clone();
+        client.clear_prepared_for_test();
+        assert!(!ui.restore_prepared_recording(&stream));
+        ui.prepared.lock().unwrap().set_connected(true);
+        let mut expired = clocks;
+        expired[0].1.expires_at = 1;
+        ui.prepared
+            .lock()
+            .unwrap()
+            .insert(&stream, review, (epoch, true), expired);
+        assert!(!ui.restore_prepared_recording(&stream));
     }
 
     #[test]

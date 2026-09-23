@@ -73,6 +73,8 @@ pub struct StreamsUi {
     loading_recording_checks: bool,
     recording_checks: crate::recording_filter::Filter,
     recording_peer: crate::review_ui::ReviewUi,
+    preparation_peer: crate::review_ui::ReviewUi,
+    preparation: crate::recording_preparation::Preparation,
     can_delete_recordings: bool,
     confirm_remove_recording: Option<Vod>,
     pov_revision: u64,
@@ -103,6 +105,7 @@ impl Default for StreamsUi {
         let review = crate::review_ui::ReviewUi::default();
         let warmup = review.metadata_peer();
         let recording_peer = review.metadata_peer();
+        let preparation_peer = review.metadata_peer();
         Self {
             youtube: Default::default(),
             twitch: Default::default(),
@@ -127,6 +130,8 @@ impl Default for StreamsUi {
             loading_recording_checks: false,
             recording_checks: Default::default(),
             recording_peer,
+            preparation_peer,
+            preparation: Default::default(),
             can_delete_recordings: false,
             confirm_remove_recording: None,
             pov_revision: 0,
@@ -544,7 +549,7 @@ impl StreamsUi {
         let warmup_stream = self
             .snapshot
             .as_ref()
-            .filter(|_| !active || self.selected.is_none())
+            .filter(|_| !active || (!self.recordings_open && self.selected.is_none()))
             .and_then(|snapshot| {
                 snapshot
                     .streams
@@ -553,10 +558,31 @@ impl StreamsUi {
                     .min_by_key(|s| (&s.user_id, s.provider.key(), &s.channel_id))
             });
         self.warmup.tick(ctx, warmup_stream);
+        let preparation_candidates: Vec<_> = self
+            .recordings
+            .as_ref()
+            .filter(|_| active && self.recordings_open)
+            .map(|recordings| {
+                self.recordings_library
+                    .preparation_candidates()
+                    .iter()
+                    .filter_map(|index| recordings.get(*index))
+                    .map(Vod::as_stream)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.preparation.tick(
+            ctx,
+            &preparation_candidates,
+            self.selected
+                .as_ref()
+                .filter(|_| active && !self.recordings_open),
+            &mut self.preparation_peer,
+        );
         self.recording_checks.tick(
             ctx,
             self.snapshot.as_deref(),
-            !(active && self.review.active()),
+            !(active && (self.review.active() || self.recordings_open)),
             &mut self.recording_peer,
         );
         if self.review.tick(
