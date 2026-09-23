@@ -1,5 +1,6 @@
 //! Private reports are fetched directly with the viewer's WCL authorization.
 pub(crate) mod boss_signature;
+mod data_cache;
 mod persistent;
 pub(crate) mod prepared;
 use crate::{
@@ -137,7 +138,7 @@ impl Pull {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum EventKind {
     Deaths,
     Defensives,
@@ -150,7 +151,7 @@ impl EventKind {
         }
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RaidEvent {
     pub at_ms: i64,
     pub actor_id: u64,
@@ -311,7 +312,7 @@ const MAX_PULL_EVENTS: usize = 20_000;
 const MAX_EVENT_PAGE_ROWS: usize = 10_000;
 const MAX_COVERAGE_IDS: usize = 512 + defensives::MAX_OVERRIDES;
 
-#[derive(Clone, Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct EventCoverage {
     casts: BTreeSet<u64>,
     buffs: BTreeSet<u64>,
@@ -430,11 +431,12 @@ impl ConfigStamp {
         self.token_hash == token.fingerprint()
     }
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Actor {
     name: String,
     class: String,
 }
+#[derive(Serialize, Deserialize)]
 struct MasterData {
     actors: HashMap<u64, Actor>,
     abilities: HashMap<u64, String>,
@@ -479,6 +481,35 @@ struct CachedMaster {
     at: Instant,
     through_ms: i64,
     data: Arc<MasterData>,
+}
+#[derive(Serialize, Deserialize)]
+struct SavedMaster {
+    through_ms: i64,
+    data: MasterData,
+}
+#[derive(Serialize, Deserialize)]
+struct SavedEvents {
+    coverage: EventCoverage,
+    raw: Vec<RaidEvent>,
+}
+impl SavedEvents {
+    fn restore(self, pull: &Pull, kind: EventKind) -> Option<CachedEvents> {
+        if !self.coverage.is_bounded()
+            || self.raw.len() > MAX_PULL_EVENTS
+            || self
+                .raw
+                .iter()
+                .any(|e| e.kind != kind || e.at_ms < pull.start_ms || e.at_ms > pull.end_ms)
+        {
+            return None;
+        }
+        Some(CachedEvents {
+            at: Instant::now(),
+            bounds: (pull.start_ms, pull.end_ms),
+            coverage: self.coverage,
+            raw: Arc::new(self.raw),
+        })
+    }
 }
 type MasterCache = HashMap<String, CachedMaster>;
 fn cache_master(cache: &mut MasterCache, code: String, through_ms: i64, data: Arc<MasterData>) {
@@ -525,6 +556,7 @@ pub struct Client {
     recording_auth_epoch: u64,
     pub(crate) prepared: Arc<Mutex<prepared::Cache>>,
     review_cache: Option<persistent::Cache>,
+    data_cache: Option<data_cache::Cache>,
     recording_match_complete: bool,
     cooldowns: Option<defensives::Preferences>,
     cooldown_catalog: defensives::CatalogCache,
@@ -581,6 +613,7 @@ impl Client {
             recording_auth_epoch: 0,
             prepared: Default::default(),
             review_cache: None,
+            data_cache: None,
             recording_match_complete: false,
             cooldowns: None,
             cooldown_catalog: Default::default(),
@@ -719,10 +752,14 @@ impl Client {
         if let Some(cache) = &mut self.review_cache {
             cache.invalidate();
         }
+        if let Some(mut cache) = self.data_cache.take() {
+            cache.invalidate();
+        }
     }
 
     fn set_session(&mut self, session: Option<Session>) {
         self.review_cache = None;
+        self.data_cache = None;
         if let Ok(mut cache) = self.prepared.lock() {
             cache.set_connected(session.is_some());
         }
@@ -1325,6 +1362,13 @@ impl Client {
         } else {
             EventCoverage::default()
         };
+        let disk_key = data_cache::pull_key(
+            match kind {
+                EventKind::Deaths => "deaths-v1",
+                EventKind::Defensives => "cooldowns-v1",
+            },
+            pull,
+        );
         let key = (pull.report.clone(), pull.id, kind);
         let bounds = (pull.start_ms, pull.end_ms);
         self.events
@@ -1334,6 +1378,11 @@ impl Client {
             .get(&key)
             .filter(|entry| entry.bounds == bounds && entry.coverage.merge(&wanted).is_bounded())
             .cloned();
+        let cached = cached.or_else(|| {
+            self.cached_data::<SavedEvents>(discord_token, &disk_key)
+                .and_then(|saved| saved.restore(pull, kind))
+                .filter(|entry| entry.coverage.merge(&wanted).is_bounded())
+        });
         let missing = wanted.missing(
             &cached
                 .as_ref()
@@ -1346,7 +1395,15 @@ impl Client {
             missing.queries()
         };
         if queries.is_empty() {
-            return Ok(cached.map_or_else(Vec::new, |entry| entry.render(&preferences)));
+            discord_token.check()?;
+            check_cancelled(&self.cancel)?;
+            let visible = cached
+                .as_ref()
+                .map_or_else(Vec::new, |entry| entry.render(&preferences));
+            if let Some(entry) = cached {
+                cache_events(&mut self.events, key, entry);
+            }
+            return Ok(visible);
         }
         // Metadata follows the fast cache path, never precedes a cache hit.
         self.masters
@@ -1356,6 +1413,26 @@ impl Client {
             .get(&pull.report)
             .filter(|entry| entry.through_ms >= pull.end_ms)
             .map(|entry| entry.data.clone());
+        let master_key = data_cache::master_key(pull);
+        if master.is_none() {
+            if let Some(saved) = self
+                .cached_data::<SavedMaster>(discord_token, &master_key)
+                .filter(|saved| {
+                    saved.through_ms >= pull.end_ms
+                        && saved.data.actors.len() <= 5000
+                        && saved.data.abilities.len() <= 5000
+                })
+            {
+                let data = Arc::new(saved.data);
+                cache_master(
+                    &mut self.masters,
+                    pull.report.clone(),
+                    saved.through_ms,
+                    data.clone(),
+                );
+                master = Some(data);
+            }
+        }
         let end = pull.end_ms - pull.report_start_ms;
         let mut added = Vec::new();
         let mut pages = 0;
@@ -1386,6 +1463,9 @@ impl Client {
                         through,
                         loaded.clone(),
                     );
+                    // Stable map ordering makes identical metadata a no-write update.
+                    let saved = serde_json::json!({"through_ms": through, "data": loaded.as_ref()});
+                    self.cache_data(discord_token, master_key.clone(), &saved);
                     master = Some(loaded);
                 }
                 added.extend(map_event_page(
@@ -1425,6 +1505,18 @@ impl Client {
         };
         let visible = entry.render(&preferences);
         // Publish only complete successful extensions; failures retain old coverage.
+        discord_token.check()?;
+        check_cancelled(&self.cancel)?;
+        self.cache_data(
+            discord_token,
+            disk_key,
+            &SavedEvents {
+                coverage: entry.coverage.clone(),
+                raw: (*entry.raw).clone(),
+            },
+        );
+        discord_token.check()?;
+        check_cancelled(&self.cancel)?;
         cache_events(&mut self.events, key, entry);
         Ok(visible)
     }
@@ -2668,6 +2760,60 @@ mod tests {
         );
         assert!(event_request_timeout(deadline, deadline).is_err());
         assert!(event_request_timeout(deadline, deadline + Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn persisted_event_coverage_retains_raw_evidence_and_only_satisfies_covered_queries() {
+        let video = replay();
+        let report = json!({"code":"abcdefghABCDEFGH","startTime":video.start_ms().unwrap(),"fights":[
+            {"id":1,"encounterID":123,"difficulty":5,"name":"Boss","kill":false,"startTime":0,"endTime":120000}
+        ]});
+        let pull = map_pulls(&report, &video).unwrap().remove(0);
+        let coverage = EventCoverage {
+            casts: BTreeSet::from([100]),
+            buffs: BTreeSet::new(),
+        };
+        let saved = SavedEvents {
+            coverage: coverage.clone(),
+            raw: vec![RaidEvent {
+                at_ms: pull.start_ms + 1000,
+                actor_id: 1,
+                observed_buff: false,
+                actor: "Healer".into(),
+                class: "Priest".into(),
+                ability: "Shield".into(),
+                ability_id: 100,
+                target: None,
+                target_actor_id: None,
+                kind: EventKind::Defensives,
+                group: None,
+            }],
+        };
+        let bytes = serde_json::to_vec(&saved).unwrap();
+        let restored: SavedEvents = serde_json::from_slice(&bytes).unwrap();
+        let entry = restored.restore(&pull, EventKind::Defensives).unwrap();
+        assert_eq!(entry.raw.len(), 1);
+        assert!(coverage.missing(&entry.coverage).queries().is_empty());
+        let broader = EventCoverage {
+            casts: BTreeSet::from([100, 200]),
+            buffs: BTreeSet::from([100]),
+        };
+        let missing = broader.missing(&entry.coverage);
+        assert_eq!(missing.casts, BTreeSet::from([200]));
+        assert_eq!(missing.buffs, BTreeSet::from([100]));
+        assert_eq!(missing.queries().len(), 2);
+        assert!(serde_json::from_slice::<SavedEvents>(&bytes)
+            .unwrap()
+            .restore(&pull, EventKind::Deaths)
+            .is_none());
+        let mut changed = pull.clone();
+        changed.start_ms += 2000;
+        assert!(serde_json::from_slice::<SavedEvents>(&bytes)
+            .unwrap()
+            .restore(&changed, EventKind::Defensives)
+            .is_none());
+        let original = data_cache::pull_key("cooldowns-v1", &pull);
+        assert_ne!(original, data_cache::pull_key("cooldowns-v1", &changed));
     }
 
     #[test]

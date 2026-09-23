@@ -397,7 +397,7 @@ fn content_job_to_native_player_uses_relative_timing_without_marker() {
         complete: true,
     };
     let signature = BossSignature {
-        schema: SCHEMA,
+        schema: SCHEMA.into(),
         report: pull.report.clone(),
         pull_id: pull.id,
         encounter_id: pull.encounter,
