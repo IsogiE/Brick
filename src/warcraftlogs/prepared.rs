@@ -1,4 +1,4 @@
-//! Short-lived, account-bound review data prepared while browsing recordings.
+//! Bounded, account-bound review snapshots with separate refresh and retention ages.
 use super::{Pull, Review};
 use crate::{
     content_alignment::{Key, RecordingClock},
@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 const TTL: Duration = Duration::from_secs(60);
 const LIVE_TTL: Duration = Duration::from_secs(10);
+const RETENTION: Duration = Duration::from_secs(15 * 60);
 const CAPACITY: usize = 8;
 const PULL_CAPACITY: usize = 4096;
 
@@ -99,7 +100,32 @@ impl Cache {
         self.find(stream).cloned()
     }
 
+    /// Keep known pulls available while the authenticated worker refreshes them.
+    /// Refresh callers still use `get`, so a displayed snapshot cannot suppress
+    /// polling for new pulls. Account reset and broadcast identity apply to both.
+    pub fn for_display(&self, stream: &Stream) -> Option<Entry> {
+        self.retained(stream).cloned()
+    }
+
     fn find(&self, stream: &Stream) -> Option<&Entry> {
+        self.retained(stream).filter(|entry| {
+            entry.at.elapsed()
+                < if entry.review.replay.growing {
+                    LIVE_TTL
+                } else {
+                    TTL
+                }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_for_test(&mut self, age: Duration) {
+        for entry in &mut self.entries {
+            entry.at = Instant::now() - age;
+        }
+    }
+
+    fn retained(&self, stream: &Stream) -> Option<&Entry> {
         if self.suspended {
             return None;
         }
@@ -109,12 +135,7 @@ impl Cache {
             entry.path == path
                 && entry.source_identity == identity
                 && entry.generation == crate::guild::generation()
-                && entry.at.elapsed()
-                    < if entry.review.replay.growing {
-                        LIVE_TTL
-                    } else {
-                        TTL
-                    }
+                && entry.at.elapsed() < RETENTION
                 && entry
                     .clocks
                     .iter()
@@ -173,7 +194,7 @@ impl Cache {
             return;
         }
         self.entries.retain(|entry| {
-            entry.path != path && entry.generation == generation && entry.at.elapsed() < TTL
+            entry.path != path && entry.generation == generation && entry.at.elapsed() < RETENTION
         });
         while self.entries.len() >= CAPACITY
             || self
@@ -312,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn live_cache_expires_before_pull_poll_and_cannot_cross_a_restarted_broadcast() {
+    fn live_refresh_age_preserves_display_without_crossing_a_restarted_broadcast() {
         let (mut stream, mut review, clocks) = fixture();
         stream.recording_id = None;
         stream.status = Status::Live;
@@ -329,8 +350,13 @@ mod tests {
         let mut restarted = stream.clone();
         restarted.replay_start_ms = Some(1_790_000_060_000);
         assert!(cache.get(&restarted).is_none());
-        cache.entries[0].at = Instant::now() - Duration::from_secs(11);
+        assert!(cache.for_display(&restarted).is_none());
+        cache.age_for_test(Duration::from_secs(11));
         assert!(cache.get(&stream).is_none());
+        assert!(!cache.contains(&stream));
+        assert_eq!(cache.for_display(&stream).unwrap().review.pulls.len(), 1);
+        cache.age_for_test(RETENTION);
+        assert!(cache.for_display(&stream).is_none());
         cache.insert(
             &restarted,
             review,
@@ -338,7 +364,33 @@ mod tests {
             Vec::new(),
         );
         assert!(cache.get(&stream).is_none());
+        assert!(cache.for_display(&stream).is_none());
         assert!(cache.get(&restarted).is_some());
+        cache.set_connected(false);
+        assert!(cache.for_display(&restarted).is_none());
+    }
+
+    #[test]
+    fn refreshing_another_recording_retains_old_display_within_memory_and_age_limits() {
+        let (stream, review, clocks) = fixture();
+        let mut cache = Cache::default();
+        cache.insert(
+            &stream,
+            review.clone(),
+            (clocks[0].0.auth_epoch, true),
+            Vec::new(),
+        );
+        cache.age_for_test(Duration::from_secs(120));
+        let mut other = stream.clone();
+        other.user_id = "202".into();
+        cache.insert(&other, review, (clocks[0].0.auth_epoch, true), Vec::new());
+        assert!(cache.get(&stream).is_none());
+        assert!(cache.for_display(&stream).is_some());
+        assert!(cache.get(&other).is_some());
+        cache.entries[0].generation = crate::guild::generation().wrapping_add(1);
+        assert!(cache.for_display(&stream).is_none());
+        cache.age_for_test(RETENTION);
+        assert!(cache.for_display(&other).is_none());
     }
 
     #[test]
