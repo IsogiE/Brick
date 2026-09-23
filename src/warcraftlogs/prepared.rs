@@ -7,6 +7,7 @@ use crate::{
 use std::time::{Duration, Instant};
 
 const TTL: Duration = Duration::from_secs(60);
+const LIVE_TTL: Duration = Duration::from_secs(10);
 const CAPACITY: usize = 8;
 const PULL_CAPACITY: usize = 4096;
 
@@ -18,6 +19,22 @@ pub(crate) struct Entry {
     pub at: Instant,
     path: String,
     generation: u64,
+    source_identity: String,
+}
+
+/// Bind live cache entries to the broadcast start, never just its channel URL.
+pub(crate) fn source_identity(stream: &Stream) -> Option<String> {
+    let path = crate::streams::review_path(stream).ok()?;
+    if stream.recording_id.is_some() {
+        return Some(path);
+    }
+    if stream.status != crate::streams::Status::Live {
+        return None;
+    }
+    Some(format!(
+        "{path}:{}:{}",
+        stream.channel_id, stream.replay_start_ms?
+    ))
 }
 
 #[derive(Default)]
@@ -86,12 +103,18 @@ impl Cache {
         if self.suspended {
             return None;
         }
-        stream.recording_id.as_ref()?;
+        let identity = source_identity(stream)?;
         let path = crate::streams::review_path(stream).ok()?;
         self.entries.iter().find(|entry| {
             entry.path == path
+                && entry.source_identity == identity
                 && entry.generation == crate::guild::generation()
-                && entry.at.elapsed() < TTL
+                && entry.at.elapsed()
+                    < if entry.review.replay.growing {
+                        LIVE_TTL
+                    } else {
+                        TTL
+                    }
                 && entry
                     .clocks
                     .iter()
@@ -136,9 +159,12 @@ impl Cache {
         status: (u64, bool),
         clocks: Vec<(Key, RecordingClock)>,
     ) {
-        if self.suspended || stream.recording_id.is_none() || review.pulls.len() > PULL_CAPACITY {
+        if self.suspended || review.pulls.len() > PULL_CAPACITY {
             return;
         }
+        let Some(identity) = source_identity(stream) else {
+            return;
+        };
         let Ok(path) = crate::streams::review_path(stream) else {
             return;
         };
@@ -167,6 +193,7 @@ impl Cache {
             at: Instant::now(),
             path,
             generation,
+            source_identity: identity,
         });
     }
 }
@@ -282,6 +309,36 @@ mod tests {
         cache.insert(&stream, review, (clocks[0].0.auth_epoch, true), clocks);
         assert!(cache.get(&stream).is_none());
         assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn live_cache_expires_before_pull_poll_and_cannot_cross_a_restarted_broadcast() {
+        let (mut stream, mut review, clocks) = fixture();
+        stream.recording_id = None;
+        stream.status = Status::Live;
+        stream.replay_start_ms = Some(1_790_000_000_000);
+        review.replay.growing = true;
+        let mut cache = Cache::default();
+        cache.insert(
+            &stream,
+            review.clone(),
+            (clocks[0].0.auth_epoch, true),
+            Vec::new(),
+        );
+        assert!(cache.get(&stream).is_some());
+        let mut restarted = stream.clone();
+        restarted.replay_start_ms = Some(1_790_000_060_000);
+        assert!(cache.get(&restarted).is_none());
+        cache.entries[0].at = Instant::now() - Duration::from_secs(11);
+        assert!(cache.get(&stream).is_none());
+        cache.insert(
+            &restarted,
+            review,
+            (clocks[0].0.auth_epoch, true),
+            Vec::new(),
+        );
+        assert!(cache.get(&stream).is_none());
+        assert!(cache.get(&restarted).is_some());
     }
 
     #[test]

@@ -74,6 +74,8 @@ pub struct Replay {
     #[serde(default)]
     pub timeline_revision: Option<String>,
     pub available_seconds: u64,
+    #[serde(default)]
+    pub growing: bool,
 }
 
 fn nullable_start<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -1073,10 +1075,8 @@ impl Client {
 
     fn recording_content_capability(
         &self,
-        stream: &Stream,
+        _stream: &Stream,
     ) -> Option<crate::content_alignment::Capability> {
-        // Growing live replays keep their existing route and clock contract.
-        stream.recording_id.as_ref()?;
         self.content_capability()
     }
 
@@ -2028,6 +2028,7 @@ mod tests {
             broadcast_id: "abcDEF_12-3".into(),
             started_at: "2026-09-08T12:00:00Z".into(),
             available_seconds: 8 * 3600,
+            growing: false,
             timeline_revision: None,
         }
     }
@@ -2895,7 +2896,7 @@ mod content_metadata_tests {
         assert_eq!(client.requests.graphql, 0);
     }
     #[test]
-    fn advertised_content_jobs_do_not_change_live_replay_contracts() {
+    fn live_streams_and_recordings_use_the_same_content_capability() {
         let mut client = Client::new().unwrap();
         client.config = Some(serde_json::from_value(json!({
             "clientId":"public-client","guildId":1,"userId":"123",
@@ -2906,7 +2907,7 @@ mod content_metadata_tests {
             "url":"https://youtube.com/watch?v=abcDEF_12-3","status":"live"
         }))
         .unwrap();
-        assert!(client.recording_content_capability(&stream).is_none());
+        assert!(client.recording_content_capability(&stream).is_some());
         stream.recording_id = Some("abcDEF_12-3".into());
         assert!(client.recording_content_capability(&stream).is_some());
         client.config.as_mut().unwrap().content_alignment = None;

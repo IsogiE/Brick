@@ -1121,6 +1121,7 @@ mod tests {
             broadcast_id: "abcDEF_12-3".into(),
             started_at: "2026-09-01T12:00:00Z".into(),
             available_seconds: 5000,
+            growing: false,
             timeline_revision: None,
         };
         let start = replay.start_ms().unwrap() + 100_375;

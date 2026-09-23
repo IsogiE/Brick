@@ -43,6 +43,7 @@ pub(crate) struct Key {
     pub started_at: String,
     pub timeline_revision: Option<String>,
     pub available_seconds: u64,
+    pub growing: bool,
     pub report: String,
     pub pull_id: u64,
     pub encounter: u64,
@@ -63,6 +64,7 @@ impl Key {
             started_at: replay.started_at.clone(),
             timeline_revision: replay.timeline_revision.clone(),
             available_seconds: replay.available_seconds,
+            growing: replay.growing,
             report: pull.report.clone(),
             pull_id: pull.id,
             encounter: pull.encounter,
@@ -79,7 +81,10 @@ impl Key {
         (self.end_ms - self.start_ms) as f64 / 1000.0
     }
     pub fn matches(&self, replay: &Replay, pull: &Pull, capability: &Capability) -> bool {
-        let current = Self::new(replay, pull, capability, self.auth_epoch);
+        let mut current = Self::new(replay, pull, capability, self.auth_epoch);
+        if self.growing && current.growing && current.available_seconds >= self.available_seconds {
+            current.available_seconds = self.available_seconds;
+        }
         *self == current
     }
 }
@@ -235,6 +240,8 @@ pub(crate) struct RecordingLookup {
     pub clock: Option<RecordingClock>,
     pub pending: bool,
     pub conflict: bool,
+    #[serde(default, rename = "recoveryPullId")]
+    pub recovery_pull_id: Option<u64>,
 }
 impl Key {
     pub fn same_recording_report(&self, other: &Self) -> bool {
@@ -243,7 +250,8 @@ impl Key {
             && self.broadcast_id == other.broadcast_id
             && self.started_at == other.started_at
             && self.timeline_revision == other.timeline_revision
-            && self.available_seconds == other.available_seconds
+            && self.growing == other.growing
+            && (self.available_seconds == other.available_seconds || self.growing)
             && self.report == other.report
             && self.report_start_ms == other.report_start_ms
             && self.algorithm_revision == other.algorithm_revision
@@ -273,7 +281,7 @@ impl RecordingClock {
             || self.timeline.provider != key.provider
             || self.timeline.video_id != key.video_id
             || key.timeline_revision.as_deref() != Some(self.timeline.revision.as_str())
-            || self.timeline.duration_seconds != key.available_seconds as f64
+            || (!key.growing && self.timeline.duration_seconds != key.available_seconds as f64)
             || !digest(&self.timeline_hash)
             || !digest(&self.evidence_hash)
             || !finite(self.report_seconds, 0.0, 7.0 * 86400.0)
@@ -288,7 +296,12 @@ impl RecordingClock {
             + key.start_ms.checked_sub(key.report_start_ms)? as f64 / 1000.0
             - self.report_seconds;
         let start = (-origin).max(0.0);
-        let end = key.duration().min(self.timeline.duration_seconds - origin);
+        let end = key.duration().min(
+            self.timeline
+                .duration_seconds
+                .min(key.available_seconds as f64)
+                - origin,
+        );
         if !origin.is_finite() || end <= start {
             return None;
         }
@@ -326,7 +339,7 @@ pub(crate) fn recording_lookup(
         access,
         Some(
             serde_json::json!({"provider":key.provider,"videoId":key.video_id,
-            "report":key.report,"reportStartMs":key.report_start_ms}),
+            "report":key.report,"reportStartMs":key.report_start_ms,"recover":true}),
         ),
     )
     .map_err(request_error)?;
@@ -335,7 +348,12 @@ pub(crate) fn recording_lookup(
     }
     let result: RecordingLookup = serde_json::from_slice(&bytes).map_err(|_| INVALID)?;
     current(access, key, cancel)?;
-    if result.conflict && (result.clock.is_some() || result.pending) {
+    if result
+        .recovery_pull_id
+        .is_some_and(|id| id == 0 || id > 1_000_000)
+        || result.conflict
+            && (result.clock.is_some() || result.pending || result.recovery_pull_id.is_some())
+    {
         return Err(INVALID.into());
     }
     if let Some(clock) = &result.clock {
@@ -354,6 +372,24 @@ pub(crate) fn recording_lookup(
         }
     }
     Ok(result)
+}
+
+/// Restore an old result only when its complete boss signature is identical.
+/// The endpoint never queues media analysis or accepts a client-supplied offset.
+pub(crate) fn recover_recording_clock(
+    access: &guild::Access,
+    key: &Key,
+    signature: &BossSignature,
+    cancel: &AtomicBool,
+) -> Result<RecordingLookup, String> {
+    current(access, key, cancel)?;
+    if signature.report != key.report || signature.report_start_ms != key.report_start_ms {
+        return Err(INVALID.into());
+    }
+    streams::request(Method::POST, &format!("{PATH}/recover"), access,
+        Some(serde_json::json!({"provider":key.provider,"videoId":key.video_id,"signature":signature})))
+        .map_err(request_error)?;
+    recording_lookup(access, key, cancel)
 }
 
 fn digest(value: &str) -> bool {
@@ -453,7 +489,7 @@ impl Job {
             || timeline.provider != key.provider
             || timeline.video_id != key.video_id
             || timeline.revision != scope.timeline_revision
-            || timeline.duration_seconds != key.available_seconds as f64
+            || (!key.growing && timeline.duration_seconds != key.available_seconds as f64)
             || timeline.raw_started_at_ms != raw_started_at_ms
             || !finite(timeline.duration_seconds, 0.001, 604800.0)
             || timeline
@@ -631,6 +667,7 @@ pub(crate) fn test_ticket() -> (Replay, Pull, Capability, Ticket) {
         started_at: String::new(),
         timeline_revision: Some("b".repeat(64)),
         available_seconds: 600,
+        growing: false,
     };
     let pull = Pull {
         report: "AbCdEfGhIjKlMnOp".into(),
@@ -730,6 +767,36 @@ pub(crate) fn test_recording_clock() -> RecordingClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_late_anchor_covers_earlier_and_new_live_pulls_without_a_new_measurement() {
+        let (_, _, _, ticket) = test_ticket();
+        let mut clock = test_recording_clock();
+        clock.report_seconds = 9015.85;
+        clock.video_seconds = 9305.7845;
+        clock.timeline.duration_seconds = 16340.0;
+        let mut early = ticket.key;
+        early.growing = true;
+        early.available_seconds = 16340;
+        early.start_ms = early.report_start_ms + 606_757;
+        early.end_ms = early.start_ms + 300_000;
+        let alignment = clock.alignment(&early).unwrap();
+        assert!((alignment.seek(0.0).unwrap() - 896.6915).abs() < 0.00001);
+        let mut newer = early.clone();
+        newer.pull_id += 1;
+        newer.available_seconds = 18000;
+        newer.start_ms = newer.report_start_ms + 17_000_000;
+        newer.end_ms = newer.start_ms + 300_000;
+        assert!(early.same_recording_report(&newer));
+        // The current provider extent must cover the new pull before playback
+        // can use it; refreshing that extent needs no new video measurement.
+        assert!(clock.alignment(&newer).is_none());
+        clock.timeline.duration_seconds = 18000.0;
+        assert!((clock.alignment(&newer).unwrap().seek(0.0).unwrap() - 17289.9345).abs() < 0.00001);
+        newer.timeline_revision = Some("f".repeat(64));
+        assert!(!early.same_recording_report(&newer));
+        assert!(clock.alignment(&newer).is_none());
+    }
+
     #[test]
     fn recording_clock_maps_later_pulls_and_clips_to_real_video_bounds() {
         let (_, _, _, ticket) = test_ticket();

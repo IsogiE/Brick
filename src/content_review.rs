@@ -596,7 +596,8 @@ mod tests {
             RecordingLookup {
                 clock: Some(crate::content_alignment::test_recording_clock()),
                 pending: false,
-                conflict: false
+                conflict: false,
+                recovery_pull_id: None,
             }
         ));
         assert_eq!(ui.playback.as_ref().unwrap().seconds, 0.0);
@@ -625,7 +626,8 @@ mod tests {
             RecordingLookup {
                 clock: None,
                 pending: true,
-                conflict: false
+                conflict: false,
+                recovery_pull_id: None,
             }
         ));
         assert!(ui.playback.is_some());
@@ -693,6 +695,7 @@ mod tests {
                 clock: Some(crate::content_alignment::test_recording_clock()),
                 pending: false,
                 conflict: false,
+                recovery_pull_id: None,
             },
         );
         ui.content.clocks[0].2 = Instant::now() - Duration::from_secs(61);
@@ -720,7 +723,8 @@ mod tests {
             RecordingLookup {
                 clock: Some(crate::content_alignment::test_recording_clock()),
                 pending: false,
-                conflict: false
+                conflict: false,
+                recovery_pull_id: None,
             }
         ));
         assert!(ui.playback.is_some());
