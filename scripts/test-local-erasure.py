@@ -6,6 +6,7 @@ This fixture requires a separate mount namespace, HOME and Secret Service.
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -89,7 +90,11 @@ def main():
     if args.privileged_setup:
         if os.geteuid() != 0 or not args.isolated_network:
             raise RuntimeError('Privileged setup requires root in an isolated network namespace')
-        fixture_uid = fixture_gid = 1000
+        # Use a non-root fixture identity without assuming the runner's UID.
+        fixture_uid = int(os.environ['SUDO_UID'])
+        fixture_gid = int(os.environ['SUDO_GID'])
+        if fixture_uid <= 0 or fixture_gid <= 0:
+            raise RuntimeError('Privileged setup requires an unprivileged invoking user')
     else:
         if os.geteuid() == 0:
             raise RuntimeError('Root invocation requires explicit privileged fixture setup')
@@ -104,8 +109,18 @@ def main():
         if interfaces != ['lo']:
             raise RuntimeError('Expected an isolated loopback-only network namespace')
     binary = test_binary(args)
-    with tempfile.TemporaryDirectory(prefix='brick-erasure-', dir=args.scratch_parent) as temporary:
+    # Privileged bwrap maps the fixture identity to the invoking root UID,
+    # then drops capabilities before resolving bind sources. It cannot cross
+    # a private runner home owned by another UID. Stage only fixture inputs
+    # outside that home, retaining mode 0700 and deterministic cleanup.
+    scratch_parent = '/var/tmp' if args.privileged_setup else args.scratch_parent
+    with tempfile.TemporaryDirectory(prefix='brick-erasure-', dir=scratch_parent) as temporary:
         root = Path(temporary)
+        if args.privileged_setup:
+            staged_binary = root / 'test-binary'
+            shutil.copyfile(binary, staged_binary)
+            staged_binary.chmod(0o500)
+            binary = staged_binary
         (root / 'bootstrap.py').write_text(BOOTSTRAP)
         (root / 'passwd').write_text(
             f'fixture:x:{fixture_uid}:{fixture_gid}:Fixture:/fixture/home:/bin/sh\n')

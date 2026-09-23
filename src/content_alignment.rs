@@ -13,6 +13,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const PATH: &str = "/v1/streams/review/content-jobs";
 const INVALID: &str = "The video alignment service returned an invalid response.";
+pub(crate) const TEMPORARY: &str = "Video alignment will retry automatically.";
+fn request_error(error: streams::Error) -> String {
+    if error.retryable {
+        TEMPORARY.into()
+    } else {
+        error.message
+    }
+}
 const CANCELED: &str = "Video alignment was canceled.";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -321,7 +329,7 @@ pub(crate) fn recording_lookup(
             "report":key.report,"reportStartMs":key.report_start_ms}),
         ),
     )
-    .map_err(|e| e.message)?;
+    .map_err(request_error)?;
     if bytes.len() > 32 * 1024 {
         return Err(INVALID.into());
     }
@@ -566,7 +574,7 @@ pub(crate) fn submit(
     })
     .map_err(|_| INVALID)?;
     let response =
-        streams::request(Method::POST, PATH, access, Some(body)).map_err(|e| e.message)?;
+        streams::request(Method::POST, PATH, access, Some(body)).map_err(request_error)?;
     let job = parse(&response)?;
     let member = member_hash(access);
     job.validate(&key, &access.guild_id, &member, None)?;
@@ -595,7 +603,7 @@ pub(crate) fn poll(
         access,
         None,
     )
-    .map_err(|e| e.message)?;
+    .map_err(request_error)?;
     let job = parse(&response)?;
     job.validate(
         &ticket.key,
