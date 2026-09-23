@@ -227,16 +227,27 @@ impl Review {
             self.marker_alignment(pull).is_some()
         }
     }
+    /// Provider time is an estimate for immediate playback, never certified or
+    /// stored as an alignment. Unknown-origin uploads remain watchable from zero.
+    pub fn estimated_video_start(&self, pull: &Pull) -> f64 {
+        let Some(start) = self.replay.start_ms().ok() else {
+            return 0.0;
+        };
+        ((pull.start_ms - start) as f64 / 1000.0)
+            .clamp(0.0, (self.replay.available_seconds as f64 - 0.001).max(0.0))
+    }
+
     pub fn pull_video_start(&self, pull: &Pull) -> f64 {
         if self.uses_content_timing(pull) {
-            return self
-                .content_alignment(pull)
-                .map_or(f64::NAN, |a| a.result.video_seconds);
+            return self.content_alignment(pull).map_or_else(
+                || self.estimated_video_start(pull),
+                |a| a.result.video_seconds,
+            );
         }
         if self.marker_backup_allowed(pull) {
             return self
                 .marker_alignment(pull)
-                .map_or(f64::NAN, |a| a.video_seconds);
+                .map_or_else(|| self.estimated_video_start(pull), |a| a.video_seconds);
         }
         self.marker_alignment(pull).map_or_else(
             || (pull.start_ms - self.replay.start_ms().unwrap_or(pull.start_ms)) as f64 / 1000.0,
@@ -245,10 +256,16 @@ impl Review {
     }
     pub fn video_seconds(&self, pull: &Pull, elapsed: f64) -> Option<f64> {
         if self.uses_content_timing(pull) {
-            return self.content_alignment(pull)?.seek(elapsed);
+            if let Some(alignment) = self.content_alignment(pull) {
+                return alignment.seek(elapsed);
+            }
         }
         let seconds = self.pull_video_start(pull) + elapsed;
-        (seconds.is_finite() && seconds >= 0.0 && seconds < self.replay.available_seconds as f64)
+        (elapsed.is_finite()
+            && elapsed >= 0.0
+            && seconds.is_finite()
+            && seconds >= 0.0
+            && seconds < self.replay.available_seconds as f64)
             .then_some(seconds)
     }
 }
@@ -504,6 +521,7 @@ pub struct Client {
     recording_match_complete: bool,
     cooldowns: Option<defensives::Preferences>,
     cooldown_catalog: defensives::CatalogCache,
+    cooldown_catalog_pending: bool,
     http: HttpClient,
     reports: HashMap<String, (Instant, Value)>,
     directory: Option<ReportDirectory>,
@@ -558,6 +576,7 @@ impl Client {
             recording_match_complete: false,
             cooldowns: None,
             cooldown_catalog: Default::default(),
+            cooldown_catalog_pending: false,
             http,
             reports: HashMap::new(),
             directory: None,
@@ -1140,6 +1159,7 @@ impl Client {
         });
         check_cancelled(&self.cancel)?;
         self.restore_cooldown_preferences()?;
+        self.cooldown_catalog_pending = false;
         self.cooldowns.as_mut().unwrap().catalog = self.cooldown_catalog.snapshot();
         if let Ok(mut cache) = self.prepared.lock() {
             cache.preferences = self.cooldown_preferences();
@@ -1150,6 +1170,7 @@ impl Client {
     // Local rules are needed immediately; catalogue refresh belongs to events.
     fn restore_cooldown_preferences(&mut self) -> Result<(), String> {
         if self.cooldowns.is_none() {
+            self.cooldown_catalog_pending = true;
             let account = &self
                 .config
                 .as_ref()
@@ -1215,7 +1236,9 @@ impl Client {
     ) -> Result<Vec<RaidEvent>, String> {
         self.configure(discord_token, true)?;
         self.access_token()?;
-        self.load_cooldown_preferences(discord_token)?;
+        if self.cooldowns.is_none() || self.cooldown_catalog_pending {
+            self.load_cooldown_preferences(discord_token)?;
+        }
         let preferences = self.cooldown_preferences();
         let wanted = if kind == EventKind::Defensives {
             EventCoverage::requested(&preferences)

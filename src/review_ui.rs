@@ -179,6 +179,7 @@ pub struct ReviewUi {
     marker_sync: crate::replay_sync::Sync,
     content: content_review::State,
     metadata_only: bool,
+    preparing_recordings: bool,
     alignment_priority: Option<Pull>,
     recording_housekeeping: bool,
     work: Option<mpsc::Receiver<Outcome>>,
@@ -237,6 +238,7 @@ impl Default for ReviewUi {
             marker_sync: crate::replay_sync::Sync::default(),
             content: Default::default(),
             metadata_only: false,
+            preparing_recordings: false,
             alignment_priority: None,
             recording_housekeeping: false,
             work: None,
@@ -310,12 +312,46 @@ impl ReviewUi {
         peer
     }
 
+    pub(crate) fn preparation_peer(&self) -> Self {
+        let mut peer = self.metadata_peer();
+        peer.preparing_recordings = true;
+        peer
+    }
+
+    pub(crate) fn preparation_retry_delay(&self, visible: bool) -> Duration {
+        Duration::from_secs(if self.preparation_failed() {
+            15 * 60
+        } else if visible {
+            60
+        } else {
+            5 * 60
+        })
+    }
+
     pub(crate) fn preferred_alignment_pull(&self) -> Option<&Pull> {
         self.pending_focus
             .as_ref()
             .map(|(pull, _, _)| pull)
             .or(self.pull.as_ref())
             .or(self.alignment_priority.as_ref())
+            .or_else(|| {
+                self.preparing_recordings
+                    .then(|| {
+                        let review = self.review.as_ref()?;
+                        review
+                            .pulls
+                            .iter()
+                            .find(|pull| pull.kill && pull.end_ms - pull.start_ms >= 60_000)
+                            .or_else(|| {
+                                review
+                                    .pulls
+                                    .iter()
+                                    .find(|pull| pull.end_ms - pull.start_ms >= 60_000)
+                            })
+                            .or(review.pulls.first())
+                    })
+                    .flatten()
+            })
     }
 
     pub(crate) fn prioritize_alignment(&mut self, selected: &Pull) {
@@ -666,11 +702,22 @@ impl ReviewUi {
         self.tick_mode(ctx, Some(stream), true);
     }
 
-    pub(crate) fn prepared_recording(&self, stream: &Stream) -> bool {
+    pub(crate) fn prepare_alignment(&mut self, enabled: bool) {
+        self.preparing_recordings = enabled;
+    }
+
+    pub(crate) fn prepared_metadata(&self, stream: &Stream) -> bool {
         self.prepared
             .lock()
             .ok()
             .is_some_and(|cache| cache.contains(stream))
+    }
+
+    pub(crate) fn prepared_recording(&self, stream: &Stream) -> bool {
+        self.prepared
+            .lock()
+            .ok()
+            .is_some_and(|cache| cache.ready(stream))
     }
 
     fn restore_prepared_recording(&mut self, stream: &Stream) -> bool {
@@ -1014,10 +1061,8 @@ impl ReviewUi {
         if self.work.is_some() {
             return None;
         }
-        // Cached playback should not wait for unrelated event-list downloads.
-        if let Some(action) = self.next_content_action() {
-            return Some(action);
-        }
+        // An open player should get its review events before exporting a new
+        // alignment signature. Metadata preparation has no selected event list.
         let missing = [EventKind::Deaths, EventKind::Defensives]
             .into_iter()
             .find(|kind| {
@@ -1029,6 +1074,8 @@ impl ReviewUi {
             });
         if let Some((pull, kind)) = self.pull.clone().zip(missing).filter(|_| self.active) {
             Some(Action::Events(pull, kind))
+        } else if let Some(action) = self.next_content_action() {
+            Some(action)
         } else if self
             .last_attempt
             .is_none_or(|at| at.elapsed() >= self.refresh_interval())
@@ -1474,11 +1521,12 @@ impl ReviewUi {
             review
                 .content_alignment(&pull)
                 .map(|alignment| alignment.first_video_seconds())
+                .or_else(|| Some(review.estimated_video_start(&pull)))
         } else if review.marker_backup_allowed(&pull) {
-            // A failed content match permits a marker lookup, never an estimated seek.
             review
                 .marker_alignment(&pull)
                 .map(|alignment| alignment.video_seconds)
+                .or_else(|| Some(review.estimated_video_start(&pull)))
         } else {
             Some(pull_video_start(review, &pull).max(0.0))
         };
@@ -1951,9 +1999,7 @@ impl ReviewUi {
                 ui.painter().text(
                     video.center(),
                     egui::Align2::CENTER_CENTER,
-                    if self.content_waiting() {
-                        "Video alignment is not ready"
-                    } else if self.playback.is_some() {
+                    if self.playback.is_some() {
                         "Opening replay…"
                     } else if self.pending_focus.is_some() && self.review.is_some() {
                         "This POV does not contain the selected moment"

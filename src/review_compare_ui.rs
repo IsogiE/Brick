@@ -1011,10 +1011,7 @@ fn replace_changed_clocks(
 }
 
 pub(crate) fn recording_clock(review: &Review, pull: &Pull) -> Result<RecordingClock, String> {
-    if review.uses_content_timing(pull) {
-        let alignment = review
-            .content_alignment(pull)
-            .ok_or("Video alignment is not ready for this POV.")?;
+    if let Some(alignment) = review.content_alignment(pull) {
         return RecordingClock::new(
             pull.start_ms,
             alignment.result.video_seconds,

@@ -25,16 +25,57 @@ pub(crate) struct Cache {
     entries: Vec<Entry>,
     suspended: bool,
     pub preferences: crate::defensives::Preferences,
+    tickets: Vec<crate::content_alignment::Ticket>,
 }
 impl Cache {
     pub fn set_connected(&mut self, connected: bool) {
         self.entries.clear();
+        self.tickets.clear();
         self.preferences = Default::default();
         self.suspended = !connected;
     }
 
     pub fn contains(&self, stream: &Stream) -> bool {
         self.find(stream).is_some()
+    }
+
+    pub fn ready(&self, stream: &Stream) -> bool {
+        self.find(stream).is_some_and(|entry| {
+            entry
+                .review
+                .pulls
+                .iter()
+                .any(|pull| entry.review.has_precise_timing(pull))
+        })
+    }
+
+    pub fn remember_ticket(&mut self, ticket: crate::content_alignment::Ticket) {
+        if self.suspended
+            || ticket.expired()
+            || crate::guild::ensure_current(ticket.key.guild_generation).is_err()
+        {
+            return;
+        }
+        self.tickets.retain(|old| {
+            !old.expired()
+                && old.key != ticket.key
+                && old.key.guild_generation == ticket.key.guild_generation
+                && old.key.auth_epoch == ticket.key.auth_epoch
+        });
+        if self.tickets.len() >= 64 {
+            self.tickets.remove(0);
+        }
+        self.tickets.push(ticket);
+    }
+
+    pub fn ticket(&self, key: &Key) -> Option<crate::content_alignment::Ticket> {
+        if self.suspended || key.guild_generation != crate::guild::generation() {
+            return None;
+        }
+        self.tickets
+            .iter()
+            .find(|ticket| &ticket.key == key && !ticket.expired())
+            .cloned()
     }
 
     pub fn get(&self, stream: &Stream) -> Option<Entry> {

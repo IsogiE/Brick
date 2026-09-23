@@ -59,11 +59,8 @@ impl Driver {
             ));
         }
         if self.phase == 0 {
-            if self.viewer.playback.is_some()
-                || self.player.is_some()
-                || !self.viewer.content_waiting()
-            {
-                return Err("Pending content job started playback".into());
+            if self.viewer.playback.is_none() || !self.viewer.content_waiting() {
+                return Err("Pending alignment prevented estimated playback".into());
             }
             if self.phase_start.elapsed() >= Duration::from_secs(2) {
                 let (tx, rx) = mpsc::channel();
@@ -102,7 +99,9 @@ impl Driver {
                         .push(other.clone());
                     self.viewer.select(other);
                     self.viewer.sync_content_selection();
-                    if self.viewer.accept_content(ticket.clone()) || self.viewer.playback.is_some()
+                    let estimate = self.viewer.playback.as_ref().unwrap().seconds;
+                    if self.viewer.accept_content(ticket.clone())
+                        || self.viewer.playback.as_ref().unwrap().seconds != estimate
                     {
                         return Err("A completed job moved a different selected fight".into());
                     }
@@ -113,7 +112,7 @@ impl Driver {
                         &ticket.key,
                         &AtomicBool::new(false),
                     )?;
-                    if !self.viewer.accept_recording_clock(ticket.key, clock)
+                    if self.viewer.accept_recording_clock(ticket.key, clock)
                         || self.viewer.content_waiting()
                     {
                         return Err(
@@ -193,10 +192,15 @@ impl Driver {
                     }
                     drop(busy);
                     self.viewer = fresh;
+                    if let Some(player) = self.player.as_mut() {
+                        player
+                            .command(PlaybackCommand::Seek(self.origin))
+                            .map_err(|_| "Prepared video seek failed")?;
+                    }
                     eprintln!("Native content UI: prepared first open ready without WCL or alignment work, elapsed_us={}", opened_at.elapsed().as_micros());
                     self.phase = 2;
                     self.phase_start = Instant::now();
-                    eprintln!("Native content UI: pending held; stale selection rejected; exact completed result accepted");
+                    eprintln!("Native content UI: estimate available while pending; stale selection rejected; verified clock reused");
                 }
                 Err(mpsc::TryRecvError::Empty) => (),
                 Err(_) => return Err("Content poll worker disconnected".into()),
@@ -320,16 +324,6 @@ impl eframe::App for Driver {
             egui::Sense::hover(),
         );
         let ctx = ui.ctx().clone();
-        if self.phase < 2 {
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "Waiting for content alignment…",
-                egui::FontId::proportional(16.0),
-                egui::Color32::GRAY,
-            );
-            return;
-        }
         if !self.activated {
             match crate::replay_smoke::native::activate_native_window(frame) {
                 Ok(()) => {

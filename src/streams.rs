@@ -320,6 +320,7 @@ fn valid_vod_url(vod: &Vod) -> bool {
 pub struct Error {
     pub message: String,
     pub access_denied: bool,
+    pub retryable: bool,
 }
 
 impl From<String> for Error {
@@ -327,6 +328,7 @@ impl From<String> for Error {
         Self {
             message,
             access_denied: false,
+            retryable: false,
         }
     }
 }
@@ -390,8 +392,10 @@ pub(crate) fn request(
     if let Some(body) = body {
         request = request.json(&body);
     }
-    let response = request.send().map_err(|_| {
-        Error::from("Couldn't reach the stream service. Brick will retry shortly.".to_string())
+    let response = request.send().map_err(|_| Error {
+        message: "Couldn't reach the stream service. Brick will retry shortly.".into(),
+        access_denied: false,
+        retryable: true,
     })?;
     let status = response.status();
     let body = download::read_response(
@@ -416,6 +420,7 @@ pub(crate) fn request(
         return Err(Error {
             message,
             access_denied: status.as_u16() == 401 || (status.as_u16() == 403 && !recording_removal),
+            retryable: status.is_server_error() || matches!(status.as_u16(), 408 | 429),
         });
     }
     Ok(body)

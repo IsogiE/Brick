@@ -43,7 +43,7 @@ enum ResultData {
     Saved,
     Removed,
     Recordings(streams::Recordings),
-    RecordingChecks(Vec<streams::RecordingCheck>),
+    RecordingChecks(streams::Recordings),
     RecordingRemoved(Provider, String),
 }
 type WorkResult = Result<ResultData, streams::Error>;
@@ -75,6 +75,7 @@ pub struct StreamsUi {
     recording_peer: crate::review_ui::ReviewUi,
     preparation_peer: crate::review_ui::ReviewUi,
     preparation: crate::recording_preparation::Preparation,
+    preparation_catalog: Vec<Stream>,
     can_delete_recordings: bool,
     confirm_remove_recording: Option<Vod>,
     pov_revision: u64,
@@ -105,7 +106,7 @@ impl Default for StreamsUi {
         let review = crate::review_ui::ReviewUi::default();
         let warmup = review.metadata_peer();
         let recording_peer = review.metadata_peer();
-        let preparation_peer = review.metadata_peer();
+        let preparation_peer = review.preparation_peer();
         Self {
             youtube: Default::default(),
             twitch: Default::default(),
@@ -132,6 +133,7 @@ impl Default for StreamsUi {
             recording_peer,
             preparation_peer,
             preparation: Default::default(),
+            preparation_catalog: Vec::new(),
             can_delete_recordings: false,
             confirm_remove_recording: None,
             pov_revision: 0,
@@ -470,6 +472,8 @@ impl StreamsUi {
                         self.start(ctx, Action::Refresh);
                     }
                     Ok(ResultData::Recordings(recordings)) => {
+                        self.preparation_catalog =
+                            recordings.vods.iter().take(8).map(Vod::as_stream).collect();
                         self.recording_checks
                             .catalog_received(recordings.log_checks);
                         self.recordings_retry_at = None;
@@ -495,7 +499,10 @@ impl StreamsUi {
                             self.notice = Some("This VOD is no longer in Brick.".into());
                         }
                     }
-                    Ok(ResultData::RecordingChecks(checks)) => {
+                    Ok(ResultData::RecordingChecks(recordings)) => {
+                        self.preparation_catalog =
+                            recordings.vods.iter().take(8).map(Vod::as_stream).collect();
+                        let checks = recordings.log_checks;
                         // Background results only replenish checks. The catalog
                         // already on screen stays stable until the next load.
                         self.recording_checks.catalog_received(checks);
@@ -558,7 +565,7 @@ impl StreamsUi {
                     .min_by_key(|s| (&s.user_id, s.provider.key(), &s.channel_id))
             });
         self.warmup.tick(ctx, warmup_stream);
-        let preparation_candidates: Vec<_> = self
+        let mut preparation_candidates: Vec<_> = self
             .recordings
             .as_ref()
             .filter(|_| active && self.recordings_open)
@@ -571,9 +578,21 @@ impl StreamsUi {
                     .collect()
             })
             .unwrap_or_default();
+        let visible_count = preparation_candidates.len();
+        if !active || self.recordings_open || self.selected.is_none() {
+            for stream in &self.preparation_catalog {
+                if !preparation_candidates.iter().any(|candidate| {
+                    streams::review_path(candidate).ok() == streams::review_path(stream).ok()
+                }) {
+                    preparation_candidates.push(stream.clone());
+                }
+            }
+        }
+        preparation_candidates.truncate(8);
         self.preparation.tick(
             ctx,
             &preparation_candidates,
+            visible_count,
             self.selected
                 .as_ref()
                 .filter(|_| active && !self.recordings_open),
@@ -725,8 +744,9 @@ impl StreamsUi {
                     streams::remove(&token, &provider).map(|()| ResultData::Removed)
                 }
                 Action::Recordings => streams::fetch_recordings(&token).map(ResultData::Recordings),
-                Action::RecordingChecks => streams::fetch_recordings(&token)
-                    .map(|recordings| ResultData::RecordingChecks(recordings.log_checks)),
+                Action::RecordingChecks => {
+                    streams::fetch_recordings(&token).map(ResultData::RecordingChecks)
+                }
                 Action::RemoveRecording(provider, id) => {
                     streams::remove_recording(&token, &provider, &id)
                         .map(|()| ResultData::RecordingRemoved(provider, id))
@@ -2366,10 +2386,12 @@ fn refreshed_token_result(
 ) -> Result<crate::guild::Access, streams::Error> {
     result
         .map_err(|error| streams::Error {
+            retryable: false,
             message: error.message,
             access_denied: !error.retryable,
         })?
         .ok_or_else(|| streams::Error {
+            retryable: false,
             message: "Please sign in with Discord.".to_string(),
             access_denied: true,
         })
@@ -2414,8 +2436,14 @@ mod tests {
         ui.loading_recording_checks = true;
         let (tx, rx) = std::sync::mpsc::channel();
         ui.work = Some(rx);
-        tx.send(Ok(super::ResultData::RecordingChecks(vec![])))
-            .unwrap();
+        tx.send(Ok(super::ResultData::RecordingChecks(
+            streams::Recordings {
+                vods: vec![],
+                can_delete_recordings: false,
+                log_checks: vec![],
+            },
+        )))
+        .unwrap();
         ui.tick(&eframe::egui::Context::default(), true, false);
         assert!(std::rc::Rc::ptr_eq(
             ui.recordings.as_ref().unwrap(),
