@@ -410,6 +410,7 @@ fn content_job_to_native_player_uses_relative_timing_without_marker() {
         replay: fixture.replay,
         pulls: vec![pull.clone()],
         marker_timing: Default::default(),
+        marker_fallback: Default::default(),
         content_capability: Some(cap),
         content_timing: Default::default(),
     });

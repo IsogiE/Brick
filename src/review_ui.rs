@@ -589,10 +589,11 @@ impl ReviewUi {
         selected: Option<&Pull>,
         desired: Option<(i64, bool)>,
     ) -> Option<PlaybackCommand> {
+        let pull = selected.or(self.pull.as_ref())?;
         if self
             .review
             .as_ref()
-            .is_some_and(|review| review.content_required())
+            .is_some_and(|review| review.uses_content_timing(pull))
         {
             if self.marker_sync.busy() {
                 self.marker_sync.reset(Some(player));
@@ -603,7 +604,6 @@ impl ReviewUi {
         {
             return None;
         }
-        let pull = selected.or(self.pull.as_ref())?;
         let review = self.review.as_mut()?;
         let estimate = review.pull_video_start(pull);
         let (elapsed, autoplay) = desired.map_or_else(
@@ -987,6 +987,19 @@ impl ReviewUi {
     fn accept_review(&mut self, mut review: Review) -> bool {
         if let Some(old) = &self.review {
             for pull in &review.pulls {
+                if old.marker_backup_allowed(pull) {
+                    let key = (pull.report.clone(), pull.id);
+                    if let Some(ticket) = old.marker_fallback.get(&key).filter(|ticket| {
+                        self.recording_match_status
+                            .is_some_and(|status| status.0 == ticket.key.auth_epoch)
+                            && review
+                                .content_capability
+                                .as_ref()
+                                .is_some_and(|cap| ticket.key.matches(&review.replay, pull, cap))
+                    }) {
+                        review.marker_fallback.insert(key, ticket.clone());
+                    }
+                }
                 if let Some(alignment) = old.content_alignment(pull).filter(|alignment| {
                     if self
                         .recording_match_status
@@ -1005,27 +1018,26 @@ impl ReviewUi {
                 }
             }
         }
-        if !review.content_required() {
-            if let Ok(mut cache) = self.marker_cache.lock() {
-                for pull in &review.pulls {
-                    if let Some(alignment) = review.marker_alignment(pull) {
-                        cache.insert(
-                            crate::replay_sync::Key::new(&review.replay, pull),
-                            alignment,
-                        );
-                    }
-                    if let Some(alignment) = cache.get(&review.replay, pull) {
-                        review
-                            .marker_timing
-                            .insert((pull.report.clone(), pull.id), alignment);
-                    }
+        if let Ok(mut cache) = self.marker_cache.lock() {
+            for pull in &review.pulls {
+                if let Some(alignment) = review.marker_alignment(pull) {
+                    cache.insert(
+                        crate::replay_sync::Key::new(&review.replay, pull),
+                        alignment,
+                    );
+                }
+                if let Some(alignment) = cache.get(&review.replay, pull) {
+                    review
+                        .marker_timing
+                        .insert((pull.report.clone(), pull.id), alignment);
                 }
             }
         }
         // A refresh may discover a better clock, but only explicit navigation
         // adopts it. Keep the currently watched pull's mapping unchanged.
         if let Some((old, selected)) = self.review.as_ref().zip(self.pull.as_ref()) {
-            if old.replay.broadcast_id == review.replay.broadcast_id
+            if self.playback.is_some()
+                && old.replay.broadcast_id == review.replay.broadcast_id
                 && old.replay.video_id == review.replay.video_id
                 && review.pulls.iter().any(|p| {
                     p.report == selected.report
@@ -1125,6 +1137,11 @@ impl ReviewUi {
         let housekeeping = self.recording_housekeeping;
         let preferred_pull = self.preferred_alignment_pull().cloned();
         let manual_report = self.content.manual_report.clone();
+        let marker_fallback = self
+            .review
+            .as_ref()
+            .map(|review| review.marker_fallback.clone())
+            .unwrap_or_default();
         self.mark_content_started(&action);
         let stream = stream.cloned();
         let ctx = ctx.clone();
@@ -1176,7 +1193,34 @@ impl ReviewUi {
                         } else {
                             client.review(&token, stream, preferred_pull.as_ref())
                         };
-                        review.map(|review| {
+                        review.map(|mut review| {
+                            if !housekeeping {
+                                for (key, ticket) in &marker_fallback {
+                                    if ticket.key.auth_epoch == client.recording_match_status().0 {
+                                        review.marker_fallback.insert(key.clone(), ticket.clone());
+                                    }
+                                }
+                                if let Some(pull) = preferred_pull
+                                    .as_ref()
+                                    .and_then(|p| review.matching_pull(p))
+                                    .cloned()
+                                {
+                                    if review.marker_backup_allowed(&pull) {
+                                        // Request backup timing only for this failed pull, using
+                                        // the existing bounded server marker reader.
+                                        let mut backup = review.clone();
+                                        backup.pulls = vec![pull.clone()];
+                                        if !cancel.load(Ordering::Relaxed) {
+                                            crate::replay_library::lookup(
+                                                &token,
+                                                &mut backup,
+                                                Some(&pull),
+                                            );
+                                            review.marker_timing.extend(backup.marker_timing);
+                                        }
+                                    }
+                                }
+                            }
                             Data::Review(
                                 review,
                                 client.cooldown_preferences(),
@@ -1318,10 +1362,15 @@ impl ReviewUi {
         let Some(review) = &self.review else {
             return;
         };
-        let seconds = if review.content_required() {
+        let seconds = if review.uses_content_timing(&pull) {
             review
                 .content_alignment(&pull)
                 .map(|alignment| alignment.first_video_seconds())
+        } else if review.marker_backup_allowed(&pull) {
+            // A failed content match permits a marker lookup, never an estimated seek.
+            review
+                .marker_alignment(&pull)
+                .map(|alignment| alignment.video_seconds)
         } else {
             Some(pull_video_start(review, &pull).max(0.0))
         };
@@ -1332,7 +1381,7 @@ impl ReviewUi {
                 autoplay: true,
                 broadcast_id: review.replay.broadcast_id.clone(),
                 public_url: review.replay.public_url(seconds as u64),
-                content_timing: review.content_required(),
+                content_timing: review.uses_content_timing(&pull),
             });
         self.cancel_read();
         self.pending_focus = None;
@@ -2451,7 +2500,7 @@ impl ReviewUi {
         }
         let pull = self.pull.as_ref()?;
         let review = self.review.as_ref()?;
-        let end = if review.content_required() {
+        let end = if review.uses_content_timing(pull) {
             let alignment = review.content_alignment(pull)?;
             alignment.result.video_seconds + alignment.result.coverage.fight_end_seconds
         } else {
@@ -3702,6 +3751,7 @@ mod tests {
         (
             Review {
                 marker_timing: HashMap::new(),
+                marker_fallback: Default::default(),
                 content_capability: None,
                 content_timing: Default::default(),
                 replay,

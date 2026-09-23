@@ -365,6 +365,14 @@ impl Ticket {
             expires_at: self.job.expires_at,
         })
     }
+    pub fn permits_marker_backup(&self) -> bool {
+        self.job.status == Status::Failed
+            && !self.job.cleanup_pending
+            && self
+                .job
+                .validate(&self.key, &self.guild_id, &self.member_hash, None)
+                .is_ok()
+    }
     pub fn expired(&self) -> bool {
         self.job.expires_at <= now_ms()
     }
@@ -751,6 +759,25 @@ mod tests {
         let mut stale = ticket;
         stale.key.guild_generation = guild::generation().wrapping_sub(1);
         assert!(poll(&right, &stale, &AtomicBool::new(false)).is_err());
+    }
+    #[test]
+    fn unix_backup_requires_a_valid_finished_failure() {
+        let (_, _, _, mut failed) = test_ticket();
+        failed.job.status = Status::Failed;
+        failed.job.result = None;
+        failed.job.error = Some("alignment_not_found".into());
+        assert!(failed.permits_marker_backup());
+        for change in 0..5 {
+            let mut ticket = failed.clone();
+            match change {
+                0 => ticket.job.cleanup_pending = true,
+                1 => ticket.job.expires_at = 1,
+                2 => ticket.job.scope.as_mut().unwrap().video_id = "other".into(),
+                3 => ticket.job.status = Status::Canceled,
+                _ => ticket.job.scope.as_mut().unwrap().algorithm_revision = "0".repeat(64),
+            }
+            assert!(!ticket.permits_marker_backup());
+        }
     }
     #[test]
     fn expired_and_oversized_or_unknown_json_are_rejected() {

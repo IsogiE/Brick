@@ -864,7 +864,7 @@ impl Comparison {
                                 autoplay: false,
                                 broadcast_id: metadata.replay.broadcast_id.clone(),
                                 public_url: metadata.replay.public_url(target.floor() as u64),
-                                content_timing: metadata.content_required(),
+                                content_timing: metadata.uses_content_timing(secondary_pull),
                             };
                             let url =
                                 crate::streams_ui::player_url_for_playback(&url, Some(&playback));
@@ -977,7 +977,7 @@ struct ClockVersion {
 impl ClockVersion {
     fn new(review: &Review, pull: &Pull) -> Result<Self, String> {
         Ok(Self {
-            recording_start_ms: if review.content_required() {
+            recording_start_ms: if review.uses_content_timing(pull) {
                 None
             } else {
                 Some(review.replay.start_ms()?)
@@ -1011,7 +1011,7 @@ fn replace_changed_clocks(
 }
 
 pub(crate) fn recording_clock(review: &Review, pull: &Pull) -> Result<RecordingClock, String> {
-    if review.content_required() {
+    if review.uses_content_timing(pull) {
         let alignment = review
             .content_alignment(pull)
             .ok_or("Video alignment is not ready for this POV.")?;
@@ -1150,6 +1150,7 @@ mod tests {
             }
             Review {
                 marker_timing: std::collections::HashMap::new(),
+                marker_fallback: Default::default(),
                 content_capability: None,
                 content_timing: Default::default(),
                 replay,
