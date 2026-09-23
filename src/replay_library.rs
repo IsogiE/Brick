@@ -321,6 +321,7 @@ mod tests {
                 replay,
                 pulls: vec![pull.clone()],
                 marker_timing: Default::default(),
+                marker_fallback: Default::default(),
                 content_capability: None,
                 content_timing: Default::default(),
             },

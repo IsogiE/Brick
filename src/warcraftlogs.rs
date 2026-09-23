@@ -165,6 +165,7 @@ pub struct Review {
     pub replay: Replay,
     pub pulls: Vec<Pull>,
     pub marker_timing: HashMap<(String, u64), crate::replay_sync::Alignment>,
+    pub marker_fallback: HashMap<(String, u64), crate::content_alignment::Ticket>,
     pub content_capability: Option<crate::content_alignment::Capability>,
     pub content_timing: HashMap<(String, u64), crate::content_alignment::Alignment>,
 }
@@ -203,18 +204,38 @@ impl Review {
     pub fn content_required(&self) -> bool {
         self.content_capability.is_some() || self.replay.start_ms().is_err()
     }
+    pub fn marker_backup_allowed(&self, pull: &Pull) -> bool {
+        self.replay.start_ms().is_ok()
+            && self.content_capability.as_ref().is_some_and(|cap| {
+                self.marker_fallback
+                    .get(&(pull.report.clone(), pull.id))
+                    .is_some_and(|ticket| {
+                        ticket.permits_marker_backup()
+                            && ticket.key.matches(&self.replay, pull, cap)
+                    })
+            })
+    }
+    pub fn uses_content_timing(&self, pull: &Pull) -> bool {
+        self.content_required()
+            && (self.content_alignment(pull).is_some() || !self.marker_backup_allowed(pull))
+    }
     pub fn has_precise_timing(&self, pull: &Pull) -> bool {
-        if self.content_required() {
+        if self.uses_content_timing(pull) {
             self.content_alignment(pull).is_some()
         } else {
             self.marker_alignment(pull).is_some()
         }
     }
     pub fn pull_video_start(&self, pull: &Pull) -> f64 {
-        if self.content_required() {
+        if self.uses_content_timing(pull) {
             return self
                 .content_alignment(pull)
                 .map_or(f64::NAN, |a| a.result.video_seconds);
+        }
+        if self.marker_backup_allowed(pull) {
+            return self
+                .marker_alignment(pull)
+                .map_or(f64::NAN, |a| a.video_seconds);
         }
         self.marker_alignment(pull).map_or_else(
             || (pull.start_ms - self.replay.start_ms().unwrap_or(pull.start_ms)) as f64 / 1000.0,
@@ -222,7 +243,7 @@ impl Review {
         )
     }
     pub fn video_seconds(&self, pull: &Pull, elapsed: f64) -> Option<f64> {
-        if self.content_required() {
+        if self.uses_content_timing(pull) {
             return self.content_alignment(pull)?.seek(elapsed);
         }
         let seconds = self.pull_video_start(pull) + elapsed;
@@ -1024,6 +1045,7 @@ impl Client {
             replay,
             pulls,
             marker_timing: HashMap::new(),
+            marker_fallback: Default::default(),
             content_capability: None,
             content_timing: HashMap::new(),
         })
@@ -1255,6 +1277,7 @@ impl Client {
                 replay,
                 pulls: Vec::new(),
                 marker_timing: HashMap::new(),
+                marker_fallback: Default::default(),
                 content_capability: None,
                 content_timing: HashMap::new(),
             });
@@ -1375,6 +1398,7 @@ impl Client {
         self.recording_match_complete = complete;
         Ok(Review {
             marker_timing: HashMap::new(),
+            marker_fallback: Default::default(),
             content_capability: None,
             content_timing: HashMap::new(),
             replay,
@@ -1755,6 +1779,7 @@ mod tests {
             replay: replay(),
             pulls: vec![first.clone(), second],
             marker_timing: HashMap::new(),
+            marker_fallback: Default::default(),
             content_capability: None,
             content_timing: HashMap::new(),
         };

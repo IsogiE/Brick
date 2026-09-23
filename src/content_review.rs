@@ -2,6 +2,9 @@
 use super::*;
 use crate::content_alignment::{Key, Status, Ticket};
 
+// Keep following long-running jobs on the small production worker.
+const MAX_CONTENT_POLLS: u16 = 1440;
+
 #[derive(Default)]
 pub(super) struct State {
     pub report_input: String,
@@ -34,9 +37,17 @@ impl ReviewUi {
             {
                 if let Some(review) = self.review.as_mut() {
                     review.content_timing.clear();
+                    review.marker_fallback.clear();
                 }
                 self.recording_match_status = Some((epoch, false));
             }
+        }
+        if let Some(review) = self.review.as_mut() {
+            review.marker_fallback.retain(|_, ticket| {
+                self.recording_match_status
+                    .is_some_and(|status| status.0 == ticket.key.auth_epoch)
+                    && ticket.permits_marker_backup()
+            });
         }
         let desired = self.review.as_ref().and_then(|review| {
             if self.recording_housekeeping || (!self.active && !self.metadata_only) {
@@ -86,6 +97,9 @@ impl ReviewUi {
         let Some(ticket) = self.content.ticket.as_ref() else {
             return false;
         };
+        if ticket.job.status == Status::Failed {
+            return self.accept_marker_backup(ticket.clone());
+        }
         if ticket.alignment().is_none()
             || self.review.as_ref().is_some_and(|review| {
                 review.pulls.iter().any(|pull| {
@@ -147,11 +161,15 @@ impl ReviewUi {
         }
         self.content.failure = None;
         self.content.next_poll = Some(Instant::now() + Duration::from_secs(5));
-        self.content.paused = self.content.polls >= 120;
+        self.content.paused = self.content.polls >= MAX_CONTENT_POLLS;
         let alignment = ticket.alignment();
         self.content.ticket = Some(ticket);
         let Some(alignment) = alignment else {
-            return false;
+            return self
+                .content
+                .ticket
+                .clone()
+                .is_some_and(|ticket| self.accept_marker_backup(ticket));
         };
         let Some(review) = self.review.as_mut() else {
             return false;
@@ -188,6 +206,55 @@ impl ReviewUi {
         false
     }
 
+    fn accept_marker_backup(&mut self, ticket: Ticket) -> bool {
+        if !ticket.permits_marker_backup()
+            || self.content.key.as_ref() != Some(&ticket.key)
+            || self
+                .recording_auth_epoch()
+                .is_some_and(|epoch| epoch != ticket.key.auth_epoch)
+            || crate::guild::ensure_current(ticket.key.guild_generation).is_err()
+        {
+            return false;
+        }
+        let Some(review) = self.review.as_mut() else {
+            return false;
+        };
+        let Some(pull) = review
+            .pulls
+            .iter()
+            .find(|pull| {
+                pull.report == ticket.key.report
+                    && pull.id == ticket.key.pull_id
+                    && review
+                        .content_capability
+                        .as_ref()
+                        .is_some_and(|cap| ticket.key.matches(&review.replay, pull, cap))
+            })
+            .cloned()
+        else {
+            return false;
+        };
+        if review.replay.start_ms().is_err() || review.content_alignment(&pull).is_some() {
+            return false;
+        }
+        let key = (pull.report.clone(), pull.id);
+        if review.marker_fallback.insert(key, ticket).is_none() {
+            self.last_attempt = None;
+        }
+        if self.active
+            && self.playback.is_none()
+            && review.marker_alignment(&pull).is_some()
+            && self
+                .pull
+                .as_ref()
+                .is_some_and(|p| pull_key(p) == pull_key(&pull))
+        {
+            self.select(pull);
+            return true;
+        }
+        false
+    }
+
     pub(super) fn content_failed(&mut self, message: String) {
         self.content.failure = Some(message.chars().take(512).collect());
     }
@@ -203,7 +270,7 @@ impl ReviewUi {
             .as_ref()
             .zip(self.pull.as_ref())
             .is_some_and(|(review, pull)| {
-                review.content_required() && review.content_alignment(pull).is_none()
+                review.content_required() && !review.has_precise_timing(pull)
             })
     }
 
@@ -268,6 +335,22 @@ impl ReviewUi {
                 .is_none_or(|r| r.content_capability.is_none())
             {
                 ("Video alignment is unavailable on this server.", false)
+            } else if self
+                .review
+                .as_ref()
+                .zip(self.pull.as_ref())
+                .is_some_and(|(review, pull)| review.marker_backup_allowed(pull))
+            {
+                if self
+                    .review
+                    .as_ref()
+                    .zip(self.pull.as_ref())
+                    .is_some_and(|(review, pull)| review.marker_alignment(pull).is_some())
+                {
+                    ("Video aligned using the backup timing.", false)
+                } else {
+                    ("Checking backup video timing…", false)
+                }
             } else if self.content.paused {
                 (
                     "This video is still processing. Check again when ready.",
@@ -343,6 +426,7 @@ mod tests {
             replay,
             pulls: vec![pull.clone()],
             marker_timing: Default::default(),
+            marker_fallback: Default::default(),
             content_capability: Some(cap),
             content_timing: Default::default(),
         });
@@ -425,7 +509,7 @@ mod tests {
             ui.next_content_action(),
             Some(Action::ContentPoll(_))
         ));
-        ui.content.polls = 120;
+        ui.content.polls = MAX_CONTENT_POLLS;
         ui.accept_content(ticket);
         assert!(ui.content.paused);
         assert!(ui.next_content_action().is_none());
@@ -497,6 +581,151 @@ mod tests {
         ));
         assert!(ui.playback.is_none());
     }
+    fn backup_viewer() -> (ReviewUi, Ticket) {
+        let (mut ui, mut ticket) = viewer();
+        let review = ui.review.as_mut().unwrap();
+        review.replay.started_at = "2023-11-14T22:13:20Z".into();
+        ticket
+            .job
+            .scope
+            .as_mut()
+            .unwrap()
+            .timeline
+            .raw_started_at_ms = review.replay.start_ms().ok();
+        ticket.key = Key::new(
+            &review.replay,
+            &review.pulls[0],
+            review.content_capability.as_ref().unwrap(),
+            0,
+        );
+        ui.sync_content_selection();
+        (ui, ticket)
+    }
+    fn marker(ui: &mut ReviewUi) {
+        let pull = ui.pull.as_ref().unwrap();
+        ui.review.as_mut().unwrap().marker_timing.insert(
+            (pull.report.clone(), pull.id),
+            crate::replay_sync::Alignment {
+                unix_seconds: pull.start_ms / 1000,
+                video_seconds: 18.125,
+                uncertainty_seconds: 0.1,
+            },
+        );
+    }
+    #[test]
+    fn live_match_wins_even_when_a_unix_backup_is_cached() {
+        let (mut ui, ticket) = backup_viewer();
+        marker(&mut ui);
+        ui.select(ui.pull.clone().unwrap());
+        assert!(ui.playback.is_none());
+        assert!(ui
+            .review
+            .as_ref()
+            .unwrap()
+            .pull_video_start(ui.pull.as_ref().unwrap())
+            .is_nan());
+        assert!(ui.accept_content(ticket));
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, 15.25);
+        assert!(ui.playback.as_ref().unwrap().content_timing);
+    }
+    #[test]
+    fn only_terminal_failure_enables_verified_marker_backup() {
+        for status in [
+            Status::Pending,
+            Status::Running,
+            Status::CleanupPending,
+            Status::Canceled,
+            Status::Failed,
+        ] {
+            let (mut ui, mut ticket) = backup_viewer();
+            marker(&mut ui);
+            ticket.job.status = status;
+            ticket.job.result = None;
+            assert_eq!(ui.accept_content(ticket), status == Status::Failed);
+            assert_eq!(ui.playback.is_some(), status == Status::Failed);
+            if let Some(playback) = ui.playback.as_ref() {
+                assert_eq!(playback.seconds, 18.125);
+                assert!(!playback.content_timing);
+                assert!(!ui.content_waiting());
+                assert!(matches!(
+                    ui.seek_absolute(ui.pull.as_ref().unwrap().start_ms + 11_125),
+                    Some(PlaybackCommand::Seek(29.25))
+                ));
+            }
+        }
+    }
+    #[test]
+    fn failed_live_match_without_marker_never_seeks_to_a_metadata_estimate() {
+        let (mut ui, mut ticket) = backup_viewer();
+        ticket.job.status = Status::Failed;
+        ticket.job.result = None;
+        ui.accept_content(ticket);
+        ui.select(ui.pull.clone().unwrap());
+        let review = ui.review.as_ref().unwrap();
+        let pull = ui.pull.as_ref().unwrap();
+        assert!(review.marker_backup_allowed(pull));
+        assert!(!review.has_precise_timing(pull));
+        assert!(review.pull_video_start(pull).is_nan());
+        assert!(review.video_seconds(pull, 0.0).is_none());
+        assert!(crate::review_compare_ui::recording_clock(review, pull).is_err());
+        assert!(ui.playback.is_none());
+        // A later verified lookup can satisfy the still-waiting explicit selection.
+        let mut refreshed = ui.review.clone().unwrap();
+        marker(&mut ui);
+        refreshed.marker_timing = ui.review.as_ref().unwrap().marker_timing.clone();
+        ui.accept_review(refreshed);
+        assert!(ui.sync_content_selection());
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, 18.125);
+    }
+    #[test]
+    fn marker_backup_permission_does_not_cross_pull_media_account_or_expiry() {
+        for change in 0..5 {
+            let (mut ui, mut ticket) = backup_viewer();
+            ticket.job.status = Status::Failed;
+            ticket.job.result = None;
+            ui.accept_content(ticket);
+            match change {
+                0 => ui.review.as_mut().unwrap().replay.timeline_revision = Some("0".repeat(64)),
+                1 => ui.review.as_mut().unwrap().pulls[0].start_ms += 1,
+                2 => ui.recording_match_status = Some((1, false)),
+                3 => {
+                    for ticket in ui.review.as_mut().unwrap().marker_fallback.values_mut() {
+                        ticket.job.expires_at = 1;
+                    }
+                    ui.content.ticket.as_mut().unwrap().job.expires_at = 1;
+                }
+                _ => {
+                    ui.review
+                        .as_mut()
+                        .unwrap()
+                        .content_capability
+                        .as_mut()
+                        .unwrap()
+                        .algorithm_revision = "0".repeat(64)
+                }
+            }
+            ui.sync_content_selection();
+            let review = ui.review.as_ref().unwrap();
+            assert!(!review.marker_backup_allowed(&review.pulls[0]));
+            assert!(ui.playback.is_none());
+        }
+    }
+    #[test]
+    fn request_errors_and_missing_provider_origin_do_not_authorize_backup() {
+        let (mut ui, _) = backup_viewer();
+        marker(&mut ui);
+        ui.content_failed("Temporary service error".into());
+        assert!(ui.review.as_ref().unwrap().marker_fallback.is_empty());
+        assert!(ui.playback.is_none());
+        let (mut ui, mut ticket) = viewer();
+        marker(&mut ui);
+        ticket.job.status = Status::Failed;
+        ticket.job.result = None;
+        ui.accept_content(ticket);
+        assert!(ui.review.as_ref().unwrap().marker_fallback.is_empty());
+        assert!(ui.playback.is_none());
+    }
+
     #[test]
     fn report_import_only_accepts_codes_or_official_https_report_links() {
         for input in [
