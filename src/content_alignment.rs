@@ -89,7 +89,7 @@ impl Key {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Timeline {
     pub provider: streams::Provider,
@@ -221,7 +221,7 @@ impl Alignment {
 
 /// A shared fixed clock for a continuous recording and one exact WCL report.
 /// The server retains private source inputs; viewers receive only timing.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RecordingClock {
     pub report_start_ms: i64,

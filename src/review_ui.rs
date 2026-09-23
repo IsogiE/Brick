@@ -725,9 +725,12 @@ impl ReviewUi {
             return false;
         }
         let entry = self.prepared.lock().ok().and_then(|cache| {
-            cache
-                .get(stream)
-                .map(|entry| (entry, cache.preferences.clone()))
+            let entry = if self.metadata_only {
+                cache.get(stream)
+            } else {
+                cache.for_display(stream)
+            };
+            entry.map(|entry| (entry, cache.preferences.clone()))
         });
         let Some((entry, preferences)) = entry else {
             return false;
@@ -1630,7 +1633,7 @@ impl ReviewUi {
                     self.active = true;
                     changed = true;
                 }
-                if self.work.is_some() {
+                if self.work.is_some() && self.review.is_none() {
                     ui.small("Finding raid pulls…");
                 }
                 let menu = ui.menu_button("…", |ui| {
@@ -4017,6 +4020,49 @@ mod tests {
     }
 
     #[test]
+    fn switching_back_restores_stale_live_pulls_while_refresh_is_busy() {
+        let (mut review, mut stream, clocks) = prepared_fixture(Provider::Twitch);
+        stream.recording_id = None;
+        stream.status = Status::Live;
+        stream.replay_start_ms = Some(1_790_000_000_000);
+        review.replay.growing = true;
+        let mut ui = ReviewUi::default();
+        ui.prepared.lock().unwrap().insert(
+            &stream,
+            review,
+            (clocks[0].0.auth_epoch, true),
+            Vec::new(),
+        );
+        ui.prepared
+            .lock()
+            .unwrap()
+            .age_for_test(Duration::from_secs(20));
+        assert!(!ui.prepared_metadata(&stream));
+        let mut peer = ui.preparation_peer();
+        assert!(!peer.restore_prepared_recording(&stream));
+        let shared_client = ui.client.clone();
+        let _busy = shared_client.lock().unwrap();
+        let (_tx, rx) = mpsc::channel();
+        ui.work = Some(rx);
+        let ctx = egui::Context::default();
+        ui.tick(&ctx, Some(&stream));
+        assert_eq!(ui.review.as_ref().unwrap().pulls.len(), 2);
+        let mut other = stream.clone();
+        other.user_id = "202".into();
+        ui.tick(&ctx, Some(&other));
+        assert!(ui.review.is_none());
+        ui.tick(&ctx, Some(&stream));
+        assert_eq!(ui.review.as_ref().unwrap().pulls.len(), 2);
+        assert!(ui.work.is_some());
+        ui.work = None;
+        // Restoring display data must not make the overdue refresh fresh.
+        assert!(matches!(ui.next_action(), Some(Action::Refresh)));
+        ui.open_recording();
+        assert!(ui.restore_prepared_recording(&stream));
+        assert!(ui.playback.is_some());
+    }
+
+    #[test]
     fn prepared_vods_respect_expiry_account_reset_and_recording_identity() {
         let (review, stream, clocks) = prepared_fixture(Provider::Youtube);
         let epoch = clocks[0].0.auth_epoch;
@@ -4039,7 +4085,8 @@ mod tests {
             .lock()
             .unwrap()
             .insert(&stream, review, (epoch, true), expired);
-        assert!(!ui.restore_prepared_recording(&stream));
+        assert!(ui.restore_prepared_recording(&stream));
+        assert_eq!(ui.review.as_ref().unwrap().pulls.len(), 2);
     }
 
     #[test]

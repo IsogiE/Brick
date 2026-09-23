@@ -90,6 +90,14 @@ pub fn save(scope: &str, bytes: &[u8]) -> Result<(), String> {
         .map_err(|_| "Couldn't save the guild cache.".into())
 }
 
+pub(crate) fn remove(scope: &str) -> Result<(), String> {
+    match fs::remove_file(path(scope)?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("Couldn't remove the guild cache.".into()),
+    }
+}
+
 fn encrypt(key: &aead::LessSafeKey, scope: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut nonce = [0; 12];
     SystemRandom::new()

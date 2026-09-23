@@ -2,7 +2,7 @@
 //! player identities, targets, damage amounts or inferred timings leave here.
 use super::{check_cancelled, report_code, Client, Config, Pull};
 use icu_properties::{props::GeneralCategory, CodePointMapData};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -38,10 +38,10 @@ const EVENTS_QUERY: &str = r#"query($code:String!,$fight:Int!,$type:EventDataTyp
  translate:false,includeResources:$resources,limit:2000){data nextPageTimestamp}
 }}}"#;
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BossSignature {
-    pub schema: &'static str,
+    pub schema: String,
     pub report: String,
     pub pull_id: u64,
     pub encounter_id: u64,
@@ -59,13 +59,13 @@ pub(crate) struct BossSignature {
     pub coverage: Coverage,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct NamedId {
     pub id: u64,
     pub name: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum CastType {
     #[serde(rename = "begincast")]
     BeginCast,
@@ -73,7 +73,7 @@ pub(crate) enum CastType {
     Cast,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BossCast {
     pub seconds: f64,
@@ -85,7 +85,7 @@ pub(crate) struct BossCast {
     pub ability_id: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BossHealth {
     pub seconds: f64,
@@ -96,12 +96,12 @@ pub(crate) struct BossHealth {
     pub max_hit_points: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Coverage {
     pub casts: PageCoverage,
     pub health: PageCoverage,
 }
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PageCoverage {
     pub pages: usize,
     pub complete: bool,
@@ -142,21 +142,73 @@ impl Client {
         validate_pull(pull)?;
         self.configure(access, true)?;
         check_scope(self.config.as_ref(), access)?;
-        let cancel = self.cancel.clone();
-        export_with(
-            pull,
-            Limits::default(),
-            |query, variables, timeout| {
-                check_scope(self.config.as_ref(), access)?;
-                let value = self.query_with_timeout(query, variables, timeout)?;
-                check_scope(self.config.as_ref(), access)?;
-                Ok(value)
-            },
-            || {
-                access.check()?;
-                check_cancelled(&cancel)
-            },
-        )
+        self.access_token()?;
+        self.boss_signature_cached(access, pull, |client| {
+            let cancel = client.cancel.clone();
+            export_with(
+                pull,
+                Limits::default(),
+                |query, variables, timeout| {
+                    check_scope(client.config.as_ref(), access)?;
+                    let value = client.query_with_timeout(query, variables, timeout)?;
+                    check_scope(client.config.as_ref(), access)?;
+                    Ok(value)
+                },
+                || {
+                    access.check()?;
+                    check_cancelled(&cancel)
+                },
+            )
+        })
+    }
+
+    fn boss_signature_cached(
+        &mut self,
+        access: &crate::guild::Access,
+        pull: &Pull,
+        export: impl FnOnce(&mut Self) -> Result<BossSignature, String>,
+    ) -> Result<BossSignature, String> {
+        access.check()?;
+        check_cancelled(&self.cancel)?;
+        check_scope(self.config.as_ref(), access)?;
+        validate_pull(pull)?;
+        let cache_key =
+            super::data_cache::pull_key("boss-brick-boss-signature-1-projection-1", pull);
+        if let Some(signature) = self
+            .cached_data::<BossSignature>(access, &cache_key)
+            .filter(|signature| signature.matches(pull))
+        {
+            access.check()?;
+            check_cancelled(&self.cancel)?;
+            return Ok(signature);
+        }
+        let signature = export(self)?;
+        check_scope(self.config.as_ref(), access)?;
+        check_cancelled(&self.cancel)?;
+        if signature.matches(pull) {
+            self.cache_data(access, cache_key, &signature);
+        }
+        access.check()?;
+        check_cancelled(&self.cancel)?;
+        Ok(signature)
+    }
+}
+
+impl BossSignature {
+    fn matches(&self, pull: &Pull) -> bool {
+        self.schema == SCHEMA
+            && self.complete
+            && self.coverage.casts.complete
+            && self.coverage.health.complete
+            && self.report == pull.report
+            && self.pull_id == pull.id
+            && self.report_start_ms == pull.report_start_ms
+            && Some(self.fight_start_ms) == pull.start_ms.checked_sub(pull.report_start_ms)
+            && Some(self.fight_end_ms) == pull.end_ms.checked_sub(pull.report_start_ms)
+            && self.encounter_id == pull.encounter
+            && self.difficulty == pull.difficulty
+            && self.casts.len() <= Limits::default().casts
+            && self.health.len() <= Limits::default().health
     }
 }
 
@@ -225,7 +277,7 @@ where
     let (start, end) = checked_fight(report, pull)?;
     let (actors, abilities) = catalog(report)?;
     let mut signature = BossSignature {
-        schema: SCHEMA,
+        schema: SCHEMA.into(),
         report: pull.report.clone(),
         pull_id: pull.id,
         encounter_id: pull.encounter,
@@ -788,6 +840,145 @@ mod tests {
             Arc,
         },
     };
+
+    #[test]
+    fn completed_signature_cache_identity_rejects_changed_bounds_schema_and_incomplete_data() {
+        let signature = run(pages(), Limits::default()).unwrap();
+        let restored: BossSignature =
+            serde_json::from_slice(&serde_json::to_vec(&signature).unwrap()).unwrap();
+        assert!(restored.matches(&pull()));
+        let mut changed = pull();
+        changed.end_ms += 1;
+        assert!(!restored.matches(&changed));
+        assert_ne!(
+            super::super::data_cache::pull_key("boss-v1", &pull()),
+            super::super::data_cache::pull_key("boss-v1", &changed)
+        );
+        assert_ne!(
+            super::super::data_cache::pull_key("boss-v1", &pull()),
+            super::super::data_cache::pull_key("boss-v2", &pull())
+        );
+        let mut incomplete = restored.clone();
+        incomplete.coverage.health.complete = false;
+        assert!(!incomplete.matches(&pull()));
+        incomplete = restored;
+        incomplete.schema = "obsolete".into();
+        assert!(!incomplete.matches(&pull()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the isolated Secret Service used by CI"]
+    fn linux_keyring_roundtrip_boss_cache_shares_povs_restarts_and_rejects_revocation() {
+        use super::super::{ConfigStamp, Session};
+        let config = Config {
+            client_id: uuid::Uuid::new_v4().to_string(),
+            guild_id: 123,
+            user_id: "102".into(),
+            discord_guild_id: crate::guild::ADVANCE.into(),
+            content_alignment: None,
+        };
+        let session = Session {
+            cache_id: super::super::random(),
+            client_id: config.client_id.clone(),
+            user_id: config.user_id.clone(),
+            access_token: "synthetic-wcl".into(),
+            refresh_token: None,
+            expires_at: super::super::now_secs() + 3600,
+        };
+        let access = crate::guild::Access::new(
+            "synthetic-discord".into(),
+            config.discord_guild_id.clone(),
+            config.user_id.clone(),
+            crate::guild::generation(),
+        );
+        let make_client = || {
+            let mut client = Client::new().unwrap();
+            client.config = Some(config.clone());
+            client.session = Some(session.clone());
+            client.config_stamp = Some(ConfigStamp {
+                token_hash: access.fingerprint(),
+                at: Instant::now(),
+            });
+            client
+        };
+        let mut client = make_client();
+        let exports = Cell::new(0);
+        let first = client
+            .boss_signature_cached(&access, &pull(), |_| {
+                exports.set(exports.get() + 1);
+                run(pages(), Limits::default())
+            })
+            .unwrap();
+        let second = client.boss_signature(&access, &pull()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(exports.get(), 1);
+        assert_eq!(client.requests.graphql, 0);
+        drop(client);
+        let mut client = make_client();
+        assert_eq!(client.boss_signature(&access, &pull()).unwrap(), first);
+        assert_eq!(client.requests.graphql, 0);
+        let event_key = super::super::data_cache::pull_key("deaths-v1", &pull());
+        client.cache_data(
+            &access,
+            event_key,
+            &super::super::SavedEvents {
+                coverage: Default::default(),
+                raw: vec![super::super::RaidEvent {
+                    at_ms: pull().start_ms + 1000,
+                    actor_id: 1,
+                    observed_buff: false,
+                    actor: "Fixture player".into(),
+                    class: "Priest".into(),
+                    ability: "Death".into(),
+                    ability_id: 0,
+                    target: None,
+                    target_actor_id: None,
+                    kind: super::super::EventKind::Deaths,
+                    group: None,
+                }],
+            },
+        );
+        drop(client);
+        let mut client = make_client();
+        client.cooldowns = Some(Default::default());
+        let events = client
+            .events(&access, &pull(), super::super::EventKind::Deaths)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor, "Fixture player");
+        assert_eq!(client.requests.graphql, 0);
+        assert_eq!(client.requests.catalogue, 0);
+        client.cancel.store(true, Ordering::Relaxed);
+        assert!(client.boss_signature(&access, &pull()).is_err());
+        client.cancel.store(false, Ordering::Relaxed);
+        let denied = crate::guild::Access::new(
+            "synthetic-other".into(),
+            config.discord_guild_id.clone(),
+            "999".into(),
+            crate::guild::generation(),
+        );
+        assert!(client
+            .boss_signature_cached(&denied, &pull(), |_| panic!(
+                "wrong account must stop before export"
+            ))
+            .is_err());
+        client.invalidate_review_cache();
+        assert!(client
+            .boss_signature_cached(&access, &pull(), |_| Err("expected miss".into()))
+            .is_err());
+        // An incomplete result is never reusable.
+        let mut incomplete = first.clone();
+        incomplete.complete = false;
+        client
+            .boss_signature_cached(&access, &pull(), |_| Ok(incomplete))
+            .unwrap();
+        assert!(client
+            .boss_signature_cached(&access, &pull(), |_| Err("expected miss".into()))
+            .is_err());
+        super::super::data_cache::remove_test_cache(&config);
+        super::super::store(&config).unwrap().remove().unwrap();
+    }
 
     fn pull() -> Pull {
         Pull {
