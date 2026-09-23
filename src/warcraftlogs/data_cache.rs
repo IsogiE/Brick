@@ -503,6 +503,7 @@ mod tests {
             content_alignment: None,
         };
         let session = Session {
+            rate_budget: Default::default(),
             cache_id: super::super::random(),
             client_id: config.client_id.clone(),
             user_id: config.user_id.clone(),
