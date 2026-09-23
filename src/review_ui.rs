@@ -467,7 +467,9 @@ impl ReviewUi {
     }
 
     pub(crate) fn comparison_notice(&self) -> Option<&str> {
-        self.notice.as_deref()
+        self.notice
+            .as_deref()
+            .filter(|notice| !crate::warcraftlogs::background_retry_notice(notice))
     }
 
     pub(crate) fn comparison_metadata(&self) -> Option<&Review> {
@@ -710,7 +712,7 @@ impl ReviewUi {
         self.prepared
             .lock()
             .ok()
-            .is_some_and(|cache| cache.contains(stream))
+            .is_some_and(|cache| cache.background_contains(stream))
     }
 
     pub(crate) fn prepared_recording(&self, stream: &Stream) -> bool {
@@ -1245,6 +1247,7 @@ impl ReviewUi {
                 cache.set_connected(false);
             }
         }
+        let background_requests = self.metadata_only;
         let housekeeping = self.recording_housekeeping;
         let preferred_pull = self.preferred_alignment_pull().cloned();
         let recovery_pulls = self
@@ -1296,6 +1299,7 @@ impl ReviewUi {
                 }
                 let client = lock.as_mut().unwrap();
                 client.set_request_cancellation(cancel.clone());
+                client.set_background_requests(background_requests);
                 connected = client.connected();
                 let result = match action {
                     Action::Connect => client
@@ -1653,7 +1657,11 @@ impl ReviewUi {
                 self.draw_connection_control(ui, stream);
             }
         });
-        if let Some(notice) = &self.notice {
+        if let Some(notice) = self
+            .notice
+            .as_ref()
+            .filter(|notice| !crate::warcraftlogs::background_retry_notice(notice))
+        {
             ui.add(egui::Label::new(RichText::new(notice).small().color(MUTED)).truncate())
                 .on_hover_text(notice);
         }
@@ -1806,7 +1814,11 @@ impl ReviewUi {
                 } else {
                     ui.heading("Loading raid review…");
                 }
-                if let Some(notice) = &self.notice {
+                if let Some(notice) = self
+                    .notice
+                    .as_ref()
+                    .filter(|notice| !crate::warcraftlogs::background_retry_notice(notice))
+                {
                     ui.add_space(8.0);
                     ui.add(egui::Label::new(RichText::new(notice).small().color(MUTED)).wrap());
                 }
@@ -1979,7 +1991,11 @@ impl ReviewUi {
         self.popup_open = egui::Popup::is_any_open(ui.ctx());
         self.draw_content_controls(ui, stream);
         ui.add_space(7.0);
-        if let Some(notice) = &self.notice {
+        if let Some(notice) = self
+            .notice
+            .as_ref()
+            .filter(|notice| !crate::warcraftlogs::background_retry_notice(notice))
+        {
             ui.add(egui::Label::new(RichText::new(notice).small().color(MUTED)).truncate());
         }
         // Allocate the workspace once. A long player/ability name must never push
@@ -2991,14 +3007,16 @@ impl ReviewUi {
             .iter()
             .find(|failure| failure.kind == self.kind)
         {
-            ui.label(RichText::new(&failure.message).small().color(MUTED));
-            if ui
-                .add_enabled(self.work.is_none(), egui::Button::new("Retry"))
-                .clicked()
-            {
-                self.requested_events.retain(|kind| *kind != self.kind);
-                self.event_failures
-                    .retain(|failure| failure.kind != self.kind);
+            if !crate::warcraftlogs::background_retry_notice(&failure.message) {
+                ui.label(RichText::new(&failure.message).small().color(MUTED));
+                if ui
+                    .add_enabled(self.work.is_none(), egui::Button::new("Retry"))
+                    .clicked()
+                {
+                    self.requested_events.retain(|kind| *kind != self.kind);
+                    self.event_failures
+                        .retain(|failure| failure.kind != self.kind);
+                }
             }
         } else if !self.loaded_events.contains(&self.kind) {
             ui.spinner();
@@ -3813,6 +3831,47 @@ mod tests {
     use crate::streams::{Provider, Status};
     use crate::warcraftlogs::Replay;
     use std::collections::HashMap;
+
+    #[test]
+    fn throttled_refresh_keeps_known_pulls_and_does_not_render_background_noise() {
+        let (review, _, stream) = fixture();
+        let mut state = ReviewUi::default();
+        state.key = pov_key(&stream);
+        state.connected = true;
+        state.review = Some(review);
+        let (tx, rx) = mpsc::channel();
+        state.work = Some(rx);
+        state.work_action = Some(Action::Refresh);
+        let message = "Warcraft Logs is busy. Brick will retry shortly.";
+        tx.send((
+            state.generation,
+            state.key.clone(),
+            Err(message.into()),
+            true,
+        ))
+        .unwrap();
+        let ctx = egui::Context::default();
+        state.tick(&ctx, Some(&stream));
+        assert_eq!(state.review.as_ref().unwrap().pulls.len(), 1);
+        assert!(state.work.is_none());
+        assert!(state.comparison_notice().is_none());
+        let draw = |state: &mut ReviewUi| {
+            ctx.run_ui(Default::default(), |ui| {
+                state.draw(ui, &stream);
+            })
+        };
+        let _ = draw(&mut state);
+        let output = draw(&mut state);
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "Review raid · 1 pulls")));
+        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text().contains("Warcraft Logs is busy"))));
+        state.notice = Some("Please reconnect Warcraft Logs.".into());
+        assert_eq!(
+            state.comparison_notice(),
+            Some("Please reconnect Warcraft Logs.")
+        );
+    }
 
     #[test]
     fn recording_housekeeping_does_not_prepare_playback_or_touch_marker_cache() {

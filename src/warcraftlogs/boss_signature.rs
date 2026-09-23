@@ -150,7 +150,7 @@ impl Client {
                 Limits::default(),
                 |query, variables, timeout| {
                     check_scope(client.config.as_ref(), access)?;
-                    let value = client.query_with_timeout(query, variables, timeout)?;
+                    let value = client.query_for(query, variables, timeout, true)?;
                     check_scope(client.config.as_ref(), access)?;
                     Ok(value)
                 },
@@ -878,7 +878,8 @@ mod tests {
             discord_guild_id: crate::guild::ADVANCE.into(),
             content_alignment: None,
         };
-        let session = Session {
+        let mut session = Session {
+            rate_budget: Default::default(),
             cache_id: super::super::random(),
             client_id: config.client_id.clone(),
             user_id: config.user_id.clone(),
@@ -886,6 +887,9 @@ mod tests {
             refresh_token: None,
             expires_at: super::super::now_secs() + 3600,
         };
+        session
+            .rate_budget
+            .throttle(Some("3600"), super::super::now_secs());
         let access = crate::guild::Access::new(
             "synthetic-discord".into(),
             config.discord_guild_id.clone(),
@@ -903,6 +907,18 @@ mod tests {
             client
         };
         let mut client = make_client();
+        client.persist_request_budget();
+        let saved: Session = serde_json::from_slice(
+            &super::super::store(&config)
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!saved.rate_budget.permits(super::super::now_secs(), false));
+        assert_eq!(saved.cache_id, session.cache_id);
+        assert_eq!(saved.expires_at, session.expires_at);
         let exports = Cell::new(0);
         let first = client
             .boss_signature_cached(&access, &pull(), |_| {

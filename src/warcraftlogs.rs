@@ -3,6 +3,7 @@ pub(crate) mod boss_signature;
 mod data_cache;
 mod persistent;
 pub(crate) mod prepared;
+mod rate_limit;
 use crate::{
     credential_store::Store,
     defensives::{self, DefensiveGroup},
@@ -39,6 +40,10 @@ pub(crate) fn while_current<T>(
     let result = operation();
     check_cancelled(cancel)?;
     Ok(result)
+}
+
+pub(crate) fn background_retry_notice(message: &str) -> bool {
+    message == rate_limit::THROTTLED
 }
 
 fn check_cancelled(cancel: &AtomicBool) -> Result<(), String> {
@@ -277,6 +282,8 @@ impl Review {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {
+    #[serde(default)]
+    rate_budget: rate_limit::Budget,
     #[serde(default)]
     cache_id: String,
     client_id: String,
@@ -547,6 +554,9 @@ struct RequestCounts {
 }
 
 pub struct Client {
+    background_requests: bool,
+    #[cfg(test)]
+    query_endpoint: Option<String>,
     #[cfg(test)]
     requests: RequestCounts,
     config: Option<Config>,
@@ -564,7 +574,6 @@ pub struct Client {
     http: HttpClient,
     reports: HashMap<String, (Instant, Value)>,
     directory: Option<ReportDirectory>,
-    retry_at: Option<Instant>,
     events: EventCache,
     cancel: Arc<AtomicBool>,
 }
@@ -604,6 +613,9 @@ impl Client {
             .build()
             .map_err(|_| "Couldn't initialize Warcraft Logs.")?;
         Ok(Self {
+            background_requests: false,
+            #[cfg(test)]
+            query_endpoint: None,
             #[cfg(test)]
             requests: Default::default(),
             config: None,
@@ -621,7 +633,6 @@ impl Client {
             http,
             reports: HashMap::new(),
             directory: None,
-            retry_at: None,
             events: HashMap::new(),
             cancel: Arc::new(AtomicBool::new(false)),
         })
@@ -631,6 +642,10 @@ impl Client {
     /// runs one worker at a time, so a cancelled request never shares a new flag.
     pub(crate) fn set_request_cancellation(&mut self, cancel: Arc<AtomicBool>) {
         self.cancel = cancel;
+    }
+
+    pub(crate) fn set_background_requests(&mut self, background: bool) {
+        self.background_requests = background;
     }
 
     fn configure(
@@ -903,7 +918,16 @@ impl Client {
             .and_then(|_| self.session.as_ref().map(|s| s.cache_id.clone()))
             .filter(|id| !id.is_empty())
             .unwrap_or_else(random);
+        let rate_budget = previous_refresh
+            .as_ref()
+            .and_then(|_| {
+                self.session
+                    .as_ref()
+                    .map(|session| session.rate_budget.clone())
+            })
+            .unwrap_or_default();
         let session = Session {
+            rate_budget,
             cache_id,
             client_id: config.client_id.clone(),
             user_id: config.user_id.clone(),
@@ -968,11 +992,46 @@ impl Client {
         variables: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
+        self.query_for(query, variables, timeout, self.background_requests)
+    }
+
+    fn query_for(
+        &mut self,
+        query: &str,
+        variables: Value,
+        timeout: Duration,
+        background: bool,
+    ) -> Result<Value, String> {
         check_cancelled(&self.cancel)?;
-        if self.retry_at.is_some_and(|until| Instant::now() < until) {
-            return Err("Warcraft Logs is busy. Brick will retry shortly.".into());
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| !session.rate_budget.permits(now_secs(), background))
+        {
+            return Err(rate_limit::THROTTLED.into());
+        }
+        if background
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| !session.rate_budget.known(now_secs()))
+        {
+            // Restored report data can start preparation before any fresh WCL
+            // request. Read only the budget first, never a large event export.
+            self.query_for("{__typename}", json!({}), timeout, false)?;
+            if self.session.as_ref().is_none_or(|session| {
+                !session.rate_budget.known(now_secs())
+                    || !session.rate_budget.permits(now_secs(), true)
+            }) {
+                return Err(rate_limit::THROTTLED.into());
+            }
         }
         let token = self.access_token()?;
+        let query = rate_limit::query(query);
+        #[cfg(test)]
+        let endpoint = self.query_endpoint.as_deref().unwrap_or(API);
+        #[cfg(not(test))]
+        let endpoint = API;
         #[cfg(test)]
         {
             self.requests.graphql += 1;
@@ -984,7 +1043,7 @@ impl Client {
         }
         let response = while_current(&self.cancel, || {
             self.http
-                .post(API)
+                .post(endpoint)
                 .timeout(timeout)
                 .bearer_auth(token)
                 .json(&json!({ "query": query, "variables": variables }))
@@ -993,15 +1052,17 @@ impl Client {
         .map_err(|_| "Couldn't reach Warcraft Logs. Brick will retry shortly.")?;
         let status = response.status().as_u16();
         if status == 429 {
-            let delay = response
-                .headers()
-                .get("retry-after")
-                .and_then(|h| h.to_str().ok())
-                .and_then(|h| h.parse::<u64>().ok())
-                .unwrap_or(60)
-                .clamp(30, 3600);
-            self.retry_at = Some(Instant::now() + Duration::from_secs(delay));
-            return Err("Warcraft Logs is busy. Brick will retry shortly.".into());
+            if let Some(session) = &mut self.session {
+                session.rate_budget.throttle(
+                    response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|h| h.to_str().ok()),
+                    now_secs(),
+                );
+                self.persist_request_budget();
+            }
+            return Err(rate_limit::THROTTLED.into());
         }
         if status == 401 || status == 403 {
             self.invalidate_review_cache();
@@ -1024,9 +1085,22 @@ impl Client {
         let bytes = while_current(&self.cancel, || {
             download::read_response(response, 4 * 1024 * 1024, "Warcraft Logs")
         })??;
-        let value: Value = serde_json::from_slice(&bytes)
+        let mut value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| "Warcraft Logs returned an invalid response.")?;
         check_cancelled(&self.cancel)?;
+        if let Some(usage) = value
+            .get_mut("data")
+            .and_then(Value::as_object_mut)
+            .and_then(|data| data.remove(rate_limit::FIELD))
+        {
+            if self
+                .session
+                .as_mut()
+                .is_some_and(|session| session.rate_budget.observe(&usage, now_secs()))
+            {
+                self.persist_request_budget();
+            }
+        }
         if value
             .get("errors")
             .and_then(Value::as_array)
@@ -1042,6 +1116,16 @@ impl Client {
             .get("data")
             .cloned()
             .ok_or_else(|| "Warcraft Logs returned an invalid response.".into())
+    }
+
+    fn persist_request_budget(&self) {
+        if let Some((config, session)) = self.config.as_ref().zip(self.session.as_ref()) {
+            if let (Ok(store), Ok(bytes)) = (store(config), serde_json::to_vec(session)) {
+                // A locked vault must not turn a useful report response into an
+                // error. The current process still observes the same pause.
+                let _ = store.save(&bytes);
+            }
+        }
     }
 
     pub fn review(
@@ -1076,11 +1160,19 @@ impl Client {
         self.access_token()?;
         if playback && report_override.is_none() {
             self.restore_review_cache(discord_token, stream);
-            let cached = self
-                .prepared
-                .lock()
-                .ok()
-                .and_then(|cache| cache.get(stream));
+            let cached = self.prepared.lock().ok().and_then(|cache| {
+                cache.get(stream).or_else(|| {
+                    self.session
+                        .as_ref()
+                        .is_some_and(|session| {
+                            !session
+                                .rate_budget
+                                .permits(now_secs(), self.background_requests)
+                        })
+                        .then(|| cache.for_display(stream))
+                        .flatten()
+                })
+            });
             if let Some(entry) = cached.filter(|entry| entry.status.0 == self.recording_auth_epoch)
             {
                 self.recording_match_complete = entry.status.1;
@@ -2924,6 +3016,7 @@ mod tests {
             at: Instant::now(),
         });
         client.session = Some(Session {
+            rate_budget: Default::default(),
             cache_id: random(),
             client_id: "fixture".into(),
             user_id: "123".into(),

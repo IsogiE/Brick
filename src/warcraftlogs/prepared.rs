@@ -57,8 +57,41 @@ impl Cache {
         self.find(stream).is_some()
     }
 
+    pub fn background_contains(&self, stream: &Stream) -> bool {
+        self.retained(stream).is_some_and(|entry| {
+            let old_archive = stream.status != crate::streams::Status::Live
+                && !entry.review.replay.growing
+                && entry
+                    .review
+                    .replay
+                    .start_ms()
+                    .ok()
+                    .and_then(|start| {
+                        start.checked_add(
+                            i64::try_from(entry.review.replay.available_seconds)
+                                .ok()?
+                                .checked_mul(1000)?,
+                        )
+                    })
+                    .or(stream.replay_end_ms)
+                    .is_some_and(|end| {
+                        end < time::OffsetDateTime::now_utc()
+                            .unix_timestamp()
+                            .saturating_mul(1000)
+                            .saturating_sub(24 * 60 * 60 * 1000)
+                    });
+            if old_archive {
+                entry.at.elapsed() < Duration::from_secs(6 * 60 * 60)
+            } else {
+                self.contains(stream)
+            }
+        })
+    }
+
     pub fn ready(&self, stream: &Stream) -> bool {
-        self.find(stream).is_some_and(|entry| {
+        // Metadata freshness is not the lifetime of a verified recording clock.
+        // A known offset must not schedule another alignment when pulls refresh.
+        self.retained(stream).is_some_and(|entry| {
             entry
                 .review
                 .pulls
@@ -379,6 +412,38 @@ mod tests {
         cache.insert(&stream, review, (clocks[0].0.auth_epoch, true), clocks);
         assert!(cache.get(&stream).is_none());
         assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn old_archives_do_not_repeatedly_fetch_metadata_or_realign_a_valid_clock() {
+        let (mut stream, review, clocks) = fixture();
+        // Uploads without a known media origin still have an archive date.
+        stream.replay_end_ms = Some(1_700_001_000_000);
+        let mut cache = Cache::default();
+        cache.insert(&stream, review, (clocks[0].0.auth_epoch, true), Vec::new());
+        cache.record_clock(&clocks[0].0, &clocks[0].1);
+        cache.age_for_test(Duration::from_secs(120));
+        assert!(
+            cache.get(&stream).is_none(),
+            "Selected review still requests fresh metadata"
+        );
+        assert!(cache.background_contains(&stream));
+        assert!(
+            cache.ready(&stream),
+            "Metadata age must not expire the recording offset"
+        );
+        cache.age_for_test(Duration::from_secs(6 * 60 * 60));
+        assert!(!cache.background_contains(&stream));
+        assert!(cache.ready(&stream));
+        for alignment in cache.entries[0].review.content_timing.values_mut() {
+            alignment.expires_at = 0;
+        }
+        assert!(
+            !cache.ready(&stream),
+            "Actually expired precision must be refreshed"
+        );
+        cache.set_connected(false);
+        assert!(!cache.background_contains(&stream));
     }
 
     #[test]
