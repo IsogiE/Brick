@@ -1,5 +1,7 @@
 //! Bounded, account-bound review snapshots with separate refresh and retention ages.
-use super::{Pull, Review};
+#[cfg(test)]
+use super::Pull;
+use super::Review;
 use crate::{
     content_alignment::{Key, RecordingClock},
     streams::Stream,

@@ -1,6 +1,8 @@
 //! Viewer state for one scoped, asynchronous content alignment request.
 use super::*;
-use crate::content_alignment::{Key, Status, Ticket};
+#[cfg(test)]
+use crate::content_alignment::Status;
+use crate::content_alignment::{Key, Ticket};
 
 // Keep following long-running jobs on the small production worker.
 const MAX_CONTENT_POLLS: u16 = 1440;

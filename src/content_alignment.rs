@@ -251,6 +251,7 @@ impl Key {
             && self.guild_generation == other.guild_generation
             && self.auth_epoch == other.auth_epoch
     }
+    #[cfg(test)]
     pub fn same_recording_report(&self, other: &Self) -> bool {
         self.same_recording(other)
             && self.report == other.report
