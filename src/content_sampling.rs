@@ -4,6 +4,7 @@ use crate::warcraftlogs::Review;
 
 const LIVE_INTERVAL_MS: i64 = 2 * 60 * 60 * 1000;
 const MAX_SAMPLES: usize = 64;
+const MAX_FAILED_SAMPLES: usize = 3;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -138,6 +139,20 @@ impl Snapshot {
                 .find(|ticket| same_pull(&ticket.key, pull))
                 .copied()
         };
+        // Failed searches are not evidence of an offset. Bound automatic
+        // fallback per report; a growing stream may try a fresh two-hour window.
+        let can_sample = |pull: &Pull| {
+            tickets
+                .iter()
+                .filter(|t| {
+                    t.key.report == pull.report
+                        && matches!(t.job.status, Status::Failed | Status::Canceled)
+                        && (!review.replay.growing
+                            || t.key.start_ms > pull.start_ms.saturating_sub(LIVE_INTERVAL_MS))
+                })
+                .count()
+                < MAX_FAILED_SAMPLES
+        };
         plan.pending = tickets
             .iter()
             .find(|ticket| ticket.pending())
@@ -160,8 +175,10 @@ impl Snapshot {
                 .iter()
                 .copied()
                 .filter(|p| {
-                    ticket_for(p)
-                        .is_none_or(|t| !matches!(t.job.status, Status::Failed | Status::Canceled))
+                    ticket_for(p).map_or_else(
+                        || can_sample(p),
+                        |t| !matches!(t.job.status, Status::Failed | Status::Canceled),
+                    )
                 })
                 .collect();
             let Some(first) = usable.first().copied() else {
@@ -244,12 +261,15 @@ impl Snapshot {
                 .filter(|t| {
                     t.key.report == report
                         && t.job.status == Status::Failed
-                        && t.job.error.as_deref() == Some("missing_footage")
+                        && matches!(
+                            t.job.error.as_deref(),
+                            Some("missing_footage" | "alignment_not_found" | "budget_exhausted")
+                        )
                 })
                 .map(|t| (t.key.start_ms, t.key.end_ms))
                 .collect();
             if next.is_none() {
-                // A benched pull is an explicit hole, not evidence that every
+                // An unverified pull is a gap, not evidence that every
                 // subsequent pull before the later check is also absent.
                 for &(_, end) in &missing {
                     if let Some(after) = usable.iter().copied().find(|p| p.start_ms >= end) {
@@ -310,7 +330,7 @@ impl Snapshot {
                 let Some(point) = anchor else {
                     continue;
                 };
-                // Do not bridge a known absence, even if offsets on either side agree.
+                // Do not bridge an unverified gap, even if offsets on either side agree.
                 if missing
                     .iter()
                     .any(|&(start, end)| start < pull.end_ms && end > point.key.start_ms)
@@ -362,7 +382,7 @@ impl Snapshot {
                     .find(|p| key.matches(&review.replay, p, cap))
                     .copied()
             })
-            .filter(|p| ticket_for(p).is_none())
+            .filter(|p| ticket_for(p).is_none() && can_sample(p))
         {
             plan.next = Some(pull.clone());
         }
@@ -518,6 +538,70 @@ mod tests {
             assert!(resumed.alignments.iter().any(|a| a.key.pull_id == id));
         }
     }
+    #[test]
+    fn repeated_no_matches_stop_archives_and_resume_only_in_a_new_live_window() {
+        let mut review = review();
+        let mut saved = Snapshot::default();
+        for pull in review.pulls.iter().take(MAX_FAILED_SAMPLES) {
+            let mut failed = ticket(&review, pull, 0.0);
+            failed.job.status = Status::Failed;
+            failed.job.result = None;
+            failed.job.error = Some("alignment_not_found".into());
+            saved.remember(failed);
+        }
+        saved.planned = Some(Key::new(
+            &review.replay,
+            &review.pulls[3],
+            review.content_capability.as_ref().unwrap(),
+            0,
+        ));
+        assert!(saved.plan(&review, 0).next.is_none());
+        assert!(saved.plan(&review, 0).alignments.is_empty());
+        // Repeated refreshes and serialization cannot restart the exhausted search.
+        let saved: Snapshot =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert!(saved.plan(&review, 0).next.is_none());
+        review.replay.growing = true;
+        // Tickets must refer to the same recording identity (including growing).
+        let mut live = Snapshot::default();
+        for pull in review.pulls.iter().take(MAX_FAILED_SAMPLES) {
+            let mut failed = ticket(&review, pull, 0.0);
+            failed.job.status = Status::Failed;
+            failed.job.result = None;
+            failed.job.error = Some("alignment_not_found".into());
+            live.remember(failed);
+        }
+        assert!(live.plan(&review, 0).next.is_none());
+        let mut later = review.pulls[0].clone();
+        later.id = 99;
+        later.start_ms += LIVE_INTERVAL_MS;
+        later.end_ms += LIVE_INTERVAL_MS;
+        review.pulls.push(later);
+        assert_eq!(live.plan(&review, 0).next.unwrap().id, 99);
+    }
+
+    #[test]
+    fn failed_search_does_not_inherit_a_nearby_verified_offset() {
+        for error in ["alignment_not_found", "budget_exhausted"] {
+            let review = review();
+            let mut saved = Snapshot::default();
+            saved.remember(ticket(&review, &review.pulls[0], 0.0));
+            saved.remember(ticket(&review, &review.pulls[10], 0.0));
+            let mut failed = ticket(&review, &review.pulls[5], 0.0);
+            failed.job.status = Status::Failed;
+            failed.job.result = None;
+            failed.job.error = Some(error.into());
+            saved.remember(failed);
+            let plan = saved.plan(&review, 0);
+            assert!(!plan
+                .alignments
+                .iter()
+                .any(|a| (6..11).contains(&a.key.pull_id)));
+            assert!(plan.alignments.iter().any(|a| a.key.pull_id == 1));
+            assert!(plan.alignments.iter().any(|a| a.key.pull_id == 11));
+        }
+    }
+
     #[test]
     fn reports_cannot_borrow_offsets_or_count_overlapping_samples_as_later() {
         let mut review = review();

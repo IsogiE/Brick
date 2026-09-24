@@ -1741,20 +1741,7 @@ impl Client {
             complete &= complete_fight_list(report);
             pulls.extend(map_pulls(report, &replay)?);
         }
-        pulls.sort_by_key(|p| (p.start_ms, p.report.clone(), p.id));
-        let mut unique: Vec<Pull> = Vec::new();
-        for pull in pulls {
-            if unique.iter().rev().take(12).any(|p| {
-                p.report != pull.report
-                    && p.encounter == pull.encounter
-                    && p.difficulty == pull.difficulty
-                    && (p.start_ms - pull.start_ms).abs() < 3000
-                    && (p.end_ms - pull.end_ms).abs() < 3000
-            }) {
-                continue;
-            }
-            unique.push(pull);
-        }
+        let unique = canonical_pulls(pulls);
         check_cancelled(&self.cancel)?;
         self.recording_match_complete = complete;
         Ok(Review {
@@ -1814,6 +1801,35 @@ pub fn map_pulls(report: &Value, replay: &Replay) -> Result<Vec<Pull>, String> {
         .ok_or("Invalid replay duration.")?;
     map_report_pulls(report, Some((start, end)))
 }
+// Exact duplicate rows within a report describe the same logged encounter.
+// Keep the original (lowest) fight ID, independent of response order. Reports
+// from different loggers retain the existing three-second overlap tolerance.
+// This also normalizes restored catalogues without deleting encrypted history.
+pub(super) fn canonical_pulls(mut pulls: Vec<Pull>) -> Vec<Pull> {
+    pulls.sort_by_key(|p| (p.start_ms, p.report.clone(), p.id));
+    let mut unique: Vec<Pull> = Vec::new();
+    for pull in pulls {
+        if unique
+            .iter()
+            .rev()
+            .take_while(|p| pull.start_ms - p.start_ms < 3000)
+            .any(|p| {
+                p.encounter == pull.encounter
+                    && p.difficulty == pull.difficulty
+                    && if p.report == pull.report {
+                        p.start_ms == pull.start_ms && p.end_ms == pull.end_ms
+                    } else {
+                        (p.end_ms - pull.end_ms).abs() < 3000
+                    }
+            })
+        {
+            continue;
+        }
+        unique.push(pull);
+    }
+    unique
+}
+
 fn map_report_pulls(report: &Value, range: Option<(i64, i64)>) -> Result<Vec<Pull>, String> {
     let code = report["code"]
         .as_str()
@@ -1877,7 +1893,7 @@ fn map_report_pulls(report: &Value, range: Option<(i64, i64)>) -> Result<Vec<Pul
             }),
         });
     }
-    Ok(pulls)
+    Ok(canonical_pulls(pulls))
 }
 
 #[cfg(test)]
@@ -2309,6 +2325,43 @@ mod tests {
             growing: false,
             timeline_revision: None,
         }
+    }
+
+    #[test]
+    fn duplicate_fights_are_normalized_without_merging_distinct_attempts() {
+        let report = json!({"code":"abcdefghijklmnop","startTime":1_700_000_000_000i64,
+        "fights":[
+            {"id":90,"encounterID":10,"difficulty":5,"name":"Boss","startTime":1000,"endTime":61000},
+            {"id":4,"encounterID":10,"difficulty":5,"name":"Boss","startTime":1000,"endTime":61000},
+            {"id":5,"encounterID":10,"difficulty":5,"name":"Boss","startTime":62000,"endTime":122000},
+            {"id":6,"encounterID":10,"difficulty":4,"name":"Boss","startTime":1000,"endTime":61000}
+        ]});
+        let pulls = map_report_pulls(&report, None).unwrap();
+        assert_eq!(
+            pulls.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![4, 6, 5]
+        );
+        // The same normalization is safe for persisted, already normalized data.
+        assert_eq!(canonical_pulls(pulls.clone()).len(), 3);
+        let mut duplicate = pulls[0].clone();
+        duplicate.id = 99;
+        let mut restored = pulls.clone();
+        restored.push(duplicate);
+        assert_eq!(canonical_pulls(restored).len(), 3);
+        let mut other_report = pulls[0].clone();
+        other_report.report = "qrstuvwxyzABCDEF".into();
+        other_report.start_ms += 1000;
+        other_report.end_ms += 1000;
+        let mut combined = pulls.clone();
+        combined.push(other_report);
+        assert_eq!(canonical_pulls(combined).len(), 3);
+        let mut different = pulls[0].clone();
+        different.id = 7;
+        different.start_ms += 1000;
+        different.end_ms += 1000;
+        let mut combined = pulls;
+        combined.push(different);
+        assert_eq!(canonical_pulls(combined).len(), 4);
     }
 
     #[test]
