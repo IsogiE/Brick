@@ -501,7 +501,10 @@ struct SavedEvents {
 }
 impl SavedEvents {
     fn restore(self, pull: &Pull, kind: EventKind) -> Option<CachedEvents> {
-        if !self.coverage.is_bounded()
+        // An empty response can precede a completed log upload. It must not
+        // become a long-lived negative cache entry across app restarts.
+        if self.raw.is_empty()
+            || !self.coverage.is_bounded()
             || self.raw.len() > MAX_PULL_EVENTS
             || self
                 .raw
@@ -1457,6 +1460,41 @@ impl Client {
         pull: &Pull,
         kind: EventKind,
     ) -> Result<Vec<RaidEvent>, String> {
+        let deadline = Instant::now() + EVENT_FETCH_BUDGET;
+        let events = self.events_exact(discord_token, pull, kind, deadline)?;
+        if !events.is_empty() {
+            return Ok(events);
+        }
+        // Empty deaths/cooldowns can be legitimate. Only try rows which WCL
+        // explicitly identifies as the exact same encounter in this report.
+        // Keep each response cached under its real fight ID and never borrow
+        // another report's clock or another fight's events.
+        let report = if let Some((_, report)) = self.reports.get(&pull.report) {
+            report.clone()
+        } else {
+            let data = self.query_with_timeout("query($code:String!){reportData{report(code:$code){code startTime endTime fights{id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime}}}}", json!({"code":pull.report}), event_request_timeout(deadline, Instant::now())?)?;
+            let report = data["reportData"]["report"].clone();
+            check_cancelled(&self.cancel)?;
+            self.reports
+                .insert(pull.report.clone(), (Instant::now(), report.clone()));
+            report
+        };
+        for alternative in exact_duplicate_pulls(&report, pull)? {
+            let events = self.events_exact(discord_token, &alternative, kind, deadline)?;
+            if !events.is_empty() {
+                return Ok(events);
+            }
+        }
+        Ok(events)
+    }
+
+    fn events_exact(
+        &mut self,
+        discord_token: &crate::guild::Access,
+        pull: &Pull,
+        kind: EventKind,
+        deadline: Instant,
+    ) -> Result<Vec<RaidEvent>, String> {
         self.configure(discord_token, true)?;
         self.access_token()?;
         if self.cooldowns.is_none() || self.cooldown_catalog_pending {
@@ -1477,8 +1515,14 @@ impl Client {
         );
         let key = (pull.report.clone(), pull.id, kind);
         let bounds = (pull.start_ms, pull.end_ms);
-        self.events
-            .retain(|_, entry| entry.at.elapsed() < EVENT_TTL);
+        self.events.retain(|_, entry| {
+            entry.at.elapsed()
+                < if entry.raw.is_empty() {
+                    Duration::from_secs(30)
+                } else {
+                    EVENT_TTL
+                }
+        });
         let cached = self
             .events
             .get(&key)
@@ -1542,7 +1586,6 @@ impl Client {
         let end = pull.end_ms - pull.report_start_ms;
         let mut added = Vec::new();
         let mut pages = 0;
-        let deadline = Instant::now() + EVENT_FETCH_BUDGET;
         for (data_type, filter) in queries {
             let mut start = pull.start_ms - pull.report_start_ms;
             loop {
@@ -1741,20 +1784,7 @@ impl Client {
             complete &= complete_fight_list(report);
             pulls.extend(map_pulls(report, &replay)?);
         }
-        pulls.sort_by_key(|p| (p.start_ms, p.report.clone(), p.id));
-        let mut unique: Vec<Pull> = Vec::new();
-        for pull in pulls {
-            if unique.iter().rev().take(12).any(|p| {
-                p.report != pull.report
-                    && p.encounter == pull.encounter
-                    && p.difficulty == pull.difficulty
-                    && (p.start_ms - pull.start_ms).abs() < 3000
-                    && (p.end_ms - pull.end_ms).abs() < 3000
-            }) {
-                continue;
-            }
-            unique.push(pull);
-        }
+        let unique = canonical_pulls(pulls);
         check_cancelled(&self.cancel)?;
         self.recording_match_complete = complete;
         Ok(Review {
@@ -1814,6 +1844,68 @@ pub fn map_pulls(report: &Value, replay: &Replay) -> Result<Vec<Pull>, String> {
         .ok_or("Invalid replay duration.")?;
     map_report_pulls(report, Some((start, end)))
 }
+fn exact_duplicate_pulls(report: &Value, pull: &Pull) -> Result<Vec<Pull>, String> {
+    if report["code"].as_str() != Some(pull.report.as_str())
+        || number_ms(&report["startTime"]) != Some(pull.report_start_ms)
+    {
+        return Ok(Vec::new());
+    }
+    let fights = report["fights"]
+        .as_array()
+        .filter(|rows| rows.len() <= 5000)
+        .ok_or("Invalid Warcraft Logs fight list.")?;
+    let mut alternatives = Vec::new();
+    for fight in fights {
+        if fight["id"].as_u64() == Some(pull.id)
+            || fight["encounterID"].as_u64() != Some(pull.encounter)
+            || fight["difficulty"].as_u64().unwrap_or(0) != pull.difficulty
+            || number_ms(&fight["startTime"]) != Some(pull.start_ms - pull.report_start_ms)
+            || number_ms(&fight["endTime"]) != Some(pull.end_ms - pull.report_start_ms)
+        {
+            continue;
+        }
+        let mut single = report.clone();
+        single["fights"] = json!([fight]);
+        alternatives.extend(map_report_pulls(&single, None)?);
+        if alternatives.len() == 3 {
+            break;
+        }
+    }
+    Ok(alternatives)
+}
+
+// Exact duplicate rows within a report describe the same logged encounter.
+// Keep the original (lowest) fight ID, independent of response order. Reports
+// from different loggers retain the existing three-second overlap tolerance.
+// This also normalizes restored catalogues without deleting encrypted history.
+pub(super) fn canonical_pulls(mut pulls: Vec<Pull>) -> Vec<Pull> {
+    pulls.sort_by_key(|p| (p.start_ms, p.report.clone(), p.id));
+    let mut unique: Vec<Pull> = Vec::new();
+    let mut same_report = std::collections::HashSet::new();
+    for pull in pulls {
+        if !same_report.insert((
+            pull.report.clone(),
+            pull.encounter,
+            pull.difficulty,
+            pull.start_ms,
+            pull.end_ms,
+        )) {
+            continue;
+        }
+        if unique.iter().rev().take(12).any(|p| {
+            p.report != pull.report
+                && p.encounter == pull.encounter
+                && p.difficulty == pull.difficulty
+                && p.start_ms.abs_diff(pull.start_ms) < 3000
+                && p.end_ms.abs_diff(pull.end_ms) < 3000
+        }) {
+            continue;
+        }
+        unique.push(pull);
+    }
+    unique
+}
+
 fn map_report_pulls(report: &Value, range: Option<(i64, i64)>) -> Result<Vec<Pull>, String> {
     let code = report["code"]
         .as_str()
@@ -1877,7 +1969,7 @@ fn map_report_pulls(report: &Value, range: Option<(i64, i64)>) -> Result<Vec<Pul
             }),
         });
     }
-    Ok(pulls)
+    Ok(canonical_pulls(pulls))
 }
 
 #[cfg(test)]
@@ -2309,6 +2401,56 @@ mod tests {
             growing: false,
             timeline_revision: None,
         }
+    }
+
+    #[test]
+    fn duplicate_fights_are_normalized_without_merging_distinct_attempts() {
+        let report = json!({"code":"abcdefghijklmnop","startTime":1_700_000_000_000i64,
+        "fights":[
+            {"id":90,"encounterID":10,"difficulty":5,"name":"Boss","startTime":1000,"endTime":61000},
+            {"id":4,"encounterID":10,"difficulty":5,"name":"Boss","startTime":1000,"endTime":61000},
+            {"id":5,"encounterID":10,"difficulty":5,"name":"Boss","startTime":62000,"endTime":122000},
+            {"id":6,"encounterID":10,"difficulty":4,"name":"Boss","startTime":1000,"endTime":61000}
+        ]});
+        let pulls = map_report_pulls(&report, None).unwrap();
+        assert_eq!(
+            pulls.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![4, 6, 5]
+        );
+        let alternatives = exact_duplicate_pulls(&report, &pulls[0]).unwrap();
+        assert_eq!(
+            alternatives.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![90]
+        );
+        assert!(exact_duplicate_pulls(&report, &pulls[2])
+            .unwrap()
+            .is_empty());
+        let mut wrong_report = report.clone();
+        wrong_report["code"] = json!("qrstuvwxyzABCDEF");
+        assert!(exact_duplicate_pulls(&wrong_report, &pulls[0])
+            .unwrap()
+            .is_empty());
+        // The same normalization is safe for persisted, already normalized data.
+        assert_eq!(canonical_pulls(pulls.clone()).len(), 3);
+        let mut duplicate = pulls[0].clone();
+        duplicate.id = 99;
+        let mut restored = pulls.clone();
+        restored.push(duplicate);
+        assert_eq!(canonical_pulls(restored).len(), 3);
+        let mut other_report = pulls[0].clone();
+        other_report.report = "qrstuvwxyzABCDEF".into();
+        other_report.start_ms += 1000;
+        other_report.end_ms += 1000;
+        let mut combined = pulls.clone();
+        combined.push(other_report);
+        assert_eq!(canonical_pulls(combined).len(), 3);
+        let mut different = pulls[0].clone();
+        different.id = 7;
+        different.start_ms += 1000;
+        different.end_ms += 1000;
+        let mut combined = pulls;
+        combined.push(different);
+        assert_eq!(canonical_pulls(combined).len(), 4);
     }
 
     #[test]
@@ -2871,6 +3013,15 @@ mod tests {
             {"id":1,"encounterID":123,"difficulty":5,"name":"Boss","kill":false,"startTime":0,"endTime":120000}
         ]});
         let pull = map_pulls(&report, &video).unwrap().remove(0);
+        assert!(
+            SavedEvents {
+                coverage: EventCoverage::default(),
+                raw: vec![]
+            }
+            .restore(&pull, EventKind::Deaths)
+            .is_none(),
+            "Persisted empty responses must allow a newly completed upload to be fetched"
+        );
         let coverage = EventCoverage {
             casts: BTreeSet::from([100]),
             buffs: BTreeSet::new(),

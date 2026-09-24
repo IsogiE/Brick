@@ -138,11 +138,13 @@ impl Cache {
         }
         let mut review = Review {
             replay: recording.replay.clone(),
-            pulls: recording
-                .pulls
-                .iter()
-                .filter_map(|(report, id)| self.document.reports.get(report)?.get(id).cloned())
-                .collect(),
+            pulls: super::canonical_pulls(
+                recording
+                    .pulls
+                    .iter()
+                    .filter_map(|(report, id)| self.document.reports.get(report)?.get(id).cloned())
+                    .collect(),
+            ),
             marker_timing: Default::default(),
             marker_fallback: Default::default(),
             content_capability: capability.cloned(),
