@@ -74,10 +74,6 @@ enum Data {
     Events(String, EventKind, Vec<RaidEvent>, defensives::Preferences),
     Cooldowns(defensives::Preferences),
     Content(crate::content_alignment::Ticket),
-    RecordingClock(
-        crate::content_alignment::Key,
-        crate::content_alignment::RecordingLookup,
-    ),
 }
 type Outcome = (u64, String, Result<Data, String>, bool);
 
@@ -754,7 +750,7 @@ impl ReviewUi {
         self.connected = true;
         self.connection_checked = true;
         self.last_attempt = Some(entry.at);
-        self.content.seed_clocks(entry.clocks, entry.at);
+        self.content.samples = entry.sampling;
         self.accept_cooldown_preferences(preferences);
         self.accept_review(entry.review);
         self.restore_pov_position();
@@ -845,7 +841,7 @@ impl ReviewUi {
                                             .ok()
                                             .and_then(|cache| cache.get(stream))
                                     }) {
-                                        self.content.seed_clocks(entry.clocks, entry.at);
+                                        self.content.samples = entry.sampling;
                                     }
                                     changed |= self.accept_review(review);
                                     changed |= self.restore_pov_position();
@@ -868,9 +864,6 @@ impl ReviewUi {
                                 self.selected_event = None;
                                 self.notice = None;
                                 self.last_attempt = None;
-                            }
-                            Ok(Data::RecordingClock(key, lookup)) => {
-                                changed |= self.accept_recording_clock(key, lookup);
                             }
                             Ok(Data::Content(ticket)) => {
                                 changed |= self.accept_content(ticket);
@@ -1263,11 +1256,6 @@ impl ReviewUi {
         let background_requests = self.metadata_only;
         let housekeeping = self.recording_housekeeping;
         let preferred_pull = self.preferred_alignment_pull().cloned();
-        let recovery_pulls = self
-            .review
-            .as_ref()
-            .map(|review| review.pulls.clone())
-            .unwrap_or_default();
         let manual_report = self.content.manual_report.clone();
         let marker_fallback = self
             .review
@@ -1275,6 +1263,7 @@ impl ReviewUi {
             .map(|review| review.marker_fallback.clone())
             .unwrap_or_default();
         self.mark_content_started(&action);
+        let mut samples = self.content.samples.clone();
         let stream = stream.cloned();
         let ctx = ctx.clone();
         let key = self.key.clone();
@@ -1392,44 +1381,14 @@ impl ReviewUi {
                         {
                             return Err("The Warcraft Logs account or alignment service changed. Reload this view.".into());
                         }
-                        let lookup =
-                            crate::content_alignment::recording_lookup(&token, &key, &cancel)?;
-                        if lookup
-                            .clock
-                            .as_ref()
-                            .is_some_and(|clock| clock.alignment(&key).is_some())
-                            || lookup.pending
-                        {
-                            return Ok(Data::RecordingClock(key, lookup));
-                        }
-                        if let Some(anchor) = lookup.recovery_pull_id.and_then(|id| {
-                            recovery_pulls.iter().find(|p| {
-                                p.id == id
-                                    && p.report == key.report
-                                    && p.report_start_ms == key.report_start_ms
-                            })
-                        }) {
-                            let signature = client.boss_signature(&token, anchor)?;
-                            let recovered = crate::content_alignment::recover_recording_clock(
-                                &token, &key, &signature, &cancel,
-                            )?;
-                            if recovered.clock.is_some() || recovered.pending {
-                                return Ok(Data::RecordingClock(key, recovered));
-                            }
-                        }
+                        let stream = stream.as_ref().ok_or("Choose a VOD first.")?;
+                        client.save_samples(&token, stream, samples.clone())?;
                         let signature = client.boss_signature(&token, &pull)?;
-                        let ticket =
-                            crate::content_alignment::submit(&token, key, &signature, &cancel)?;
-                        if ticket.alignment().is_some() {
-                            let lookup = crate::content_alignment::recording_lookup(
-                                &token,
-                                &ticket.key,
-                                &cancel,
-                            )?;
-                            if lookup.clock.is_some() {
-                                return Ok(Data::RecordingClock(ticket.key, lookup));
-                            }
-                        }
+                        let ticket = crate::content_alignment::sampling::submit(
+                            &token, key, &signature, &cancel,
+                        )?;
+                        samples.remember(ticket.clone());
+                        client.save_samples(&token, stream, samples)?;
                         Ok(Data::Content(ticket))
                     })(),
                     Action::ContentPoll(ticket) => (|| {
@@ -1438,29 +1397,10 @@ impl ReviewUi {
                                 "The Warcraft Logs account changed. Reload this view.".into()
                             );
                         }
-                        let lookup = crate::content_alignment::recording_lookup(
-                            &token,
-                            &ticket.key,
-                            &cancel,
-                        )?;
-                        if lookup
-                            .clock
-                            .as_ref()
-                            .is_some_and(|clock| clock.alignment(&ticket.key).is_some())
-                        {
-                            return Ok(Data::RecordingClock(ticket.key, lookup));
-                        }
                         let ticket = crate::content_alignment::poll(&token, &ticket, &cancel)?;
-                        if ticket.alignment().is_some() {
-                            let lookup = crate::content_alignment::recording_lookup(
-                                &token,
-                                &ticket.key,
-                                &cancel,
-                            )?;
-                            if lookup.clock.is_some() {
-                                return Ok(Data::RecordingClock(ticket.key, lookup));
-                            }
-                        }
+                        samples.remember(ticket.clone());
+                        let stream = stream.as_ref().ok_or("Choose a VOD first.")?;
+                        client.save_samples(&token, stream, samples)?;
                         Ok(Data::Content(ticket))
                     })(),
                     Action::SaveCooldowns(preferences) => client
@@ -1579,7 +1519,12 @@ impl ReviewUi {
                 public_url: review.replay.public_url(seconds as u64),
                 content_timing: review.uses_content_timing(&pull),
             });
-        self.cancel_read();
+        if !matches!(
+            self.work_action,
+            Some(Action::ContentSubmit(..) | Action::ContentPoll(..))
+        ) {
+            self.cancel_read();
+        }
         self.pending_focus = None;
         self.aligning = playback.is_none();
         self.playback = playback;
@@ -4134,10 +4079,12 @@ mod tests {
                 .seek_video_seconds;
             let later = review.pulls[1].clone();
             let mut ui = ReviewUi::default();
+            let samples = crate::content_alignment::sampling::test_samples(&review, epoch);
             ui.prepared
                 .lock()
                 .unwrap()
                 .insert(&stream, review, (epoch, true), clocks);
+            ui.prepared.lock().unwrap().set_samples(&stream, samples);
             let shared_client = ui.client.clone();
             let _busy = shared_client.lock().unwrap();
             ui.open_recording();

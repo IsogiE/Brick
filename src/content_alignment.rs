@@ -1,4 +1,6 @@
 //! Authenticated per-fight content alignment, separate from marker calibration.
+#[path = "content_sampling.rs"]
+pub(crate) mod sampling;
 use crate::{
     guild, streams,
     warcraftlogs::{
@@ -35,7 +37,8 @@ impl Capability {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Key {
     pub provider: streams::Provider,
     pub video_id: String,
@@ -98,7 +101,7 @@ pub(crate) struct Timeline {
     pub duration_seconds: f64,
     pub raw_started_at_ms: Option<i64>,
 }
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Scope {
     pub guild_id: String,
@@ -114,7 +117,7 @@ pub(crate) struct Scope {
     pub timeline: Timeline,
     pub duration_seconds: f64,
 }
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Status {
     Pending,
@@ -124,13 +127,13 @@ pub(crate) enum Status {
     Failed,
     Canceled,
 }
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Coverage {
     pub fight_start_seconds: f64,
     pub fight_end_seconds: f64,
 }
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ResultData {
     pub video_seconds: f64,
@@ -141,13 +144,13 @@ pub(crate) struct ResultData {
     pub evidence_hash: String,
     pub method_version: String,
 }
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Progress {
     pub stage: String,
     pub completed_units: u64,
 }
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Job {
     pub id: String,
@@ -166,7 +169,8 @@ struct Envelope {
     job: Job,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Ticket {
     pub key: Key,
     pub guild_id: String,
@@ -234,17 +238,8 @@ pub(crate) struct RecordingClock {
     pub timeline_hash: String,
     pub expires_at: i64,
 }
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RecordingLookup {
-    pub clock: Option<RecordingClock>,
-    pub pending: bool,
-    pub conflict: bool,
-    #[serde(default, rename = "recoveryPullId")]
-    pub recovery_pull_id: Option<u64>,
-}
 impl Key {
-    pub fn same_recording_report(&self, other: &Self) -> bool {
+    pub fn same_recording(&self, other: &Self) -> bool {
         self.provider == other.provider
             && self.video_id == other.video_id
             && self.broadcast_id == other.broadcast_id
@@ -252,11 +247,14 @@ impl Key {
             && self.timeline_revision == other.timeline_revision
             && self.growing == other.growing
             && (self.available_seconds == other.available_seconds || self.growing)
-            && self.report == other.report
-            && self.report_start_ms == other.report_start_ms
             && self.algorithm_revision == other.algorithm_revision
             && self.guild_generation == other.guild_generation
             && self.auth_epoch == other.auth_epoch
+    }
+    pub fn same_recording_report(&self, other: &Self) -> bool {
+        self.same_recording(other)
+            && self.report == other.report
+            && self.report_start_ms == other.report_start_ms
     }
 }
 impl RecordingClock {
@@ -327,71 +325,6 @@ impl RecordingClock {
         })
     }
 }
-pub(crate) fn recording_lookup(
-    access: &guild::Access,
-    key: &Key,
-    cancel: &AtomicBool,
-) -> Result<RecordingLookup, String> {
-    current(access, key, cancel)?;
-    let bytes = streams::request(
-        Method::POST,
-        &format!("{PATH}/recording"),
-        access,
-        Some(
-            serde_json::json!({"provider":key.provider,"videoId":key.video_id,
-            "report":key.report,"reportStartMs":key.report_start_ms,"recover":true}),
-        ),
-    )
-    .map_err(request_error)?;
-    if bytes.len() > 32 * 1024 {
-        return Err(INVALID.into());
-    }
-    let result: RecordingLookup = serde_json::from_slice(&bytes).map_err(|_| INVALID)?;
-    current(access, key, cancel)?;
-    if result
-        .recovery_pull_id
-        .is_some_and(|id| id == 0 || id > 1_000_000)
-        || result.conflict
-            && (result.clock.is_some() || result.pending || result.recovery_pull_id.is_some())
-    {
-        return Err(INVALID.into());
-    }
-    if let Some(clock) = &result.clock {
-        // A non-overlapping pull is a cache miss, but malformed identity is not.
-        if !finite(clock.report_seconds, 0.0, 7.0 * 86400.0) {
-            return Err(INVALID.into());
-        }
-        let mut probe = key.clone();
-        probe.start_ms = key
-            .report_start_ms
-            .checked_add((clock.report_seconds * 1000.0).round() as i64)
-            .ok_or(INVALID)?;
-        probe.end_ms = probe.start_ms.saturating_add(3_600_000);
-        if clock.alignment(&probe).is_none() {
-            return Err(INVALID.into());
-        }
-    }
-    Ok(result)
-}
-
-/// Restore an old result only when its complete boss signature is identical.
-/// The endpoint never queues media analysis or accepts a client-supplied offset.
-pub(crate) fn recover_recording_clock(
-    access: &guild::Access,
-    key: &Key,
-    signature: &BossSignature,
-    cancel: &AtomicBool,
-) -> Result<RecordingLookup, String> {
-    current(access, key, cancel)?;
-    if signature.report != key.report || signature.report_start_ms != key.report_start_ms {
-        return Err(INVALID.into());
-    }
-    streams::request(Method::POST, &format!("{PATH}/recover"), access,
-        Some(serde_json::json!({"provider":key.provider,"videoId":key.video_id,"signature":signature})))
-        .map_err(request_error)?;
-    recording_lookup(access, key, cancel)
-}
-
 fn digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -578,11 +511,12 @@ fn parse(bytes: &[u8]) -> Result<Job, String> {
         .map_err(|_| INVALID.into())
 }
 
-pub(crate) fn submit(
+fn submit_to(
     access: &guild::Access,
     key: Key,
     signature: &BossSignature,
     cancel: &AtomicBool,
+    path: &str,
 ) -> Result<Ticket, String> {
     current(access, &key, cancel)?;
     if signature.report != key.report
@@ -610,7 +544,7 @@ pub(crate) fn submit(
     })
     .map_err(|_| INVALID)?;
     let response =
-        streams::request(Method::POST, PATH, access, Some(body)).map_err(request_error)?;
+        streams::request(Method::POST, path, access, Some(body)).map_err(request_error)?;
     let job = parse(&response)?;
     let member = member_hash(access);
     job.validate(&key, &access.guild_id, &member, None)?;

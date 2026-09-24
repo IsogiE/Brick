@@ -1221,16 +1221,7 @@ impl Client {
             })?;
         }
         if playback && review.content_required() {
-            let clocks = prepared::clocks(
-                &mut review,
-                preferred_pull,
-                self.recording_auth_epoch,
-                |key| {
-                    crate::content_alignment::recording_lookup(discord_token, key, &self.cancel)
-                        .ok()
-                        .and_then(|lookup| lookup.clock)
-                },
-            );
+            let clocks = Vec::new();
             check_cancelled(&self.cancel)?;
             // Explicit report choices must not replace the automatic directory.
             if report_override.is_none() {
@@ -1256,6 +1247,23 @@ impl Client {
         Ok(review)
     }
 
+    pub(crate) fn save_samples(
+        &mut self,
+        access: &crate::guild::Access,
+        stream: &Stream,
+        samples: crate::content_alignment::sampling::Snapshot,
+    ) -> Result<(), String> {
+        access.check()?;
+        check_cancelled(&self.cancel)?;
+        if let Some(cache) = self.review_cache.as_mut() {
+            cache.update_samples(access, stream, &samples);
+        }
+        if let Ok(mut cache) = self.prepared.lock() {
+            cache.set_samples(stream, samples);
+        }
+        Ok(())
+    }
+
     fn restore_review_cache(&mut self, access: &crate::guild::Access, stream: &Stream) {
         let capability = self.content_capability();
         if self.review_cache.is_none() {
@@ -1263,7 +1271,12 @@ impl Client {
                 self.review_cache = persistent::Cache::load(config, session, access);
                 if let Some(disk) = &self.review_cache {
                     if let Ok(mut cache) = self.prepared.lock() {
-                        disk.hydrate(&mut cache, capability.as_ref(), self.recording_auth_epoch);
+                        disk.hydrate(
+                            &mut cache,
+                            capability.as_ref(),
+                            self.recording_auth_epoch,
+                            access,
+                        );
                     }
                 }
             }
@@ -1276,6 +1289,7 @@ impl Client {
                         &mut cache,
                         capability.as_ref(),
                         self.recording_auth_epoch,
+                        access,
                     );
                 }
             }

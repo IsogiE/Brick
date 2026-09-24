@@ -17,6 +17,7 @@ pub(crate) struct Entry {
     pub review: Review,
     pub status: (u64, bool),
     pub clocks: Vec<(Key, RecordingClock)>,
+    pub sampling: crate::content_alignment::sampling::Snapshot,
     pub at: Instant,
     path: String,
     generation: u64,
@@ -43,12 +44,10 @@ pub(crate) struct Cache {
     entries: Vec<Entry>,
     suspended: bool,
     pub preferences: crate::defensives::Preferences,
-    tickets: Vec<crate::content_alignment::Ticket>,
 }
 impl Cache {
     pub fn set_connected(&mut self, connected: bool) {
         self.entries.clear();
-        self.tickets.clear();
         self.preferences = Default::default();
         self.suspended = !connected;
     }
@@ -89,44 +88,58 @@ impl Cache {
     }
 
     pub fn ready(&self, stream: &Stream) -> bool {
-        // Metadata freshness is not the lifetime of a verified recording clock.
-        // A known offset must not schedule another alignment when pulls refresh.
         self.retained(stream).is_some_and(|entry| {
-            entry
-                .review
-                .pulls
-                .iter()
-                .any(|pull| entry.review.has_precise_timing(pull))
+            let plan = entry.sampling.plan(&entry.review, entry.status.0);
+            plan.next.is_none()
+                && plan.pending.is_none()
+                && (!entry.sampling.tickets.is_empty() || entry.review.pulls.is_empty())
         })
     }
 
-    pub fn remember_ticket(&mut self, ticket: crate::content_alignment::Ticket) {
-        if self.suspended
-            || ticket.expired()
-            || crate::guild::ensure_current(ticket.key.guild_generation).is_err()
+    pub(super) fn restore_samples(
+        &mut self,
+        identity: &str,
+        samples: crate::content_alignment::sampling::Snapshot,
+    ) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.source_identity == identity)
         {
-            return;
+            entry.review.content_timing.clear();
+            for alignment in samples.plan(&entry.review, entry.status.0).alignments {
+                entry.review.content_timing.insert(
+                    (alignment.key.report.clone(), alignment.key.pull_id),
+                    alignment,
+                );
+            }
+            entry.sampling = samples;
         }
-        self.tickets.retain(|old| {
-            !old.expired()
-                && old.key != ticket.key
-                && old.key.guild_generation == ticket.key.guild_generation
-                && old.key.auth_epoch == ticket.key.auth_epoch
-        });
-        if self.tickets.len() >= 64 {
-            self.tickets.remove(0);
-        }
-        self.tickets.push(ticket);
     }
 
-    pub fn ticket(&self, key: &Key) -> Option<crate::content_alignment::Ticket> {
-        if self.suspended || key.guild_generation != crate::guild::generation() {
-            return None;
+    pub fn set_samples(
+        &mut self,
+        stream: &Stream,
+        samples: crate::content_alignment::sampling::Snapshot,
+    ) {
+        if self.suspended {
+            return;
         }
-        self.tickets
-            .iter()
-            .find(|ticket| &ticket.key == key && !ticket.expired())
-            .cloned()
+        let Some(identity) = source_identity(stream) else {
+            return;
+        };
+        if let Some(entry) = self.entries.iter_mut().find(|entry| {
+            entry.source_identity == identity && entry.generation == crate::guild::generation()
+        }) {
+            entry.review.content_timing.clear();
+            for alignment in samples.plan(&entry.review, entry.status.0).alignments {
+                entry.review.content_timing.insert(
+                    (alignment.key.report.clone(), alignment.key.pull_id),
+                    alignment,
+                );
+            }
+            entry.sampling = samples;
+        }
     }
 
     pub fn get(&self, stream: &Stream) -> Option<Entry> {
@@ -218,6 +231,7 @@ impl Cache {
             review,
             status,
             clocks,
+            sampling: Default::default(),
             at,
             path,
             generation,
@@ -225,6 +239,7 @@ impl Cache {
         });
     }
 
+    #[cfg(test)]
     pub fn record_clock(&mut self, key: &Key, clock: &RecordingClock) {
         for entry in &mut self.entries {
             if entry.generation != key.guild_generation || entry.status.0 != key.auth_epoch {
@@ -275,6 +290,16 @@ impl Cache {
         if crate::guild::ensure_current(generation).is_err() {
             return;
         }
+        let sampling = self
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.path == path
+                    && entry.source_identity == identity
+                    && entry.status.0 == status.0
+            })
+            .map(|entry| entry.sampling.clone())
+            .unwrap_or_default();
         self.entries.retain(|entry| {
             entry.path != path && entry.generation == generation && entry.at.elapsed() < RETENTION
         });
@@ -293,6 +318,7 @@ impl Cache {
             review,
             status,
             clocks,
+            sampling,
             at: Instant::now(),
             path,
             generation,
@@ -303,6 +329,7 @@ impl Cache {
 
 /// One lookup covers every pull from the same report; never export boss events
 /// or submit inference jobs merely because a recording is visible in the list.
+#[cfg(test)]
 pub(crate) fn clocks(
     review: &mut Review,
     preferred: Option<&Pull>,
@@ -420,8 +447,10 @@ mod tests {
         // Uploads without a known media origin still have an archive date.
         stream.replay_end_ms = Some(1_700_001_000_000);
         let mut cache = Cache::default();
+        let samples =
+            crate::content_alignment::sampling::test_samples(&review, clocks[0].0.auth_epoch);
         cache.insert(&stream, review, (clocks[0].0.auth_epoch, true), Vec::new());
-        cache.record_clock(&clocks[0].0, &clocks[0].1);
+        cache.set_samples(&stream, samples);
         cache.age_for_test(Duration::from_secs(120));
         assert!(
             cache.get(&stream).is_none(),
@@ -435,8 +464,8 @@ mod tests {
         cache.age_for_test(Duration::from_secs(6 * 60 * 60));
         assert!(!cache.background_contains(&stream));
         assert!(cache.ready(&stream));
-        for alignment in cache.entries[0].review.content_timing.values_mut() {
-            alignment.expires_at = 0;
+        for ticket in &mut cache.entries[0].sampling.tickets {
+            ticket.job.expires_at = 1;
         }
         assert!(
             !cache.ready(&stream),

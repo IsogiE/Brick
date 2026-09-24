@@ -107,16 +107,9 @@ impl Driver {
                     }
                     self.viewer.select(first);
                     self.viewer.sync_content_selection();
-                    let clock = content_alignment::recording_lookup(
-                        &self.access,
-                        &ticket.key,
-                        &AtomicBool::new(false),
-                    )?;
-                    if self.viewer.accept_recording_clock(ticket.key, clock)
-                        || self.viewer.content_waiting()
-                    {
+                    if self.viewer.content_waiting() {
                         return Err(
-                            "Current completed job did not unlock the selected fight".into()
+                            "Current completed sample did not unlock the selected fight".into()
                         );
                     }
                     let first = self.viewer.pull.clone().unwrap();
@@ -130,6 +123,32 @@ impl Driver {
                         .unwrap()
                         .pulls
                         .push(later.clone());
+                    // A second scoped fixture ticket represents an independently
+                    // checked later pull; no legacy server-wide clock is injected.
+                    let mut later_ticket = ticket.clone();
+                    later_ticket.key = content_alignment::Key::new(
+                        &self.viewer.review.as_ref().unwrap().replay,
+                        &later,
+                        self.viewer
+                            .review
+                            .as_ref()
+                            .unwrap()
+                            .content_capability
+                            .as_ref()
+                            .unwrap(),
+                        ticket.key.auth_epoch,
+                    );
+                    later_ticket.job.scope.as_mut().unwrap().pull_id = later.id;
+                    let result = later_ticket.job.result.as_mut().unwrap();
+                    result.video_seconds += 60.0;
+                    result.seek_video_seconds += 60.0;
+                    self.viewer.content.samples.remember(later_ticket);
+                    self.viewer
+                        .review
+                        .as_mut()
+                        .unwrap()
+                        .pulls
+                        .retain(|p| p.id != first.id + 1);
                     self.viewer.select(later);
                     self.viewer.sync_content_selection();
                     if self
@@ -162,13 +181,18 @@ impl Driver {
                     // A different viewer sharing this account's metadata cache
                     // opens directly at the aligned pull, even while WCL is busy.
                     let prepared_review = self.viewer.review.as_ref().unwrap().clone();
-                    let clocks = self.viewer.content.prepared_clocks();
+                    let samples = self.viewer.content.samples.clone();
                     self.viewer.prepared.lock().unwrap().insert(
                         &self.stream,
                         prepared_review,
                         self.viewer.recording_match_status.unwrap(),
-                        clocks,
+                        Vec::new(),
                     );
+                    self.viewer
+                        .prepared
+                        .lock()
+                        .unwrap()
+                        .set_samples(&self.stream, samples);
                     let mut fresh = self.viewer.metadata_peer();
                     fresh.metadata_only = false;
                     let shared_client = fresh.client.clone();
@@ -504,8 +528,9 @@ fn content_job_to_native_player_uses_relative_timing_without_marker() {
         "101".into(),
         guild::generation(),
     );
-    let pending = content_alignment::submit(&access, key, &signature, &AtomicBool::new(false))
-        .expect("Loopback content submission failed");
+    let pending =
+        content_alignment::sampling::submit(&access, key, &signature, &AtomicBool::new(false))
+            .expect("Loopback content submission failed");
     assert!(pending.pending() && pending.alignment().is_none());
     let stream = Stream {
         user_id: "101".into(),
