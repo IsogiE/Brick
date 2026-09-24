@@ -6,27 +6,9 @@
 [![License](https://img.shields.io/github/license/IsogiE/Brick)](LICENSE)
 [![Issues](https://img.shields.io/github/issues/IsogiE/Brick)](https://github.com/IsogiE/Brick/issues)
 
-A small desktop updater for [Advance Raid Tools](https://github.com/IsogiE/AdvanceRaidTools), written in Rust with egui.
+A small desktop updater for [Advance Raid Tools](https://github.com/IsogiE/AdvanceRaidTools) & VoD reviewer, written in Rust with egui.
 
 Brick is developed and maintained by Lucas Thoolen (GitHub: IsogiE).
-
-Brick keeps the guild addon installed across your WoW clients, runs in the system tray, and checks for updates automatically. Downloads are verified against signed manifests before installation. Sign in with a Discord account that has a Raider or Officer role in a supported guild.
-
-If you qualify for more than one guild, use the guild selector beside the navigation tabs. Brick remembers your selection and opens that guild's roster, profile, streams and recordings. Your guild roles are independent; being an Officer in one guild does not grant Officer access in another. Personal settings and your Warcraft Logs sign-in follow your account.
-
-Brick keeps an encrypted raid-review cache on your device so known pulls remain available when switching streams or restarting. It refreshes in the background, updates existing reports instead of duplicating them, and retains up to three weeks of data. Completed pull events and boss timelines are shared across POVs, with unchanged data left untouched. The review snapshot is limited to 2 MiB; the additional Warcraft Logs cache uses fixed encrypted storage within 34 MiB, for a combined maximum of 36 MiB per guild and account. Older entries are evicted as needed. Background preparation respects Warcraft Logs’ hourly allowance and leaves capacity for reviewing pulls. Known pulls stay available during a temporary provider limit; retries resume automatically. Completed recording offsets remain reusable while live pull lists refresh.
-
-Open **Video Player Sign In** at the top of **Streams** for YouTube and Twitch viewing controls. Each provider has one **Sign in** or **Sign out** button. Sign in opens that provider's website inside Brick. Sign out closes its windows and clears its viewing session. These sessions are isolated by provider and Brick account. Persistent viewing cookies are saved in Linux Secret Service or protected with Windows DPAPI, so they can survive restarts and updates until the provider expires or revokes them. There is no plaintext fallback. Brick does not import your normal browser's cookies; the provider handles and controls sign-in.
-
-In **Your streams**, share a public YouTube channel link or @handle without authorizing Google account access. Public live-stream discovery is best effort; add an individual video link when a stream is missing or unlisted. Private broadcasts are not discovered. Twitch channel connection remains optional, and each guild keeps its own sharing settings. Older YouTube API credentials are removed locally after signing in to Brick; you can revoke any old Google grant at https://myaccount.google.com/permissions. Video Player Sign In is a separate provider website viewing session.
-
-On startup and every minute while running and signed in, Brick checks the installed addon versions against the current signed release. If a managed addon's folder or TOC file is missing, or its TOC version differs, Brick reinstalls the current package automatically.
-
-Saved VODs without matching raid logs can be hidden after 12 hours. Brick checks the reports your Warcraft Logs account can access and saves only the result, encrypted on the server for your own guild view. The next VOD load applies saved results immediately, keeping the displayed list stable while background checks run. Later matching reports can restore hidden VODs.
-
-Raid replay review uses ART's small Unix timestamp to calibrate YouTube and Twitch recordings. ART displays it at the top left for five seconds in normal, heroic and mythic raids; `/art unix` previews it in-game. One verified pull establishes the recording's timing, which can then align later pulls across Warcraft Logs reports. New recordings are calibrated separately. Overlapping pulls establish clock corrections between log reports; a new report without overlap may need one background check, shared by the other calibrated POVs. Manual seconds offsets are no longer used.
-
-Verified timing is saved locally and shared with the guild. Passive reading during playback never seeks or changes video quality, and a newly discovered timestamp does not move the currently playing pull. Provider timing remains available when a marker cannot be read.
 
 ## Download
 
@@ -96,4 +78,4 @@ Bug reports should include the Brick version, operating system, and steps to rep
 
 ## License
 
-[MIT](LICENSE).
+[MIT](https://github.com/IsogiE/Brick/blob/main/LICENSE)
