@@ -1872,21 +1872,24 @@ fn exact_duplicate_pulls(report: &Value, pull: &Pull) -> Result<Vec<Pull>, Strin
 pub(super) fn canonical_pulls(mut pulls: Vec<Pull>) -> Vec<Pull> {
     pulls.sort_by_key(|p| (p.start_ms, p.report.clone(), p.id));
     let mut unique: Vec<Pull> = Vec::new();
+    let mut same_report = std::collections::HashSet::new();
     for pull in pulls {
-        if unique
-            .iter()
-            .rev()
-            .take_while(|p| pull.start_ms - p.start_ms < 3000)
-            .any(|p| {
-                p.encounter == pull.encounter
-                    && p.difficulty == pull.difficulty
-                    && if p.report == pull.report {
-                        p.start_ms == pull.start_ms && p.end_ms == pull.end_ms
-                    } else {
-                        (p.end_ms - pull.end_ms).abs() < 3000
-                    }
-            })
-        {
+        if !same_report.insert((
+            pull.report.clone(),
+            pull.encounter,
+            pull.difficulty,
+            pull.start_ms,
+            pull.end_ms,
+        )) {
+            continue;
+        }
+        if unique.iter().rev().take(12).any(|p| {
+            p.report != pull.report
+                && p.encounter == pull.encounter
+                && p.difficulty == pull.difficulty
+                && p.start_ms.abs_diff(pull.start_ms) < 3000
+                && p.end_ms.abs_diff(pull.end_ms) < 3000
+        }) {
             continue;
         }
         unique.push(pull);
