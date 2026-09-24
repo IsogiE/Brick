@@ -501,7 +501,10 @@ struct SavedEvents {
 }
 impl SavedEvents {
     fn restore(self, pull: &Pull, kind: EventKind) -> Option<CachedEvents> {
-        if !self.coverage.is_bounded()
+        // An empty response can precede a completed log upload. It must not
+        // become a long-lived negative cache entry across app restarts.
+        if self.raw.is_empty()
+            || !self.coverage.is_bounded()
             || self.raw.len() > MAX_PULL_EVENTS
             || self
                 .raw
@@ -1512,8 +1515,14 @@ impl Client {
         );
         let key = (pull.report.clone(), pull.id, kind);
         let bounds = (pull.start_ms, pull.end_ms);
-        self.events
-            .retain(|_, entry| entry.at.elapsed() < EVENT_TTL);
+        self.events.retain(|_, entry| {
+            entry.at.elapsed()
+                < if entry.raw.is_empty() {
+                    Duration::from_secs(30)
+                } else {
+                    EVENT_TTL
+                }
+        });
         let cached = self
             .events
             .get(&key)
@@ -3004,6 +3013,15 @@ mod tests {
             {"id":1,"encounterID":123,"difficulty":5,"name":"Boss","kill":false,"startTime":0,"endTime":120000}
         ]});
         let pull = map_pulls(&report, &video).unwrap().remove(0);
+        assert!(
+            SavedEvents {
+                coverage: EventCoverage::default(),
+                raw: vec![]
+            }
+            .restore(&pull, EventKind::Deaths)
+            .is_none(),
+            "Persisted empty responses must allow a newly completed upload to be fetched"
+        );
         let coverage = EventCoverage {
             casts: BTreeSet::from([100]),
             buffs: BTreeSet::new(),
