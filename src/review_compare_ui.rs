@@ -125,6 +125,34 @@ impl Comparison {
     }
 
     #[cfg(test)]
+    pub(crate) fn refresh_controller_for_test(
+        &mut self,
+        primary: &ReviewUi,
+        now: Instant,
+    ) -> &mut Controller {
+        let (review, pull) = primary.comparison_context().unwrap();
+        self.refresh_clocks(review, pull, now).unwrap();
+        if self.controller.is_none() {
+            let secondary = self.metadata.comparison_metadata().unwrap();
+            let clocks = [
+                recording_clock(review, pull).unwrap(),
+                recording_clock(secondary, matching_pull(secondary, pull).unwrap()).unwrap(),
+            ];
+            self.controller = Some(
+                Controller::new(
+                    clocks,
+                    [pull.start_ms, pull.end_ms],
+                    self.desired.0,
+                    self.desired.1,
+                    now,
+                )
+                .unwrap(),
+            );
+        }
+        self.controller.as_mut().unwrap()
+    }
+
+    #[cfg(test)]
     pub fn new(review: &ReviewUi, selected: Stream, at_ms: i64, playing: bool) -> Self {
         Self::new_with_sessions(
             review,

@@ -790,27 +790,125 @@ mod tests {
     }
     #[test]
     fn comparison_clock_adoption_and_exit_use_the_clock_that_comparison_seeks() {
-        let (mut ui, ticket) = viewer();
-        ui.set_comparing(true);
-        ui.accept_content(ticket);
-        let pull = ui.pull.clone().unwrap();
-        assert_eq!(ui.active_playback_range().unwrap().0, 15.25);
-        ui.follow_comparison_position(Some(pull.clone()), 45.25, true);
-        assert_eq!(
-            ui.comparison_position(&PlaybackState::default()).unwrap().0,
-            pull.start_ms + 30_000
-        );
-        ui.set_comparing(false);
-        assert_eq!(ui.active_playback_range().unwrap(), (15.25, 195.25));
-        let mut state = PlaybackState::default();
-        state.ready = true;
-        state.playing = true;
-        state.seconds = 195.25;
-        state.mark_polled_now();
-        assert!(matches!(
-            ui.pause_at_pull_end(&state),
-            Some(PlaybackCommand::Pause)
-        ));
+        for playing in [false, true] {
+            let (mut ui, ticket) = viewer();
+            let pull = ui.pull.clone().unwrap();
+            let at_ms = pull.start_ms + 30_000;
+            ui.set_comparing(true);
+            let mut secondary = ui.review.clone().unwrap();
+            secondary.replay.video_id = "different12".into();
+            secondary.replay.broadcast_id = "different12".into();
+            let stream = Stream {
+                replay_start_ms: None,
+                replay_end_ms: None,
+                recording_id: Some(secondary.replay.video_id.clone()),
+                user_id: "202".into(),
+                raid_role: None,
+                name: "Second POV".into(),
+                provider: secondary.replay.provider.clone(),
+                channel_id: secondary.replay.video_id.clone(),
+                url: secondary.replay.public_url(0),
+                status: crate::streams::Status::Offline,
+                broadcast_state: None,
+            };
+            let mut comparison =
+                crate::review_compare_ui::Comparison::new(&ui, stream, at_ms, playing);
+            comparison.metadata_for_test().review = Some(secondary);
+            let mut now = Instant::now() - Duration::from_millis(100);
+            ui.range_epoch = now;
+            let mut next = || {
+                now += Duration::from_millis(1);
+                now
+            };
+            let sample = |seconds, playing, at| {
+                let mut state = PlaybackState::default();
+                state.ready = true;
+                state.seconds = seconds;
+                state.playing = playing;
+                state.mark_polled_at(at);
+                state
+            };
+            let initial = ui.active_playback_range().unwrap().0 + 30.0;
+            let empty = PlaybackState::default();
+            comparison
+                .refresh_controller_for_test(&ui, next())
+                .tick([&empty, &empty], next());
+            let ready = sample(initial, false, next());
+            comparison
+                .refresh_controller_for_test(&ui, next())
+                .tick([&ready, &ready], next());
+            if playing {
+                let running = sample(initial, true, next());
+                comparison
+                    .refresh_controller_for_test(&ui, next())
+                    .tick([&running, &running], next());
+            }
+
+            // A callback started before the new clock cannot acknowledge its
+            // seek, even when it happens to report the corrected position.
+            let stale = [sample(45.25, false, next()), sample(initial, false, next())];
+            ui.accept_content(ticket);
+            let controller = comparison.refresh_controller_for_test(&ui, next());
+            assert_eq!(controller.position_ms(), at_ms);
+            assert_eq!(controller.wants_playing(), playing);
+            let commands = controller.tick([&stale[0], &stale[1]], next());
+            assert!(matches!(
+                commands.primary,
+                Some(PlaybackCommand::SeekPaused(45.25))
+            ));
+            assert!(
+                matches!(commands.secondary, Some(PlaybackCommand::SeekPaused(s)) if s == initial)
+            );
+            let commands = controller.tick([&stale[0], &stale[1]], next());
+            assert!(commands.primary.is_none() && commands.secondary.is_none());
+            assert_eq!(
+                controller.status(),
+                crate::review_compare::Status::Preparing
+            );
+
+            let fresh = [sample(45.25, false, next()), sample(initial, false, next())];
+            let commands = controller.tick([&fresh[0], &fresh[1]], next());
+            assert_eq!(
+                matches!(commands.primary, Some(PlaybackCommand::Play)),
+                playing
+            );
+            assert_eq!(
+                matches!(commands.secondary, Some(PlaybackCommand::Play)),
+                playing
+            );
+            assert_eq!(controller.position_ms(), at_ms);
+            assert_eq!(ui.comparison_position(&fresh[0]), Some((at_ms, false)));
+
+            ui.set_comparing(false);
+            assert_eq!(ui.active_playback_range().unwrap(), (15.25, 195.25));
+            assert_eq!(ui.comparison_position(&fresh[0]), Some((at_ms, false)));
+            let end = sample(195.25, true, next());
+            assert!(matches!(
+                ui.pause_at_pull_end(&end),
+                Some(PlaybackCommand::Pause)
+            ));
+            assert!(ui.pause_at_pull_end(&end).is_none());
+        }
+    }
+    #[test]
+    fn timeline_label_stays_inside_pull_bounds_while_provider_settles() {
+        let (mut ui, _) = viewer();
+        let (start, end) = ui.active_playback_range().unwrap();
+        let ctx = egui::Context::default();
+        for (seconds, label) in [(start - 2.0, "0:00 / 3:00"), (end + 2.0, "3:00 / 3:00")] {
+            let mut state = PlaybackState::default();
+            state.ready = true;
+            state.seconds = seconds;
+            state.mark_polled_now();
+            let output = ctx.run_ui(Default::default(), |egui| {
+                ui.draw_timeline(egui, &state);
+            });
+            assert!(
+                output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == label)),
+                "The timer and slider must share the selected pull's bounds"
+            );
+        }
     }
     #[test]
     fn new_alignment_keeps_the_watched_timeline_at_zero_until_explicit_navigation() {

@@ -2304,7 +2304,7 @@ impl ReviewUi {
                     RichText::new(format!(
                         "{} / {}",
                         if self.scrub.is_some() || display_position.is_some() {
-                            relative_clock(self.scrub.unwrap_or(elapsed))
+                            clock(self.scrub.unwrap_or(current))
                         } else {
                             "–:––".into()
                         },
@@ -3828,13 +3828,6 @@ fn pull_key(pull: &Pull) -> String {
 fn clock(seconds: f64) -> String {
     let s = seconds.max(0.0) as u64;
     format!("{}:{:02}", s / 60, s % 60)
-}
-fn relative_clock(seconds: f64) -> String {
-    if seconds < 0.0 {
-        format!("-{}", clock(-seconds))
-    } else {
-        clock(seconds)
-    }
 }
 fn class_color(class: &str) -> Color32 {
     match class {

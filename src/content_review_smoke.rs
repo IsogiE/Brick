@@ -291,8 +291,70 @@ impl Driver {
                 {
                     return Err("Content coverage allowed an out-of-fight seek".into());
                 }
-                eprintln!("Native content UI verified: HTTP pending/poll, exact nullable-UTC result, stale-selection rejection, paused and resumed log seeks, one native player; synthetic timing fixture only");
-                return Ok(true);
+                let at = pull.end_ms - 1_000;
+                let command = self
+                    .viewer
+                    .seek_absolute(at)
+                    .ok_or("End-of-pull seek unavailable")?;
+                player
+                    .command(command)
+                    .map_err(|_| "End-of-pull seek failed")?;
+                self.phase = 6;
+                self.phase_start = Instant::now();
+            }
+            6 | 8 => {
+                if let Some(command) = self.viewer.pause_at_pull_end(&state) {
+                    if !matches!(command, PlaybackCommand::Pause) {
+                        return Err("Pull boundary issued an unexpected command".into());
+                    }
+                    self.sample = state.seconds;
+                    player
+                        .command(command)
+                        .map_err(|_| "Pull boundary pause failed")?;
+                    self.phase += 1;
+                    self.phase_start = Instant::now();
+                }
+            }
+            7 | 9
+                if state.is_fresh()
+                    && state.playback_intent.is_none()
+                    && state.observation_window().is_some_and(|window| {
+                        window[0] >= self.phase_start + Duration::from_secs(2)
+                    }) =>
+            {
+                let end = self.viewer.active_playback_range().unwrap().1;
+                if !state.ready
+                    || state.playing
+                    || state.seeking.is_some()
+                    || state.seconds < end
+                    || state.seconds > end + 2.0
+                    || (state.seconds - self.sample).abs() > 0.5
+                {
+                    return Err("Native player did not stay paused at the pull boundary".into());
+                }
+                if self.phase == 9 {
+                    eprintln!("Native content UI verified: HTTP pending/poll, stale-selection rejection, paused and resumed log seeks, one native player, automatic end pause with verified and pending timing; synthetic timing fixture only");
+                    return Ok(true);
+                }
+                // Reproduce the reported case: playback is available while the
+                // content result is still pending. The same boundary must pause
+                // the real player even without a verified alignment.
+                self.viewer.content = State::default();
+                self.viewer.review.as_mut().unwrap().content_timing.clear();
+                let pull = self.viewer.pull.clone().unwrap();
+                self.viewer.select(pull.clone());
+                if !self.viewer.content_waiting() {
+                    return Err("Pending-timing boundary fixture retained an alignment".into());
+                }
+                let command = self
+                    .viewer
+                    .seek_absolute(pull.end_ms - 1_000)
+                    .ok_or("Estimated end-of-pull seek unavailable")?;
+                player
+                    .command(command)
+                    .map_err(|_| "Estimated boundary seek failed")?;
+                self.phase = 8;
+                self.phase_start = Instant::now();
             }
             _ => (),
         }
