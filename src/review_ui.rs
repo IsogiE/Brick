@@ -45,6 +45,14 @@ pub struct Playback {
     pub content_timing: bool,
 }
 
+struct PlaybackRange {
+    pull: Pull,
+    broadcast_id: String,
+    video_id: String,
+    start: f64,
+    end: f64,
+}
+
 #[derive(Clone)]
 enum Action {
     Refresh,
@@ -66,10 +74,6 @@ enum Data {
     Events(String, EventKind, Vec<RaidEvent>, defensives::Preferences),
     Cooldowns(defensives::Preferences),
     Content(crate::content_alignment::Ticket),
-    RecordingClock(
-        crate::content_alignment::Key,
-        crate::content_alignment::RecordingLookup,
-    ),
 }
 type Outcome = (u64, String, Result<Data, String>, bool);
 
@@ -224,6 +228,7 @@ pub struct ReviewUi {
     pov_menu: PovMenuState,
     range_epoch: Instant,
     range_pause_sent: bool,
+    playback_range: Option<PlaybackRange>,
     provider_observation: Option<(Instant, f64)>,
     provider_seek_generation: Option<u64>,
     provider_seek_pending: bool,
@@ -283,6 +288,7 @@ impl Default for ReviewUi {
             pov_menu: PovMenuState::default(),
             range_epoch: Instant::now(),
             range_pause_sent: false,
+            playback_range: None,
             provider_observation: None,
             provider_seek_generation: None,
             provider_seek_pending: false,
@@ -534,7 +540,7 @@ impl ReviewUi {
             })
             .or_else(|| self.playback.as_ref().map(|p| p.seconds))?;
         Some((
-            encounter_moment(review, pull, seconds),
+            self.playback_moment(review, pull, seconds),
             playback_intent(state, self.playback.as_ref()),
         ))
     }
@@ -577,7 +583,10 @@ impl ReviewUi {
     }
 
     pub(crate) fn set_comparing(&mut self, comparing: bool) {
-        self.comparing = comparing;
+        if self.comparing != comparing {
+            self.comparing = comparing;
+            self.remember_playback_range();
+        }
     }
 
     pub(crate) fn open_recording(&mut self) {
@@ -741,7 +750,7 @@ impl ReviewUi {
         self.connected = true;
         self.connection_checked = true;
         self.last_attempt = Some(entry.at);
-        self.content.seed_clocks(entry.clocks, entry.at);
+        self.content.samples = entry.sampling;
         self.accept_cooldown_preferences(preferences);
         self.accept_review(entry.review);
         self.restore_pov_position();
@@ -832,7 +841,7 @@ impl ReviewUi {
                                             .ok()
                                             .and_then(|cache| cache.get(stream))
                                     }) {
-                                        self.content.seed_clocks(entry.clocks, entry.at);
+                                        self.content.samples = entry.sampling;
                                     }
                                     changed |= self.accept_review(review);
                                     changed |= self.restore_pov_position();
@@ -855,9 +864,6 @@ impl ReviewUi {
                                 self.selected_event = None;
                                 self.notice = None;
                                 self.last_attempt = None;
-                            }
-                            Ok(Data::RecordingClock(key, lookup)) => {
-                                changed |= self.accept_recording_clock(key, lookup);
                             }
                             Ok(Data::Content(ticket)) => {
                                 changed |= self.accept_content(ticket);
@@ -1250,11 +1256,6 @@ impl ReviewUi {
         let background_requests = self.metadata_only;
         let housekeeping = self.recording_housekeeping;
         let preferred_pull = self.preferred_alignment_pull().cloned();
-        let recovery_pulls = self
-            .review
-            .as_ref()
-            .map(|review| review.pulls.clone())
-            .unwrap_or_default();
         let manual_report = self.content.manual_report.clone();
         let marker_fallback = self
             .review
@@ -1262,6 +1263,7 @@ impl ReviewUi {
             .map(|review| review.marker_fallback.clone())
             .unwrap_or_default();
         self.mark_content_started(&action);
+        let mut samples = self.content.samples.clone();
         let stream = stream.cloned();
         let ctx = ctx.clone();
         let key = self.key.clone();
@@ -1379,44 +1381,14 @@ impl ReviewUi {
                         {
                             return Err("The Warcraft Logs account or alignment service changed. Reload this view.".into());
                         }
-                        let lookup =
-                            crate::content_alignment::recording_lookup(&token, &key, &cancel)?;
-                        if lookup
-                            .clock
-                            .as_ref()
-                            .is_some_and(|clock| clock.alignment(&key).is_some())
-                            || lookup.pending
-                        {
-                            return Ok(Data::RecordingClock(key, lookup));
-                        }
-                        if let Some(anchor) = lookup.recovery_pull_id.and_then(|id| {
-                            recovery_pulls.iter().find(|p| {
-                                p.id == id
-                                    && p.report == key.report
-                                    && p.report_start_ms == key.report_start_ms
-                            })
-                        }) {
-                            let signature = client.boss_signature(&token, anchor)?;
-                            let recovered = crate::content_alignment::recover_recording_clock(
-                                &token, &key, &signature, &cancel,
-                            )?;
-                            if recovered.clock.is_some() || recovered.pending {
-                                return Ok(Data::RecordingClock(key, recovered));
-                            }
-                        }
+                        let stream = stream.as_ref().ok_or("Choose a VOD first.")?;
+                        client.save_samples(&token, stream, samples.clone())?;
                         let signature = client.boss_signature(&token, &pull)?;
-                        let ticket =
-                            crate::content_alignment::submit(&token, key, &signature, &cancel)?;
-                        if ticket.alignment().is_some() {
-                            let lookup = crate::content_alignment::recording_lookup(
-                                &token,
-                                &ticket.key,
-                                &cancel,
-                            )?;
-                            if lookup.clock.is_some() {
-                                return Ok(Data::RecordingClock(ticket.key, lookup));
-                            }
-                        }
+                        let ticket = crate::content_alignment::sampling::submit(
+                            &token, key, &signature, &cancel,
+                        )?;
+                        samples.remember(ticket.clone());
+                        client.save_samples(&token, stream, samples)?;
                         Ok(Data::Content(ticket))
                     })(),
                     Action::ContentPoll(ticket) => (|| {
@@ -1425,29 +1397,10 @@ impl ReviewUi {
                                 "The Warcraft Logs account changed. Reload this view.".into()
                             );
                         }
-                        let lookup = crate::content_alignment::recording_lookup(
-                            &token,
-                            &ticket.key,
-                            &cancel,
-                        )?;
-                        if lookup
-                            .clock
-                            .as_ref()
-                            .is_some_and(|clock| clock.alignment(&ticket.key).is_some())
-                        {
-                            return Ok(Data::RecordingClock(ticket.key, lookup));
-                        }
                         let ticket = crate::content_alignment::poll(&token, &ticket, &cancel)?;
-                        if ticket.alignment().is_some() {
-                            let lookup = crate::content_alignment::recording_lookup(
-                                &token,
-                                &ticket.key,
-                                &cancel,
-                            )?;
-                            if lookup.clock.is_some() {
-                                return Ok(Data::RecordingClock(ticket.key, lookup));
-                            }
-                        }
+                        samples.remember(ticket.clone());
+                        let stream = stream.as_ref().ok_or("Choose a VOD first.")?;
+                        client.save_samples(&token, stream, samples)?;
                         Ok(Data::Content(ticket))
                     })(),
                     Action::SaveCooldowns(preferences) => client
@@ -1566,7 +1519,12 @@ impl ReviewUi {
                 public_url: review.replay.public_url(seconds as u64),
                 content_timing: review.uses_content_timing(&pull),
             });
-        self.cancel_read();
+        if !matches!(
+            self.work_action,
+            Some(Action::ContentSubmit(..) | Action::ContentPoll(..))
+        ) {
+            self.cancel_read();
+        }
         self.pending_focus = None;
         self.aligning = playback.is_none();
         self.playback = playback;
@@ -2171,7 +2129,7 @@ impl ReviewUi {
             };
             self.pending_focus = Some((
                 pull.clone(),
-                encounter_moment(review, pull, seconds),
+                self.playback_moment(review, pull, seconds),
                 state.playback_intent.unwrap_or_else(|| {
                     if current {
                         playback_intent(state, self.playback.as_ref())
@@ -2222,7 +2180,7 @@ impl ReviewUi {
             return None;
         };
         let duration = (pull.end_ms - pull.start_ms) as f64 / 1000.0;
-        let video_start = pull_video_start(self.review.as_ref()?, &pull);
+        let video_start = self.active_playback_range()?.0;
         if !video_start.is_finite() {
             return None;
         }
@@ -2291,7 +2249,7 @@ impl ReviewUi {
                     RichText::new(format!(
                         "{} / {}",
                         if self.scrub.is_some() || display_position.is_some() {
-                            relative_clock(self.scrub.unwrap_or(elapsed))
+                            clock(self.scrub.unwrap_or(current))
                         } else {
                             "–:––".into()
                         },
@@ -2556,6 +2514,51 @@ impl ReviewUi {
         self.provider_observation = None;
         self.provider_seek_generation = None;
         self.provider_seek_pending = false;
+        self.remember_playback_range();
+    }
+
+    fn remember_playback_range(&mut self) {
+        self.playback_range = self
+            .review
+            .as_ref()
+            .zip(self.pull.as_ref())
+            .map(|(review, pull)| {
+                let (start, end) = playback_bounds(review, pull);
+                PlaybackRange {
+                    pull: pull.clone(),
+                    broadcast_id: review.replay.broadcast_id.clone(),
+                    video_id: review.replay.video_id.clone(),
+                    start,
+                    end,
+                }
+            });
+    }
+
+    fn active_playback_range(&self) -> Option<(f64, f64)> {
+        let review = self.review.as_ref()?;
+        let pull = self.pull.as_ref()?;
+        // Comparison owns a canonical clock and a paused-seek barrier when it
+        // adopts new timing. It must see that clock, not the solo playback pin.
+        if self.comparing {
+            return Some(playback_bounds(review, pull));
+        }
+        if let Some(range) = self.playback_range.as_ref().filter(|range| {
+            range.broadcast_id == review.replay.broadcast_id
+                && range.video_id == review.replay.video_id
+                && pull_key(&range.pull) == pull_key(pull)
+                && range.pull.start_ms == pull.start_ms
+                && range.pull.end_ms == pull.end_ms
+        }) {
+            return Some((range.start, range.end));
+        }
+        Some(playback_bounds(review, pull))
+    }
+
+    fn playback_moment(&self, review: &Review, pull: &Pull, seconds: f64) -> i64 {
+        let start = self
+            .active_playback_range()
+            .map_or_else(|| pull_video_start(review, pull), |range| range.0);
+        pull.start_ms + ((seconds - start) * 1000.0).round() as i64
     }
 
     /// Follow provider controls without issuing playback commands. This runs in
@@ -2625,10 +2628,21 @@ impl ReviewUi {
         if !self.provider_seek_pending && self.pull.is_some() {
             return;
         }
+        let provider_seek = self.provider_seek_pending;
         self.provider_seek_pending = false;
         let review = self.review.as_ref().unwrap();
         let contains = |pull: &Pull| {
-            let start = pull_video_start(review, pull);
+            let start = if !provider_seek
+                && self
+                    .pull
+                    .as_ref()
+                    .is_some_and(|current| pull_key(current) == pull_key(pull))
+            {
+                self.active_playback_range()
+                    .map_or_else(|| pull_video_start(review, pull), |range| range.0)
+            } else {
+                pull_video_start(review, pull)
+            };
             state.seconds >= start
                 && state.seconds < start + (pull.end_ms - pull.start_ms) as f64 / 1000.0
         };
@@ -2641,6 +2655,9 @@ impl ReviewUi {
             .or_else(|| review.pulls.iter().find(|pull| contains(pull)))
             .cloned();
         let changed = self.pull.as_ref().map(pull_key) != selected.as_ref().map(pull_key);
+        if changed || provider_seek {
+            self.playback_range = None;
+        }
         if changed {
             self.cancel_read();
             self.marker_sync.reset(None);
@@ -2651,6 +2668,9 @@ impl ReviewUi {
             self.loaded_events.clear();
             self.event_failures.clear();
             self.scroll_to_event = false;
+        }
+        if changed || provider_seek {
+            self.remember_playback_range();
         }
         self.selected_event = None;
         self.scrub = None;
@@ -2691,14 +2711,7 @@ impl ReviewUi {
         {
             return None;
         }
-        let pull = self.pull.as_ref()?;
-        let review = self.review.as_ref()?;
-        let end = if review.uses_content_timing(pull) {
-            let alignment = review.content_alignment(pull)?;
-            alignment.result.video_seconds + alignment.result.coverage.fight_end_seconds
-        } else {
-            pull_video_start(review, pull) + (pull.end_ms - pull.start_ms) as f64 / 1000.0
-        };
+        let end = self.active_playback_range()?.1;
         if state.seconds < end - 1.0 {
             // Re-arm on a real return into the pull, avoiding jitter at its end.
             self.range_pause_sent = false;
@@ -3761,13 +3774,6 @@ fn clock(seconds: f64) -> String {
     let s = seconds.max(0.0) as u64;
     format!("{}:{:02}", s / 60, s % 60)
 }
-fn relative_clock(seconds: f64) -> String {
-    if seconds < 0.0 {
-        format!("-{}", clock(-seconds))
-    } else {
-        clock(seconds)
-    }
-}
 fn class_color(class: &str) -> Color32 {
     match class {
         "DeathKnight" => Color32::from_rgb(196, 30, 58),
@@ -3811,6 +3817,21 @@ fn pull_video_start(review: &Review, pull: &Pull) -> f64 {
     review.pull_video_start(pull)
 }
 
+fn playback_bounds(review: &Review, pull: &Pull) -> (f64, f64) {
+    let start = pull_video_start(review, pull);
+    let end = review
+        .content_alignment(pull)
+        .filter(|_| review.uses_content_timing(pull))
+        .map_or(
+            start + (pull.end_ms - pull.start_ms) as f64 / 1000.0,
+            |alignment| {
+                alignment.result.video_seconds + alignment.result.coverage.fight_end_seconds
+            },
+        );
+    (start, end)
+}
+
+#[cfg(test)]
 fn encounter_moment(review: &Review, pull: &Pull, video_seconds: f64) -> i64 {
     pull.start_ms + ((video_seconds - pull_video_start(review, pull)) * 1000.0).round() as i64
 }
@@ -4058,10 +4079,12 @@ mod tests {
                 .seek_video_seconds;
             let later = review.pulls[1].clone();
             let mut ui = ReviewUi::default();
+            let samples = crate::content_alignment::sampling::test_samples(&review, epoch);
             ui.prepared
                 .lock()
                 .unwrap()
                 .insert(&stream, review, (epoch, true), clocks);
+            ui.prepared.lock().unwrap().set_samples(&stream, samples);
             let shared_client = ui.client.clone();
             let _busy = shared_client.lock().unwrap();
             ui.open_recording();

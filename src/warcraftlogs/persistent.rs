@@ -26,6 +26,8 @@ struct Recording {
     replay: Replay,
     pulls: Vec<(String, u64)>,
     clocks: BTreeMap<String, RecordingClock>,
+    #[serde(default)]
+    sampling: crate::content_alignment::sampling::Snapshot,
     complete: bool,
     updated_at: u64,
 }
@@ -94,9 +96,10 @@ impl Cache {
         cache: &mut prepared::Cache,
         capability: Option<&Capability>,
         epoch: u64,
+        access: &Access,
     ) {
         for recording in &self.document.recordings {
-            self.restore(recording, cache, capability, epoch);
+            self.restore(recording, cache, capability, epoch, access);
         }
     }
 
@@ -106,6 +109,7 @@ impl Cache {
         cache: &mut prepared::Cache,
         capability: Option<&Capability>,
         epoch: u64,
+        access: &Access,
     ) {
         let Some(identity) = prepared::source_identity(stream) else {
             return;
@@ -116,7 +120,7 @@ impl Cache {
             .iter()
             .find(|r| r.identity == identity)
         {
-            self.restore(recording, cache, capability, epoch);
+            self.restore(recording, cache, capability, epoch, access);
         }
     }
 
@@ -126,6 +130,7 @@ impl Cache {
         cache: &mut prepared::Cache,
         capability: Option<&Capability>,
         epoch: u64,
+        access: &Access,
     ) {
         let now = super::now_secs();
         if recording.updated_at > now || now - recording.updated_at >= AGE.as_secs() {
@@ -161,6 +166,7 @@ impl Cache {
                 }
             }
         }
+        let samples = recording.sampling.rebound(&review, epoch, access);
         cache.restore_snapshot(
             recording.path.clone(),
             recording.identity.clone(),
@@ -169,6 +175,7 @@ impl Cache {
             clocks,
             Duration::from_secs(now - recording.updated_at).max(Duration::from_secs(61)),
         );
+        cache.restore_samples(&recording.identity, samples);
     }
 
     pub fn update(
@@ -184,6 +191,32 @@ impl Cache {
         }
         self.merge(stream, review, complete, clocks, super::now_secs());
         self.save(access);
+    }
+
+    pub fn update_samples(
+        &mut self,
+        access: &Access,
+        stream: &Stream,
+        samples: &crate::content_alignment::sampling::Snapshot,
+    ) {
+        if access.check().is_err() {
+            return;
+        }
+        let Some(identity) = prepared::source_identity(stream) else {
+            return;
+        };
+        if let Some(recording) = self
+            .document
+            .recordings
+            .iter_mut()
+            .find(|r| r.identity == identity)
+        {
+            if &recording.sampling != samples {
+                recording.sampling = samples.clone();
+                // A poll does not extend metadata retention or ticket expiry.
+                self.save(access);
+            }
+        }
     }
 
     fn merge(
@@ -226,6 +259,10 @@ impl Cache {
                 .iter()
                 .map(|(key, clock)| (key.report.clone(), clock.clone()))
                 .collect(),
+            sampling: previous
+                .as_ref()
+                .map(|r| r.sampling.clone())
+                .unwrap_or_default(),
             complete,
             updated_at: previous.as_ref().map_or(now, |r| r.updated_at),
         };
@@ -357,6 +394,7 @@ fn decode(bytes: &[u8]) -> Option<Document> {
                 || !valid_replay(&r.replay)
                 || r.pulls.len() > MAX_PULLS
                 || r.clocks.len() > MAX_REPORTS
+                || r.sampling.tickets.len() > 64
                 || r.pulls
                     .iter()
                     .any(|(report, id)| d.reports.get(report).and_then(|p| p.get(id)).is_none())
@@ -517,7 +555,7 @@ mod tests {
             saved: cache.saved,
         };
         let mut hot = prepared::Cache::default();
-        recovered.hydrate(&mut hot, None, 4);
+        recovered.hydrate(&mut hot, None, 4, &Access::from("fixture"));
         let entry = hot.for_display(&stream).unwrap();
         assert_eq!(entry.review.pulls.len(), 1);
         assert_eq!(entry.status.0, 4);
@@ -579,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_clocks_rebind_to_current_authorization_and_expiry_keeps_pull_metadata() {
+    fn persisted_samples_rebind_to_current_authorization_and_expiry_keeps_pull_metadata() {
         let (mut cache, mut stream, mut review) = fixture();
         let (replay, pull, cap, ticket) = crate::content_alignment::test_ticket();
         stream.provider = replay.provider.clone();
@@ -595,10 +633,18 @@ mod tests {
             &[(ticket.key, clock)],
             super::super::now_secs(),
         );
+        cache.document.recordings[0].sampling =
+            crate::content_alignment::sampling::test_samples(&review, 0);
+        let access = Access::new(
+            "fixture".into(),
+            crate::guild::ADVANCE.into(),
+            "123".into(),
+            crate::guild::generation(),
+        );
         let bytes = serde_json::to_vec(&cache.document).unwrap();
         cache.document = decode(&bytes).unwrap();
         let mut hot = prepared::Cache::default();
-        cache.hydrate(&mut hot, Some(&cap), 7);
+        cache.hydrate(&mut hot, Some(&cap), 7, &access);
         let entry = hot.for_display(&stream).unwrap();
         let aligned = entry
             .review
@@ -606,11 +652,12 @@ mod tests {
             .unwrap();
         assert_eq!(aligned.key.auth_epoch, 7);
         assert_eq!(aligned.result.video_seconds, 15.25);
-        for clock in cache.document.recordings[0].clocks.values_mut() {
-            clock.expires_at = 1;
+        for ticket in &mut cache.document.recordings[0].sampling.tickets {
+            ticket.job.expires_at = 1;
         }
+        cache.document.recordings[0].clocks.clear();
         let mut hot = prepared::Cache::default();
-        cache.hydrate(&mut hot, Some(&cap), 8);
+        cache.hydrate(&mut hot, Some(&cap), 8, &access);
         let entry = hot.for_display(&stream).unwrap();
         assert_eq!(entry.review.pulls.len(), 1);
         assert!(entry.clocks.is_empty());

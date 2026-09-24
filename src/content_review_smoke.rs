@@ -107,16 +107,9 @@ impl Driver {
                     }
                     self.viewer.select(first);
                     self.viewer.sync_content_selection();
-                    let clock = content_alignment::recording_lookup(
-                        &self.access,
-                        &ticket.key,
-                        &AtomicBool::new(false),
-                    )?;
-                    if self.viewer.accept_recording_clock(ticket.key, clock)
-                        || self.viewer.content_waiting()
-                    {
+                    if self.viewer.content_waiting() {
                         return Err(
-                            "Current completed job did not unlock the selected fight".into()
+                            "Current completed sample did not unlock the selected fight".into()
                         );
                     }
                     let first = self.viewer.pull.clone().unwrap();
@@ -130,6 +123,32 @@ impl Driver {
                         .unwrap()
                         .pulls
                         .push(later.clone());
+                    // A second scoped fixture ticket represents an independently
+                    // checked later pull; no legacy server-wide clock is injected.
+                    let mut later_ticket = ticket.clone();
+                    later_ticket.key = content_alignment::Key::new(
+                        &self.viewer.review.as_ref().unwrap().replay,
+                        &later,
+                        self.viewer
+                            .review
+                            .as_ref()
+                            .unwrap()
+                            .content_capability
+                            .as_ref()
+                            .unwrap(),
+                        ticket.key.auth_epoch,
+                    );
+                    later_ticket.job.scope.as_mut().unwrap().pull_id = later.id;
+                    let result = later_ticket.job.result.as_mut().unwrap();
+                    result.video_seconds += 60.0;
+                    result.seek_video_seconds += 60.0;
+                    self.viewer.content.samples.remember(later_ticket);
+                    self.viewer
+                        .review
+                        .as_mut()
+                        .unwrap()
+                        .pulls
+                        .retain(|p| p.id != first.id + 1);
                     self.viewer.select(later);
                     self.viewer.sync_content_selection();
                     if self
@@ -162,13 +181,18 @@ impl Driver {
                     // A different viewer sharing this account's metadata cache
                     // opens directly at the aligned pull, even while WCL is busy.
                     let prepared_review = self.viewer.review.as_ref().unwrap().clone();
-                    let clocks = self.viewer.content.prepared_clocks();
+                    let samples = self.viewer.content.samples.clone();
                     self.viewer.prepared.lock().unwrap().insert(
                         &self.stream,
                         prepared_review,
                         self.viewer.recording_match_status.unwrap(),
-                        clocks,
+                        Vec::new(),
                     );
+                    self.viewer
+                        .prepared
+                        .lock()
+                        .unwrap()
+                        .set_samples(&self.stream, samples);
                     let mut fresh = self.viewer.metadata_peer();
                     fresh.metadata_only = false;
                     let shared_client = fresh.client.clone();
@@ -291,8 +315,70 @@ impl Driver {
                 {
                     return Err("Content coverage allowed an out-of-fight seek".into());
                 }
-                eprintln!("Native content UI verified: HTTP pending/poll, exact nullable-UTC result, stale-selection rejection, paused and resumed log seeks, one native player; synthetic timing fixture only");
-                return Ok(true);
+                let at = pull.end_ms - 1_000;
+                let command = self
+                    .viewer
+                    .seek_absolute(at)
+                    .ok_or("End-of-pull seek unavailable")?;
+                player
+                    .command(command)
+                    .map_err(|_| "End-of-pull seek failed")?;
+                self.phase = 6;
+                self.phase_start = Instant::now();
+            }
+            6 | 8 => {
+                if let Some(command) = self.viewer.pause_at_pull_end(&state) {
+                    if !matches!(command, PlaybackCommand::Pause) {
+                        return Err("Pull boundary issued an unexpected command".into());
+                    }
+                    self.sample = state.seconds;
+                    player
+                        .command(command)
+                        .map_err(|_| "Pull boundary pause failed")?;
+                    self.phase += 1;
+                    self.phase_start = Instant::now();
+                }
+            }
+            7 | 9
+                if state.is_fresh()
+                    && state.playback_intent.is_none()
+                    && state.observation_window().is_some_and(|window| {
+                        window[0] >= self.phase_start + Duration::from_secs(2)
+                    }) =>
+            {
+                let end = self.viewer.active_playback_range().unwrap().1;
+                if !state.ready
+                    || state.playing
+                    || state.seeking.is_some()
+                    || state.seconds < end
+                    || state.seconds > end + 2.0
+                    || (state.seconds - self.sample).abs() > 0.5
+                {
+                    return Err("Native player did not stay paused at the pull boundary".into());
+                }
+                if self.phase == 9 {
+                    eprintln!("Native content UI verified: HTTP pending/poll, stale-selection rejection, paused and resumed log seeks, one native player, automatic end pause with verified and pending timing; synthetic timing fixture only");
+                    return Ok(true);
+                }
+                // Reproduce the reported case: playback is available while the
+                // content result is still pending. The same boundary must pause
+                // the real player even without a verified alignment.
+                self.viewer.content = State::default();
+                self.viewer.review.as_mut().unwrap().content_timing.clear();
+                let pull = self.viewer.pull.clone().unwrap();
+                self.viewer.select(pull.clone());
+                if !self.viewer.content_waiting() {
+                    return Err("Pending-timing boundary fixture retained an alignment".into());
+                }
+                let command = self
+                    .viewer
+                    .seek_absolute(pull.end_ms - 1_000)
+                    .ok_or("Estimated end-of-pull seek unavailable")?;
+                player
+                    .command(command)
+                    .map_err(|_| "Estimated boundary seek failed")?;
+                self.phase = 8;
+                self.phase_start = Instant::now();
             }
             _ => (),
         }
@@ -442,8 +528,9 @@ fn content_job_to_native_player_uses_relative_timing_without_marker() {
         "101".into(),
         guild::generation(),
     );
-    let pending = content_alignment::submit(&access, key, &signature, &AtomicBool::new(false))
-        .expect("Loopback content submission failed");
+    let pending =
+        content_alignment::sampling::submit(&access, key, &signature, &AtomicBool::new(false))
+            .expect("Loopback content submission failed");
     assert!(pending.pending() && pending.alignment().is_none());
     let stream = Stream {
         user_id: "101".into(),
