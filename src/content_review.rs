@@ -750,6 +750,98 @@ mod tests {
         );
     }
     #[test]
+    fn estimated_playback_stops_at_the_displayed_pull_end_without_a_result() {
+        let (mut ui, _) = viewer();
+        let (_, end) = ui.active_playback_range().unwrap();
+        let mut state = PlaybackState::default();
+        state.ready = true;
+        state.playing = true;
+        state.seconds = end;
+        state.mark_polled_now();
+        assert!(matches!(
+            ui.pause_at_pull_end(&state),
+            Some(PlaybackCommand::Pause)
+        ));
+        assert!(ui.pause_at_pull_end(&state).is_none());
+    }
+    #[test]
+    fn provider_seek_pins_its_new_clock_before_a_background_result_arrives() {
+        let (mut ui, ticket) = viewer();
+        let origin = ui.active_playback_range().unwrap().0;
+        let epoch = Instant::now() - Duration::from_millis(100);
+        ui.range_epoch = epoch;
+        let mut state = PlaybackState::default();
+        state.ready = true;
+        state.playing = true;
+        state.seconds = origin + 10.0;
+        state.mark_polled_at(epoch + Duration::from_millis(10));
+        ui.observe_provider_playback(&state);
+        state.seconds = origin + 30.0;
+        state.mark_polled_at(epoch + Duration::from_millis(20));
+        ui.observe_provider_playback(&state);
+        assert_eq!(ui.provider_observation.unwrap().1, origin + 30.0);
+        assert_eq!(ui.active_playback_range().unwrap().0, origin);
+        ui.accept_content(ticket);
+        assert_eq!(ui.active_playback_range().unwrap().0, origin);
+        assert_eq!(
+            ui.comparison_position(&state).unwrap().0,
+            ui.pull.as_ref().unwrap().start_ms + 30_000
+        );
+    }
+    #[test]
+    fn comparison_clock_adoption_and_exit_use_the_clock_that_comparison_seeks() {
+        let (mut ui, ticket) = viewer();
+        ui.set_comparing(true);
+        ui.accept_content(ticket);
+        let pull = ui.pull.clone().unwrap();
+        assert_eq!(ui.active_playback_range().unwrap().0, 15.25);
+        ui.follow_comparison_position(Some(pull.clone()), 45.25, true);
+        assert_eq!(
+            ui.comparison_position(&PlaybackState::default()).unwrap().0,
+            pull.start_ms + 30_000
+        );
+        ui.set_comparing(false);
+        assert_eq!(ui.active_playback_range().unwrap(), (15.25, 195.25));
+        let mut state = PlaybackState::default();
+        state.ready = true;
+        state.playing = true;
+        state.seconds = 195.25;
+        state.mark_polled_now();
+        assert!(matches!(
+            ui.pause_at_pull_end(&state),
+            Some(PlaybackCommand::Pause)
+        ));
+    }
+    #[test]
+    fn new_alignment_keeps_the_watched_timeline_at_zero_until_explicit_navigation() {
+        let (mut ui, ticket) = viewer();
+        let original = ui.playback.as_ref().unwrap().seconds;
+        let before = ui.active_playback_range().unwrap();
+        assert_eq!(original - before.0, 0.0);
+        assert!(!ui.accept_content(ticket));
+        assert_eq!(ui.active_playback_range().unwrap(), before);
+        assert_eq!(
+            ui.playback.as_ref().unwrap().seconds - ui.active_playback_range().unwrap().0,
+            0.0
+        );
+        assert_eq!(
+            ui.comparison_position(&PlaybackState::default()).unwrap().0,
+            ui.pull.as_ref().unwrap().start_ms
+        );
+        let pull = ui.pull.clone().unwrap();
+        ui.select(pull.clone());
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, 15.25);
+        assert_eq!(
+            ui.playback.as_ref().unwrap().seconds - ui.active_playback_range().unwrap().0,
+            0.0
+        );
+        ui.seek_absolute(pull.start_ms + 30_000).unwrap();
+        assert_eq!(
+            ui.playback.as_ref().unwrap().seconds - ui.active_playback_range().unwrap().0,
+            30.0
+        );
+    }
+    #[test]
     fn changed_pull_media_or_wcl_account_cannot_publish_a_completed_job() {
         for change in 0..3 {
             let (mut ui, ticket) = viewer();
