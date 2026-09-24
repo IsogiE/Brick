@@ -5,7 +5,7 @@ use crate::content_alignment::Status;
 use crate::content_alignment::{Key, Ticket};
 
 // Keep following long-running jobs on the small production worker.
-const MAX_CONTENT_POLLS: u16 = 1440;
+const SLOW_CONTENT_POLLS: u16 = 1440;
 
 #[derive(Default)]
 pub(super) struct State {
@@ -18,7 +18,6 @@ pub(super) struct State {
     next_poll: Option<Instant>,
     polls: u16,
     failure: Option<String>,
-    paused: bool,
     transport_retries: u8,
 }
 
@@ -75,7 +74,6 @@ impl ReviewUi {
             self.content.next_poll = None;
             self.content.polls = 0;
             self.content.failure = None;
-            self.content.paused = false;
             self.content.transport_retries = 0;
         }
         self.apply_sample_model();
@@ -123,7 +121,7 @@ impl ReviewUi {
 
     pub(super) fn next_content_action(&self) -> Option<Action> {
         let key = self.content.key.as_ref()?;
-        if self.content.failure.is_some() || self.content.paused {
+        if self.content.failure.is_some() {
             return None;
         }
         let review = self.review.as_ref()?;
@@ -175,8 +173,12 @@ impl ReviewUi {
         self.content.samples.remember(ticket.clone());
         self.content.failure = None;
         self.content.transport_retries = 0;
-        self.content.next_poll = Some(Instant::now() + Duration::from_secs(5));
-        self.content.paused = self.content.polls >= MAX_CONTENT_POLLS;
+        let delay = if self.content.polls >= SLOW_CONTENT_POLLS {
+            60
+        } else {
+            5
+        };
+        self.content.next_poll = Some(Instant::now() + Duration::from_secs(delay));
         let alignment = ticket.alignment();
         self.content.ticket = Some(ticket);
         let Some(alignment) = alignment else {
@@ -275,7 +277,6 @@ impl ReviewUi {
             self.content.transport_retries = self.content.transport_retries.saturating_add(1);
             let seconds = (5u64 << self.content.transport_retries.saturating_sub(1).min(4)).min(60);
             self.content.next_poll = Some(Instant::now() + Duration::from_secs(seconds));
-            self.content.paused = self.content.polls >= MAX_CONTENT_POLLS;
             return;
         }
         self.content.failure = Some(message.chars().take(512).collect());
@@ -286,8 +287,7 @@ impl ReviewUi {
     }
 
     pub(super) fn content_poll_pending(&self) -> bool {
-        !self.content.paused
-            && self.content.failure.is_none()
+        self.content.failure.is_none()
             && (self.content.next_poll.is_some()
                 || self.content.ticket.as_ref().is_some_and(|t| t.pending()))
     }
@@ -741,7 +741,7 @@ mod tests {
         drop(tx);
     }
     #[test]
-    fn reopening_pending_scope_reuses_job_and_polling_has_a_bound() {
+    fn pending_scope_reuses_job_and_slow_polling_still_adopts_late_completion() {
         let (mut ui, mut ticket) = viewer();
         ticket.job.status = Status::Pending;
         ticket.job.result = None;
@@ -759,10 +759,26 @@ mod tests {
             ui.next_content_action(),
             Some(Action::ContentPoll(_))
         ));
-        ui.content.polls = MAX_CONTENT_POLLS;
+        ui.content.polls = SLOW_CONTENT_POLLS;
         ui.accept_content(ticket);
-        assert!(ui.content.paused);
+        assert!(
+            ui.content.next_poll.unwrap().duration_since(Instant::now()) > Duration::from_secs(55)
+        );
         assert!(ui.next_content_action().is_none());
+        ui.content.next_poll = Some(Instant::now() - Duration::from_secs(1));
+        assert!(matches!(
+            ui.next_content_action(),
+            Some(Action::ContentPoll(_))
+        ));
+        let (_, completed) = viewer();
+        ui.accept_content(completed);
+        ui.sync_content_selection();
+        assert!(ui
+            .review
+            .as_ref()
+            .unwrap()
+            .content_alignment(ui.pull.as_ref().unwrap())
+            .is_some());
     }
     #[test]
     fn terminal_job_and_closed_view_do_not_restart_analysis_or_seek() {

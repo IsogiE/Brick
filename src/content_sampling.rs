@@ -239,9 +239,6 @@ impl Snapshot {
                     );
                 }
             }
-            if plan.next.is_none() {
-                plan.next = next.cloned();
-            }
             let missing: Vec<_> = tickets
                 .iter()
                 .filter(|t| {
@@ -251,6 +248,21 @@ impl Snapshot {
                 })
                 .map(|t| (t.key.start_ms, t.key.end_ms))
                 .collect();
+            if next.is_none() {
+                // A benched pull is an explicit hole, not evidence that every
+                // subsequent pull before the later check is also absent.
+                for &(_, end) in &missing {
+                    if let Some(after) = usable.iter().copied().find(|p| p.start_ms >= end) {
+                        if ticket_for(after).is_none() {
+                            next = Some(after);
+                            break;
+                        }
+                    }
+                }
+            }
+            if plan.next.is_none() {
+                plan.next = next.cloned();
+            }
             let expiry = points.iter().map(|p| p.expires_at).min().unwrap_or(0);
             let mut hash = Sha256::new();
             for point in &points {
@@ -497,6 +509,14 @@ mod tests {
             .iter()
             .any(|a| a.key.pull_id == 1 || (6..11).contains(&a.key.pull_id)));
         assert!(plan.alignments.iter().any(|a| a.key.pull_id == 12));
+        assert_eq!(plan.next.unwrap().id, 7);
+        saved.remember(ticket(&review, &review.pulls[6], 0.0));
+        let resumed = saved.plan(&review, 0);
+        assert!(resumed.next.is_none());
+        assert!(!resumed.alignments.iter().any(|a| a.key.pull_id == 6));
+        for id in 7..=12 {
+            assert!(resumed.alignments.iter().any(|a| a.key.pull_id == id));
+        }
     }
     #[test]
     fn reports_cannot_borrow_offsets_or_count_overlapping_samples_as_later() {
