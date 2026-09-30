@@ -1188,10 +1188,12 @@ mod tests {
                 vec![egui::Event::PointerMoved(gutter)],
             );
             assert_eq!(library.row_rects[0].width(), width);
-            assert!(library
-                .row_rects
-                .iter()
-                .all(|rect| rect.right() <= viewport.right() - 10.0));
+            assert!(
+                library
+                    .row_rects
+                    .iter()
+                    .all(|rect| rect.right() <= viewport.right() - 10.0)
+            );
         }
         assert!(library.painted_scrollbars > 0);
         assert!(click(&ctx, &mut library, &source, size, gutter).is_none());
@@ -1322,7 +1324,14 @@ mod tests {
                 max_rows = max_rows.max(library.row_rects.len());
             }
             samples.sort_by(f64::total_cmp);
-            println!("recordings_library_benchmark size={size:?} records={} initial_ms={initial_ms:.3} median_ms={:.3} p95_ms={:.3} worst_ms={:.3} max_rows={max_rows} builds={}", source.len(), samples[300], samples[570], samples[599], library.builds);
+            println!(
+                "recordings_library_benchmark size={size:?} records={} initial_ms={initial_ms:.3} median_ms={:.3} p95_ms={:.3} worst_ms={:.3} max_rows={max_rows} builds={}",
+                source.len(),
+                samples[300],
+                samples[570],
+                samples[599],
+                library.builds
+            );
             assert_eq!(library.builds, 1);
         }
     }
@@ -1387,7 +1396,12 @@ mod tests {
 
 impl Library {
     fn draw_calendar(&mut self, ui: &mut egui::Ui, source: &[Vod]) {
-        ui.label(RichText::new("RAID DATES").small().strong().color(MUTED));
+        ui.label(
+            RichText::new("RECORDING DATES")
+                .small()
+                .strong()
+                .color(MUTED),
+        );
         ui.add_space(7.0);
         let Some(mut month) = self.calendar_month else {
             ui.small("No recording dates yet.");

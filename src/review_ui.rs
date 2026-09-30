@@ -5,13 +5,14 @@ use crate::{
     discord_auth,
     stream_player::{PlaybackCommand, PlaybackState},
     streams::{Status, Stream},
-    warcraftlogs::{while_current, Client, EventKind, Pull, RaidEvent, Review},
+    warcraftlogs::{Client, EventKind, Pull, RaidEvent, Review, while_current},
 };
 use eframe::egui::{self, Color32, RichText};
 use std::{
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -3950,7 +3951,7 @@ impl ReviewUi {
         if pulls.is_empty() {
             ui.add(
                 egui::Label::new(
-                    RichText::new("Select a POV to load its raid pulls.")
+                    RichText::new("Select a POV to load its pulls.")
                         .small()
                         .color(MUTED),
                 )
@@ -3965,11 +3966,15 @@ impl ReviewUi {
                 .margin(egui::vec2(8.0, 7.0))
                 .desired_width(ui.available_width()),
         );
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.pull_filter, 0, "All");
-            ui.selectable_value(&mut self.pull_filter, 1, "Best");
-            ui.selectable_value(&mut self.pull_filter, 2, "Kills");
-        });
+        if pulls.iter().any(|pull| pull.difficulty != 10) {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.pull_filter, 0, "All");
+                ui.selectable_value(&mut self.pull_filter, 1, "Best");
+                ui.selectable_value(&mut self.pull_filter, 2, "Kills");
+            });
+        } else {
+            self.pull_filter = 0;
+        }
         let query = self.pull_search.to_lowercase();
         let current = self.pull.as_ref().map(|p| (p.report.clone(), p.id));
         let follow = current != self.scroll_pull;
@@ -3989,6 +3994,7 @@ impl ReviewUi {
                     for (key, group) in groups {
                         let best = group
                             .iter()
+                            .filter(|p| p.difficulty != 10)
                             .filter_map(|p| if p.kill { Some(0.0) } else { p.remaining })
                             .reduce(f64::min);
                         let filtered: Vec<_> = group
@@ -3998,7 +4004,11 @@ impl ReviewUi {
                                     format!("{} {} {}", p.name, p.report, p.id)
                                         .to_lowercase()
                                         .contains(q)
-                                }) && match self.pull_filter {
+                                }) && match if p.difficulty == 10 {
+                                    0
+                                } else {
+                                    self.pull_filter
+                                } {
                                     1 => {
                                         best.is_some()
                                             && if p.kill {
@@ -4026,7 +4036,7 @@ impl ReviewUi {
                                 .as_ref()
                                 .is_some_and(|p| p.report == pull.report && p.id == pull.id)
                         });
-                        let cleared = group.iter().any(|p| p.kill);
+                        let cleared = group.iter().any(|p| p.difficulty != 10 && p.kill);
                         egui::Frame::new()
                             .fill(egui::Color32::from_rgb(21, 25, 32))
                             .stroke(egui::Stroke::new(
@@ -4591,12 +4601,13 @@ mod tests {
         changed.pulls[0].start_ms += 1;
         let changed_pull = changed.pulls[0].clone();
         ui.accept_review(changed);
-        assert!(ui
-            .review
-            .as_ref()
-            .unwrap()
-            .marker_alignment(&changed_pull)
-            .is_none());
+        assert!(
+            ui.review
+                .as_ref()
+                .unwrap()
+                .marker_alignment(&changed_pull)
+                .is_none()
+        );
     }
 
     #[test]
@@ -5404,9 +5415,10 @@ mod tests {
                     assert_eq!(keys[0]["startMs"], wanted.start_ms);
                     assert_eq!(keys[0]["recordingStartMs"], recording_start);
                     assert_eq!(keys[0]["videoId"], "different12");
-                    assert!(keys
-                        .iter()
-                        .any(|key| key["pullId"] == destination.pulls[79].id));
+                    assert!(
+                        keys.iter()
+                            .any(|key| key["pullId"] == destination.pulls[79].id)
+                    );
                     Some(serde_json::json!({"results":[{
                         "key":keys[0],
                         "alignment":{
@@ -5546,18 +5558,20 @@ mod tests {
         .unwrap();
         ui.tick(&egui::Context::default(), None);
         assert_eq!(ui.pull.as_ref().unwrap().id, second.id);
-        assert!(ui
-            .review
-            .as_ref()
-            .unwrap()
-            .marker_alignment(&first)
-            .is_none());
-        assert!(ui
-            .marker_cache
-            .lock()
-            .unwrap()
-            .get(&review.replay, &first)
-            .is_none());
+        assert!(
+            ui.review
+                .as_ref()
+                .unwrap()
+                .marker_alignment(&first)
+                .is_none()
+        );
+        assert!(
+            ui.marker_cache
+                .lock()
+                .unwrap()
+                .get(&review.replay, &first)
+                .is_none()
+        );
         ui.loaded_events = vec![EventKind::Deaths, EventKind::Defensives];
         assert!(matches!(ui.next_action(), Some(Action::Refresh)));
     }
@@ -5907,13 +5921,15 @@ mod tests {
                         .pull_video_start(&first),
                 ];
                 let baseline = starts.map(|start| provider_sample(start + 10.0, playing, 0));
-                assert!(comparison
-                    .follow_provider_controls(
-                        &mut primary,
-                        [&baseline[0], &baseline[1]],
-                        provider_test_now()
-                    )
-                    .is_none());
+                assert!(
+                    comparison
+                        .follow_provider_controls(
+                            &mut primary,
+                            [&baseline[0], &baseline[1]],
+                            provider_test_now()
+                        )
+                        .is_none()
+                );
                 let mut seeking = baseline.clone();
                 seeking[leader] = provider_sample(starts[leader] + 342.375, playing, 1);
                 let commands = comparison

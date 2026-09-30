@@ -31,10 +31,18 @@ pub fn outcome_color(kill: bool, remaining: Option<f64>) -> Color32 {
 
 pub fn encounter_groups(
     pulls: Vec<crate::warcraftlogs::Pull>,
-) -> Vec<((u64, u64), Vec<crate::warcraftlogs::Pull>)> {
-    let mut groups: Vec<((u64, u64), Vec<crate::warcraftlogs::Pull>)> = Vec::new();
+) -> Vec<((u64, u64, String), Vec<crate::warcraftlogs::Pull>)> {
+    let mut groups: Vec<((u64, u64, String), Vec<crate::warcraftlogs::Pull>)> = Vec::new();
     for pull in crate::warcraftlogs::canonical_pulls(pulls) {
-        let key = (pull.encounter, pull.difficulty);
+        let key = (
+            pull.encounter,
+            pull.difficulty,
+            if pull.difficulty == 10 {
+                pull.name.clone()
+            } else {
+                String::new()
+            },
+        );
         if let Some((_, group)) = groups.iter_mut().find(|(k, _)| *k == key) {
             group.push(pull);
         } else {
@@ -46,6 +54,7 @@ pub fn encounter_groups(
 
 pub fn encounter_label(pull: &crate::warcraftlogs::Pull) -> String {
     let difficulty = match pull.difficulty {
+        10 => "M+",
         3 | 4 | 14 => "Normal",
         5 | 6 | 15 => "Heroic",
         16 => "Mythic",
@@ -207,6 +216,7 @@ pub fn encounter_header(
     };
     painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, MUTED)));
     let difficulty = match pull.difficulty {
+        10 => "M+",
         3 | 4 | 14 => "Normal",
         5 | 6 | 15 => "Heroic",
         16 => "Mythic",
@@ -218,12 +228,20 @@ pub fn encounter_header(
         egui::Align2::LEFT_CENTER,
         format!(
             "{difficulty} · {count} {}",
-            if count == 1 { "pull" } else { "pulls" }
+            if pull.difficulty == 10 {
+                if count == 1 { "segment" } else { "segments" }
+            } else if count == 1 {
+                "pull"
+            } else {
+                "pulls"
+            }
         ),
         egui::FontId::proportional(10.0),
         MUTED,
     );
-    let status = if cleared {
+    let status = if pull.difficulty == 10 {
+        String::new()
+    } else if cleared {
         "Cleared".into()
     } else {
         best.map(|hp| format!("Best {hp:.1}%")).unwrap_or_default()
@@ -240,7 +258,15 @@ pub fn encounter_header(
             egui::WidgetType::Button,
             true,
             open,
-            format!("{}: {count} pulls", pull.name),
+            format!(
+                "{}: {count} {}",
+                pull.name,
+                if pull.difficulty == 10 {
+                    "segments"
+                } else {
+                    "pulls"
+                }
+            ),
         )
     });
     response
@@ -278,9 +304,16 @@ pub fn pull(
             ACCENT,
         );
     }
-    let outcome = outcome_color(pull.kill, pull.remaining);
+    let dungeon = pull.difficulty == 10;
+    let outcome = if dungeon {
+        MUTED
+    } else {
+        outcome_color(pull.kill, pull.remaining)
+    };
     let seconds = (pull.end_ms - pull.start_ms).max(0) / 1000;
-    let result = if pull.kill {
+    let result = if dungeon {
+        "M+".into()
+    } else if pull.kill {
         "Kill".into()
     } else {
         pull.remaining
@@ -303,7 +336,11 @@ pub fn pull(
         egui::FontId::proportional(12.0),
         outcome,
     );
-    let phase = pull.last_phase.map(|p| format!("P{p}")).unwrap_or_default();
+    let phase = if dungeon {
+        String::new()
+    } else {
+        pull.last_phase.map(|p| format!("P{p}")).unwrap_or_default()
+    };
     painter.text(
         egui::pos2(right - 62.0, rect.top() + 15.0),
         egui::Align2::RIGHT_CENTER,
@@ -312,7 +349,7 @@ pub fn pull(
         MUTED,
     );
     // A best marker does not change the outcome color or compete with selection.
-    if best && !pull.kill {
+    if best && !pull.kill && !dungeon {
         painter.circle_filled(egui::pos2(left + 2.0, rect.bottom() - 12.0), 2.0, outcome);
     }
     painter.rect_stroke(
@@ -321,7 +358,9 @@ pub fn pull(
         Stroke::new(1.0_f32, if selected { ACCENT } else { BORDER }),
         egui::StrokeKind::Inside,
     );
-    if let Some(remaining) = if pull.kill {
+    if let Some(remaining) = if dungeon {
+        None
+    } else if pull.kill {
         Some(0.0)
     } else {
         pull.remaining.filter(|hp| hp.is_finite())
@@ -348,14 +387,21 @@ pub fn pull(
             egui::WidgetType::Button,
             true,
             selected,
-            format!("{} fight {} {}", pull.name, pull.id, result),
+            format!(
+                "{} {} {} {}",
+                pull.name,
+                if dungeon { "segment" } else { "fight" },
+                pull.id,
+                result
+            ),
         )
     });
     response
-        .on_hover_text(format!(
-            "{}\nLog {} · Fight {}\nPercentage: boss health remaining. Bar: health depleted.\nSelect to watch this moment",
-            pull.name, pull.report, pull.id
-        ))
+        .on_hover_text(if dungeon {
+            format!("{}\nLog {} · Segment {}\nSelect to watch this moment", pull.name, pull.report, pull.id)
+        } else {
+            format!("{}\nLog {} · Fight {}\nPercentage: boss health remaining. Bar: health depleted.\nSelect to watch this moment", pull.name, pull.report, pull.id)
+        })
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -416,5 +462,69 @@ mod tests {
         assert_eq!(outcome_color(true, Some(70.0)), GREEN);
         assert_eq!(outcome_color(false, None), MUTED);
         assert_eq!(outcome_color(false, Some(f64::NAN)), MUTED);
+    }
+    #[test]
+    fn mythic_plus_dungeons_with_zero_encounter_ids_stay_separate() {
+        let mut first = pull("first", 1, 10, 0);
+        first.encounter = 0;
+        first.name = "Voidscar Arena".into();
+        let mut second = pull("first", 2, 10, 500_000);
+        second.encounter = 0;
+        second.name = "Magisters' Terrace".into();
+        let mut third = first.clone();
+        third.id = 3;
+        third.start_ms = 1_000_000;
+        third.end_ms = 1_247_000;
+        let groups = encounter_groups(vec![first, second, third]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].1.len(), 1);
+        assert!(encounter_label(&groups[0].1[0]).ends_with("M+"));
+    }
+
+    #[test]
+    fn dungeon_cards_hide_raid_outcomes_phases_and_health_bars() {
+        fn collect(shape: &egui::Shape, labels: &mut Vec<String>, health_bars: &mut usize) {
+            match shape {
+                egui::Shape::Text(text) => labels.push(text.galley.job.text.clone()),
+                egui::Shape::Rect(rect) if (rect.rect.height() - 3.0).abs() < 0.01 => {
+                    *health_bars += 1
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, labels, health_bars);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for kill in [false, true] {
+            let mut dungeon = pull("first", 1, 10, 0);
+            dungeon.kill = kill;
+            let ctx = egui::Context::default();
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    encounter_header(ui, &dungeon, 2, Some(70.3), kill, true);
+                    super::pull(ui, &dungeon, false, true);
+                });
+            });
+            let mut labels = Vec::new();
+            let mut bars = 0;
+            for shape in &output.shapes {
+                collect(&shape.shape, &mut labels, &mut bars);
+            }
+            assert!(labels.iter().any(|s| s == "M+"), "{labels:?}");
+            assert!(
+                labels.iter().any(|s| s.contains("2 segments")),
+                "{labels:?}"
+            );
+            assert!(
+                !labels
+                    .iter()
+                    .any(|s| s.contains('%') || s == "Kill" || s == "Cleared" || s == "P2"),
+                "{labels:?}"
+            );
+            assert_eq!(bars, 0);
+        }
     }
 }
