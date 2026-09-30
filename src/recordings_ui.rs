@@ -13,7 +13,7 @@ use crate::{
 const MUTED: Color32 = Color32::from_rgb(159, 169, 184);
 const TEXT: Color32 = Color32::from_rgb(239, 242, 247);
 const ROW_HEIGHT: f32 = 48.0;
-const MEMBER_HEIGHT: f32 = 30.0;
+const MEMBER_HEIGHT: f32 = 34.0;
 const DATE_HEIGHT: f32 = 28.0;
 const ROW_SPACING: f32 = 2.0;
 
@@ -55,6 +55,8 @@ pub struct Library {
     months: Vec<(String, String)>,
     member: Option<String>,
     month: Option<String>,
+    calendar_month: Option<time::Date>,
+    calendar_day: Option<String>,
     query: String,
     filtered: Vec<usize>,
     rows: Vec<DisplayRow>,
@@ -163,6 +165,19 @@ impl Library {
         });
         self.months = months.into_iter().collect();
         self.months.sort_by(|a, b| b.0.cmp(&a.0));
+        if self.calendar_month.is_none() {
+            self.calendar_month = self
+                .months
+                .first()
+                .and_then(|(m, _)| parse_date(&format!("{m}-01")));
+        }
+        if self
+            .calendar_day
+            .as_ref()
+            .is_some_and(|day| !self.entries.iter().any(|e| &e.day == day))
+        {
+            self.calendar_day = None;
+        }
         if self
             .member
             .as_ref()
@@ -202,6 +217,10 @@ impl Library {
                             .month
                             .as_ref()
                             .is_none_or(|month| month == &entry.month)
+                        && self
+                            .calendar_day
+                            .as_ref()
+                            .is_none_or(|day| day == &entry.day)
                         && words.iter().all(|word| entry.search.contains(word)))
                     .then_some(index)
                 }),
@@ -255,6 +274,7 @@ impl Library {
         can_remove: bool,
         busy: bool,
     ) -> Option<Action> {
+        crate::stream_widgets::style(ui);
         self.prepare(source);
         self.preparation.clear();
         #[cfg(test)]
@@ -265,9 +285,9 @@ impl Library {
         let mut action = None;
         let height = ui.available_height().max(1.0);
         let sidebar = if ui.available_width() < 1000.0 {
-            156.0
+            196.0
         } else {
-            176.0
+            216.0
         };
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
@@ -277,6 +297,19 @@ impl Library {
                     ui.set_width(sidebar);
                     ui.spacing_mut().scroll = library_scroll_style();
                     ui.visuals_mut().clip_rect_margin = 0.0;
+                    if height < 500.0 {
+                        egui::CollapsingHeader::new("Calendar").show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("compact-recording-calendar")
+                                .max_height(height * 0.45)
+                                .show(ui, |ui| self.draw_calendar(ui, source));
+                        });
+                    } else {
+                        self.draw_calendar(ui, source);
+                    }
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(10.0);
                     ui.label(RichText::new("PLAYERS").small().strong().color(MUTED));
                     ui.add_space(10.0);
                     ui.spacing_mut().item_spacing.y = 2.0;
@@ -342,6 +375,7 @@ impl Library {
                         .and_then(|month| self.months.iter().find(|entry| &entry.0 == month))
                         .map(|entry| entry.1.as_str())
                         .unwrap_or("All months");
+                    let previous_month = self.month.clone();
                     egui::ComboBox::from_id_salt("recording-library-month")
                         .selected_text(label)
                         .width(filter_width)
@@ -356,7 +390,22 @@ impl Library {
                                     .changed();
                             }
                         });
+                    if self.month != previous_month {
+                        self.calendar_day = None;
+                        if let Some(month) = &self.month {
+                            self.calendar_month = parse_date(&format!("{month}-01"));
+                        }
+                    }
                 });
+                if let Some(day) = self.calendar_day.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(date_label(&day)).small().color(MUTED));
+                        if ui.small_button("Clear date").clicked() {
+                            self.calendar_day = None;
+                            self.dirty = true;
+                        }
+                    });
+                }
                 self.filter(source);
                 ui.add_space(8.0);
                 ui.label(
@@ -386,6 +435,7 @@ impl Library {
                     if !source.is_empty() && ui.button("Clear filters").clicked() {
                         self.member = None;
                         self.month = None;
+                        self.calendar_day = None;
                         self.query.clear();
                         self.dirty = true;
                     }
@@ -720,9 +770,7 @@ fn member_row(
     });
     if ui.is_rect_visible(rect) {
         let painter = ui.painter_at(rect);
-        if selected || response.hovered() || response.has_focus() {
-            painter.rect_filled(rect, 4.0, Color32::from_rgb(36, 42, 52));
-        }
+        crate::stream_widgets::member_background(ui, rect, &response, selected);
         let count_rect = painter.text(
             egui::pos2(rect.right() - 8.0, rect.center().y),
             egui::Align2::RIGHT_CENTER,
@@ -1334,5 +1382,205 @@ mod tests {
             }),
         )
         .unwrap();
+    }
+}
+
+impl Library {
+    fn draw_calendar(&mut self, ui: &mut egui::Ui, source: &[Vod]) {
+        ui.label(RichText::new("RAID DATES").small().strong().color(MUTED));
+        ui.add_space(7.0);
+        let Some(mut month) = self.calendar_month else {
+            ui.small("No recording dates yet.");
+            return;
+        };
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("‹")
+                .on_hover_text("Previous month")
+                .clicked()
+            {
+                if let Some(date) = calendar_shift(month, -1) {
+                    month = date;
+                    self.month = Some(format!("{}-{:02}", date.year(), date.month() as u8));
+                    self.calendar_day = None;
+                    self.dirty = true;
+                }
+            }
+            let label = format!("{} {}", month.month(), month.year());
+            ui.add_sized(
+                [ui.available_width() - 29.0, 22.0],
+                egui::Label::new(RichText::new(label).size(12.0).strong()),
+            );
+            if ui.small_button("›").on_hover_text("Next month").clicked() {
+                if let Some(date) = calendar_shift(month, 1) {
+                    month = date;
+                    self.month = Some(format!("{}-{:02}", date.year(), date.month() as u8));
+                    self.calendar_day = None;
+                    self.dirty = true;
+                }
+            }
+        });
+        self.calendar_month = Some(month);
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for entry in &self.entries {
+            if self
+                .member
+                .as_ref()
+                .is_none_or(|id| id == &source[entry.index].user_id)
+            {
+                *counts.entry(&entry.day).or_default() += 1;
+            }
+        }
+        let cell = (ui.available_width() - 6.0 * 3.0) / 7.0;
+        ui.add_space(4.0);
+        egui::Grid::new("recording-calendar")
+            .spacing([3.0, 3.0])
+            .show(ui, |ui| {
+                for day in ["M", "T", "W", "T", "F", "S", "S"] {
+                    ui.add_sized(
+                        [cell, 18.0],
+                        egui::Label::new(RichText::new(day).size(10.0).color(MUTED)),
+                    );
+                }
+                ui.end_row();
+                let offset = month.weekday().number_days_from_monday() as i32;
+                let days = (28..=31)
+                    .rev()
+                    .find(|day| {
+                        time::Date::from_calendar_date(month.year(), month.month(), *day).is_ok()
+                    })
+                    .unwrap_or(28) as i32;
+                let slots = ((offset + days + 6) / 7) * 7;
+                for slot in 0..slots {
+                    let day = slot - offset + 1;
+                    if day > 0
+                        && day <= 31
+                        && time::Date::from_calendar_date(month.year(), month.month(), day as u8)
+                            .is_ok()
+                    {
+                        let key = format!("{}-{:02}-{day:02}", month.year(), month.month() as u8);
+                        let count = counts.get(key.as_str()).copied().unwrap_or(0);
+                        let selected = self.calendar_day.as_ref() == Some(&key);
+                        let response = ui.add_sized(
+                            [cell, 25.0],
+                            egui::Button::new(
+                                RichText::new(day.to_string())
+                                    .size(11.0)
+                                    .color(if count > 0 { TEXT } else { MUTED }),
+                            )
+                            .fill(if selected {
+                                crate::stream_widgets::SOFT
+                            } else if count > 0 {
+                                Color32::from_rgb(35, 40, 49)
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .stroke(egui::Stroke::new(
+                                1.0_f32,
+                                if selected {
+                                    crate::stream_widgets::ACCENT
+                                } else {
+                                    Color32::TRANSPARENT
+                                },
+                            )),
+                        );
+                        if count > 0 {
+                            ui.painter().circle_filled(
+                                response.rect.center_bottom() - egui::vec2(0.0, 3.0),
+                                1.5,
+                                Color32::from_rgb(244, 100, 56),
+                            );
+                        }
+                        if response.clicked() {
+                            self.calendar_day = if selected { None } else { Some(key) };
+                            self.month =
+                                Some(format!("{}-{:02}", month.year(), month.month() as u8));
+                            self.dirty = true;
+                        }
+                        response.on_hover_text(format!("{count} recordings"));
+                    } else {
+                        ui.allocate_space(egui::vec2(cell, 25.0));
+                    }
+                    if slot % 7 == 6 {
+                        ui.end_row();
+                    }
+                }
+            });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Dates in UTC").size(10.0).color(MUTED));
+            if ui.small_button("All dates").clicked() {
+                self.calendar_day = None;
+                self.month = None;
+                self.dirty = true;
+            }
+        });
+    }
+}
+fn calendar_shift(date: time::Date, delta: i32) -> Option<time::Date> {
+    let month = date.year() * 12 + date.month() as i32 - 1 + delta;
+    time::Date::from_calendar_date(
+        month.div_euclid(12),
+        time::Month::try_from((month.rem_euclid(12) + 1) as u8).ok()?,
+        1,
+    )
+    .ok()
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use super::*;
+    #[test]
+    fn month_navigation_wraps_years_and_handles_leap_days() {
+        assert_eq!(
+            calendar_shift(parse_date("2026-12-01").unwrap(), 1)
+                .unwrap()
+                .to_string(),
+            "2027-01-01"
+        );
+        assert_eq!(
+            calendar_shift(parse_date("2026-01-01").unwrap(), -1)
+                .unwrap()
+                .to_string(),
+            "2025-12-01"
+        );
+        assert!(parse_date("2024-02-29").is_some());
+        assert!(parse_date("2026-02-29").is_none());
+    }
+    #[test]
+    fn calendar_combines_with_existing_player_and_search_filters() {
+        let vod = |id: &str, user: &str, day: &str| Vod {
+            id: id.into(),
+            user_id: user.into(),
+            name: format!("Player {user}"),
+            raid_role: None,
+            provider: crate::streams::Provider::Youtube,
+            url: "https://www.youtube.com/watch?v=abcdefghijk".into(),
+            started_at: Some(format!("{day}T19:00:00Z")),
+            ended_at: None,
+            title: "Raid progression".into(),
+        };
+        let source = Rc::new(vec![
+            vod("one", "1", "2026-09-23"),
+            vod("two", "2", "2026-09-23"),
+            vod("three", "1", "2026-09-24"),
+        ]);
+        let mut library = Library::default();
+        library.prepare(&source);
+        library.calendar_day = Some("2026-09-23".into());
+        library.member = Some("1".into());
+        library.query = "progression".into();
+        library.filter(&source);
+        assert_eq!(library.filtered.len(), 1);
+        assert_eq!(library.entries[library.filtered[0]].index, 0);
+        library.query = "unmatched".into();
+        library.dirty = true;
+        library.filter(&source);
+        assert!(library.filtered.is_empty());
+        library.query.clear();
+        library.calendar_day = None;
+        library.member = None;
+        library.dirty = true;
+        library.filter(&source);
+        assert_eq!(library.filtered.len(), 3);
     }
 }
