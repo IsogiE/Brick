@@ -21,6 +21,15 @@ impl Preparation {
         let now = Instant::now();
         self.attempted
             .retain(|(_, _, at, delay)| now.duration_since(*at) < *delay);
+        // A selected review owns the shared WCL client. Finish an already
+        // useful read of that same source, but do not export background boss
+        // signatures or start another VOD while foreground logs are loading.
+        let candidates = if selected.is_some() {
+            peer.prepare_alignment(false);
+            &[][..]
+        } else {
+            candidates
+        };
         if candidates.is_empty() {
             // Clicking the VOD being prepared hands off that same read. Do not
             // cancel it only to queue a duplicate behind the shared WCL client.
