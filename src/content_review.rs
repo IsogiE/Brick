@@ -552,7 +552,8 @@ mod tests {
         assert_eq!(ui.range_epoch, epoch);
         assert_eq!(
             ui.comparison_position(&state).unwrap().0,
-            ui.pull.as_ref().unwrap().start_ms + ((origin + 30.0 - verified) * 1000.0).round() as i64
+            ui.pull.as_ref().unwrap().start_ms
+                + ((origin + 30.0 - verified) * 1000.0).round() as i64
         );
     }
     #[test]
