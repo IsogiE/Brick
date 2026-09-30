@@ -11,7 +11,7 @@ env:
 jobs:
   build-linux:
     runs-on: ${{ fromJSON(vars.BRICK_RELEASE_LINUX_RUNNER || '"ubuntu-24.04"') }}
-    timeout-minutes: 45
+    timeout-minutes: 180
     permissions:
       contents: read
       id-token: write
@@ -110,7 +110,7 @@ jobs:
         retention-days: 14
   build-windows:
     runs-on: ${{ fromJSON(vars.BRICK_RELEASE_WINDOWS_RUNNER || '"windows-latest"') }}
-    timeout-minutes: 45
+    timeout-minutes: 180
     permissions:
       contents: read
       id-token: write
