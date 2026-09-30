@@ -513,8 +513,8 @@ fn validate_pull(pull: &Pull) -> Result<(), String> {
         || pull.id == 0
         || pull.id > 100_000
         || pull.encounter == 0
-        || pull.encounter > 100_000
-        || !(3..=5).contains(&pull.difficulty)
+        || pull.encounter > 1_000_000
+        || !matches!(pull.difficulty, 3..=5 | 10)
         || !(1_500_000_000_000..=4_000_000_000_000).contains(&pull.report_start_ms)
         || pull.start_ms < pull.report_start_ms
         || pull.end_ms > MAX_TIMESTAMP
@@ -1013,6 +1013,16 @@ mod tests {
             seconds: 10,
         }
     }
+    #[test]
+    fn mplus_keeps_real_difficulty_and_dungeon_identity() {
+        let mut p = pull();
+        p.difficulty = 10;
+        p.encounter = 112521;
+        assert!(validate_pull(&p).is_ok());
+        p.difficulty = 9;
+        assert!(validate_pull(&p).is_err());
+    }
+
     fn metadata() -> Value {
         json!({"reportData":{"report":{"code":pull().report,"startTime":pull().report_start_ms,
             "fights":[{"id":21,"encounterID":100,"difficulty":5,"startTime":1000,"endTime":11000}],
