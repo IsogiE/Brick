@@ -1839,7 +1839,7 @@ impl ReviewUi {
                     selected = index.map(|i| i + 1);
                 }
                 if let Some(pull) = &self.pull {
-                    if !pull.kill {
+                    if pull.difficulty != 10 && !pull.kill {
                         if let Some(remaining) = pull.remaining {
                             ui.label(
                                 RichText::new(format!("{remaining:.1}% remaining")).color(DEATH),
@@ -1854,7 +1854,14 @@ impl ReviewUi {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let menu = ui.menu_button("…", |ui| {
                         if let Some(pull) = &self.pull {
-                            ui.hyperlink_to("Open this pull in Warcraft Logs", pull.log_url());
+                            ui.hyperlink_to(
+                                if pull.difficulty == 10 {
+                                    "Open this segment in Warcraft Logs"
+                                } else {
+                                    "Open this pull in Warcraft Logs"
+                                },
+                                pull.log_url(),
+                            );
                         }
                         if let Some(playback) = &self.playback {
                             ui.hyperlink_to("Open video in browser", &playback.public_url);
@@ -3586,6 +3593,14 @@ fn dropdown_indicator(ui: &egui::Ui, button: &egui::Response) {
     ));
 }
 
+fn review_outcome(pull: &Pull) -> String {
+    if pull.difficulty == 10 {
+        "M+".into()
+    } else {
+        pull_outcome(pull.kill, pull.last_phase, pull.last_phase_is_intermission)
+    }
+}
+
 fn pull_outcome(kill: bool, last_phase: Option<u32>, intermission: bool) -> String {
     if kill {
         "Kill".into()
@@ -3668,8 +3683,13 @@ fn draw_pull_selector_sized(
     let primary_label = current
         .map(|index| {
             format!(
-                "{} · Pull {} of {}",
+                "{} · {} {} of {}",
                 pulls[index].name,
+                if pulls[index].difficulty == 10 {
+                    "Segment"
+                } else {
+                    "Pull"
+                },
                 index + 1,
                 pulls.len()
             )
@@ -3677,7 +3697,7 @@ fn draw_pull_selector_sized(
         .unwrap_or_else(|| pending_label.unwrap_or("Choose a pull").into());
     let outcome = current.map(|index| {
         let pull = &pulls[index];
-        pull_outcome(pull.kill, pull.last_phase, pull.last_phase_is_intermission)
+        review_outcome(pull)
     });
     let label = outcome.as_ref().map_or_else(
         || primary_label.clone(),
@@ -3737,7 +3757,7 @@ fn draw_pull_selector_sized(
                 let name = format!("{} · {}", index + 1, pull.name);
                 let details = format!(
                     "{} · {}",
-                    pull_outcome(pull.kill, pull.last_phase, pull.last_phase_is_intermission),
+                    review_outcome(pull),
                     clock((pull.end_ms - pull.start_ms) as f64 / 1000.0)
                 );
                 let label = format!("{name} · {details}");
