@@ -679,20 +679,17 @@ mod tests {
         }
     }
     #[test]
-    fn new_alignment_keeps_the_watched_timeline_at_zero_until_explicit_navigation() {
+    fn new_alignment_corrects_log_time_while_preserving_video_until_navigation() {
         let (mut ui, ticket) = viewer();
         let original = ui.playback.as_ref().unwrap().seconds;
         let before = ui.active_playback_range().unwrap();
         assert_eq!(original - before.0, 0.0);
         assert!(!ui.accept_content(ticket));
-        assert_eq!(ui.active_playback_range().unwrap(), before);
-        assert_eq!(
-            ui.playback.as_ref().unwrap().seconds - ui.active_playback_range().unwrap().0,
-            0.0
-        );
+        assert_eq!(ui.active_playback_range().unwrap(), (15.25, 195.25));
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, original);
         assert_eq!(
             ui.comparison_position(&PlaybackState::default()).unwrap().0,
-            ui.pull.as_ref().unwrap().start_ms
+            ui.pull.as_ref().unwrap().start_ms + ((original - 15.25) * 1000.0).round() as i64
         );
         let pull = ui.pull.clone().unwrap();
         ui.select(pull.clone());
