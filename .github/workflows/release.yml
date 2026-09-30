@@ -56,7 +56,7 @@ jobs:
           https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
         echo "LDAI_RUNTIME_FILE=$RUNNER_TEMP/appimage-runtime/runtime-x86_64" >> "$GITHUB_ENV"
 
-        echo "1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf  $RUNNER_TEMP/appimage-runtime/runtime-x86_64" | sha256sum -c -
+        echo "156f4bdbde9c52d01814600013e0a273f0118dc2de98975f3c8c63427ec79074  $RUNNER_TEMP/appimage-runtime/runtime-x86_64" | sha256sum -c -
     - name: Configure version
       env:
         BRICK_APP_VERSION: ${{ inputs.version }}
