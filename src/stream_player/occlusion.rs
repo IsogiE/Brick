@@ -362,7 +362,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod native_tests {
+pub(crate) mod native_tests {
     use super::*;
     use std::{
         sync::{
@@ -383,9 +383,15 @@ mod native_tests {
       media.src=URL.createObjectURL(new Blob([b],{type:'audio/wav'}));media.play().catch(()=>{});
       </script>"#;
 
+    #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires a native display and media runtime"]
     fn native_overlays_preserve_media_visibility_size_and_playback() {
+        run_native_overlays();
+    }
+
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub(crate) fn run_native_overlays() {
         struct App {
             view: Option<WebView>,
             loaded: Arc<AtomicBool>,

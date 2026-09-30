@@ -15,7 +15,7 @@ pub(super) fn set_visible(view: &WebView, visible: bool, bounds: [i32; 4]) -> wr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use eframe::egui;
     use std::{
@@ -26,9 +26,15 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires a native display"]
     fn native_player_viewport_shrinks_for_compare_and_grows_for_single_view() {
+        run_native_resize();
+    }
+
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub(crate) fn run_native_resize() {
         struct App {
             view: Option<WebView>,
             loaded: Arc<AtomicBool>,

@@ -452,9 +452,15 @@ impl eframe::App for Driver {
     }
 }
 
+#[cfg(target_os = "windows")]
 #[test]
 #[ignore = "requires an explicit synthetic content-job fixture, loopback service and native desktop"]
 fn content_job_to_native_player_uses_relative_timing_without_marker() {
+    run_native_content();
+}
+
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn run_native_content() {
     assert_eq!(
         option_env!("BRICK_PRESENCE_API_URL"),
         Some(ENDPOINT),

@@ -1,5 +1,5 @@
 #[path = "content_review.rs"]
-mod content_review;
+pub(crate) mod content_review;
 use crate::{
     defensives::{self, DefensiveGroup},
     discord_auth,
