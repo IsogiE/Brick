@@ -27,7 +27,7 @@ const REFRESH: Duration = Duration::from_secs(5);
 const MAX_STALE: Duration = Duration::from_secs(90);
 const MUTED: Color32 = Color32::from_rgb(159, 169, 184);
 const LIVE: Color32 = Color32::from_rgb(69, 211, 127);
-const MEMBER_ROW_HEIGHT: f32 = 30.0;
+const MEMBER_ROW_HEIGHT: f32 = 34.0;
 
 enum Action {
     Refresh,
@@ -790,7 +790,7 @@ impl StreamsUi {
             .show(ctx, |ui| {
                 ui.set_width(470.0_f32.min((ctx.content_rect().width() - 72.0).max(280.0)));
                 ui.horizontal(|ui| {
-                    ui.heading("Video Player Sign In");
+                    ui.heading("Player sign-in");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         done |= ui.button("×").on_hover_text("Close").clicked();
                     });
@@ -900,6 +900,7 @@ impl StreamsUi {
     }
 
     pub fn draw(&mut self, ui: &mut egui::Ui) {
+        crate::stream_widgets::style(ui);
         self.finish_recording_review();
         self.player_rect = None;
         if self.review.active() && !self.recordings_open {
@@ -1097,14 +1098,15 @@ impl StreamsUi {
         };
         let people = live_people(live);
         let height = ui.available_height().max(330.0);
+        let sidebar_width = (ui.available_width() * 0.25).clamp(288.0, 360.0);
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
-                egui::vec2(176.0, height),
+                egui::vec2(sidebar_width, height),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    ui.set_width(176.0);
+                    ui.set_width(sidebar_width);
                     ui.label(
-                        RichText::new(format!("LIVE NOW  {}", people.len()))
+                        RichText::new(format!("{}  {}", "LIVE NOW", people.len()))
                             .small()
                             .strong()
                             .color(MUTED),
@@ -1119,35 +1121,77 @@ impl StreamsUi {
                         };
                         ui.label(RichText::new(message).color(MUTED));
                     }
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    egui::ScrollArea::vertical()
-                        .id_salt(("stream-members", self.recordings_open))
-                        .max_height((height - 36.0).max(80.0))
-                        .show_rows(ui, MEMBER_ROW_HEIGHT, count, |ui, rows| {
-                            for index in rows {
-                                let stream = people[index];
-                                let selected = self
-                                    .focused
-                                    .as_ref()
-                                    .is_some_and(|(id, _)| id == &stream.user_id);
-                                if member_row(
-                                    ui,
-                                    &stream.name,
-                                    stream.raid_role,
-                                    None,
-                                    selected,
-                                    true,
-                                )
-                                .clicked()
-                                {
-                                    self.stop_player();
-                                    self.player_error = None;
-                                    self.focused =
-                                        Some((stream.user_id.clone(), stream.name.clone()));
-                                    self.selected = Some(stream.clone());
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                    let mut chosen = None;
+                    ui.scope(|ui| {
+                        crate::stream_widgets::list_scroll_style(ui);
+                        egui::ScrollArea::vertical()
+                            .id_salt(("stream-members", self.recordings_open))
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                            )
+                            .max_height(
+                                3.0 * MEMBER_ROW_HEIGHT + 2.0 * ui.spacing().item_spacing.y + 4.0,
+                            )
+                            .show_rows(ui, MEMBER_ROW_HEIGHT, count.div_ceil(2), |ui, rows| {
+                                let cell_width =
+                                    (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                                for row in rows {
+                                    ui.horizontal(|ui| {
+                                        for index in (row * 2)..((row * 2 + 2).min(count)) {
+                                            let stream = people[index];
+                                            let selected = self
+                                                .focused
+                                                .as_ref()
+                                                .is_some_and(|(id, _)| id == &stream.user_id);
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(cell_width, MEMBER_ROW_HEIGHT),
+                                                egui::Layout::top_down(egui::Align::Min),
+                                                |ui| {
+                                                    ui.set_width(cell_width);
+                                                    ui.push_id(
+                                                        ("pov-tile", &stream.user_id),
+                                                        |ui| {
+                                                            if member_row(
+                                                                ui,
+                                                                &stream.name,
+                                                                stream.raid_role,
+                                                                None,
+                                                                selected,
+                                                                true,
+                                                            )
+                                                            .clicked()
+                                                            {
+                                                                chosen = Some(stream.clone());
+                                                            }
+                                                        },
+                                                    );
+                                                },
+                                            );
+                                        }
+                                    });
                                 }
-                            }
-                        });
+                            });
+                    });
+                    if count > 6 {
+                        ui.label(
+                            RichText::new("Scroll for more players")
+                                .size(10.0)
+                                .color(MUTED),
+                        );
+                    }
+                    if let Some(stream) = chosen {
+                        self.stop_player();
+                        self.player_error = None;
+                        self.focused = Some((stream.user_id.clone(), stream.name.clone()));
+                        self.selected = Some(stream);
+                    }
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    if self.review.draw_pulls(ui, true).is_some() {
+                        self.stop_player();
+                    }
                 },
             );
             ui.separator();
@@ -1209,10 +1253,22 @@ impl StreamsUi {
                         },
                     );
                     ui.add_space(8.0);
+                    // The viewer fills its column at every window aspect ratio.
+                    // The native provider player preserves the footage's aspect ratio.
+                    // Footer: 30-point controls + 16 padding + 2 border, and an 8-point gap.
+                    let supplemental_height = if self.review.playback().is_some() {
+                        24.0
+                    } else {
+                        0.0
+                    } + if self.player_error.is_some() {
+                        24.0
+                    } else {
+                        0.0
+                    };
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     let size = egui::vec2(
                         ui.available_width(),
-                        (ui.available_width() * 9.0 / 16.0)
-                            .min((ui.available_height() - 112.0).max(160.0)),
+                        (ui.available_height() - 48.0 - 8.0 - supplemental_height).max(1.0),
                     );
                     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
                     ui.painter()
@@ -1231,11 +1287,7 @@ impl StreamsUi {
                         );
                     }
                     self.player_rect = Some(rect);
-                    ui.add_space(if ui.ctx().content_rect().height() < 640.0 {
-                        4.0
-                    } else {
-                        10.0
-                    });
+                    ui.add_space(8.0);
                     let mut caption = egui::text::LayoutJob::default();
                     caption.append(
                         if self.review.playback().is_some() {
@@ -1268,13 +1320,32 @@ impl StreamsUi {
                             ..Default::default()
                         },
                     );
-                    ui.add_sized(
-                        egui::vec2(ui.available_width(), 22.0),
-                        egui::Label::new(caption)
-                            .halign(egui::Align::Center)
-                            .truncate(),
-                    );
-                    if self.review.draw(ui, &stream) {
+                    let mut review_changed = false;
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(26, 30, 38))
+                        .stroke(egui::Stroke::new(1.0_f32, crate::stream_widgets::BORDER))
+                        .corner_radius(6)
+                        .inner_margin(8)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            let controls_width = (ui.available_width() * 0.55).clamp(215.0, 330.0);
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(controls_width, 30.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        review_changed = self.review.draw(ui, &stream);
+                                    },
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.add(egui::Label::new(caption).truncate());
+                                    },
+                                );
+                            });
+                        });
+                    if review_changed {
                         self.stop_player();
                         self.player_rect = Some(rect);
                         self.player_error = None;
@@ -1302,87 +1373,84 @@ impl StreamsUi {
     }
 
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        if ui.available_width() < 640.0 {
+            ui.horizontal(|ui| self.draw_mode_tabs(ui));
+            self.draw_toolbar_actions(ui);
+        } else {
+            ui.horizontal(|ui| {
+                self.draw_mode_tabs(ui);
+                self.draw_toolbar_actions(ui);
+            });
+        }
+    }
+
+    fn draw_mode_tabs(&mut self, ui: &mut egui::Ui) {
+        let live =
+            crate::stream_widgets::tab(ui, "Live streams", !self.recordings_open, 116.0).clicked();
+        let vod = crate::stream_widgets::tab(ui, "VODs", self.recordings_open, 88.0).clicked();
+        if (live && self.recordings_open) || (vod && !self.recordings_open) {
+            self.recordings_open = vod;
+            self.confirm_remove_recording = None;
+            self.focused = None;
+            self.selected = None;
+            self.notice = None;
+            self.stop_player();
             if self.recordings_open {
-                ui.label(
-                    RichText::new("VODs")
-                        .size(18.0)
-                        .strong()
-                        .color(Color32::from_rgb(239, 242, 247)),
-                );
+                self.start(ui.ctx(), Action::Recordings);
             }
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true),
-                |ui| {
-                    if ui
-                        .add_enabled(
-                            presence::configured() && self.work.is_none(),
-                            interactive_button("Your streams").min_size(egui::vec2(108.0, 32.0)),
-                        )
-                        .clicked()
-                    {
-                        for (i, provider) in
-                            [Provider::Twitch, Provider::Youtube].iter().enumerate()
-                        {
-                            self.drafts[i] = self
-                                .snapshot
-                                .as_ref()
-                                .and_then(|s| {
-                                    s.own_streams
-                                        .iter()
-                                        .find(|stream| &stream.provider == provider)
-                                })
-                                .map(|s| s.url.clone())
-                                .unwrap_or_default();
-                        }
-                        self.confirm_remove = None;
-                        self.edit_open = true;
-                        self.viewing_open = false;
+        }
+    }
+
+    fn draw_toolbar_actions(&mut self, ui: &mut egui::Ui) {
+        ui.with_layout(
+            egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true),
+            |ui| {
+                if ui
+                    .add_enabled(
+                        presence::configured() && self.work.is_none(),
+                        interactive_button("Your streams"),
+                    )
+                    .clicked()
+                {
+                    for (i, provider) in [Provider::Twitch, Provider::Youtube].iter().enumerate() {
+                        self.drafts[i] = self
+                            .snapshot
+                            .as_ref()
+                            .and_then(|s| {
+                                s.own_streams
+                                    .iter()
+                                    .find(|stream| &stream.provider == provider)
+                            })
+                            .map(|s| s.url.clone())
+                            .unwrap_or_default();
                     }
-                    let refresh = ui.add_enabled(
+                    self.confirm_remove = None;
+                    self.edit_open = true;
+                    self.viewing_open = false;
+                }
+                if ui
+                    .add_enabled(
                         self.work.is_none() && presence::configured(),
                         interactive_button("Refresh"),
-                    );
-                    if refresh.clicked() {
-                        self.notice = None;
-                        self.start(
-                            ui.ctx(),
-                            if self.recordings_open {
-                                Action::Recordings
-                            } else {
-                                Action::RefreshNow
-                            },
-                        );
-                    }
-                    if ui
-                        .add_enabled(
-                            self.work.is_none(),
-                            interactive_button(if self.recordings_open {
-                                "Live streams"
-                            } else {
-                                "VODs"
-                            })
-                            .min_size(egui::vec2(108.0, 32.0)),
-                        )
-                        .clicked()
-                    {
-                        self.recordings_open = !self.recordings_open;
-                        self.confirm_remove_recording = None;
-                        self.focused = None;
-                        self.selected = None;
-                        self.notice = None;
-                        self.stop_player();
+                    )
+                    .clicked()
+                {
+                    self.notice = None;
+                    self.start(
+                        ui.ctx(),
                         if self.recordings_open {
-                            self.start(ui.ctx(), Action::Recordings);
-                        }
-                    }
-                    if ui.add(interactive_button("Video Player Sign In")).clicked() {
-                        self.viewing_open = true;
-                        self.edit_open = false;
-                    }
-                },
-            );
-        });
+                            Action::Recordings
+                        } else {
+                            Action::RefreshNow
+                        },
+                    );
+                }
+                if ui.add(interactive_button("Player sign-in")).clicked() {
+                    self.viewing_open = true;
+                    self.edit_open = false;
+                }
+            },
+        );
     }
 
     fn draw_recordings(&mut self, ui: &mut egui::Ui) {
@@ -2054,17 +2122,21 @@ fn member_row(
     });
     if ui.is_rect_visible(rect) {
         let painter = ui.painter_at(rect);
-        if selected || response.hovered() || response.has_focus() {
-            painter.rect_filled(
-                rect,
-                4.0,
+        painter.rect_filled(rect, 6.0, Color32::from_rgb(28, 33, 41));
+        crate::stream_widgets::member_background(ui, rect, &response, selected);
+        painter.rect_stroke(
+            rect,
+            6.0,
+            egui::Stroke::new(
+                1.0_f32,
                 if selected {
-                    Color32::from_rgb(36, 42, 52)
+                    crate::stream_widgets::ACCENT
                 } else {
-                    Color32::from_rgb(29, 34, 42)
+                    crate::stream_widgets::BORDER
                 },
-            );
-        }
+            ),
+            egui::StrokeKind::Inside,
+        );
         if response.has_focus() {
             painter.rect_stroke(
                 rect,
@@ -3220,7 +3292,7 @@ mod tests {
                 let labels = labels(&output);
                 let (_, viewing) = labels
                     .iter()
-                    .find(|(label, _)| label == "Video Player Sign In")
+                    .find(|(label, _)| label == "Player sign-in")
                     .unwrap();
                 assert!(screen.contains_rect(*viewing), "{width}: {viewing:?}");
                 let (_, mode) = labels
@@ -3228,7 +3300,7 @@ mod tests {
                     .find(|(label, _)| label == if vods { "Live streams" } else { "VODs" })
                     .unwrap();
                 if width >= 720.0 {
-                    assert!(viewing.right() < mode.left());
+                    assert!(mode.right() < viewing.left());
                     assert!((viewing.center().y - mode.center().y).abs() < 1.0);
                     if let Some(previous) = position {
                         assert_eq!(previous, viewing.center());
@@ -3292,7 +3364,7 @@ mod tests {
     #[test]
     fn streams_toolbar_and_sign_in_controls_show_hover_and_pressed_feedback() {
         for label in [
-            "Video Player Sign In",
+            "Player sign-in",
             "VODs",
             "Live streams",
             "Refresh",

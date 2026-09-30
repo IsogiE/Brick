@@ -203,6 +203,11 @@ pub struct ReviewUi {
     comparing: bool,
     open_first_pull: bool,
     popup_open: bool,
+    show_pulls: bool,
+    pull_search: String,
+    pull_filter: u8,
+    scroll_pull: Option<(String, u64)>,
+    report_input: String,
     signing_in: bool,
     playback: Option<Playback>,
     pull: Option<Pull>,
@@ -263,6 +268,11 @@ impl Default for ReviewUi {
             comparing: false,
             open_first_pull: false,
             popup_open: false,
+            show_pulls: true,
+            pull_search: String::new(),
+            pull_filter: 0,
+            scroll_pull: None,
+            report_input: String::new(),
             signing_in: false,
             playback: None,
             pull: None,
@@ -2041,7 +2051,61 @@ impl ReviewUi {
         if !self.comparing {
             ui.scope_builder(egui::UiBuilder::new().max_rect(rail), |ui| {
                 ui.set_clip_rect(rail.intersect(ui.clip_rect()));
-                if let Some(command) = self.draw_events(ui, rail.height()) {
+                ui.horizontal(|ui| {
+                    let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                    if crate::stream_widgets::tab(ui, "Pulls", self.show_pulls, width).clicked() {
+                        self.show_pulls = true;
+                    }
+                    if crate::stream_widgets::tab(ui, "Events", !self.show_pulls, width).clicked() {
+                        self.show_pulls = false;
+                    }
+                });
+                ui.add_space(8.0);
+                if self.show_pulls {
+                    egui::CollapsingHeader::new("Find a log").show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.report_input)
+                                .hint_text("Report link or code")
+                                .desired_width(ui.available_width()),
+                        );
+                        if ui
+                            .add_enabled(self.work.is_none(), egui::Button::new("Load report"))
+                            .clicked()
+                        {
+                            let input = self.report_input.trim();
+                            let code = if let Ok(url) = url::Url::parse(input) {
+                                if url.scheme() == "https"
+                                    && matches!(
+                                        url.host_str(),
+                                        Some("www.warcraftlogs.com" | "warcraftlogs.com")
+                                    )
+                                {
+                                    url.path()
+                                        .strip_prefix("/reports/")
+                                        .and_then(|s| s.split('/').next())
+                                        .unwrap_or("")
+                                        .to_owned()
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                input.to_owned()
+                            };
+                            if code.len() == 16 && code.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                                self.cancel_read();
+                                self.start(ui.ctx(), Some(stream), Action::Report(code));
+                            } else {
+                                self.notice = Some(
+                                    "Enter a Warcraft Logs report link or its 16-character code."
+                                        .into(),
+                                );
+                            }
+                        }
+                    });
+                    if let Some(command) = self.draw_pulls(ui, false) {
+                        action.command = Some(command);
+                    }
+                } else if let Some(command) = self.draw_events(ui, rail.height() - 42.0) {
                     action.command = Some(command);
                 }
             });
@@ -3863,6 +3927,173 @@ fn playback_intent(state: &PlaybackState, playback: Option<&Playback>) -> bool {
         playback.is_none_or(|p| p.autoplay)
     } else {
         state.playing
+    }
+}
+
+impl ReviewUi {
+    pub(crate) fn draw_pulls(
+        &mut self,
+        ui: &mut egui::Ui,
+        enter_review: bool,
+    ) -> Option<PlaybackCommand> {
+        ui.label(
+            RichText::new("ENCOUNTERS & PULLS")
+                .small()
+                .strong()
+                .color(MUTED),
+        );
+        let pulls = self
+            .review
+            .as_ref()
+            .map(|r| r.pulls.clone())
+            .unwrap_or_default();
+        if pulls.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new("Select a POV to load its pulls.")
+                        .small()
+                        .color(MUTED),
+                )
+                .wrap(),
+            );
+            return None;
+        }
+        ui.add_space(4.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.pull_search)
+                .hint_text("Boss, log or pull…")
+                .margin(egui::vec2(8.0, 7.0))
+                .desired_width(ui.available_width()),
+        );
+        if pulls.iter().any(|pull| pull.difficulty != 10) {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.pull_filter, 0, "All");
+                ui.selectable_value(&mut self.pull_filter, 1, "Best");
+                ui.selectable_value(&mut self.pull_filter, 2, "Kills");
+            });
+        } else {
+            self.pull_filter = 0;
+        }
+        let query = self.pull_search.to_lowercase();
+        let current = self.pull.as_ref().map(|p| (p.report.clone(), p.id));
+        let follow = current != self.scroll_pull;
+        self.scroll_pull = current;
+        let groups = crate::stream_widgets::encounter_groups(pulls);
+        let mut selected = None;
+        ui.scope(|ui| {
+            crate::stream_widgets::list_scroll_style(ui);
+            egui::ScrollArea::vertical()
+                .id_salt(("encounter-browser", enter_review))
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                .auto_shrink([false, false])
+                .max_height(ui.available_height())
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 5.0;
+                    let mut shown = 0;
+                    for (key, group) in groups {
+                        let best = group
+                            .iter()
+                            .filter(|p| p.difficulty != 10)
+                            .filter_map(|p| if p.kill { Some(0.0) } else { p.remaining })
+                            .reduce(f64::min);
+                        let filtered: Vec<_> = group
+                            .iter()
+                            .filter(|p| {
+                                query.split_whitespace().all(|q| {
+                                    format!("{} {} {}", p.name, p.report, p.id)
+                                        .to_lowercase()
+                                        .contains(q)
+                                }) && match if p.difficulty == 10 {
+                                    0
+                                } else {
+                                    self.pull_filter
+                                } {
+                                    1 => {
+                                        best.is_some()
+                                            && if p.kill {
+                                                best == Some(0.0)
+                                            } else {
+                                                p.remaining == best
+                                            }
+                                    }
+                                    2 => p.kill,
+                                    _ => true,
+                                }
+                            })
+                            .collect();
+                        if filtered.is_empty() {
+                            continue;
+                        }
+                        shown += filtered.len();
+                        ui.add_space(4.0);
+                        let group_id = ui.make_persistent_id(("boss-section", enter_review, key));
+                        let mut open = ui
+                            .data_mut(|data| data.get_temp::<bool>(group_id))
+                            .unwrap_or(true);
+                        let active_group = group.iter().any(|pull| {
+                            self.pull
+                                .as_ref()
+                                .is_some_and(|p| p.report == pull.report && p.id == pull.id)
+                        });
+                        let cleared = group.iter().any(|p| p.difficulty != 10 && p.kill);
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(21, 25, 32))
+                            .stroke(egui::Stroke::new(
+                                1.0_f32,
+                                if active_group {
+                                    egui::Color32::from_rgb(107, 65, 48)
+                                } else {
+                                    crate::stream_widgets::BORDER
+                                },
+                            ))
+                            .corner_radius(7)
+                            .inner_margin(7)
+                            .show(ui, |ui| {
+                                ui.set_width((ui.available_width()).max(120.0));
+                                if crate::stream_widgets::encounter_header(
+                                    ui,
+                                    &group[0],
+                                    group.len(),
+                                    best,
+                                    cleared,
+                                    open,
+                                )
+                                .clicked()
+                                {
+                                    open = !open;
+                                    ui.data_mut(|data| data.insert_temp(group_id, open));
+                                }
+                                if open {
+                                    for pull in filtered {
+                                        let active = self.pull.as_ref().is_some_and(|p| {
+                                            p.report == pull.report && p.id == pull.id
+                                        });
+                                        let is_best = best.is_some() && pull.remaining == best;
+                                        let response =
+                                            crate::stream_widgets::pull(ui, pull, active, is_best);
+                                        if active && follow {
+                                            response.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        if response.clicked() {
+                                            selected = Some(pull.clone());
+                                        }
+                                    }
+                                }
+                            });
+                    }
+                    if shown == 0 {
+                        ui.label(RichText::new("No matching pulls.").small().color(MUTED));
+                    }
+                });
+        });
+        if let Some(pull) = selected {
+            let command = self.navigate_pull(pull);
+            if enter_review {
+                self.active = true;
+            }
+            return command.or(Some(PlaybackCommand::Play));
+        }
+        None
     }
 }
 
@@ -7654,6 +7885,7 @@ mod tests {
                 let (review, pull, stream) = fixture();
                 let mut review_ui = ReviewUi::default();
                 review_ui.review = Some(review);
+                review_ui.show_pulls = false;
                 review_ui.connected = true;
                 review_ui.active = true;
                 review_ui.select(pull.clone());
