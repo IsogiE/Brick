@@ -77,6 +77,7 @@ impl ReviewUi {
             self.content.transport_retries = 0;
         }
         self.apply_sample_model();
+        self.adopt_verified_content_range();
         if self.active && self.playback.is_none() {
             if let Some(pull) = self.pull.clone().filter(|pull| {
                 self.review
@@ -208,8 +209,9 @@ impl ReviewUi {
             return false;
         }
         review.content_timing.insert(key, alignment);
+        self.adopt_verified_content_range();
         // Only a still-waiting explicit selection starts playback. Background
-        // completion never shifts a currently watched clock or a different fight.
+        // completion never seeks the watched video or selects a different fight.
         if self.active
             && self.playback.is_none()
             && self
@@ -526,7 +528,7 @@ mod tests {
         assert!(ui.pause_at_pull_end(&state).is_none());
     }
     #[test]
-    fn provider_seek_pins_its_new_clock_before_a_background_result_arrives() {
+    fn verified_timing_corrects_the_logs_after_a_provider_seek_without_moving_video() {
         let (mut ui, ticket) = viewer();
         let origin = ui.active_playback_range().unwrap().0;
         let epoch = Instant::now() - Duration::from_millis(100);
@@ -543,10 +545,14 @@ mod tests {
         assert_eq!(ui.provider_observation.unwrap().1, origin + 30.0);
         assert_eq!(ui.active_playback_range().unwrap().0, origin);
         ui.accept_content(ticket);
-        assert_eq!(ui.active_playback_range().unwrap().0, origin);
+        let verified = ui.active_playback_range().unwrap().0;
+        assert_eq!(verified, 15.25);
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, origin + 30.0);
+        assert!(ui.playback.as_ref().unwrap().autoplay);
+        assert_eq!(ui.range_epoch, epoch);
         assert_eq!(
             ui.comparison_position(&state).unwrap().0,
-            ui.pull.as_ref().unwrap().start_ms + 30_000
+            ui.pull.as_ref().unwrap().start_ms + ((origin + 30.0 - verified) * 1000.0).round() as i64
         );
     }
     #[test]
@@ -802,6 +808,32 @@ mod tests {
         ui.playback.as_mut().unwrap().seconds = 50.0;
         assert!(!ui.accept_content(ticket));
         assert_eq!(ui.playback.as_ref().unwrap().seconds, 50.0);
+    }
+    #[test]
+    fn paused_estimate_adopts_verified_logs_without_restarting_or_reseeking() {
+        let (mut ui, ticket) = viewer();
+        ui.playback.as_mut().unwrap().seconds = 50.0;
+        ui.playback.as_mut().unwrap().autoplay = false;
+        ui.timeline_position = Some(50.0);
+        let epoch = ui.range_epoch;
+        assert!(!ui.accept_content(ticket));
+        assert_eq!(ui.active_playback_range().unwrap().0, 15.25);
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, 50.0);
+        assert!(!ui.playback.as_ref().unwrap().autoplay);
+        assert_eq!(ui.timeline_position, Some(50.0));
+        assert_eq!(ui.range_epoch, epoch);
+    }
+
+    #[test]
+    fn verified_clock_adoption_waits_for_scrubbing_to_finish() {
+        let (mut ui, ticket) = viewer();
+        let estimated = ui.active_playback_range().unwrap().0;
+        ui.scrub = Some(10.0);
+        ui.accept_content(ticket);
+        assert_eq!(ui.active_playback_range().unwrap().0, estimated);
+        ui.scrub = None;
+        ui.sync_content_selection();
+        assert_eq!(ui.active_playback_range().unwrap().0, 15.25);
     }
     #[test]
     fn unavailable_capability_keeps_upload_watchable_without_certifying_an_origin() {

@@ -51,6 +51,7 @@ struct PlaybackRange {
     video_id: String,
     start: f64,
     end: f64,
+    precise: bool,
 }
 
 #[derive(Clone)]
@@ -2601,8 +2602,37 @@ impl ReviewUi {
                     video_id: review.replay.video_id.clone(),
                     start,
                     end,
+                    precise: review.has_precise_timing(pull),
                 }
             });
+    }
+
+    fn adopt_verified_content_range(&mut self) {
+        if !self.active || self.comparing || self.pending_focus.is_some() || self.scrub.is_some() {
+            return;
+        }
+        let Some((review, pull)) = self.review.as_ref().zip(self.pull.as_ref()) else {
+            return;
+        };
+        let Some(range) = self.playback_range.as_mut() else {
+            return;
+        };
+        if range.precise
+            || range.broadcast_id != review.replay.broadcast_id
+            || range.video_id != review.replay.video_id
+            || pull_key(&range.pull) != pull_key(pull)
+            || range.pull.start_ms != pull.start_ms
+            || range.pull.end_ms != pull.end_ms
+            || review.content_alignment(pull).is_none()
+        {
+            return;
+        }
+        // Correct the logs' mapping once an estimate becomes verified. Keep the
+        // provider position, play intent and observation epoch: no video seek,
+        // reload or fabricated playback acknowledgment is needed.
+        (range.start, range.end) = playback_bounds(review, pull);
+        range.precise = true;
+        self.range_pause_sent = false;
     }
 
     fn active_playback_range(&self) -> Option<(f64, f64)> {
@@ -4103,6 +4133,31 @@ mod tests {
     use crate::streams::{Provider, Status};
     use crate::warcraftlogs::Replay;
     use std::collections::HashMap;
+
+    #[test]
+    fn selecting_a_review_cancels_unrelated_background_preparation() {
+        let (_, _, stream) = fixture();
+        let mut selected = stream.clone();
+        selected.user_id = "another-viewer".into();
+        selected.channel_id = "another-channel".into();
+        let mut peer = ReviewUi::default().preparation_peer();
+        peer.key = pov_key(&stream);
+        let (_tx, rx) = mpsc::channel();
+        peer.work = Some(rx);
+        peer.work_action = Some(Action::Refresh);
+        let canceled = peer.cancel.clone();
+        let mut preparation = crate::recording_preparation::Preparation::default();
+        preparation.tick(
+            &egui::Context::default(),
+            &[stream],
+            1,
+            Some(&selected),
+            &mut peer,
+        );
+        assert!(canceled.load(Ordering::Relaxed));
+        assert!(!peer.preparing_recordings);
+        assert!(peer.next_action().is_none());
+    }
 
     #[test]
     fn throttled_refresh_keeps_known_pulls_and_does_not_render_background_noise() {
