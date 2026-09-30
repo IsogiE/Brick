@@ -1596,7 +1596,7 @@ impl ReviewUi {
                     changed = true;
                 }
                 if self.work.is_some() && self.review.is_none() {
-                    ui.small("Finding raid pulls…");
+                    ui.small("Finding pulls…");
                 }
                 let menu = ui.menu_button("…", |ui| {
                     if ui
@@ -2016,7 +2016,7 @@ impl ReviewUi {
                     {
                         "No raid pulls are available for this view"
                     } else if self.work.is_some() {
-                        "Finding raid pulls…"
+                        "Finding pulls…"
                     } else {
                         "Choose a pull to watch"
                     },
