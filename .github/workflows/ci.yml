@@ -61,6 +61,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cargo fmt --check
+          rustfmt --check --edition 2021 src/app_modules.rs
           rustfmt --check --edition 2021 packaging/linux/apprun.rs
 
       - name: Check
