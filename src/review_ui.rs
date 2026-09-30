@@ -5,14 +5,13 @@ use crate::{
     discord_auth,
     stream_player::{PlaybackCommand, PlaybackState},
     streams::{Status, Stream},
-    warcraftlogs::{Client, EventKind, Pull, RaidEvent, Review, while_current},
+    warcraftlogs::{while_current, Client, EventKind, Pull, RaidEvent, Review},
 };
 use eframe::egui::{self, Color32, RichText};
 use std::{
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc,
+        mpsc, Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -4601,13 +4600,12 @@ mod tests {
         changed.pulls[0].start_ms += 1;
         let changed_pull = changed.pulls[0].clone();
         ui.accept_review(changed);
-        assert!(
-            ui.review
-                .as_ref()
-                .unwrap()
-                .marker_alignment(&changed_pull)
-                .is_none()
-        );
+        assert!(ui
+            .review
+            .as_ref()
+            .unwrap()
+            .marker_alignment(&changed_pull)
+            .is_none());
     }
 
     #[test]
@@ -5415,10 +5413,9 @@ mod tests {
                     assert_eq!(keys[0]["startMs"], wanted.start_ms);
                     assert_eq!(keys[0]["recordingStartMs"], recording_start);
                     assert_eq!(keys[0]["videoId"], "different12");
-                    assert!(
-                        keys.iter()
-                            .any(|key| key["pullId"] == destination.pulls[79].id)
-                    );
+                    assert!(keys
+                        .iter()
+                        .any(|key| key["pullId"] == destination.pulls[79].id));
                     Some(serde_json::json!({"results":[{
                         "key":keys[0],
                         "alignment":{
@@ -5558,20 +5555,18 @@ mod tests {
         .unwrap();
         ui.tick(&egui::Context::default(), None);
         assert_eq!(ui.pull.as_ref().unwrap().id, second.id);
-        assert!(
-            ui.review
-                .as_ref()
-                .unwrap()
-                .marker_alignment(&first)
-                .is_none()
-        );
-        assert!(
-            ui.marker_cache
-                .lock()
-                .unwrap()
-                .get(&review.replay, &first)
-                .is_none()
-        );
+        assert!(ui
+            .review
+            .as_ref()
+            .unwrap()
+            .marker_alignment(&first)
+            .is_none());
+        assert!(ui
+            .marker_cache
+            .lock()
+            .unwrap()
+            .get(&review.replay, &first)
+            .is_none());
         ui.loaded_events = vec![EventKind::Deaths, EventKind::Defensives];
         assert!(matches!(ui.next_action(), Some(Action::Refresh)));
     }
@@ -5921,15 +5916,13 @@ mod tests {
                         .pull_video_start(&first),
                 ];
                 let baseline = starts.map(|start| provider_sample(start + 10.0, playing, 0));
-                assert!(
-                    comparison
-                        .follow_provider_controls(
-                            &mut primary,
-                            [&baseline[0], &baseline[1]],
-                            provider_test_now()
-                        )
-                        .is_none()
-                );
+                assert!(comparison
+                    .follow_provider_controls(
+                        &mut primary,
+                        [&baseline[0], &baseline[1]],
+                        provider_test_now()
+                    )
+                    .is_none());
                 let mut seeking = baseline.clone();
                 seeking[leader] = provider_sample(starts[leader] + 342.375, playing, 1);
                 let commands = comparison

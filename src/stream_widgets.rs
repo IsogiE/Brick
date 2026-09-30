@@ -229,7 +229,11 @@ pub fn encounter_header(
         format!(
             "{difficulty} · {count} {}",
             if pull.difficulty == 10 {
-                if count == 1 { "segment" } else { "segments" }
+                if count == 1 {
+                    "segment"
+                } else {
+                    "segments"
+                }
             } else if count == 1 {
                 "pull"
             } else {

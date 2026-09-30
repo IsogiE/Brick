@@ -1188,12 +1188,10 @@ mod tests {
                 vec![egui::Event::PointerMoved(gutter)],
             );
             assert_eq!(library.row_rects[0].width(), width);
-            assert!(
-                library
-                    .row_rects
-                    .iter()
-                    .all(|rect| rect.right() <= viewport.right() - 10.0)
-            );
+            assert!(library
+                .row_rects
+                .iter()
+                .all(|rect| rect.right() <= viewport.right() - 10.0));
         }
         assert!(library.painted_scrollbars > 0);
         assert!(click(&ctx, &mut library, &source, size, gutter).is_none());
