@@ -790,7 +790,7 @@ impl StreamsUi {
             .show(ctx, |ui| {
                 ui.set_width(470.0_f32.min((ctx.content_rect().width() - 72.0).max(280.0)));
                 ui.horizontal(|ui| {
-                    ui.heading("Video Player Sign In");
+                    ui.heading("Player sign-in");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         done |= ui.button("×").on_hover_text("Close").clicked();
                     });
@@ -1373,73 +1373,84 @@ impl StreamsUi {
     }
 
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let live = crate::stream_widgets::tab(ui, "Live streams", !self.recordings_open, 116.0)
-                .clicked();
-            let vod = crate::stream_widgets::tab(ui, "VODs", self.recordings_open, 88.0).clicked();
-            if (live && self.recordings_open) || (vod && !self.recordings_open) {
-                self.recordings_open = vod;
-                self.confirm_remove_recording = None;
-                self.focused = None;
-                self.selected = None;
-                self.notice = None;
-                self.stop_player();
-                if self.recordings_open {
-                    self.start(ui.ctx(), Action::Recordings);
-                }
+        if ui.available_width() < 640.0 {
+            ui.horizontal(|ui| self.draw_mode_tabs(ui));
+            self.draw_toolbar_actions(ui);
+        } else {
+            ui.horizontal(|ui| {
+                self.draw_mode_tabs(ui);
+                self.draw_toolbar_actions(ui);
+            });
+        }
+    }
+
+    fn draw_mode_tabs(&mut self, ui: &mut egui::Ui) {
+        let live =
+            crate::stream_widgets::tab(ui, "Live streams", !self.recordings_open, 116.0).clicked();
+        let vod = crate::stream_widgets::tab(ui, "VODs", self.recordings_open, 88.0).clicked();
+        if (live && self.recordings_open) || (vod && !self.recordings_open) {
+            self.recordings_open = vod;
+            self.confirm_remove_recording = None;
+            self.focused = None;
+            self.selected = None;
+            self.notice = None;
+            self.stop_player();
+            if self.recordings_open {
+                self.start(ui.ctx(), Action::Recordings);
             }
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true),
-                |ui| {
-                    if ui
-                        .add_enabled(
-                            presence::configured() && self.work.is_none(),
-                            interactive_button("Your streams"),
-                        )
-                        .clicked()
-                    {
-                        for (i, provider) in
-                            [Provider::Twitch, Provider::Youtube].iter().enumerate()
-                        {
-                            self.drafts[i] = self
-                                .snapshot
-                                .as_ref()
-                                .and_then(|s| {
-                                    s.own_streams
-                                        .iter()
-                                        .find(|stream| &stream.provider == provider)
-                                })
-                                .map(|s| s.url.clone())
-                                .unwrap_or_default();
-                        }
-                        self.confirm_remove = None;
-                        self.edit_open = true;
-                        self.viewing_open = false;
+        }
+    }
+
+    fn draw_toolbar_actions(&mut self, ui: &mut egui::Ui) {
+        ui.with_layout(
+            egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true),
+            |ui| {
+                if ui
+                    .add_enabled(
+                        presence::configured() && self.work.is_none(),
+                        interactive_button("Your streams"),
+                    )
+                    .clicked()
+                {
+                    for (i, provider) in [Provider::Twitch, Provider::Youtube].iter().enumerate() {
+                        self.drafts[i] = self
+                            .snapshot
+                            .as_ref()
+                            .and_then(|s| {
+                                s.own_streams
+                                    .iter()
+                                    .find(|stream| &stream.provider == provider)
+                            })
+                            .map(|s| s.url.clone())
+                            .unwrap_or_default();
                     }
-                    if ui
-                        .add_enabled(
-                            self.work.is_none() && presence::configured(),
-                            interactive_button("Refresh"),
-                        )
-                        .clicked()
-                    {
-                        self.notice = None;
-                        self.start(
-                            ui.ctx(),
-                            if self.recordings_open {
-                                Action::Recordings
-                            } else {
-                                Action::RefreshNow
-                            },
-                        );
-                    }
-                    if ui.add(interactive_button("Player sign-in")).clicked() {
-                        self.viewing_open = true;
-                        self.edit_open = false;
-                    }
-                },
-            );
-        });
+                    self.confirm_remove = None;
+                    self.edit_open = true;
+                    self.viewing_open = false;
+                }
+                if ui
+                    .add_enabled(
+                        self.work.is_none() && presence::configured(),
+                        interactive_button("Refresh"),
+                    )
+                    .clicked()
+                {
+                    self.notice = None;
+                    self.start(
+                        ui.ctx(),
+                        if self.recordings_open {
+                            Action::Recordings
+                        } else {
+                            Action::RefreshNow
+                        },
+                    );
+                }
+                if ui.add(interactive_button("Player sign-in")).clicked() {
+                    self.viewing_open = true;
+                    self.edit_open = false;
+                }
+            },
+        );
     }
 
     fn draw_recordings(&mut self, ui: &mut egui::Ui) {
@@ -3281,7 +3292,7 @@ mod tests {
                 let labels = labels(&output);
                 let (_, viewing) = labels
                     .iter()
-                    .find(|(label, _)| label == "Video Player Sign In")
+                    .find(|(label, _)| label == "Player sign-in")
                     .unwrap();
                 assert!(screen.contains_rect(*viewing), "{width}: {viewing:?}");
                 let (_, mode) = labels
@@ -3289,7 +3300,7 @@ mod tests {
                     .find(|(label, _)| label == if vods { "Live streams" } else { "VODs" })
                     .unwrap();
                 if width >= 720.0 {
-                    assert!(viewing.right() < mode.left());
+                    assert!(mode.right() < viewing.left());
                     assert!((viewing.center().y - mode.center().y).abs() < 1.0);
                     if let Some(previous) = position {
                         assert_eq!(previous, viewing.center());
@@ -3353,7 +3364,7 @@ mod tests {
     #[test]
     fn streams_toolbar_and_sign_in_controls_show_hover_and_pressed_feedback() {
         for label in [
-            "Video Player Sign In",
+            "Player sign-in",
             "VODs",
             "Live streams",
             "Refresh",

@@ -7876,6 +7876,7 @@ mod tests {
                 let (review, pull, stream) = fixture();
                 let mut review_ui = ReviewUi::default();
                 review_ui.review = Some(review);
+                review_ui.show_pulls = false;
                 review_ui.connected = true;
                 review_ui.active = true;
                 review_ui.select(pull.clone());

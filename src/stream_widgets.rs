@@ -100,20 +100,42 @@ pub fn style(ui: &mut egui::Ui) {
     visuals.widgets.active.weak_bg_fill = SOFT;
 }
 pub fn tab(ui: &mut egui::Ui, label: &str, selected: bool, width: f32) -> egui::Response {
-    ui.add_sized(
-        [width, 34.0],
-        egui::Button::new(RichText::new(label).size(13.0).color(if selected {
-            TEXT
-        } else {
-            MUTED
-        }))
-        .fill(if selected {
+    ui.scope(|ui| {
+        let visuals = ui.visuals_mut();
+        let idle = if selected {
             SOFT
         } else {
             Color32::from_rgb(27, 31, 39)
-        })
-        .stroke(Stroke::new(1.0_f32, if selected { ACCENT } else { BORDER })),
-    )
+        };
+        let hover = if selected {
+            Color32::from_rgb(78, 49, 39)
+        } else {
+            Color32::from_rgb(43, 49, 61)
+        };
+        let pressed = if selected {
+            Color32::from_rgb(94, 51, 37)
+        } else {
+            SOFT
+        };
+        for (state, fill) in [
+            (&mut visuals.widgets.inactive, idle),
+            (&mut visuals.widgets.hovered, hover),
+            (&mut visuals.widgets.active, pressed),
+        ] {
+            state.bg_fill = fill;
+            state.weak_bg_fill = fill;
+        }
+        ui.add_sized(
+            [width, 34.0],
+            egui::Button::new(RichText::new(label).size(13.0).color(if selected {
+                TEXT
+            } else {
+                MUTED
+            }))
+            .stroke(Stroke::new(1.0_f32, if selected { ACCENT } else { BORDER })),
+        )
+    })
+    .inner
 }
 pub fn member_background(
     ui: &egui::Ui,
