@@ -16,9 +16,9 @@ try {
     $function = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-LoginWindow' }, $true)
     if ($function.Count -ne 1) { throw 'Login selector is ambiguous.' }
     . ([scriptblock]::Create($function[0].Extent.Text))
-    function Set-Stage([string]$Stage) {
+    function Set-Stage([string]$Stage, [int]$TimeoutSeconds = 15) {
         [IO.File]::WriteAllText((Join-Path $directory 'command.txt'), $Stage)
-        $deadline = [DateTime]::UtcNow.AddSeconds(15)
+        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
         while ([DateTime]::UtcNow -lt $deadline) {
             $fixture.Refresh()
             if ($fixture.HasExited) { throw 'Fixture exited before the readiness assertion.' }
@@ -34,7 +34,8 @@ try {
     $fixturePath = Join-Path $PSScriptRoot 'certum-window-fixture.ps1'
     $fixture = Start-Process "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$fixturePath`"",'-Directory',"`"$directory`"") -PassThru -WindowStyle Hidden
     function Select-Login { return Get-LoginWindow -Windows ([WinAPI]::GetVisibleWindows([uint32]$fixture.Id)) }
-    $state = Set-Stage 'initial'
+    # A cold .NET Framework UI can start slowly while another VM builds images.
+    $state = Set-Stage 'initial' -TimeoutSeconds 60
     if ((Select-Login) -ne [IntPtr]::Zero) { throw 'Startup or popup window was mistaken for a login form.' }
     if ([WinAPI]::GetVisibleWindows([uint32]$fixture.Id).Contains([IntPtr]$state.startupHandle)) { throw 'Minimized startup window was retained as a popup.' }
     $state = Set-Stage 'ready'
