@@ -37,7 +37,7 @@ cmake -S "$build_root/webkitgtk-$version" -B "$build_root/build" -G Ninja \
   -DENABLE_MINIBROWSER=OFF -DENABLE_WEBDRIVER=OFF -DENABLE_GAMEPAD=OFF \
   -DUSE_FLITE=OFF -DENABLE_SPEECH_SYNTHESIS=OFF -DUSE_SYSTEM_SYSPROF_CAPTURE=OFF -DUSE_LIBBACKTRACE=OFF
 # Bound compiler parallelism for the disposable build VM's 12 GiB RAM limit.
-cmake --build "$build_root/build" --parallel 8
+cmake --build "$build_root/build" --parallel 4
 cmake --install "$build_root/build" --strip
 # Preserve the source identity and notices alongside distribution notices.
 notice=/usr/share/doc/brick-webkit-runtime/copyright
