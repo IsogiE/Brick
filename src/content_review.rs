@@ -1042,4 +1042,4 @@ mod tests {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
 #[path = "content_review_smoke.rs"]
-mod native_smoke;
+pub(crate) mod native_smoke;

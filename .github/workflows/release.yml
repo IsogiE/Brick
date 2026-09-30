@@ -11,7 +11,7 @@ env:
 jobs:
   build-linux:
     runs-on: ${{ fromJSON(vars.BRICK_RELEASE_LINUX_RUNNER || '"ubuntu-24.04"') }}
-    timeout-minutes: 45
+    timeout-minutes: 180
     permissions:
       contents: read
       id-token: write
@@ -38,9 +38,11 @@ jobs:
         sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/google-chrome*.sources
         sudo apt-get update
         sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav patchelf squashfs-tools
+    - name: Build patched Linux playback runtime when needed
+      run: sudo --preserve-env=HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy bash packaging/linux/build-webkit.sh
     - name: Verify Linux playback runtime
       run: |
-        pkg-config --atleast-version=2.52.6 webkit2gtk-4.1
+        pkg-config --atleast-version=2.54.0 webkit2gtk-4.1
         pkg-config --modversion webkit2gtk-4.1
         dpkg-query --show --showformat='${Package} ${Version}\n' libgstreamer1.0-0
     - name: Install Cargo Packager
@@ -56,7 +58,7 @@ jobs:
           https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
         echo "LDAI_RUNTIME_FILE=$RUNNER_TEMP/appimage-runtime/runtime-x86_64" >> "$GITHUB_ENV"
 
-        echo "1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf  $RUNNER_TEMP/appimage-runtime/runtime-x86_64" | sha256sum -c -
+        echo "156f4bdbde9c52d01814600013e0a273f0118dc2de98975f3c8c63427ec79074  $RUNNER_TEMP/appimage-runtime/runtime-x86_64" | sha256sum -c -
     - name: Configure version
       env:
         BRICK_APP_VERSION: ${{ inputs.version }}
@@ -108,7 +110,7 @@ jobs:
         retention-days: 14
   build-windows:
     runs-on: ${{ fromJSON(vars.BRICK_RELEASE_WINDOWS_RUNNER || '"windows-latest"') }}
-    timeout-minutes: 45
+    timeout-minutes: 180
     permissions:
       contents: read
       id-token: write

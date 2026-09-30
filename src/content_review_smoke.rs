@@ -354,7 +354,10 @@ impl Driver {
                     || state.seconds > end + 2.0
                     || (state.seconds - self.sample).abs() > 0.5
                 {
-                    return Err("Native player did not stay paused at the pull boundary".into());
+                    return Err(format!(
+                        "Native player did not stay paused at the pull boundary: phase={} ready={} playing={} seeking={:?} seconds={} end={} sample={}",
+                        self.phase, state.ready, state.playing, state.seeking, state.seconds, end, self.sample
+                    ));
                 }
                 if self.phase == 9 {
                     eprintln!("Native content UI verified: HTTP pending/poll, stale-selection rejection, paused and resumed log seeks, one native player, automatic end pause with verified and pending timing; synthetic timing fixture only");
@@ -452,9 +455,15 @@ impl eframe::App for Driver {
     }
 }
 
+#[cfg(target_os = "windows")]
 #[test]
 #[ignore = "requires an explicit synthetic content-job fixture, loopback service and native desktop"]
 fn content_job_to_native_player_uses_relative_timing_without_marker() {
+    run_native_content();
+}
+
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn run_native_content() {
     assert_eq!(
         option_env!("BRICK_PRESENCE_API_URL"),
         Some(ENDPOINT),

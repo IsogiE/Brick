@@ -37,6 +37,23 @@ try {
     required.push(`usr/lib/${file}`);
   }
   const env = { ...process.env, LD_LIBRARY_PATH: `${appdir}/usr/lib:${appdir}/usr/lib/${process.arch === 'x64' ? 'x86_64' : 'aarch64'}-linux-gnu` };
+  const webkitLibrary = files.find((file) => path.basename(file).startsWith('libwebkit2gtk-4.1.so'));
+  const runtimeVersion = JSON.parse(execFileSync('python3', ['-c', `
+import ctypes, json, sys
+library = ctypes.CDLL(sys.argv[1])
+version = []
+for component in ('major', 'minor', 'micro'):
+    getter = getattr(library, 'webkit_get_' + component + '_version')
+    getter.argtypes = []
+    getter.restype = ctypes.c_uint
+    version.append(getter())
+print(json.dumps(version))
+`, path.join(appdir, 'usr/lib', webkitLibrary)], { env, encoding: 'utf8', timeout: 10_000 }));
+  assert(runtimeVersion.length === 3 && runtimeVersion.every(Number.isInteger), 'Invalid bundled WebKit version');
+  const minimum = [2, 54, 0];
+  const different = runtimeVersion.findIndex((value, index) => value !== minimum[index]);
+  assert(different === -1 || runtimeVersion[different] > minimum[different],
+    `Bundled WebKit ${runtimeVersion.join('.')} is older than the reviewed minimum ${minimum.join('.')}`);
   for (const relative of required) {
     const file = path.join(appdir, relative);
     assert((await stat(file)).isFile(), `Missing runtime file ${relative}`);

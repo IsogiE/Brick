@@ -385,13 +385,16 @@ mod tests {
             WRAPPER,
             &message(&bridge, serde_json::json!({"SexualThemes": expiry})),
         );
-        for _ in 0..100 {
-            if !preferences.0.lock().unwrap().writing {
-                break;
-            }
+        // This checks persisted content and permissions, not disk throughput.
+        // A cold, busy VM can take longer than one second to commit the file.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while preferences.0.lock().unwrap().writing {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "preference write did not complete within 30 seconds"
+            );
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(!preferences.0.lock().unwrap().writing);
         let saved = fs::read_to_string(&path).unwrap();
         assert_eq!(saved, format!("{{\"SexualThemes\":{expiry}}}"));
         assert_eq!(

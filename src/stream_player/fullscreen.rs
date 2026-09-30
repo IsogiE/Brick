@@ -215,7 +215,7 @@ impl Drop for Controller {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn assert_no_window_commands(ctx: &egui::Context) {
@@ -300,10 +300,16 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires an isolated desktop (X11 or Windows); no credentials"]
     fn native_expand_and_escape_preserve_window_and_restore_child_bounds() {
+        run_native_fullscreen();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub(crate) fn run_native_fullscreen() {
         #[cfg(target_os = "linux")]
         use gtk::{glib::translate::ToGlibPtr, prelude::*};
         use std::{

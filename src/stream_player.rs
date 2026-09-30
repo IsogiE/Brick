@@ -22,10 +22,10 @@ use crate::stream_preferences::{PreferenceBridge, Preferences};
 
 mod capture;
 mod diagnostics;
-mod fullscreen;
-mod occlusion;
+pub(crate) mod fullscreen;
+pub(crate) mod occlusion;
 mod provider_login;
-mod resize;
+pub(crate) mod resize;
 #[cfg(target_os = "windows")]
 mod windows_lifecycle;
 pub use provider_login::ProviderSessions;

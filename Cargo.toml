@@ -1,11 +1,18 @@
 [package]
 name = "brick"
-version = "0.6.9"
+version = "0.7.0"
 description = "Advance"
 authors = ["Advance Raid Tools"]
 license = "MIT"
 repository = "https://github.com/IsogiE/Brick"
 edition = "2021"
+
+# Native WebKit tests must own the process main thread, not a libtest worker.
+[[test]]
+name = "native_player"
+path = "src/native_player_tests.rs"
+harness = false
+test = false
 
 [dependencies]
 auto-launch = "0.6"

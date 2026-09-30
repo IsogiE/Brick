@@ -1,4 +1,5 @@
-//! A complete, boss-only WCL projection for content alignment. No credentials,
+//! A complete NPC-only WCL projection: bosses first, with a hostile dungeon
+//! trash fallback for M+ segments without boss casts. No credentials,
 //! player identities, targets, damage amounts or inferred timings leave here.
 use super::{check_cancelled, report_code, Client, Config, Pull};
 use icu_properties::{props::GeneralCategory, CodePointMapData};
@@ -12,6 +13,8 @@ use std::{
 use unicode_normalization::UnicodeNormalization;
 
 pub(crate) const SCHEMA: &str = "brick-boss-signature-1";
+const NO_BOSS_CASTS: &str = "This report has no boss casts for video alignment.";
+const NO_BOSS_IDENTITIES: &str = "This report has no boss identities for video alignment.";
 const INVALID: &str = "Warcraft Logs returned an invalid boss timeline.";
 const CHANGED: &str = "This Warcraft Logs fight changed. Reload its report and try again.";
 const TOO_LARGE: &str = "This fight is too large for automatic video alignment.";
@@ -172,8 +175,14 @@ impl Client {
         check_cancelled(&self.cancel)?;
         check_scope(self.config.as_ref(), access)?;
         validate_pull(pull)?;
-        let cache_key =
-            super::data_cache::pull_key("boss-brick-boss-signature-1-projection-1", pull);
+        let cache_key = super::data_cache::pull_key(
+            if pull.difficulty == 10 {
+                "boss-brick-boss-signature-1-mplus-npc-2"
+            } else {
+                "boss-brick-boss-signature-1-projection-1"
+            },
+            pull,
+        );
         if let Some(signature) = self
             .cached_data::<BossSignature>(access, &cache_key)
             .filter(|signature| signature.matches(pull))
@@ -255,8 +264,38 @@ where
 fn export_with<F, G>(
     pull: &Pull,
     limits: Limits,
+    mut fetch: F,
+    current: G,
+) -> Result<BossSignature, String>
+where
+    F: FnMut(&str, Value, Duration) -> Result<Value, String>,
+    G: Fn() -> Result<(), String>,
+{
+    let started = Instant::now();
+    let first = export_npcs(pull, limits, &mut fetch, &current, false);
+    if pull.difficulty != 10
+        || !matches!(
+            first.as_ref().err().map(String::as_str),
+            Some(NO_BOSS_CASTS | NO_BOSS_IDENTITIES)
+        )
+    {
+        return first;
+    }
+    // An M+ log can split before the first boss. Use only enemy NPC events
+    // returned by the same authenticated, fully paged query; never players.
+    // Keep the total deadline across both projections.
+    current()?;
+    let mut remaining = limits;
+    remaining.budget = limits.budget.saturating_sub(started.elapsed());
+    export_npcs(pull, remaining, &mut fetch, &current, true)
+}
+
+fn export_npcs<F, G>(
+    pull: &Pull,
+    limits: Limits,
     fetch: F,
     current: G,
+    include_nonboss: bool,
 ) -> Result<BossSignature, String>
 where
     F: FnMut(&str, Value, Duration) -> Result<Value, String>,
@@ -275,7 +314,7 @@ where
     let data = reader.request(METADATA_QUERY, json!({"code":pull.report}))?;
     let report = checked_report(&data, pull)?;
     let (start, end) = checked_fight(report, pull)?;
-    let (actors, abilities) = catalog(report)?;
+    let (actors, abilities) = catalog(report, include_nonboss)?;
     let mut signature = BossSignature {
         schema: SCHEMA.into(),
         report: pull.report.clone(),
@@ -479,7 +518,7 @@ where
         }
     }
     if signature.casts.is_empty() {
-        return Err("This report has no boss casts for video alignment.".into());
+        return Err(NO_BOSS_CASTS.into());
     }
     if used_actors.len() > 64 {
         return Err(bound_error("used_actors", used_actors.len(), 64));
@@ -513,8 +552,8 @@ fn validate_pull(pull: &Pull) -> Result<(), String> {
         || pull.id == 0
         || pull.id > 100_000
         || pull.encounter == 0
-        || pull.encounter > 100_000
-        || !(3..=5).contains(&pull.difficulty)
+        || pull.encounter > 1_000_000
+        || !matches!(pull.difficulty, 3..=5 | 10)
         || !(1_500_000_000_000..=4_000_000_000_000).contains(&pull.report_start_ms)
         || pull.start_ms < pull.report_start_ms
         || pull.end_ms > MAX_TIMESTAMP
@@ -566,7 +605,7 @@ fn checked_fight(report: &Value, pull: &Pull) -> Result<(i64, i64), String> {
 }
 
 type Names = BTreeMap<u64, String>;
-fn catalog(report: &Value) -> Result<(Names, Names), String> {
+fn catalog(report: &Value, include_nonboss: bool) -> Result<(Names, Names), String> {
     let master = &report["masterData"];
     let actor_rows = master["actors"]
         .as_array()
@@ -578,7 +617,7 @@ fn catalog(report: &Value) -> Result<(Names, Names), String> {
         .ok_or_else(|| invalid_error("ability_catalog"))?;
     let mut actors = Names::new();
     for row in actor_rows {
-        if row["type"] != "NPC" || row["subType"] != "Boss" {
+        if row["type"] != "NPC" || (!include_nonboss && row["subType"] != "Boss") {
             continue;
         }
         // WCL's reserved World actor is labelled NPC/Boss but also owns
@@ -592,7 +631,7 @@ fn catalog(report: &Value) -> Result<(Names, Names), String> {
         }
     }
     if actors.is_empty() {
-        return Err("This report has no boss identities for video alignment.".into());
+        return Err(NO_BOSS_IDENTITIES.into());
     }
     let mut abilities = Names::new();
     for row in ability_rows {
@@ -1013,6 +1052,16 @@ mod tests {
             seconds: 10,
         }
     }
+    #[test]
+    fn mplus_keeps_real_difficulty_and_dungeon_identity() {
+        let mut p = pull();
+        p.difficulty = 10;
+        p.encounter = 112521;
+        assert!(validate_pull(&p).is_ok());
+        p.difficulty = 9;
+        assert!(validate_pull(&p).is_err());
+    }
+
     fn metadata() -> Value {
         json!({"reportData":{"report":{"code":pull().report,"startTime":pull().report_start_ms,
             "fights":[{"id":21,"encounterID":100,"difficulty":5,"startTime":1000,"endTime":11000}],
@@ -1061,6 +1110,87 @@ mod tests {
             |_, _, _| Ok(rows.pop_front().expect("unexpected extra WCL request")),
             || Ok(()),
         )
+    }
+
+    #[test]
+    fn mplus_without_boss_casts_uses_hostile_npcs_without_player_data() {
+        let mut p = pull();
+        p.difficulty = 10;
+        let mut meta = metadata();
+        meta["reportData"]["report"]["fights"][0]["difficulty"] = json!(10);
+        let mut rows = VecDeque::from([
+            meta.clone(),
+            page(vec![], Value::Null),
+            page(vec![], Value::Null),
+            meta.clone(),
+            page(
+                vec![
+                    {
+                        let mut row = cast(1100, "begincast");
+                        row["sourceID"] = json!(12);
+                        row
+                    },
+                    {
+                        let mut row = cast(3100, "cast");
+                        row["sourceID"] = json!(12);
+                        row
+                    },
+                    {
+                        let mut row = cast(3200, "cast");
+                        row["sourceID"] = json!(7);
+                        row
+                    },
+                    {
+                        let mut row = cast(3200, "cast");
+                        row["sourceID"] = json!(-1);
+                        row
+                    },
+                ],
+                Value::Null,
+            ),
+            page(vec![], Value::Null),
+            meta,
+        ]);
+        let signature = export_with(
+            &p,
+            Limits::default(),
+            |query, vars, _| {
+                if vars.get("type").is_some() {
+                    assert!(query.contains("hostilityType:Enemies"));
+                }
+                Ok(rows.pop_front().expect("unexpected extra request"))
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(
+            signature.actors,
+            vec![NamedId {
+                id: 12,
+                name: "Add".into()
+            }]
+        );
+        assert_eq!(signature.casts.len(), 2);
+        assert_eq!(signature.casts[0].seconds, 0.1);
+        assert_eq!(signature.casts[1].seconds, 2.1);
+        assert!(signature.complete);
+        let serialized = serde_json::to_string(&signature).unwrap();
+        assert!(!serialized.contains("Private player"));
+        assert!(!serialized.contains("World"));
+    }
+
+    #[test]
+    fn raid_without_boss_casts_does_not_fall_back_to_trash() {
+        let result = run(
+            vec![
+                metadata(),
+                page(vec![], Value::Null),
+                page(vec![], Value::Null),
+            ],
+            Limits::default(),
+        );
+        assert_eq!(result.unwrap_err(), NO_BOSS_CASTS);
     }
 
     #[test]

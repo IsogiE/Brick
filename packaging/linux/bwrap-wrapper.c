@@ -11,7 +11,16 @@
 
 #define MAX_ARGUMENT_BYTES (1024 * 1024)
 
-static void fail(const char *message) {
+#ifndef BRICK_SYSTEM_BWRAP
+#define BRICK_SYSTEM_BWRAP "/usr/bin/bwrap"
+#endif
+
+static int trusted_system_helper(const struct stat *status) {
+    return S_ISREG(status->st_mode) && status->st_uid == 0 &&
+        !(status->st_mode & (S_IWGRP | S_IWOTH)) && (status->st_mode & S_IXOTH);
+}
+
+static _Noreturn void fail(const char *message) {
     fprintf(stderr, "Brick sandbox runtime: %s\n", message);
     exit(1);
 }
@@ -135,6 +144,13 @@ int main(int argc, char **argv) {
             relocate_fd(root, argv[index + 1]);
         }
         arguments[index] = relocate(root, argv[index]);
+    }
+    // Ubuntu attaches its user-namespace allowance to the system Bubblewrap
+    // path. Preserve that policy while passing the same relocated arguments
+    // and sandbox descriptors. Never search PATH or use a writable helper.
+    struct stat system_helper;
+    if (!stat(BRICK_SYSTEM_BWRAP, &system_helper) && trusted_system_helper(&system_helper)) {
+        arguments[0] = BRICK_SYSTEM_BWRAP;
     }
     execv(arguments[0], arguments);
     fail("could not start bubblewrap");

@@ -15,7 +15,7 @@ jobs:
   rust:
     name: ${{ matrix.os }}
     runs-on: ${{ fromJSON(matrix.os == 'windows-latest' && (vars.BRICK_WINDOWS_RUNNER || '"windows-latest"') || (vars.BRICK_LINUX_RUNNER || '"ubuntu-22.04"')) }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -40,10 +40,28 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav gnome-keyring xvfb squashfs-tools bubblewrap
 
+      - name: Allow the native player sandbox in the disposable Linux runner
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [[ $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0) == 1 ]]; then
+            # WebKit still uses Bubblewrap isolation; Ubuntu requires an explicit
+            # userns allowance for this system helper in the disposable test VM.
+            sudo tee /etc/apparmor.d/brick-ci-bwrap >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile brick-ci-bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+            sudo apparmor_parser -r /etc/apparmor.d/brick-ci-bwrap
+          fi
+
       - name: Check formatting
         if: runner.os == 'Linux'
         run: |
           cargo fmt --check
+          rustfmt --check --edition 2021 src/app_modules.rs
           rustfmt --check --edition 2021 packaging/linux/apprun.rs
 
       - name: Check
@@ -85,7 +103,7 @@ jobs:
           GDK_BACKEND: x11
           LIBGL_ALWAYS_SOFTWARE: '1'
           WEBKIT_DISABLE_DMABUF_RENDERER: '1'
-        run: xvfb-run -a dbus-run-session -- cargo test --locked stream_player::resize::tests::native_player_viewport_shrinks_for_compare_and_grows_for_single_view -- --exact --ignored --test-threads=1
+        run: xvfb-run -a dbus-run-session -- cargo test --locked --test native_player -- resize
 
       - name: Test native playback overlays
         if: runner.os == 'Linux'
@@ -94,7 +112,16 @@ jobs:
           GDK_BACKEND: x11
           LIBGL_ALWAYS_SOFTWARE: '1'
           WEBKIT_DISABLE_DMABUF_RENDERER: '1'
-        run: xvfb-run -a dbus-run-session -- cargo test --locked stream_player::occlusion::native_tests::native_overlays_preserve_media_visibility_size_and_playback -- --exact --ignored --test-threads=1
+        run: xvfb-run -a dbus-run-session -- cargo test --locked --test native_player -- overlays
+
+      - name: Test native fullscreen transitions
+        if: runner.os == 'Linux'
+        env:
+          RUSTFLAGS: '-D warnings'
+          GDK_BACKEND: x11
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          WEBKIT_DISABLE_DMABUF_RENDERER: '1'
+        run: xvfb-run -a dbus-run-session -- cargo test --locked --test native_player -- fullscreen
 
       - name: Test Windows signature verification
         if: runner.os == 'Windows'
