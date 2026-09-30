@@ -38,9 +38,11 @@ jobs:
         sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/google-chrome*.sources
         sudo apt-get update
         sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav patchelf squashfs-tools
+    - name: Build patched Linux playback runtime when needed
+      run: sudo --preserve-env=HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy bash packaging/linux/build-webkit.sh
     - name: Verify Linux playback runtime
       run: |
-        pkg-config --atleast-version=2.52.6 webkit2gtk-4.1
+        pkg-config --atleast-version=2.54.0 webkit2gtk-4.1
         pkg-config --modversion webkit2gtk-4.1
         dpkg-query --show --showformat='${Package} ${Version}\n' libgstreamer1.0-0
     - name: Install Cargo Packager

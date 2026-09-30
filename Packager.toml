@@ -20,10 +20,10 @@ resources = ["LICENSE"]
 generate-desktop-entry = true
 
 [deb]
-depends = ["libgtk-3-0 | libgtk-3-0t64", "libwebkit2gtk-4.1-0", "gstreamer1.0-plugins-good", "gstreamer1.0-plugins-bad", "gstreamer1.0-libav"]
+depends = ["libgtk-3-0 | libgtk-3-0t64", "libwebkit2gtk-4.1-0 (>= 2.54.0)", "gstreamer1.0-plugins-good", "gstreamer1.0-plugins-bad", "gstreamer1.0-libav"]
 
 [pacman]
-depends = ["gtk3", "webkit2gtk-4.1", "gst-plugins-good", "gst-plugins-bad", "gst-libav"]
+depends = ["gtk3", "webkit2gtk-4.1>=2.54.0", "gst-plugins-good", "gst-plugins-bad", "gst-libav"]
 
 [appimage]
 files = { "target/appimage-runtime" = "/" }
