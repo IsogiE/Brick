@@ -9,8 +9,9 @@ import { fileURLToPath } from 'node:url';
 const temporary = mkdtempSync(path.join(os.tmpdir(), 'brick-sandbox-test-'));
 const initial = path.join(temporary, 'Original AppDir');
 const runtime = path.join(temporary, 'Moved AppDir', 'usr');
+const systemHelper = path.join(temporary, 'system-bwrap');
 mkdirSync(path.join(initial, 'usr/bin'), { recursive: true });
-execFileSync('cc', ['-O2', '-Wall', '-Wextra', '-Werror', '-o', path.join(initial, 'usr/bin/bwrap'), fileURLToPath(new URL('./bwrap-wrapper.c', import.meta.url))]);
+execFileSync('cc', ['-O2', '-Wall', '-Wextra', '-Werror', `-DBRICK_SYSTEM_BWRAP=${JSON.stringify(systemHelper)}`, '-o', path.join(initial, 'usr/bin/bwrap'), fileURLToPath(new URL('./bwrap-wrapper.c', import.meta.url))]);
 writeFileSync(path.join(initial, 'usr/bin/brick-bwrap'), `#!/usr/bin/python3
 import fcntl, json, os, sys
 result = {'argv': sys.argv[1:]}
@@ -73,4 +74,37 @@ test('rejects malformed, oversized or nested argument blocks before execution', 
     assert.equal(result.stdout, '');
     assert.match(result.stderr, /Brick sandbox runtime:/);
   }
+});
+
+// Compile the production eligibility predicate directly so mode/ownership
+// rejection also runs without root or changes to the host system helper.
+test('accepts only a root-owned executable system helper without writable permissions', () => {
+  const source = fileURLToPath(new URL('./bwrap-wrapper.c', import.meta.url));
+  const check = path.join(temporary, 'helper-policy.c');
+  const binary = path.join(temporary, 'helper-policy');
+  writeFileSync(check, `#define main brick_wrapper_main
+#include ${JSON.stringify(source)}
+#undef main
+#include <assert.h>
+int main(void) {
+    struct stat value = {0};
+    value.st_mode = S_IFREG | 0755;
+    value.st_uid = 0;
+    assert(trusted_system_helper(&value));
+    value.st_uid = 1000;
+    assert(!trusted_system_helper(&value));
+    value.st_uid = 0;
+    value.st_mode = S_IFREG | 0775;
+    assert(!trusted_system_helper(&value));
+    value.st_mode = S_IFREG | 0757;
+    assert(!trusted_system_helper(&value));
+    value.st_mode = S_IFDIR | 0755;
+    assert(!trusted_system_helper(&value));
+    value.st_mode = S_IFREG | 0644;
+    assert(!trusted_system_helper(&value));
+    return 0;
+}
+`);
+  execFileSync('cc', ['-O2', '-Wall', '-Wextra', '-Werror', '-o', binary, check]);
+  execFileSync(binary);
 });
