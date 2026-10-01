@@ -52,15 +52,21 @@ pub fn encounter_groups(
     groups
 }
 
+// Pulls use Warcraft Logs difficulty IDs, which differ from the game's IDs.
+fn difficulty_label(difficulty: u64) -> Option<&'static str> {
+    match difficulty {
+        1 => Some("Raid Finder"),
+        2 => Some("Flex"),
+        3 => Some("Normal"),
+        4 => Some("Heroic"),
+        5 => Some("Mythic"),
+        10 => Some("M+"),
+        _ => None,
+    }
+}
+
 pub fn encounter_label(pull: &crate::warcraftlogs::Pull) -> String {
-    let difficulty = match pull.difficulty {
-        10 => "M+",
-        3 | 4 | 14 => "Normal",
-        5 | 6 | 15 => "Heroic",
-        16 => "Mythic",
-        7 | 17 => "Raid Finder",
-        _ => "",
-    };
+    let difficulty = difficulty_label(pull.difficulty).unwrap_or_default();
     if difficulty.is_empty() {
         pull.name.clone()
     } else {
@@ -180,7 +186,7 @@ pub fn encounter_header(
     pull: &crate::warcraftlogs::Pull,
     count: usize,
     best: Option<f64>,
-    cleared: bool,
+    killed: bool,
     open: bool,
 ) -> egui::Response {
     let (rect, response) =
@@ -215,14 +221,7 @@ pub fn encounter_header(
         ]
     };
     painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, MUTED)));
-    let difficulty = match pull.difficulty {
-        10 => "M+",
-        3 | 4 | 14 => "Normal",
-        5 | 6 | 15 => "Heroic",
-        16 => "Mythic",
-        7 | 17 => "LFR",
-        _ => "Raid",
-    };
+    let difficulty = difficulty_label(pull.difficulty).unwrap_or("Raid");
     painter.text(
         egui::pos2(left, rect.top() + 36.0),
         egui::Align2::LEFT_CENTER,
@@ -245,8 +244,8 @@ pub fn encounter_header(
     );
     let status = if pull.difficulty == 10 {
         String::new()
-    } else if cleared {
-        "Cleared".into()
+    } else if killed {
+        "Killed".into()
     } else {
         best.map(|hp| format!("Best {hp:.1}%")).unwrap_or_default()
     };
@@ -255,7 +254,7 @@ pub fn encounter_header(
         egui::Align2::RIGHT_CENTER,
         status,
         egui::FontId::proportional(10.0),
-        outcome_color(cleared, best),
+        outcome_color(killed, best),
     );
     response.widget_info(|| {
         egui::WidgetInfo::selected(
@@ -274,7 +273,7 @@ pub fn encounter_header(
         )
     });
     response
-        .on_hover_text(encounter_label(pull))
+        .on_hover_text(RichText::new(encounter_label(pull)).size(12.0).color(TEXT))
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -318,7 +317,7 @@ pub fn pull(
     let result = if dungeon {
         "M+".into()
     } else if pull.kill {
-        "Kill".into()
+        "Killed".into()
     } else {
         pull.remaining
             .map(|r| format!("{r:.1}%"))
@@ -401,10 +400,44 @@ pub fn pull(
         )
     });
     response
-        .on_hover_text(if dungeon {
-            format!("{}\nLog {} · Segment {}\nSelect to watch this moment", pull.name, pull.report, pull.id)
-        } else {
-            format!("{}\nLog {} · Fight {}\nPercentage: boss health remaining. Bar: health depleted.\nSelect to watch this moment", pull.name, pull.report, pull.id)
+        .on_hover_ui(|ui| {
+            ui.set_max_width(280.0);
+            ui.label(
+                RichText::new(encounter_label(pull))
+                    .size(13.0)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{} {} · {}:{:02}",
+                    if dungeon { "Segment" } else { "Pull" },
+                    pull.id,
+                    seconds / 60,
+                    seconds % 60,
+                ))
+                .size(11.0)
+                .color(MUTED),
+            );
+            if !dungeon {
+                ui.label(
+                    RichText::new(if pull.kill {
+                        "Killed".to_string()
+                    } else {
+                        pull.remaining
+                            .filter(|hp| hp.is_finite())
+                            .map(|hp| format!("{hp:.1}% boss health remaining"))
+                            .unwrap_or_else(|| "Wipe".into())
+                    })
+                    .size(12.0)
+                    .color(outcome),
+                );
+            }
+            ui.label(
+                RichText::new("Select to watch this moment")
+                    .size(11.0)
+                    .color(TEXT),
+            );
         })
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -431,11 +464,11 @@ mod tests {
     }
     #[test]
     fn same_boss_across_reports_has_one_group_and_preserves_navigation() {
-        let mut kill = pull("first", 69, 16, 900_000);
+        let mut kill = pull("first", 69, 5, 900_000);
         kill.kill = true;
         kill.remaining = Some(0.0);
-        let other = pull("second", 7, 16, 100_000);
-        let duplicate_log = pull("third", 22, 16, 101_000);
+        let other = pull("second", 7, 5, 100_000);
+        let duplicate_log = pull("third", 22, 5, 101_000);
         let groups = encounter_groups(vec![kill, other.clone(), duplicate_log, other]);
         assert_eq!(groups.len(), 1);
         let group = &groups[0].1;
@@ -452,10 +485,20 @@ mod tests {
     }
     #[test]
     fn difficulties_stay_distinct_and_are_labelled() {
-        let groups = encounter_groups(vec![pull("first", 1, 15, 0), pull("first", 2, 16, 500_000)]);
+        let groups = encounter_groups(vec![pull("first", 1, 4, 0), pull("first", 2, 5, 500_000)]);
         assert_eq!(groups.len(), 2);
         assert!(encounter_label(&groups[0].1[0]).ends_with("Heroic"));
         assert!(encounter_label(&groups[1].1[0]).ends_with("Mythic"));
+        for (difficulty, label) in [
+            (1, "Raid Finder"),
+            (2, "Flex"),
+            (3, "Normal"),
+            (4, "Heroic"),
+            (5, "Mythic"),
+            (10, "M+"),
+        ] {
+            assert!(encounter_label(&pull("first", 1, difficulty, 0)).ends_with(label));
+        }
     }
     #[test]
     fn outcomes_use_health_not_best_rank() {
@@ -525,7 +568,7 @@ mod tests {
             assert!(
                 !labels
                     .iter()
-                    .any(|s| s.contains('%') || s == "Kill" || s == "Cleared" || s == "P2"),
+                    .any(|s| s.contains('%') || s == "Killed" || s == "P2"),
                 "{labels:?}"
             );
             assert_eq!(bars, 0);
