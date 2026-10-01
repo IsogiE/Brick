@@ -20,6 +20,10 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         persist-credentials: false
+    - name: Check Linux release runtime availability
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: node scripts/check-release-runtime.mjs
     - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
       with:
         node-version: 22.23.2
@@ -38,11 +42,13 @@ jobs:
         sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/google-chrome*.sources
         sudo apt-get update
         sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav patchelf squashfs-tools
+    - name: Install verified prebuilt Linux playback runtime
+      run: sudo --preserve-env=HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy python3 packaging/linux/install-runtime.py
     - name: Verify prebuilt Linux playback runtime
       run: |
         if ! pkg-config --atleast-version=2.54.0 webkit2gtk-4.1; then
           installed=$(pkg-config --modversion webkit2gtk-4.1)
-          echo "::error::WebKitGTK $installed is older than the required 2.54.0. Update the build environment from a trusted package repository before retrying. Release jobs do not compile WebKit from source."
+          echo "::error::WebKitGTK $installed is older than the required 2.54.0. Repair the pinned runtime artifact before retrying. Release jobs do not compile WebKit from source."
           exit 1
         fi
         pkg-config --modversion webkit2gtk-4.1
@@ -122,6 +128,10 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         persist-credentials: false
+    - name: Check Linux release runtime availability
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: node scripts/check-release-runtime.mjs
     - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
       with:
         node-version: 22.23.2

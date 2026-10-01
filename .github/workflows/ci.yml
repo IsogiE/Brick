@@ -14,7 +14,7 @@ permissions:
 jobs:
   rust:
     name: ${{ matrix.os }}
-    runs-on: ${{ fromJSON(matrix.os == 'windows-latest' && (vars.BRICK_WINDOWS_RUNNER || '"windows-latest"') || (vars.BRICK_LINUX_RUNNER || '"ubuntu-22.04"')) }}
+    runs-on: ${{ fromJSON(matrix.os == 'windows-latest' && (vars.BRICK_WINDOWS_RUNNER || '"windows-latest"') || (vars.BRICK_LINUX_RUNNER || '"ubuntu-24.04"')) }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -27,6 +27,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check Linux release runtime availability
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/check-release-runtime.mjs
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
@@ -38,7 +42,11 @@ jobs:
           # Brick does not use the runner's optional Chrome package repository.
           sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/google-chrome*.sources
           sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav gnome-keyring xvfb squashfs-tools bubblewrap
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev libssl-dev librsvg2-dev libgtk-3-dev libwebkit2gtk-4.1-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav gnome-keyring xvfb squashfs-tools bubblewrap ffmpeg
+
+      - name: Install the verified Linux release runtime
+        if: runner.os == 'Linux'
+        run: sudo --preserve-env=HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy python3 packaging/linux/install-runtime.py
 
       - name: Allow the native player sandbox in the disposable Linux runner
         if: runner.os == 'Linux'
@@ -56,6 +64,10 @@ jobs:
           PROFILE
             sudo apparmor_parser -r /etc/apparmor.d/brick-ci-bwrap
           fi
+
+      - name: Test the installed release runtime before compiling Brick
+        if: runner.os == 'Linux'
+        run: python3 packaging/linux/test-runtime.py
 
       - name: Check formatting
         if: runner.os == 'Linux'
@@ -81,7 +93,9 @@ jobs:
 
       - name: Test AppImage sandbox relocation and startup
         if: runner.os == 'Linux'
-        run: node --test packaging/linux/*.test.mjs
+        run: |
+          node --test packaging/linux/*.test.mjs
+          python3 packaging/linux/install-runtime.test.py
 
       - name: Test addon feed publication decisions
         if: runner.os == 'Linux'
