@@ -36,6 +36,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/check-release-runtime.mjs
 
+      - name: Check Pacman recipe configuration
+        if: runner.os == 'Linux'
+        run: |
+          python3 packaging/linux/check-pacman.py
+          python3 packaging/linux/check-pacman.test.py
+
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: 1.98.1
