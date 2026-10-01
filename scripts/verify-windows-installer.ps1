@@ -29,6 +29,11 @@ if ($content -notmatch 'Page custom InstallScopePage InstallScopeLeave' -or $con
 if ($content -notmatch '(?s)!include MultiUser.nsh.*?RequestExecutionLevel user') {
     throw 'The installer must remain launchable by the existing 0.4.5 updater.'
 }
+if ($content -notmatch 'MUI_FINISHPAGE_RUN_FUNCTION RunBrickAsUser' -or
+    $content -notmatch '(?s)Function \.onInstSuccess.*?Call RunBrickAsUser' -or
+    $content -notmatch '--launch-as-user') {
+    throw 'Brick must restart as the desktop user after interactive installs and automatic updates.'
+}
 if ($content -notmatch 'QuietUninstallString') {
     throw 'The installer did not register QuietUninstallString.'
 }

@@ -3697,7 +3697,7 @@ fn review_outcome(pull: &Pull) -> String {
 
 fn pull_outcome(kill: bool, last_phase: Option<u32>, intermission: bool) -> String {
     if kill {
-        "Kill".into()
+        "Killed".into()
     } else if let Some(phase) = last_phase {
         format!(
             "Wipe · {} {phase}",
@@ -4065,7 +4065,7 @@ impl ReviewUi {
                                 .as_ref()
                                 .is_some_and(|p| p.report == pull.report && p.id == pull.id)
                         });
-                        let cleared = group.iter().any(|p| p.difficulty != 10 && p.kill);
+                        let killed = group.iter().any(|p| p.difficulty != 10 && p.kill);
                         egui::Frame::new()
                             .fill(egui::Color32::from_rgb(21, 25, 32))
                             .stroke(egui::Stroke::new(
@@ -4085,7 +4085,7 @@ impl ReviewUi {
                                     &group[0],
                                     group.len(),
                                     best,
-                                    cleared,
+                                    killed,
                                     open,
                                 )
                                 .clicked()
@@ -6407,7 +6407,7 @@ mod tests {
         assert_eq!(pull_outcome(false, Some(2), false), "Wipe · Phase 2");
         assert_eq!(pull_outcome(false, Some(1), true), "Wipe · Intermission 1");
         assert_eq!(pull_outcome(false, None, false), "Wipe");
-        assert_eq!(pull_outcome(true, Some(3), false), "Kill");
+        assert_eq!(pull_outcome(true, Some(3), false), "Killed");
     }
 
     struct SelectorHarness {

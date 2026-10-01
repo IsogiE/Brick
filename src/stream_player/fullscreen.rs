@@ -156,8 +156,25 @@ impl Controller {
     pub fn attach(&self, view: &WebView) -> Result<(), String> {
         use webview2_com::{
             AcceleratorKeyPressedEventHandler, ContainsFullScreenElementChangedEventHandler,
+            Microsoft::Web::WebView2::Win32::{
+                ICoreWebView2AcceleratorKeyPressedEventArgs2, ICoreWebView2Settings3,
+            },
         };
+        use windows::core::Interface;
         use wry::WebViewExtWindows;
+
+        // This child is a media player. Browser commands such as Web Capture
+        // must not claim the user's screenshot shortcut when it has focus.
+        (|| -> windows::core::Result<()> {
+            // SAFETY: the WebView and settings belong to the native UI thread.
+            unsafe {
+                if let Ok(settings) = view.webview().Settings()?.cast::<ICoreWebView2Settings3>() {
+                    settings.SetAreBrowserAcceleratorKeysEnabled(false)?;
+                }
+            }
+            Ok(())
+        })()
+        .map_err(|_| "The player could not configure keyboard controls.".to_string())?;
 
         let bridge = self.bridge.clone();
         let fullscreen =
@@ -173,6 +190,13 @@ impl Controller {
         let bridge = self.bridge.clone();
         let keyboard = AcceleratorKeyPressedEventHandler::create(Box::new(move |_, args| {
             if let Some(args) = args {
+                // Some runtimes still enable Web Capture despite the settings
+                // flag. Disable the browser action for each event as well; do
+                // not mark it handled, so provider and Windows input still work.
+                if let Ok(browser_key) = args.cast::<ICoreWebView2AcceleratorKeyPressedEventArgs2>()
+                {
+                    unsafe { browser_key.SetIsBrowserAcceleratorKeyEnabled(false)? };
+                }
                 let mut key = 0;
                 // Leave this unhandled so the provider also exits DOM fullscreen.
                 unsafe { args.VirtualKey(&mut key)? };
@@ -532,6 +556,16 @@ pub(crate) mod tests {
                         let view = WebViewBuilder::new().with_bounds(super::super::wry_bounds(super::super::physical_bounds(rect, ctx.pixels_per_point()).unwrap())).with_focused(true).build_as_child(frame).unwrap();
                         let fullscreen = Controller::new(&ctx);
                         fullscreen.attach(&view).unwrap();
+                        #[cfg(target_os = "windows")]
+                        {
+                            use windows::core::Interface;
+                            use wry::WebViewExtWindows;
+                            use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+                            let settings = unsafe { view.webview().Settings().unwrap() }.cast::<ICoreWebView2Settings3>().unwrap();
+                            let mut enabled = windows::core::BOOL::default();
+                            unsafe { settings.AreBrowserAcceleratorKeysEnabled(&mut enabled).unwrap() };
+                            assert!(!enabled.as_bool(), "The media player must not capture browser shortcuts");
+                        }
                         view.load_html("<!doctype html><style>html,body{margin:0;height:100%;background:#123;color:white}</style><button style='margin:20px;width:300px;height:100px' onclick='document.documentElement.requestFullscreen().catch(e=>document.title=e.message)'>Expand through trusted click</button>").unwrap();
                         #[cfg(target_os = "linux")]
                         if let Some(settings) = webkit2gtk::WebViewExt::settings(&view.webview()) { webkit2gtk::SettingsExt::set_hardware_acceleration_policy(&settings, webkit2gtk::HardwareAccelerationPolicy::Never); }

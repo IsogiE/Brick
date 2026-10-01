@@ -13,6 +13,14 @@ use std::{
 use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
+    #[cfg(target_os = "windows")]
+    if env::args().any(|arg| arg == "--launch-as-user") {
+        if let Err(error) = windows_launch::relaunch() {
+            eprintln!("Could not reopen Brick as the desktop user: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if env::args().any(|arg| arg == "--local-erasure-protocol") {
         println!("BRICK-LOCAL-ERASURE-v1");
         return Ok(());

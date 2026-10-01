@@ -42,5 +42,7 @@ mod twitch_account;
 mod twitch_account_ui;
 mod ui;
 mod warcraftlogs;
+#[cfg(target_os = "windows")]
+mod windows_launch;
 mod youtube_account;
 mod youtube_account_ui;

@@ -1406,10 +1406,16 @@ impl Library {
             return;
         };
         ui.horizontal(|ui| {
-            if ui
-                .small_button("‹")
-                .on_hover_text("Previous month")
-                .clicked()
+            let title_width =
+                (ui.available_width() - 56.0 - 2.0 * ui.spacing().item_spacing.x).max(1.0);
+            if crate::stream_widgets::button(
+                ui,
+                RichText::new("‹").size(12.0).color(TEXT),
+                false,
+                [28.0, 25.0],
+            )
+            .on_hover_text(RichText::new("Previous month").color(TEXT))
+            .clicked()
             {
                 if let Some(date) = calendar_shift(month, -1) {
                     month = date;
@@ -1420,10 +1426,18 @@ impl Library {
             }
             let label = format!("{} {}", month.month(), month.year());
             ui.add_sized(
-                [ui.available_width() - 29.0, 22.0],
-                egui::Label::new(RichText::new(label).size(12.0).strong()),
+                [title_width, 25.0],
+                egui::Label::new(RichText::new(label).size(12.0).strong().color(TEXT)),
             );
-            if ui.small_button("›").on_hover_text("Next month").clicked() {
+            if crate::stream_widgets::button(
+                ui,
+                RichText::new("›").size(12.0).color(TEXT),
+                false,
+                [28.0, 25.0],
+            )
+            .on_hover_text(RichText::new("Next month").color(TEXT))
+            .clicked()
+            {
                 if let Some(date) = calendar_shift(month, 1) {
                     month = date;
                     self.month = Some(format!("{}-{:02}", date.year(), date.month() as u8));
@@ -1446,6 +1460,8 @@ impl Library {
         let cell = (ui.available_width() - 6.0 * 3.0) / 7.0;
         ui.add_space(4.0);
         egui::Grid::new("recording-calendar")
+            .min_col_width(cell)
+            .max_col_width(cell)
             .spacing([3.0, 3.0])
             .show(ui, |ui| {
                 for day in ["M", "T", "W", "T", "F", "S", "S"] {
@@ -1473,28 +1489,13 @@ impl Library {
                         let key = format!("{}-{:02}-{day:02}", month.year(), month.month() as u8);
                         let count = counts.get(key.as_str()).copied().unwrap_or(0);
                         let selected = self.calendar_day.as_ref() == Some(&key);
-                        let response = ui.add_sized(
+                        let response = crate::stream_widgets::button(
+                            ui,
+                            RichText::new(day.to_string())
+                                .size(11.0)
+                                .color(if selected || count > 0 { TEXT } else { MUTED }),
+                            selected,
                             [cell, 25.0],
-                            egui::Button::new(
-                                RichText::new(day.to_string())
-                                    .size(11.0)
-                                    .color(if count > 0 { TEXT } else { MUTED }),
-                            )
-                            .fill(if selected {
-                                crate::stream_widgets::SOFT
-                            } else if count > 0 {
-                                Color32::from_rgb(35, 40, 49)
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .stroke(egui::Stroke::new(
-                                1.0_f32,
-                                if selected {
-                                    crate::stream_widgets::ACCENT
-                                } else {
-                                    Color32::TRANSPARENT
-                                },
-                            )),
                         );
                         if count > 0 {
                             ui.painter().circle_filled(
@@ -1509,7 +1510,11 @@ impl Library {
                                 Some(format!("{}-{:02}", month.year(), month.month() as u8));
                             self.dirty = true;
                         }
-                        response.on_hover_text(format!("{count} recordings"));
+                        response.on_hover_text(
+                            RichText::new(format!("{count} recordings"))
+                                .size(12.0)
+                                .color(TEXT),
+                        );
                     } else {
                         ui.allocate_space(egui::vec2(cell, 25.0));
                     }
@@ -1520,7 +1525,14 @@ impl Library {
             });
         ui.horizontal(|ui| {
             ui.label(RichText::new("Dates in UTC").size(10.0).color(MUTED));
-            if ui.small_button("All dates").clicked() {
+            if crate::stream_widgets::button(
+                ui,
+                RichText::new("All dates").size(11.0).color(TEXT),
+                self.month.is_none() && self.calendar_day.is_none(),
+                [82.0, 25.0],
+            )
+            .clicked()
+            {
                 self.calendar_day = None;
                 self.month = None;
                 self.dirty = true;
