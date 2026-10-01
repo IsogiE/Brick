@@ -1,13 +1,27 @@
 #!/bin/bash
-# Build the reviewed upstream runtime when the distribution has not caught up.
+# Build a reusable runtime artifact separately from Brick release packaging.
 set -euo pipefail
 version=2.54.0
 sha256=846fd19ccedbae1dbfe904f26dbf2d68a800a33a50caf2ad5222c8dcb3f25682
-if pkg-config --atleast-version="$version" webkit2gtk-4.1; then
-  exit 0
-fi
 if [[ $(id -u) != 0 || $(dpkg --print-architecture) != amd64 ]]; then
   echo 'The runtime builder requires an amd64 Ubuntu build environment and root.' >&2
+  exit 1
+fi
+output=${1:?Specify an empty output directory}
+mkdir -p "$output"
+output=$(realpath "$output")
+if [[ -n $(ls -A "$output") ]]; then
+  echo 'Runtime output directory must be empty.' >&2
+  exit 1
+fi
+jobs=${BRICK_RUNTIME_BUILD_JOBS:-8}
+if [[ ! "$jobs" =~ ^([1-9]|1[0-6])$ ]]; then
+  echo 'BRICK_RUNTIME_BUILD_JOBS must be between 1 and 16.' >&2
+  exit 1
+fi
+. /etc/os-release
+if [[ "$ID" != ubuntu || "$VERSION_ID" != 24.04 ]]; then
+  echo 'The runtime artifact requires Ubuntu 24.04.' >&2
   exit 1
 fi
 export DEBIAN_FRONTEND=noninteractive
@@ -22,7 +36,7 @@ apt-get install -y --no-install-recommends \
   libsoup-3.0-dev libseccomp-dev libsqlite3-dev libegl1-mesa-dev libgles2-mesa-dev \
   libgbm-dev libdrm-dev libwayland-dev wayland-protocols bubblewrap xdg-dbus-proxy \
   libunwind-dev libdw-dev libevent-dev unifdef libxcomposite-dev libxdamage-dev \
-  libxt-dev libxrandr-dev libxml2-dev libpng-dev libfontconfig1-dev libfreetype-dev
+  libxt-dev libxrandr-dev libxml2-dev libpng-dev libfontconfig1-dev libfreetype-dev xz-utils
 build_root=$(mktemp -d /var/tmp/brick-webkit.XXXXXXXX)
 trap 'rm -rf -- "$build_root"' EXIT
 curl --fail --location --retry 3 -o "$build_root/source.tar.xz" \
@@ -36,11 +50,11 @@ cmake -S "$build_root/webkitgtk-$version" -B "$build_root/build" -G Ninja \
   -DENABLE_DOCUMENTATION=OFF -DENABLE_INTROSPECTION=OFF \
   -DENABLE_MINIBROWSER=OFF -DENABLE_WEBDRIVER=OFF -DENABLE_GAMEPAD=OFF \
   -DUSE_FLITE=OFF -DENABLE_SPEECH_SYNTHESIS=OFF -DUSE_SYSTEM_SYSPROF_CAPTURE=OFF -DUSE_LIBBACKTRACE=OFF
-# Bound compiler parallelism for the disposable build VM's 12 GiB RAM limit.
-cmake --build "$build_root/build" --parallel 4
-cmake --install "$build_root/build" --strip
+# Eight compiler jobs require the dedicated runtime VM with 32 GiB of RAM.
+cmake --build "$build_root/build" --parallel "$jobs"
+DESTDIR="$build_root/runtime" cmake --install "$build_root/build" --strip
 # Preserve the source identity and notices alongside distribution notices.
-notice=/usr/share/doc/brick-webkit-runtime/copyright
+notice="$build_root/runtime/usr/share/doc/brick-webkit-runtime/copyright"
 mkdir -p "$(dirname "$notice")"
 {
   printf 'WebKitGTK %s\nSource: https://webkitgtk.org/releases/webkitgtk-%s.tar.xz\nSHA-256: %s\n\n' "$version" "$version" "$sha256"
@@ -49,6 +63,12 @@ mkdir -p "$(dirname "$notice")"
     cat "$build_root/webkitgtk-$version/$file"
   done
 } > "$notice"
-ldconfig
-pkg-config --atleast-version="$version" webkit2gtk-4.1
-pkg-config --modversion webkit2gtk-4.1
+cp "$build_root/build/install_manifest.txt" "$output/install-manifest.txt"
+dpkg-query -W -f='${binary:Package} ${Version}\n' | LC_ALL=C sort > "$output/build-packages.txt"
+printf '%s\n' "$version" > "$output/version.txt"
+printf '%s  %s\n' "$sha256" "webkitgtk-$version.tar.xz" > "$output/source.sha256"
+cp "$notice" "$output/copyright"
+tar --sort=name --mtime='UTC 2026-09-16' --owner=0 --group=0 --numeric-owner \
+  -C "$build_root/runtime" -cf - usr | xz -T4 -3 > "$output/brick-webkitgtk-$version-ubuntu24.04-amd64.tar.xz"
+sha256sum "$output/brick-webkitgtk-$version-ubuntu24.04-amd64.tar.xz" > "$output/runtime.sha256"
+printf 'Reusable WebKitGTK %s runtime packaged successfully.\n' "$version"

@@ -53,6 +53,8 @@ cargo install cargo-packager --locked
 
 Then run `cargo packager --release --formats nsis` on Windows, or `NO_STRIP=1 cargo packager --release --formats appimage` on Linux. Linux AppImage packaging also needs `patchelf`. Packages are written to `dist/packages/`.
 
+Linux CI and releases use the prebuilt WebKit runtime pinned in `packaging/linux/runtime.lock.json`. They verify its immutable release metadata, SHA-256 and archive contents before installation. CI exercises JavaScript and H.264 playback with that runtime before compiling Brick. The separate `packaging/linux/build-runtime-artifact.sh` recipe builds a replacement runtime on Ubuntu 24.04; ordinary Brick releases do not compile WebKit.
+
 ## Working on the code
 
 | Path | Contents |
