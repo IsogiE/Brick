@@ -24,6 +24,7 @@ updateJson(resolve('package.json'), (config) => {
   config.version = rawVersion;
 });
 updateCargoVersion(resolve('Cargo.toml'), rawVersion);
+updateCargoLockVersion(resolve('Cargo.lock'), rawVersion);
 updateCargoVersion(resolve('Packager.toml'), rawVersion);
 
 console.log(`Configured Brick app version ${rawVersion}.`);
@@ -41,4 +42,13 @@ function updateCargoVersion(path, version) {
     `version = "${version}"`
   );
   writeFileSync(path, next);
+}
+
+function updateCargoLockVersion(path, version) {
+  const lock = readFileSync(path, 'utf8');
+  const brick = /^(\[\[package\]\]\r?\nname = "brick"\r?\nversion = ")[^"]+("\r?$)/gm;
+  if ([...lock.matchAll(brick)].length !== 1) {
+    throw new Error('Expected exactly one Brick package in Cargo.lock.');
+  }
+  writeFileSync(path, lock.replace(brick, (_, before, after) => `${before}${version}${after}`));
 }
