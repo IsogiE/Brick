@@ -261,10 +261,7 @@ impl Snapshot {
                 .filter(|t| {
                     t.key.report == report
                         && t.job.status == Status::Failed
-                        && matches!(
-                            t.job.error.as_deref(),
-                            Some("missing_footage" | "alignment_not_found" | "budget_exhausted")
-                        )
+                        && matches!(t.job.error.as_deref(), Some("missing_footage"))
                 })
                 .map(|t| (t.key.start_ms, t.key.end_ms))
                 .collect();
@@ -283,7 +280,6 @@ impl Snapshot {
             if plan.next.is_none() {
                 plan.next = next.cloned();
             }
-            let expiry = points.iter().map(|p| p.expires_at).min().unwrap_or(0);
             let mut hash = Sha256::new();
             for point in &points {
                 hash.update(point.version());
@@ -305,38 +301,24 @@ impl Snapshot {
                     plan.alignments.push(exact);
                     continue;
                 }
+                // An accepted measurement supplies a usable offset immediately.
+                // The two-hour interval schedules drift checks; it does not expire
+                // playback timing. Only contradictory measurements create a gap.
+                if points.windows(2).any(|pair| {
+                    !agrees(&pair[0], &pair[1])
+                        && pull.start_ms < pair[1].key.start_ms
+                        && pull.end_ms > pair[0].key.end_ms
+                }) {
+                    continue;
+                }
                 let anchor = points
                     .iter()
-                    .enumerate()
                     .rev()
-                    .find(|(i, left)| {
-                        if pull.start_ms < left.key.start_ms {
-                            return false;
-                        }
-                        if let Some(right) = points.get(i + 1) {
-                            pull.end_ms <= right.key.start_ms
-                                && left.key.end_ms <= right.key.start_ms
-                                && agrees(left, right)
-                        } else if review.replay.growing {
-                            pull.end_ms <= left.key.start_ms.saturating_add(LIVE_INTERVAL_MS)
-                        } else {
-                            checked_later
-                                && *i > 0
-                                && points[i - 1].key.end_ms <= left.key.start_ms
-                                && agrees(&points[i - 1], left)
-                        }
-                    })
-                    .map(|(_, point)| point);
+                    .find(|point| point.key.start_ms <= pull.start_ms)
+                    .or_else(|| points.first());
                 let Some(point) = anchor else {
                     continue;
                 };
-                // Do not bridge an unverified gap, even if offsets on either side agree.
-                if missing
-                    .iter()
-                    .any(|&(start, end)| start < pull.end_ms && end > point.key.start_ms)
-                {
-                    continue;
-                }
                 let key = Key::new(&review.replay, pull, cap, epoch);
                 let origin = point.result.video_seconds
                     + (pull.start_ms - point.key.start_ms) as f64 / 1000.0;
@@ -354,7 +336,7 @@ impl Snapshot {
                     timeline,
                     timeline_hash: point.timeline_hash.clone(),
                     signature_revision: revision.clone(),
-                    expires_at: expiry,
+                    expires_at: point.expires_at,
                     result: ResultData {
                         video_seconds: origin,
                         seek_video_seconds: origin.max(0.0),
@@ -456,7 +438,8 @@ mod tests {
         assert_eq!(saved.plan(&review, 0).next.unwrap().id, 1);
         saved.remember(ticket(&review, &review.pulls[0], 0.0));
         let plan = saved.plan(&review, 0);
-        assert_eq!(plan.alignments.len(), 1);
+        assert_eq!(plan.alignments.len(), 12);
+        assert_eq!(plan.alignments.last().unwrap().seek(0.0), Some(6615.25));
         let later = plan.next.unwrap();
         assert!(later.id >= 7);
         saved.planned = Some(Key::new(
@@ -489,6 +472,21 @@ mod tests {
         }
     }
     #[test]
+    fn a_single_later_measurement_maps_both_earlier_and_later_pulls() {
+        let review = review();
+        let mut saved = Snapshot::default();
+        saved.remember(ticket(&review, &review.pulls[5], 0.0));
+        let plan = saved.plan(&review, 0);
+        assert_eq!(plan.alignments.len(), review.pulls.len());
+        for alignment in plan.alignments {
+            assert_eq!(
+                alignment.seek(0.0),
+                Some(15.25 + (alignment.key.pull_id - 1) as f64 * 600.0)
+            );
+        }
+        assert_eq!(plan.next.unwrap().id, 1);
+    }
+    #[test]
     fn drift_requests_more_evidence_and_never_interpolates_a_jump() {
         let review = review();
         let mut saved = Snapshot::default();
@@ -496,7 +494,8 @@ mod tests {
         saved.remember(ticket(&review, &review.pulls[10], 12.0));
         let plan = saved.plan(&review, 0);
         assert_eq!(plan.next.unwrap().id, 6);
-        assert_eq!(plan.alignments.len(), 2);
+        assert_eq!(plan.alignments.len(), 3);
+        assert_eq!(plan.alignments.last().unwrap().seek(0.0), Some(6627.25));
         saved.remember(ticket(&review, &review.pulls[5], 12.0));
         let plan = saved.plan(&review, 0);
         assert!(plan.next.unwrap().id < 6);
@@ -527,7 +526,8 @@ mod tests {
         assert!(!plan
             .alignments
             .iter()
-            .any(|a| a.key.pull_id == 1 || (6..11).contains(&a.key.pull_id)));
+            .any(|a| a.key.pull_id == 1 || a.key.pull_id == 6));
+        assert!(plan.alignments.iter().any(|a| a.key.pull_id == 7));
         assert!(plan.alignments.iter().any(|a| a.key.pull_id == 12));
         assert_eq!(plan.next.unwrap().id, 7);
         saved.remember(ticket(&review, &review.pulls[6], 0.0));
@@ -581,22 +581,19 @@ mod tests {
     }
 
     #[test]
-    fn failed_search_does_not_inherit_a_nearby_verified_offset() {
+    fn unsuccessful_search_does_not_discard_a_known_offset() {
         for error in ["alignment_not_found", "budget_exhausted"] {
             let review = review();
             let mut saved = Snapshot::default();
             saved.remember(ticket(&review, &review.pulls[0], 0.0));
-            saved.remember(ticket(&review, &review.pulls[10], 0.0));
             let mut failed = ticket(&review, &review.pulls[5], 0.0);
             failed.job.status = Status::Failed;
             failed.job.result = None;
             failed.job.error = Some(error.into());
             saved.remember(failed);
             let plan = saved.plan(&review, 0);
-            assert!(!plan
-                .alignments
-                .iter()
-                .any(|a| (6..11).contains(&a.key.pull_id)));
+            assert_eq!(plan.alignments.len(), review.pulls.len());
+            assert_eq!(plan.alignments[5].seek(0.0), Some(3015.25));
             assert!(plan.alignments.iter().any(|a| a.key.pull_id == 1));
             assert!(plan.alignments.iter().any(|a| a.key.pull_id == 11));
         }
@@ -622,10 +619,37 @@ mod tests {
         one.remember(ticket(&review, &duplicate, 0.0));
         let plan = one.plan(&review, 0);
         assert!(plan.next.unwrap().start_ms >= review.pulls[0].end_ms);
-        assert_eq!(plan.alignments.len(), 2);
+        assert_eq!(plan.alignments.len(), review.pulls.len() - 1);
     }
     #[test]
-    fn live_sampling_waits_two_hours_and_has_bounded_future_coverage() {
+    fn live_pull_42_keeps_the_known_offset_while_a_drift_check_is_pending() {
+        let mut review = review();
+        review.replay.growing = true;
+        let mut later = review.pulls[0].clone();
+        later.id = 42;
+        later.start_ms += 2 * LIVE_INTERVAL_MS;
+        later.end_ms = later.start_ms + 143_000;
+        review.pulls.push(later.clone());
+        let mut saved = Snapshot::default();
+        saved.remember(ticket(&review, &review.pulls[0], 0.0));
+        let mut pending = ticket(&review, &later, 0.0);
+        pending.job.status = Status::Running;
+        pending.job.result = None;
+        saved.remember(pending.clone());
+        let plan = saved.plan(&review, 0);
+        assert_eq!(plan.pending, Some(pending));
+        assert!(plan.next.is_none());
+        assert_eq!(
+            plan.alignments
+                .iter()
+                .find(|a| a.key.pull_id == 42)
+                .unwrap()
+                .seek(0.0),
+            Some(14415.25)
+        );
+    }
+    #[test]
+    fn live_sampling_checks_after_two_hours_without_expiring_known_timing() {
         let mut review = review();
         review.replay.growing = true;
         let mut extra = review.pulls.last().unwrap().clone();
@@ -637,11 +661,15 @@ mod tests {
         assert!(saved.plan(&review, 0).next.is_none());
         review.pulls.push(extra.clone());
         assert_eq!(saved.plan(&review, 0).next.unwrap().id, 13);
-        assert!(!saved
-            .plan(&review, 0)
-            .alignments
-            .iter()
-            .any(|a| a.key.pull_id == 13));
+        let plan = saved.plan(&review, 0);
+        assert_eq!(
+            plan.alignments
+                .iter()
+                .find(|a| a.key.pull_id == 13)
+                .unwrap()
+                .seek(0.0),
+            Some(7215.25)
+        );
         saved.remember(ticket(&review, &extra, 0.0));
         assert!(saved.plan(&review, 0).next.is_none());
     }
@@ -654,22 +682,16 @@ mod tests {
         let expiry = first.job.expires_at;
         saved.remember(first);
         saved.remember(ticket(&review, &review.pulls[10], 0.0));
-        assert!(saved
-            .plan(&review, 0)
-            .alignments
-            .iter()
-            .filter(|a| a.signature_revision == a.result.evidence_hash)
-            .all(|a| a.expires_at == expiry));
+        assert_eq!(saved.plan(&review, 0).alignments[1].expires_at, expiry);
         assert!(saved.plan(&review, 1).alignments.is_empty());
         let mut changed = review.clone();
         changed.replay.timeline_revision = Some("f".repeat(64));
         assert!(saved.plan(&changed, 0).alignments.is_empty());
         saved.tickets[0].job.expires_at = 1;
-        assert!(saved
-            .plan(&review, 0)
-            .alignments
-            .iter()
-            .all(|a| a.key.pull_id == 11));
+        let plan = saved.plan(&review, 0);
+        assert_eq!(plan.alignments.len(), review.pulls.len());
+        assert!(plan.alignments.iter().all(|a| a.expires_at > now_ms()));
+        assert_eq!(plan.alignments[0].seek(0.0), Some(15.25));
     }
     #[test]
     fn pending_samples_survive_catalogue_refresh_and_do_not_queue_other_pulls() {

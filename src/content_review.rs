@@ -130,9 +130,8 @@ impl ReviewUi {
             .pulls
             .iter()
             .find(|p| p.report == key.report && p.id == key.pull_id)?;
-        if review.content_alignment(pull).is_some() {
-            return None;
-        }
+        // Playback may already inherit a known offset. A planned drift check
+        // still needs its own measurement and must continue submitting/polling.
         if self.content.next_poll.is_some_and(|at| Instant::now() < at) {
             return None;
         }
@@ -400,7 +399,7 @@ mod tests {
         (ui, ticket)
     }
     #[test]
-    fn two_authenticated_samples_cover_later_pulls_without_repeated_jobs() {
+    fn one_authenticated_sample_covers_later_pulls_while_drift_checks_continue() {
         let (mut ui, ticket) = viewer();
         let mut later = ui.pull.clone().unwrap();
         later.id += 1;
@@ -409,6 +408,12 @@ mod tests {
         ui.review.as_mut().unwrap().pulls.push(later.clone());
         ui.accept_content(ticket);
         ui.sync_content_selection();
+        assert!(matches!(
+            ui.next_content_action(),
+            Some(Action::ContentSubmit(..))
+        ));
+        ui.select(later.clone());
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, 255.25);
         assert!(matches!(
             ui.next_content_action(),
             Some(Action::ContentSubmit(..))
