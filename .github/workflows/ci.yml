@@ -85,12 +85,6 @@ jobs:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo check --locked
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: runner.os == 'Linux'
-        with:
-          node-version: 22.23.2
-          package-manager-cache: false
-
       - name: Test player scripts
         if: runner.os == 'Linux'
         run: node --test tests/*.test.mjs

@@ -5,11 +5,15 @@ import { resolve } from 'node:path';
 import { readBoundedMetadata } from './check-security-runtimes.mjs';
 
 const repository = 'IsogiE/Brick-Releases';
+// A runtime update must review this endpoint together with runtime.lock.json.
+// Never construct an outbound request from file contents.
+const runtimeReleaseTag = 'runtime-webkitgtk-2.54.0-ubuntu24.04-amd64-r1';
+const runtimeReleaseUrl = 'https://api.github.com/repos/IsogiE/Brick-Releases/releases/tags/runtime-webkitgtk-2.54.0-ubuntu24.04-amd64-r1';
 export function validateRuntimeLock(lock, workflow) {
   const minimum = workflow.match(/--atleast-version=(\d+\.\d+\.\d+) webkit2gtk-4\.1/)?.[1];
   assert(minimum && lock?.schema === 1 && lock.version === minimum, 'Runtime lock must match the reviewed release minimum');
   assert(lock.distribution === 'ubuntu-24.04' && lock.architecture === 'amd64', 'Unexpected runtime build target');
-  assert(lock.tag === `runtime-webkitgtk-${lock.version}-ubuntu24.04-amd64-r1`, 'Unexpected runtime release tag');
+  assert(lock.tag === runtimeReleaseTag && lock.tag === `runtime-webkitgtk-${lock.version}-ubuntu24.04-amd64-r1`, 'Unexpected runtime release tag');
   assert(lock.fileName === `brick-webkitgtk-${lock.version}-ubuntu24.04-amd64.tar.xz`, 'Unexpected runtime filename');
   assert(lock.url === `https://github.com/${repository}/releases/download/${lock.tag}/${lock.fileName}`, 'Unexpected runtime download URL');
   assert(/^[a-f0-9]{64}$/.test(lock.sha256 || ''), 'Missing pinned runtime digest');
@@ -37,7 +41,7 @@ async function main() {
   const lock = validateRuntimeLock(JSON.parse(readFileSync(new URL('../packaging/linux/runtime.lock.json', import.meta.url), 'utf8')), workflow);
   const headers = { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
   if (process.env.GH_TOKEN) headers.Authorization = `Bearer ${process.env.GH_TOKEN}`;
-  const response = await fetch(`https://api.github.com/repos/${repository}/releases/tags/${lock.tag}`,
+  const response = await fetch(runtimeReleaseUrl,
     { headers, redirect: 'error', signal: AbortSignal.timeout(20_000) });
   assert(response.ok, `Pinned Linux runtime is not available: HTTP ${response.status}. Resolve it before builds or signing.`);
   console.log(JSON.stringify(verifyRuntimeRelease(lock, JSON.parse(await readBoundedMetadata(response.body)), workflow)));
