@@ -115,7 +115,26 @@ pub fn style(ui: &mut egui::Ui) {
     visuals.widgets.active.weak_bg_fill = SOFT;
 }
 pub fn tab(ui: &mut egui::Ui, label: &str, selected: bool, width: f32) -> egui::Response {
+    button(
+        ui,
+        RichText::new(label)
+            .size(13.0)
+            .color(if selected { TEXT } else { MUTED }),
+        selected,
+        [width, 34.0],
+    )
+}
+
+pub fn button(
+    ui: &mut egui::Ui,
+    label: RichText,
+    selected: bool,
+    size: [f32; 2],
+) -> egui::Response {
     ui.scope(|ui| {
+        if size[1] <= 26.0 {
+            ui.spacing_mut().button_padding = egui::vec2(4.0, 3.0);
+        }
         let visuals = ui.visuals_mut();
         let idle = if selected {
             SOFT
@@ -141,13 +160,9 @@ pub fn tab(ui: &mut egui::Ui, label: &str, selected: bool, width: f32) -> egui::
             state.weak_bg_fill = fill;
         }
         ui.add_sized(
-            [width, 34.0],
-            egui::Button::new(RichText::new(label).size(13.0).color(if selected {
-                TEXT
-            } else {
-                MUTED
-            }))
-            .stroke(Stroke::new(1.0_f32, if selected { ACCENT } else { BORDER })),
+            size,
+            egui::Button::new(label)
+                .stroke(Stroke::new(1.0_f32, if selected { ACCENT } else { BORDER })),
         )
     })
     .inner

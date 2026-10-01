@@ -373,7 +373,8 @@ Var AppStartMenuFolder
 !define MUI_FINISHPAGE_SHOWREADME_TEXT "$(createDesktop)"
 !define MUI_FINISHPAGE_SHOWREADME_FUNCTION CreateDesktopShortcut
 ; Show run app after installation.
-!define MUI_FINISHPAGE_RUN "$INSTDIR\${MAINBINARYNAME}.exe"
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_FUNCTION RunBrickAsUser
 !define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
 !insertmacro MUI_PAGE_FINISH
 
@@ -654,6 +655,17 @@ Section Install
   ${IfThen} $PassiveMode == 1 ${|} SetAutoClose true ${|}
 SectionEnd
 
+; The installer may be elevated for an all-users update. Let the signed app
+; delegate its own restart to Explorer so it does not inherit administrator
+; privileges and block normal keyboard utilities through Windows UIPI.
+Function RunBrickAsUser
+  ExecWait '"$INSTDIR\${MAINBINARYNAME}.exe" --launch-as-user' $0
+  ${If} ${Errors}
+  ${OrIf} $0 != 0
+    MessageBox MB_ICONEXCLAMATION "Brick is installed. Open Brick from the Start menu to continue."
+  ${EndIf}
+FunctionEnd
+
 Function .onInstSuccess
   ; Check for `/R` flag only in silent and passive installers because
   ; GUI installer has a toggle for the user to (re)start the app
@@ -663,7 +675,7 @@ Function .onInstSuccess
   check_r_flag:
     ${GetOptions} $CMDLINE "/R" $R0
     IfErrors run_done 0
-      Exec '"$INSTDIR\${MAINBINARYNAME}.exe"'
+      Call RunBrickAsUser
   run_done:
 FunctionEnd
 
