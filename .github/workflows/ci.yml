@@ -145,6 +145,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          ./scripts/sync-signing-clock.test.ps1
           ./scripts/prepare-certum-action.test.ps1
           ./scripts/sign-windows.test.ps1
           ./scripts/sign-windows-uninstaller.test.ps1

@@ -5,6 +5,7 @@ $fixture = $null
 try {
     $path = Join-Path $directory 'Connect-SimplySign-Enhanced.ps1'
     Invoke-WebRequest 'https://raw.githubusercontent.com/dismine/windows-app-signing-setup-action/89ae3b032d4bc7a5b98d1a42a34e61ecb6faad64/Connect-SimplySign-Enhanced.ps1' -OutFile $path
+    $upstream = [IO.File]::ReadAllText($path).Replace([string][char]13, "")
     & "$PSScriptRoot/prepare-certum-action.ps1" -ActionScriptPath $path
     $source = [IO.File]::ReadAllText($path)
     $match = [regex]::Match($source, '(?s)Add-Type @"\n(using System;\nusing System.Runtime.InteropServices;.*?)\n"@')
@@ -13,6 +14,16 @@ try {
     $tokens = $null; $errors = $null
     $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
     if ($errors.Count) { throw 'Patched action is not valid PowerShell.' }
+    $generatorPattern = '(?s)Add-Type -Language CSharp @"\n.*?\n"@'
+    if (-not [regex]::Match($upstream, $generatorPattern).Success -or [regex]::Match($source, $generatorPattern).Value -ne [regex]::Match($upstream, $generatorPattern).Value) {
+        throw 'UTC adaptation changed the pinned TOTP algorithm.'
+    }
+    foreach ($name in @('Get-FreshTotpCode', 'Get-RecoveryTotpCode')) {
+        $definition = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+        if ($definition.Count -ne 1 -or $definition[0].Extent.Text -notmatch 'Wait-BrickSigningTotpWindow') {
+            throw 'A token generation path lacks verified fresh UTC.'
+        }
+    }
     $function = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-LoginWindow' }, $true)
     if ($function.Count -ne 1) { throw 'Login selector is ambiguous.' }
     . ([scriptblock]::Create($function[0].Extent.Text))
