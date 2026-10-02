@@ -1523,21 +1523,25 @@ impl Library {
                     }
                 }
             });
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Dates in UTC").size(10.0).color(MUTED));
-            if crate::stream_widgets::button(
-                ui,
-                RichText::new("All dates").size(11.0).color(TEXT),
-                self.month.is_none() && self.calendar_day.is_none(),
-                [82.0, 25.0],
-            )
-            .clicked()
-            {
-                self.calendar_day = None;
-                self.month = None;
-                self.dirty = true;
-            }
-        });
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 25.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(RichText::new("Dates in UTC").size(10.0).color(MUTED));
+                if crate::stream_widgets::button(
+                    ui,
+                    RichText::new("All dates").size(11.0).color(TEXT),
+                    self.month.is_none() && self.calendar_day.is_none(),
+                    [82.0, 25.0],
+                )
+                .clicked()
+                {
+                    self.calendar_day = None;
+                    self.month = None;
+                    self.dirty = true;
+                }
+            },
+        );
     }
 }
 fn calendar_shift(date: time::Date, delta: i32) -> Option<time::Date> {
