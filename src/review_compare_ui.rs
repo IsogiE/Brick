@@ -462,7 +462,7 @@ impl Comparison {
 
     pub fn command(&mut self, command: PlaybackCommand, review: &ReviewUi) {
         self.reset_provider_navigation();
-        self.metadata.cancel_marker(self.player.as_ref());
+
         let now = Instant::now();
         if let Some((metadata, pull)) = review.comparison_context() {
             if let Err(error) = self.refresh_clocks(metadata, pull, now) {
@@ -535,6 +535,7 @@ impl Comparison {
             }
             return;
         };
+
         if !self.navigating {
             if let Some(secondary) = &self.player {
                 let states = [primary.playback_state(), secondary.playback_state()];
@@ -559,30 +560,6 @@ impl Comparison {
             }
             return;
         };
-        let secondary_pull = self
-            .metadata
-            .comparison_metadata()
-            .and_then(|r| matching_pull(r, pull))
-            .cloned();
-        if !self.navigating {
-            if let (Some(secondary), Some(secondary_pull)) =
-                (&mut self.player, secondary_pull.as_ref())
-            {
-                if let Some(command) = self.metadata.sync_marker(
-                    ctx,
-                    secondary,
-                    Some(secondary_pull),
-                    Some(self.desired),
-                ) {
-                    if let Err(error) = secondary.command(command) {
-                        self.error = Some(error);
-                    }
-                }
-            }
-        }
-        if review.syncing_marker() || self.metadata.syncing_marker() {
-            return;
-        }
         if let Err(error) = self.refresh_clocks(primary_review, pull, Instant::now()) {
             self.error = Some(error);
         }
@@ -999,7 +976,6 @@ struct ClockVersion {
     content_version: Option<[u8; 32]>,
     pull_start_ms: i64,
     available_seconds: u64,
-    marker_start: Option<u64>,
 }
 
 impl ClockVersion {
@@ -1013,9 +989,6 @@ impl ClockVersion {
             content_version: review.content_alignment(pull).map(|a| a.version()),
             pull_start_ms: pull.start_ms,
             available_seconds: review.replay.available_seconds,
-            marker_start: review
-                .marker_alignment(pull)
-                .map(|alignment| alignment.video_seconds.to_bits()),
         })
     }
 }
@@ -1175,8 +1148,6 @@ mod tests {
                 replay.broadcast_id = "different12".into();
             }
             Review {
-                marker_timing: std::collections::HashMap::new(),
-                marker_fallback: Default::default(),
                 content_capability: None,
                 content_timing: Default::default(),
                 replay,
@@ -1203,19 +1174,12 @@ mod tests {
     }
 
     #[test]
-    fn marker_calibration_changes_only_the_matching_recording_clock() {
+    fn gpu_measurement_changes_only_the_matching_recording_clock() {
         let (mut reviews, pull) = timing_reviews();
         let before = std::array::from_fn::<_, 2, _>(|side| {
             ClockVersion::new(&reviews[side], &pull).unwrap()
         });
-        reviews[1].marker_timing.insert(
-            (pull.report.clone(), pull.id),
-            crate::replay_sync::Alignment {
-                unix_seconds: pull.start_ms / 1000,
-                video_seconds: 123.456,
-                uncertainty_seconds: 0.10,
-            },
-        );
+        crate::content_alignment::test_set_timing(&mut reviews[1], &pull, 123.456);
         assert!(before[0] == ClockVersion::new(&reviews[0], &pull).unwrap());
         assert!(before[1] != ClockVersion::new(&reviews[1], &pull).unwrap());
         let clock = recording_clock(&reviews[1], &pull).unwrap();
@@ -1226,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn either_unix_calibration_preserves_canonical_time_and_intent_then_rejects_old_samples() {
+    fn either_gpu_measurement_preserves_canonical_time_and_intent_then_rejects_old_samples() {
         for side in 0..2 {
             for playing in [false, true] {
                 let (mut reviews, pull) = timing_reviews();
@@ -1252,14 +1216,8 @@ mod tests {
                 }
                 let old = std::array::from_fn(|i| ClockVersion::new(&reviews[i], &pull).unwrap());
                 let old_identity = context_key(&reviews[side], &pull);
-                reviews[side].marker_timing.insert(
-                    (pull.report.clone(), pull.id),
-                    crate::replay_sync::Alignment {
-                        unix_seconds: pull.start_ms / 1000,
-                        video_seconds: reviews[side].pull_video_start(&pull) + 3.0,
-                        uncertainty_seconds: 0.10,
-                    },
-                );
+                let seconds = reviews[side].pull_video_start(&pull) + 3.0;
+                crate::content_alignment::test_set_timing(&mut reviews[side], &pull, seconds);
                 assert_eq!(old_identity, context_key(&reviews[side], &pull));
                 let next = std::array::from_fn(|i| ClockVersion::new(&reviews[i], &pull).unwrap());
                 let clocks = std::array::from_fn(|i| recording_clock(&reviews[i], &pull).unwrap());
@@ -1312,29 +1270,15 @@ mod tests {
         reviews[1].pulls.clear();
         assert!(!covers_moment(&reviews[1], &pull, at_ms));
         reviews[1].pulls.push(pull.clone());
-        reviews[1].marker_timing.insert(
-            (pull.report.clone(), pull.id),
-            crate::replay_sync::Alignment {
-                unix_seconds: pull.start_ms / 1000,
-                video_seconds: -13.0,
-                uncertainty_seconds: 0.10,
-            },
-        );
+        crate::content_alignment::test_set_timing(&mut reviews[1], &pull, -13.0);
         assert!(!covers_moment(&reviews[1], &pull, at_ms));
-        reviews[1]
-            .marker_timing
-            .get_mut(&(pull.report.clone(), pull.id))
-            .unwrap()
-            .video_seconds = -12.0;
+        crate::content_alignment::test_set_timing(&mut reviews[1], &pull, -12.0);
         assert!(covers_moment(&reviews[1], &pull, at_ms));
-        reviews[1]
-            .marker_timing
-            .get_mut(&(pull.report.clone(), pull.id))
-            .unwrap()
-            .video_seconds = 107.0;
         reviews[1].replay.available_seconds = 119;
+        crate::content_alignment::test_set_timing(&mut reviews[1], &pull, 107.0);
         assert!(!covers_moment(&reviews[1], &pull, at_ms));
         reviews[1].replay.available_seconds = 120;
+        crate::content_alignment::test_set_timing(&mut reviews[1], &pull, 107.0);
         assert!(covers_moment(&reviews[1], &pull, at_ms));
     }
 

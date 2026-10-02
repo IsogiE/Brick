@@ -11,13 +11,13 @@ spec.loader.exec_module(pacman)
 
 class PacmanRecipeTests(unittest.TestCase):
     def setUp(self):
-        self.config = {"version": "0.7.1", "pacman": {"depends": ["gtk3", "'webkit2gtk-4.1>=2.54.0'"]}}
+        self.config = {"version": "0.7.1", "pacman": {"depends": ["gtk3", "'webkit2gtk-4.1>=2.54.1'"]}}
 
     def test_quoted_version_constraint_is_one_dependency(self):
-        self.assertEqual(pacman.dependencies(self.config), ["gtk3", "webkit2gtk-4.1>=2.54.0"])
+        self.assertEqual(pacman.dependencies(self.config), ["gtk3", "webkit2gtk-4.1>=2.54.1"])
 
     def test_original_unquoted_constraint_is_rejected(self):
-        self.config["pacman"]["depends"][1] = "webkit2gtk-4.1>=2.54.0"
+        self.config["pacman"]["depends"][1] = "webkit2gtk-4.1>=2.54.1"
         with self.assertRaisesRegex(ValueError, "Bash syntax"):
             pacman.dependencies(self.config)
 
@@ -28,7 +28,7 @@ class PacmanRecipeTests(unittest.TestCase):
             archive.write_bytes(b"package fixture")
             digest = hashlib.sha512(archive.read_bytes()).hexdigest()
             recipe = root / "PKGBUILD"
-            recipe.write_text(f'pkgver=0.7.1\ndepends=(gtk3 \n\'webkit2gtk-4.1>=2.54.0\')\nsource=("{archive.name}")\nsha512sums=("{digest}")\n')
+            recipe.write_text(f'pkgver=0.7.1\ndepends=(gtk3 \n\'webkit2gtk-4.1>=2.54.1\')\nsource=("{archive.name}")\nsha512sums=("{digest}")\n')
             pacman.check_recipe(self.config, recipe)
             archive.write_bytes(b"changed package")
             with self.assertRaisesRegex(ValueError, "checksum"):

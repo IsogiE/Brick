@@ -317,7 +317,7 @@ impl StreamsUi {
     pub fn stop_player(&mut self) {
         self.comparison = None;
         self.review.set_comparing(false);
-        self.review.cancel_marker(self.player.as_ref());
+
         self.player = None;
         self.player_switch_pending = false;
         self.player_work = None;
@@ -348,7 +348,7 @@ impl StreamsUi {
                     .prepare_player_recovery(&player.playback_state());
             }
         }
-        self.review.cancel_marker(self.player.as_ref());
+
         self.player = None;
         self.player_work = None;
         self.player_preparing_since = None;
@@ -651,15 +651,7 @@ impl StreamsUi {
         if let Some(error) = self.player.as_ref().and_then(StreamPlayer::failure) {
             self.recover_player(error);
         }
-        if active && !self.recordings_open && !self.player_switch_pending {
-            if let Some(player) = &mut self.player {
-                if let Some(command) = self.review.sync_marker(ctx, player, None, None) {
-                    if let Err(error) = player.command(command) {
-                        self.player_error = Some(error);
-                    }
-                }
-            }
-        }
+
         self.leave_unavailable_comparison();
         if let Some(comparison) = &mut self.comparison {
             comparison.tick(
@@ -881,7 +873,6 @@ impl StreamsUi {
             .as_ref()
             .is_some_and(|player| player.provider_name() == name);
         if primary {
-            self.review.cancel_marker(self.player.as_ref());
             self.player = None;
             self.player_work = None;
             self.player_preparing_since = None;

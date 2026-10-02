@@ -1,7 +1,5 @@
 //! Bounded, account-bound review snapshots with separate refresh and retention ages.
-#[cfg(test)]
-use super::Pull;
-use super::Review;
+use super::{Pull, Review};
 use crate::{
     content_alignment::{Key, RecordingClock},
     streams::Stream,
@@ -108,13 +106,7 @@ impl Cache {
             .iter_mut()
             .find(|entry| entry.source_identity == identity)
         {
-            entry.review.content_timing.clear();
-            for alignment in samples.plan(&entry.review, entry.status.0).alignments {
-                entry.review.content_timing.insert(
-                    (alignment.key.report.clone(), alignment.key.pull_id),
-                    alignment,
-                );
-            }
+            samples.apply_to(&mut entry.review, entry.status.0);
             entry.sampling = samples;
         }
     }
@@ -133,13 +125,7 @@ impl Cache {
         if let Some(entry) = self.entries.iter_mut().find(|entry| {
             entry.source_identity == identity && entry.generation == crate::guild::generation()
         }) {
-            entry.review.content_timing.clear();
-            for alignment in samples.plan(&entry.review, entry.status.0).alignments {
-                entry.review.content_timing.insert(
-                    (alignment.key.report.clone(), alignment.key.pull_id),
-                    alignment,
-                );
-            }
+            samples.apply_to(&mut entry.review, entry.status.0);
             entry.sampling = samples;
         }
     }
@@ -272,6 +258,28 @@ impl Cache {
         }
     }
 
+    /// Refresh only timing, preserving the metadata age and this viewer's samples.
+    pub fn refresh_clocks(
+        &mut self,
+        stream: &Stream,
+        mut review: Review,
+        clocks: Vec<(Key, RecordingClock)>,
+    ) {
+        if self.suspended {
+            return;
+        }
+        let Some(identity) = source_identity(stream) else {
+            return;
+        };
+        if let Some(entry) = self.entries.iter_mut().find(|entry| {
+            entry.source_identity == identity && entry.generation == crate::guild::generation()
+        }) {
+            entry.sampling.apply_to(&mut review, entry.status.0);
+            entry.review = review;
+            entry.clocks = clocks;
+        }
+    }
+
     pub fn insert(
         &mut self,
         stream: &Stream,
@@ -329,39 +337,53 @@ impl Cache {
     }
 }
 
-/// One lookup covers every pull from the same report; never export boss events
-/// or submit inference jobs merely because a recording is visible in the list.
-#[cfg(test)]
+/// One lookup per distinct report covers matching pulls without exporting events.
+/// Prioritize the selected report, and bound unusual multi-report catalogues.
 pub(crate) fn clocks(
     review: &mut Review,
     preferred: Option<&Pull>,
     epoch: u64,
     mut lookup: impl FnMut(&Key) -> Option<RecordingClock>,
 ) -> Vec<(Key, RecordingClock)> {
-    let Some(cap) = review.content_capability.as_ref() else {
+    let Some(cap) = review.content_capability.clone() else {
         return Vec::new();
     };
-    let Some(pull) = preferred
-        .and_then(|pull| review.matching_pull(pull))
-        .or(review.pulls.first())
-    else {
-        return Vec::new();
-    };
-    let key = Key::new(&review.replay, pull, cap, epoch);
-    let Some(clock) = lookup(&key) else {
-        return Vec::new();
-    };
-    for pull in &review.pulls {
-        let wanted = Key::new(&review.replay, pull, cap, epoch);
-        if wanted.same_recording_report(&key) {
-            if let Some(alignment) = clock.alignment(&wanted) {
-                review
-                    .content_timing
-                    .insert((pull.report.clone(), pull.id), alignment);
+    let preferred = preferred.and_then(|pull| review.matching_pull(pull));
+    let mut keys = Vec::new();
+    for pull in preferred.into_iter().chain(review.pulls.iter()) {
+        let key = Key::new(&review.replay, pull, &cap, epoch);
+        if !keys
+            .iter()
+            .any(|saved: &Key| saved.same_recording_report(&key))
+        {
+            keys.push(key);
+            if keys.len() == 64 {
+                break;
             }
         }
     }
-    vec![(key, clock)]
+    let mut clocks = Vec::new();
+    for key in keys {
+        let clock = lookup(&key).filter(|clock| clock.alignment(&key).is_some());
+        review.content_timing.retain(|_, alignment| {
+            !alignment.shared_clock || !alignment.key.same_recording_report(&key)
+        });
+        let Some(clock) = clock else {
+            continue;
+        };
+        for pull in &review.pulls {
+            let wanted = Key::new(&review.replay, pull, &cap, epoch);
+            if wanted.same_recording_report(&key) {
+                if let Some(alignment) = clock.alignment(&wanted) {
+                    review
+                        .content_timing
+                        .insert((pull.report.clone(), pull.id), alignment);
+                }
+            }
+        }
+        clocks.push((key, clock));
+    }
+    clocks
 }
 
 #[cfg(test)]
@@ -391,8 +413,7 @@ mod tests {
             replay,
             pulls: vec![pull],
             content_capability: Some(cap),
-            marker_timing: Default::default(),
-            marker_fallback: Default::default(),
+
             content_timing: Default::default(),
         };
         (stream, review, vec![(ticket.key, test_recording_clock())])
@@ -536,6 +557,79 @@ mod tests {
         assert!(cache.for_display(&stream).is_none());
         cache.age_for_test(RETENTION);
         assert!(cache.for_display(&other).is_none());
+    }
+
+    #[test]
+    fn saved_server_clock_survives_empty_viewer_samples_and_cache_restore() {
+        let (stream, mut review, saved) = fixture();
+        let epoch = saved[0].0.auth_epoch;
+        let clocks = super::clocks(&mut review, None, epoch, |_| Some(saved[0].1.clone()));
+        let expected = review
+            .content_alignment(&review.pulls[0])
+            .unwrap()
+            .result
+            .video_seconds;
+        let mut cache = Cache::default();
+        cache.insert(&stream, review, (epoch, true), clocks);
+        cache.set_samples(&stream, Default::default());
+        let entry = cache.get(&stream).unwrap();
+        assert_eq!(
+            entry
+                .review
+                .content_alignment(&entry.review.pulls[0])
+                .unwrap()
+                .result
+                .video_seconds,
+            expected
+        );
+        assert!(entry.sampling.tickets.is_empty());
+        cache.age_for_test(Duration::from_secs(120));
+        let entry = cache.for_display(&stream).unwrap();
+        cache.refresh_clocks(&stream, entry.review, entry.clocks);
+        assert!(
+            cache.get(&stream).is_none(),
+            "Clock lookup must not renew metadata age"
+        );
+        assert!(
+            cache
+                .for_display(&stream)
+                .unwrap()
+                .review
+                .content_timing
+                .len()
+                == 1
+        );
+    }
+
+    #[test]
+    fn saved_clocks_cover_each_report_once_and_authoritative_absence_clears_only_shared_timing() {
+        let (_, mut review, saved) = fixture();
+        let mut second = review.pulls[0].clone();
+        second.report = "ZYXWzyxw87654321".into();
+        second.report_start_ms += 1000;
+        second.start_ms += 1000;
+        second.end_ms += 1000;
+        review.pulls.push(second.clone());
+        let mut calls = Vec::new();
+        let clocks = super::clocks(&mut review, Some(&second), saved[0].0.auth_epoch, |key| {
+            calls.push(key.report.clone());
+            let mut clock = saved[0].1.clone();
+            clock.report_start_ms = key.report_start_ms;
+            Some(clock)
+        });
+        assert_eq!(
+            calls,
+            vec![second.report.clone(), review.pulls[0].report.clone()]
+        );
+        assert_eq!(clocks.len(), 2);
+        assert_eq!(review.content_timing.len(), 2);
+        let mut calls = 0;
+        super::clocks(&mut review, None, saved[0].0.auth_epoch, |_| {
+            calls += 1;
+            None
+        });
+        assert_eq!(calls, 2);
+        assert!(review.content_timing.is_empty());
     }
 
     #[test]

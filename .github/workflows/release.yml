@@ -48,9 +48,9 @@ jobs:
       run: sudo --preserve-env=HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy python3 packaging/linux/install-runtime.py
     - name: Verify prebuilt Linux playback runtime
       run: |
-        if ! pkg-config --atleast-version=2.54.0 webkit2gtk-4.1; then
+        if ! pkg-config --atleast-version=2.54.1 webkit2gtk-4.1; then
           installed=$(pkg-config --modversion webkit2gtk-4.1)
-          echo "::error::WebKitGTK $installed is older than the required 2.54.0. Repair the pinned runtime artifact before retrying. Release jobs do not compile WebKit from source."
+          echo "::error::WebKitGTK $installed is older than the required 2.54.1. Repair the pinned runtime artifact before retrying. Release jobs do not compile WebKit from source."
           exit 1
         fi
         pkg-config --modversion webkit2gtk-4.1

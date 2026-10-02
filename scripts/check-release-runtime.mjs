@@ -7,8 +7,8 @@ import { readBoundedMetadata } from './check-security-runtimes.mjs';
 const repository = 'IsogiE/Brick-Releases';
 // A runtime update must review this endpoint together with runtime.lock.json.
 // Never construct an outbound request from file contents.
-const runtimeReleaseTag = 'runtime-webkitgtk-2.54.0-ubuntu24.04-amd64-r1';
-const runtimeReleaseUrl = 'https://api.github.com/repos/IsogiE/Brick-Releases/releases/tags/runtime-webkitgtk-2.54.0-ubuntu24.04-amd64-r1';
+const runtimeReleaseTag = 'runtime-webkitgtk-2.54.1-ubuntu24.04-amd64-r1';
+const runtimeReleaseUrl = 'https://api.github.com/repos/IsogiE/Brick-Releases/releases/tags/runtime-webkitgtk-2.54.1-ubuntu24.04-amd64-r1';
 export function validateRuntimeLock(lock, workflow) {
   const minimum = workflow.match(/--atleast-version=(\d+\.\d+\.\d+) webkit2gtk-4\.1/)?.[1];
   assert(minimum && lock?.schema === 1 && lock.version === minimum, 'Runtime lock must match the reviewed release minimum');

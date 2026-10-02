@@ -14,13 +14,6 @@ use std::{
 };
 use wry::WebView;
 
-pub(super) fn clock_script(origin: &str) -> String {
-    format!("{}\n{}", include_str!("clock.js"), include_str!("frame.js")).replace(
-        "__BRICK_WRAPPER_ORIGIN__",
-        &serde_json::to_string(origin).unwrap(),
-    )
-}
-
 const MAX_BYTES: usize = 24 * 1024 * 1024;
 const MAX_SIDE: u32 = 8192;
 const MAX_PIXELS: u64 = 8_847_360;
@@ -32,14 +25,12 @@ static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// The browser APIs provide an image, but no decoded-frame presentation time.
 /// These media-clock readings bracket the capture; they are not an exact frame timestamp.
 pub struct FrameCapture {
-    pub generation: u64,
     pub png: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub before_seconds: f64,
     pub after_seconds: f64,
     pub playing: bool,
-    pub observed_at: Instant,
     #[cfg(test)]
     pub bracket_duration: Duration,
     #[cfg(test)]
@@ -112,10 +103,6 @@ impl Controller {
         self.job.borrow_mut().take();
         self.generation
             .set(NEXT_GENERATION.fetch_add(1, Ordering::Relaxed));
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.generation.get()
     }
 
     pub fn pending(&self) -> bool {
@@ -357,14 +344,12 @@ fn source_frame(value: &str, generation: u64, started: Instant) -> Result<FrameC
         return Err("Invalid video frame dimensions.".into());
     }
     Ok(FrameCapture {
-        generation,
         png,
         width: data.width,
         height: data.height,
         before_seconds: data.before,
         after_seconds: data.after,
         playing: true,
-        observed_at: started,
         #[cfg(test)]
         bracket_duration: started.elapsed(),
         #[cfg(test)]
@@ -629,7 +614,7 @@ fn frame(
     _finished: Instant,
     job: &Weak<Mutex<Job>>,
 ) -> Result<FrameCapture, String> {
-    let generation = job
+    let _generation = job
         .upgrade()
         .and_then(|job| job.lock().ok().map(|job| job.generation))
         .ok_or("The media snapshot was cancelled.")?;
@@ -679,14 +664,12 @@ fn frame(
         }
     };
     Ok(FrameCapture {
-        generation,
         png,
         width,
         height,
         before_seconds: before.state.seconds,
         after_seconds: after.state.seconds,
         playing: before.state.playing,
-        observed_at: before.requested + elapsed / 2,
         #[cfg(test)]
         bracket_duration: elapsed,
         #[cfg(test)]

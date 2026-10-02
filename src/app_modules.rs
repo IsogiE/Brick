@@ -21,13 +21,8 @@ mod protected_cache;
 mod recording_filter;
 mod recording_preparation;
 mod recordings_ui;
-mod replay_digits;
-mod replay_edge;
-mod replay_library;
-mod replay_marker;
 #[cfg(test)]
 mod replay_smoke;
-mod replay_sync;
 mod review_compare;
 mod review_compare_ui;
 mod review_ui;

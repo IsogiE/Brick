@@ -145,8 +145,7 @@ impl Cache {
                     .filter_map(|(report, id)| self.document.reports.get(report)?.get(id).cloned())
                     .collect(),
             ),
-            marker_timing: Default::default(),
-            marker_fallback: Default::default(),
+
             content_capability: capability.cloned(),
             content_timing: Default::default(),
         };
@@ -193,6 +192,33 @@ impl Cache {
         }
         self.merge(stream, review, complete, clocks, super::now_secs());
         self.save(access);
+    }
+
+    /// Refresh saved clocks without renewing the age of cached raid metadata.
+    pub fn update_clocks(
+        &mut self,
+        access: &Access,
+        stream: &Stream,
+        clocks: &[(Key, RecordingClock)],
+    ) {
+        if access.check().is_err() {
+            return;
+        }
+        let Some(identity) = prepared::source_identity(stream) else {
+            return;
+        };
+        if let Some(recording) = self
+            .document
+            .recordings
+            .iter_mut()
+            .find(|r| r.identity == identity)
+        {
+            recording.clocks = clocks
+                .iter()
+                .map(|(key, clock)| (key.report.clone(), clock.clone()))
+                .collect();
+            self.save(access);
+        }
     }
 
     pub fn update_samples(
@@ -495,8 +521,6 @@ mod tests {
         let review = Review {
             replay,
             pulls: vec![pull],
-            marker_timing: Default::default(),
-            marker_fallback: Default::default(),
             content_capability: None,
             content_timing: Default::default(),
         };
