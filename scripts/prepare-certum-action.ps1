@@ -13,6 +13,9 @@ if ((Get-FileHash -LiteralPath $ActionScriptPath -Algorithm SHA256).Hash -ne '3e
 }
 $source = [IO.File]::ReadAllText($ActionScriptPath).Replace("`r`n", "`n")
 function Replace-Once([string]$Before, [string]$After) {
+    # Git checks out CRLF on Windows; normalize literal patch blocks too.
+    $Before = $Before.Replace([string][char]13, '')
+    $After = $After.Replace([string][char]13, '')
     if (($script:source.Split(@($Before), [StringSplitOptions]::None)).Count -ne 2) {
         throw 'The reviewed SimplySign patch no longer matches exactly once.'
     }
