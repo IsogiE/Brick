@@ -180,6 +180,7 @@ pub(crate) struct Ticket {
 #[derive(Clone, Debug)]
 pub(crate) struct Alignment {
     pub key: Key,
+    pub shared_clock: bool,
     pub result: ResultData,
     pub timeline: Timeline,
     pub signature_revision: String,
@@ -251,7 +252,6 @@ impl Key {
             && self.guild_generation == other.guild_generation
             && self.auth_epoch == other.auth_epoch
     }
-    #[cfg(test)]
     pub fn same_recording_report(&self, other: &Self) -> bool {
         self.same_recording(other)
             && self.report == other.report
@@ -306,6 +306,7 @@ impl RecordingClock {
         }
         Some(Alignment {
             key: key.clone(),
+            shared_clock: true,
             timeline: self.timeline.clone(),
             timeline_hash: self.timeline_hash.clone(),
             // This is a recording-clock measurement, not another submitted signature.
@@ -478,6 +479,7 @@ impl Ticket {
         let scope = self.job.scope.as_ref()?;
         Some(Alignment {
             key: self.key.clone(),
+            shared_clock: false,
             result: self.job.result.clone()?,
             timeline: scope.timeline.clone(),
             signature_revision: scope.signature_revision.clone(),
@@ -503,6 +505,61 @@ impl Ticket {
         ) || self.job.cleanup_pending
     }
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecordingResponse {
+    clock: Option<RecordingClock>,
+    pending: bool,
+    conflict: bool,
+}
+
+fn parse_recording_clock(bytes: &[u8], key: &Key) -> Result<Option<RecordingClock>, String> {
+    if bytes.len() > 32 * 1024 {
+        return Err(INVALID.into());
+    }
+    let response: RecordingResponse = serde_json::from_slice(bytes).map_err(|_| INVALID)?;
+    if response.conflict && (response.clock.is_some() || response.pending) {
+        return Err(INVALID.into());
+    }
+    if let Some(clock) = &response.clock {
+        if clock.alignment(key).is_none() {
+            return Err(INVALID.into());
+        }
+    }
+    Ok(response.clock)
+}
+
+/// Fetch a measured recording/report clock without exporting events or creating a job.
+/// The short timeout bounds first-open latency during a server outage.
+pub(crate) fn recording_clock(
+    access: &guild::Access,
+    key: &Key,
+    cancel: &AtomicBool,
+) -> Result<Option<RecordingClock>, String> {
+    current(access, key, cancel)?;
+    let url = access
+        .endpoint(&format!("{PATH}/recording"))
+        .map_err(|_| INVALID)?;
+    let response = crate::presence::http_client()
+        .map_err(|_| TEMPORARY)?
+        .post(url)
+        .timeout(std::time::Duration::from_secs(2))
+        .bearer_auth(access.secret())
+        .json(&serde_json::json!({
+            "provider": key.provider.key(), "videoId": key.video_id,
+            "report": key.report, "reportStartMs": key.report_start_ms,
+        }))
+        .send()
+        .map_err(|_| TEMPORARY)?;
+    if !response.status().is_success() {
+        return Err(TEMPORARY.into());
+    }
+    let bytes = crate::download::read_response(response, 32 * 1024, "Video timing")
+        .map_err(|_| TEMPORARY)?;
+    current(access, key, cancel)?;
+    parse_recording_clock(&bytes, key)
+}
+
 fn parse(bytes: &[u8]) -> Result<Job, String> {
     if bytes.len() > 32 * 1024 {
         return Err(INVALID.into());
@@ -985,6 +1042,59 @@ mod tests {
         stale.key.guild_generation = guild::generation().wrapping_sub(1);
         assert!(poll(&right, &stale, &AtomicBool::new(false)).is_err());
     }
+    #[test]
+    fn saved_recording_clock_response_maps_first_pull_without_a_signature_or_job() {
+        let (mut replay, mut pull, cap, _) = test_ticket();
+        replay.provider = streams::Provider::Twitch;
+        replay.video_id = "1234567890".into();
+        replay.broadcast_id = "yaya-fixture".into();
+        replay.started_at = "2026-09-04T17:04:01Z".into();
+        replay.available_seconds = 16420;
+        pull.report = "ABCDabcd12345678".into();
+        pull.id = 3;
+        pull.report_start_ms = 1788537261111;
+        pull.start_ms = pull.report_start_ms + 5247846;
+        pull.end_ms = pull.start_ms + 155093;
+        let key = Key::new(&replay, &pull, &cap, 0);
+        let mut clock = test_recording_clock();
+        clock.report_start_ms = pull.report_start_ms;
+        clock.report_seconds = 5247.846;
+        clock.video_seconds = 1071.73475;
+        clock.timeline.provider = replay.provider.clone();
+        clock.timeline.video_id = replay.video_id.clone();
+        clock.timeline.raw_started_at_ms = Some(1788541441000);
+        clock.timeline.duration_seconds = 16420.0;
+        let bytes = serde_json::to_vec(
+            &serde_json::json!({"clock":clock,"pending":false,"conflict":false}),
+        )
+        .unwrap();
+        let received = parse_recording_clock(&bytes, &key).unwrap().unwrap();
+        let alignment = received.alignment(&key).unwrap();
+        assert!(alignment.shared_clock);
+        assert!((alignment.result.video_seconds - 1071.73475).abs() < 0.000001);
+        assert!((pull.start_ms - replay.start_ms().unwrap()) as f64 / 1000.0 < 1068.0);
+        for change in 0..4 {
+            let mut wrong = key.clone();
+            match change {
+                0 => wrong.video_id = "999999999".into(),
+                1 => wrong.report_start_ms += 1,
+                2 => wrong.started_at = "2026-09-04T17:04:02Z".into(),
+                _ => wrong.timeline_revision = Some("f".repeat(64)),
+            }
+            assert!(parse_recording_clock(&bytes, &wrong).is_err());
+        }
+        assert!(
+            parse_recording_clock(br#"{"clock":null,"pending":false,"conflict":true}"#, &key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_recording_clock(br#"{"clock":null,"pending":true,"conflict":true}"#, &key)
+                .is_err()
+        );
+        assert!(parse_recording_clock(&vec![b' '; 32769], &key).is_err());
+    }
+
     #[test]
     fn unix_backup_requires_a_valid_finished_failure() {
         let (_, _, _, mut failed) = test_ticket();

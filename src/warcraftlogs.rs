@@ -1179,7 +1179,24 @@ impl Client {
             if let Some(entry) = cached.filter(|entry| entry.status.0 == self.recording_auth_epoch)
             {
                 self.recording_match_complete = entry.status.1;
-                return Ok(entry.review);
+                let mut review = entry.review;
+                let clocks = self.saved_recording_clocks(
+                    discord_token,
+                    &mut review,
+                    preferred_pull,
+                    &entry.clocks,
+                );
+                entry
+                    .sampling
+                    .apply_to(&mut review, self.recording_auth_epoch);
+                check_cancelled(&self.cancel)?;
+                if let Some(cache) = &mut self.review_cache {
+                    cache.update_clocks(discord_token, stream, &clocks);
+                }
+                if let Ok(mut cache) = self.prepared.lock() {
+                    cache.refresh_clocks(stream, review.clone(), clocks);
+                }
+                return Ok(review);
             }
         }
         let capability = self.recording_content_capability(stream);
@@ -1224,7 +1241,8 @@ impl Client {
             })?;
         }
         if playback && review.content_required() {
-            let clocks = Vec::new();
+            let clocks =
+                self.saved_recording_clocks(discord_token, &mut review, preferred_pull, &[]);
             check_cancelled(&self.cancel)?;
             // Explicit report choices must not replace the automatic directory.
             if report_override.is_none() {
@@ -1248,6 +1266,37 @@ impl Client {
             }
         }
         Ok(review)
+    }
+
+    fn saved_recording_clocks(
+        &self,
+        access: &crate::guild::Access,
+        review: &mut Review,
+        preferred: Option<&Pull>,
+        previous: &[(
+            crate::content_alignment::Key,
+            crate::content_alignment::RecordingClock,
+        )],
+    ) -> Vec<(
+        crate::content_alignment::Key,
+        crate::content_alignment::RecordingClock,
+    )> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        prepared::clocks(review, preferred, self.recording_auth_epoch, |key| {
+            let fallback = || {
+                previous
+                    .iter()
+                    .find(|(saved, clock)| {
+                        saved.same_recording_report(key) && clock.alignment(key).is_some()
+                    })
+                    .map(|(_, clock)| clock.clone())
+            };
+            if Instant::now() >= deadline || self.cancel.load(Ordering::Relaxed) {
+                return fallback();
+            }
+            crate::content_alignment::recording_clock(access, key, &self.cancel)
+                .unwrap_or_else(|_| fallback())
+        })
     }
 
     pub(crate) fn save_samples(

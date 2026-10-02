@@ -195,6 +195,33 @@ impl Cache {
         self.save(access);
     }
 
+    /// Refresh saved clocks without renewing the age of cached raid metadata.
+    pub fn update_clocks(
+        &mut self,
+        access: &Access,
+        stream: &Stream,
+        clocks: &[(Key, RecordingClock)],
+    ) {
+        if access.check().is_err() {
+            return;
+        }
+        let Some(identity) = prepared::source_identity(stream) else {
+            return;
+        };
+        if let Some(recording) = self
+            .document
+            .recordings
+            .iter_mut()
+            .find(|r| r.identity == identity)
+        {
+            recording.clocks = clocks
+                .iter()
+                .map(|(key, clock)| (key.report.clone(), clock.clone()))
+                .collect();
+            self.save(access);
+        }
+    }
+
     pub fn update_samples(
         &mut self,
         access: &Access,

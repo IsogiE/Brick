@@ -96,14 +96,7 @@ impl ReviewUi {
         let Some(review) = self.review.as_mut() else {
             return;
         };
-        let plan = self.content.samples.plan(review, epoch);
-        review.content_timing.clear();
-        for alignment in plan.alignments {
-            review.content_timing.insert(
-                (alignment.key.report.clone(), alignment.key.pull_id),
-                alignment,
-            );
-        }
+        self.content.samples.apply_to(review, epoch);
         review.marker_fallback.retain(|_, ticket| {
             ticket.key.auth_epoch == epoch
                 && ticket.permits_marker_backup()

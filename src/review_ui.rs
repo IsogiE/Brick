@@ -757,6 +757,18 @@ impl ReviewUi {
         let Some((entry, preferences)) = entry else {
             return false;
         };
+        // An estimated cached review must first ask the server for already saved
+        // GPU timing. Warm precise reviews still open without the WCL worker.
+        if self.open_first_pull
+            && entry.review.content_required()
+            && entry
+                .review
+                .pulls
+                .first()
+                .is_some_and(|pull| entry.review.content_alignment(pull).is_none())
+        {
+            return false;
+        }
         self.recording_match_status = Some(entry.status);
         self.connected = true;
         self.connection_checked = true;
@@ -1125,6 +1137,11 @@ impl ReviewUi {
                     }
                 }
                 if let Some(alignment) = old.content_alignment(pull).filter(|alignment| {
+                    // Shared timing is supplied by the refreshed server answer.
+                    // Never revive an absent or conflicting cached clock.
+                    if alignment.shared_clock {
+                        return false;
+                    }
                     if self
                         .recording_match_status
                         .is_some_and(|status| status.0 != alignment.key.auth_epoch)
@@ -1138,7 +1155,8 @@ impl ReviewUi {
                 }) {
                     review
                         .content_timing
-                        .insert((pull.report.clone(), pull.id), alignment.clone());
+                        .entry((pull.report.clone(), pull.id))
+                        .or_insert_with(|| alignment.clone());
                 }
             }
         }
@@ -4374,6 +4392,78 @@ mod tests {
     }
 
     #[test]
+    fn opening_an_estimated_cached_vod_requests_saved_server_timing_before_playback() {
+        let (mut review, stream, clocks) = prepared_fixture(Provider::Twitch);
+        let epoch = clocks[0].0.auth_epoch;
+        review.content_timing.clear();
+        let mut ui = ReviewUi::default();
+        ui.prepared
+            .lock()
+            .unwrap()
+            .insert(&stream, review, (epoch, true), Vec::new());
+        ui.open_recording();
+        assert!(!ui.restore_prepared_recording(&stream));
+        assert!(ui.playback.is_none());
+        assert!(matches!(ui.next_action(), Some(Action::Refresh)));
+    }
+
+    #[test]
+    fn saved_server_clock_opens_first_pull_without_viewer_tickets_and_survives_selection_updates() {
+        let (review, stream, clocks) = prepared_fixture(Provider::Twitch);
+        let epoch = clocks[0].0.auth_epoch;
+        let expected = review
+            .content_alignment(&review.pulls[0])
+            .unwrap()
+            .result
+            .video_seconds;
+        let later = review.pulls[1].clone();
+        let mut ui = ReviewUi::default();
+        ui.prepared
+            .lock()
+            .unwrap()
+            .insert(&stream, review, (epoch, true), clocks);
+        ui.open_recording();
+        assert!(ui.restore_prepared_recording(&stream));
+        ui.sync_content_selection();
+        assert!(ui.content.samples.tickets.is_empty());
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, expected);
+        assert!(!ui.content_waiting());
+        ui.select(later);
+        ui.sync_content_selection();
+        assert!(ui.playback.as_ref().unwrap().content_timing);
+        assert!(!ui.content_waiting());
+    }
+
+    #[test]
+    fn refreshed_server_timing_replaces_cached_clock_and_cannot_revive_a_conflict() {
+        for absent in [false, true] {
+            let (old, _, mut clocks) = prepared_fixture(Provider::Twitch);
+            let epoch = clocks[0].0.auth_epoch;
+            let mut fresh = old.clone();
+            fresh.content_timing.clear();
+            if !absent {
+                clocks[0].1.video_seconds += 4.0;
+                crate::warcraftlogs::prepared::clocks(&mut fresh, None, epoch, |_| {
+                    Some(clocks[0].1.clone())
+                });
+            }
+            let expected = fresh.content_timing.clone();
+            let mut ui = ReviewUi::default();
+            ui.recording_match_status = Some((epoch, true));
+            ui.review = Some(old);
+            ui.accept_review(fresh);
+            let review = ui.review.as_ref().unwrap();
+            assert_eq!(review.content_timing.len(), expected.len());
+            for (key, alignment) in &expected {
+                assert_eq!(
+                    review.content_timing[key].result.video_seconds,
+                    alignment.result.video_seconds
+                );
+            }
+        }
+    }
+
+    #[test]
     fn prepared_vods_open_and_switch_pulls_while_wcl_worker_is_busy() {
         for provider in [Provider::Youtube, Provider::Twitch] {
             let (review, stream, clocks) = prepared_fixture(provider);
@@ -4446,8 +4536,10 @@ mod tests {
         // Restoring display data must not make the overdue refresh fresh.
         assert!(matches!(ui.next_action(), Some(Action::Refresh)));
         ui.open_recording();
-        assert!(ui.restore_prepared_recording(&stream));
-        assert!(ui.playback.is_some());
+        // Displaying stale metadata must not open an estimate before the clock lookup.
+        assert!(!ui.restore_prepared_recording(&stream));
+        assert!(ui.playback.is_none());
+        assert!(matches!(ui.next_action(), Some(Action::Refresh)));
     }
 
     #[test]

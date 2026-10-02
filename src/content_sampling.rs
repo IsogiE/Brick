@@ -99,6 +99,48 @@ impl Snapshot {
             planned: self.planned.as_ref().and_then(rebind),
         }
     }
+    /// Keep server clocks independent of this viewer's sparse sample tickets.
+    /// A fresh conflicting measurement or confirmed missing range still takes precedence.
+    pub fn apply_to(&self, review: &mut Review, epoch: u64) {
+        let plan = self.plan(review, epoch);
+        let measured: Vec<_> = self.tickets.iter().filter_map(Ticket::alignment).collect();
+        let replay = &review.replay;
+        let pulls = &review.pulls;
+        let cap = review.content_capability.as_ref();
+        review.content_timing.retain(|_, shared| {
+            shared.shared_clock
+                && shared.key.auth_epoch == epoch
+                && cap.is_some_and(|cap| pulls.iter().any(|p| shared.matches(replay, p, cap)))
+                && !measured.iter().any(|point| {
+                    point.key.same_recording_report(&shared.key)
+                        && ((shared.result.video_seconds
+                            + (point.key.start_ms - shared.key.start_ms) as f64 / 1000.0)
+                            - point.result.video_seconds)
+                            .abs()
+                            > (shared.result.uncertainty_seconds + point.result.uncertainty_seconds)
+                                .max(0.1)
+                })
+                && !self.tickets.iter().any(|ticket| {
+                    !ticket.expired()
+                        && ticket.key.same_recording_report(&shared.key)
+                        && ticket.job.status == Status::Failed
+                        && ticket
+                            .job
+                            .validate(&ticket.key, &ticket.guild_id, &ticket.member_hash, None)
+                            .is_ok()
+                        && ticket.job.error.as_deref() == Some("missing_footage")
+                        && ticket.key.start_ms < shared.key.end_ms
+                        && ticket.key.end_ms > shared.key.start_ms
+                })
+        });
+        for alignment in plan.alignments {
+            review.content_timing.insert(
+                (alignment.key.report.clone(), alignment.key.pull_id),
+                alignment,
+            );
+        }
+    }
+
     pub fn plan(&self, review: &Review, epoch: u64) -> Plan {
         let mut plan = Plan {
             next: None,
@@ -333,6 +375,7 @@ impl Snapshot {
                 timeline.duration_seconds = review.replay.available_seconds as f64;
                 plan.alignments.push(Alignment {
                     key,
+                    shared_clock: false,
                     timeline,
                     timeline_hash: point.timeline_hash.clone(),
                     signature_revision: revision.clone(),
@@ -431,6 +474,43 @@ mod tests {
             .unwrap();
         ticket
     }
+    #[test]
+    fn shared_clock_survives_empty_or_unsuccessful_samples_but_excludes_confirmed_gaps() {
+        for outcome in [None, Some("alignment_not_found"), Some("missing_footage")] {
+            let mut review = review();
+            for pull in &review.pulls {
+                let mut alignment = ticket(&review, pull, 0.0).alignment().unwrap();
+                alignment.shared_clock = true;
+                review
+                    .content_timing
+                    .insert((pull.report.clone(), pull.id), alignment);
+            }
+            let mut saved = Snapshot::default();
+            if let Some(error) = outcome {
+                let mut failed = ticket(&review, &review.pulls[5], 0.0);
+                failed.job.status = Status::Failed;
+                failed.job.result = None;
+                failed.job.error = Some(error.into());
+                saved.remember(failed);
+            }
+            saved.apply_to(&mut review, 0);
+            assert_eq!(
+                review.content_timing.len(),
+                if outcome == Some("missing_footage") {
+                    11
+                } else {
+                    12
+                }
+            );
+            assert!(review.content_alignment(&review.pulls[0]).is_some());
+            assert_eq!(
+                review.content_alignment(&review.pulls[5]).is_none(),
+                outcome == Some("missing_footage")
+            );
+            assert!(review.content_alignment(&review.pulls[11]).is_some());
+        }
+    }
+
     #[test]
     fn first_then_stable_later_sample_covers_a_continuous_recording() {
         let review = review();
