@@ -1,8 +1,8 @@
 #!/bin/bash
 # Build a reusable runtime artifact separately from Brick release packaging.
 set -euo pipefail
-version=2.54.0
-sha256=846fd19ccedbae1dbfe904f26dbf2d68a800a33a50caf2ad5222c8dcb3f25682
+version=2.54.1
+sha256=ea0bbb02dbdbc596874a4e7ad35b66645b3e0a232bd0e4081de5ed92eb0a397d
 if [[ $(id -u) != 0 || $(dpkg --print-architecture) != amd64 ]]; then
   echo 'The runtime builder requires an amd64 Ubuntu build environment and root.' >&2
   exit 1
@@ -68,7 +68,7 @@ dpkg-query -W -f='${binary:Package} ${Version}\n' | LC_ALL=C sort > "$output/bui
 printf '%s\n' "$version" > "$output/version.txt"
 printf '%s  %s\n' "$sha256" "webkitgtk-$version.tar.xz" > "$output/source.sha256"
 cp "$notice" "$output/copyright"
-tar --sort=name --mtime='UTC 2026-09-16' --owner=0 --group=0 --numeric-owner \
+tar --sort=name --mtime='UTC 2026-10-02' --owner=0 --group=0 --numeric-owner \
   -C "$build_root/runtime" -cf - usr | xz -T4 -3 > "$output/brick-webkitgtk-$version-ubuntu24.04-amd64.tar.xz"
 sha256sum "$output/brick-webkitgtk-$version-ubuntu24.04-amd64.tar.xz" > "$output/runtime.sha256"
 printf 'Reusable WebKitGTK %s runtime packaged successfully.\n' "$version"

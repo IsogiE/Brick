@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { verifyRuntimeRelease } from '../scripts/check-release-runtime.mjs';
-const workflow = 'pkg-config --atleast-version=2.54.0 webkit2gtk-4.1';
+const workflow = 'pkg-config --atleast-version=2.54.1 webkit2gtk-4.1';
 function fixture() {
-  const version = '2.54.0', tag = `runtime-webkitgtk-${version}-ubuntu24.04-amd64-r1`;
+  const version = '2.54.1', tag = `runtime-webkitgtk-${version}-ubuntu24.04-amd64-r1`;
   const fileName = `brick-webkitgtk-${version}-ubuntu24.04-amd64.tar.xz`;
   const lock = { schema: 1, version, distribution: 'ubuntu-24.04', architecture: 'amd64', tag, fileName,
     url: `https://github.com/IsogiE/Brick-Releases/releases/download/${tag}/${fileName}`, sha256: 'a'.repeat(64), bytes: 123,
