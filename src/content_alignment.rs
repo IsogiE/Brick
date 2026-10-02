@@ -1,4 +1,4 @@
-//! Authenticated per-fight content alignment, separate from marker calibration.
+//! Authenticated GPU measurements and server recording clocks.
 #[path = "content_sampling.rs"]
 pub(crate) mod sampling;
 use crate::{
@@ -487,14 +487,7 @@ impl Ticket {
             expires_at: self.job.expires_at,
         })
     }
-    pub fn permits_marker_backup(&self) -> bool {
-        self.job.status == Status::Failed
-            && !self.job.cleanup_pending
-            && self
-                .job
-                .validate(&self.key, &self.guild_id, &self.member_hash, None)
-                .is_ok()
-    }
+
     pub fn expired(&self) -> bool {
         self.job.expires_at <= now_ms()
     }
@@ -754,6 +747,36 @@ pub(crate) fn test_recording_clock() -> RecordingClock {
         timeline_hash: scope.timeline_hash,
         expires_at: ticket.job.expires_at,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_timing(review: &mut crate::warcraftlogs::Review, pull: &Pull, seconds: f64) {
+    let (_, _, cap, _) = test_ticket();
+    review.content_capability.get_or_insert(cap);
+    review
+        .replay
+        .timeline_revision
+        .get_or_insert_with(|| "c".repeat(64));
+    let key = Key::new(
+        &review.replay,
+        pull,
+        review.content_capability.as_ref().unwrap(),
+        0,
+    );
+    let mut clock = test_recording_clock();
+    clock.report_start_ms = pull.report_start_ms;
+    clock.report_seconds = (pull.start_ms - pull.report_start_ms) as f64 / 1000.0;
+    clock.video_seconds = seconds;
+    clock.algorithm_revision = key.algorithm_revision.clone();
+    clock.timeline.provider = review.replay.provider.clone();
+    clock.timeline.video_id = review.replay.video_id.clone();
+    clock.timeline.raw_started_at_ms = review.replay.start_ms().ok();
+    clock.timeline.revision = review.replay.timeline_revision.clone().unwrap();
+    clock.timeline.duration_seconds = review.replay.available_seconds as f64;
+    let alignment = clock.alignment(&key).expect("valid measured test timing");
+    review
+        .content_timing
+        .insert((pull.report.clone(), pull.id), alignment);
 }
 
 #[cfg(test)]
@@ -1095,25 +1118,6 @@ mod tests {
         assert!(parse_recording_clock(&vec![b' '; 32769], &key).is_err());
     }
 
-    #[test]
-    fn unix_backup_requires_a_valid_finished_failure() {
-        let (_, _, _, mut failed) = test_ticket();
-        failed.job.status = Status::Failed;
-        failed.job.result = None;
-        failed.job.error = Some("alignment_not_found".into());
-        assert!(failed.permits_marker_backup());
-        for change in 0..5 {
-            let mut ticket = failed.clone();
-            match change {
-                0 => ticket.job.cleanup_pending = true,
-                1 => ticket.job.expires_at = 1,
-                2 => ticket.job.scope.as_mut().unwrap().video_id = "other".into(),
-                3 => ticket.job.status = Status::Canceled,
-                _ => ticket.job.scope.as_mut().unwrap().algorithm_revision = "0".repeat(64),
-            }
-            assert!(!ticket.permits_marker_backup());
-        }
-    }
     #[test]
     fn expired_and_oversized_or_unknown_json_are_rejected() {
         let (_, _, _, mut ticket) = test_ticket();

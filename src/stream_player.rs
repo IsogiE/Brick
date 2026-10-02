@@ -20,6 +20,7 @@ use wry::{
 
 use crate::stream_preferences::{PreferenceBridge, Preferences};
 
+#[cfg(test)]
 mod capture;
 mod diagnostics;
 pub(crate) mod fullscreen;
@@ -31,7 +32,18 @@ mod windows_lifecycle;
 pub use provider_login::ProviderSessions;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_profile;
+#[cfg(test)]
 pub use capture::FrameCapture;
+
+fn clock_script(origin: &str) -> String {
+    let script = include_str!("stream_player/clock.js").to_owned();
+    #[cfg(test)]
+    let script = format!("{}\n{}", script, include_str!("stream_player/frame.js"));
+    script.replace(
+        "__BRICK_WRAPPER_ORIGIN__",
+        &serde_json::to_string(origin).unwrap(),
+    )
+}
 
 const WRAPPER_LOAD_TIMEOUT: Duration = Duration::from_secs(25);
 const COMMAND_RETRY_AFTER: Duration = Duration::from_secs(4);
@@ -195,6 +207,7 @@ pub struct StreamPlayer {
     pending_seek: Option<(f64, bool, Instant)>,
     pending_playback: Option<(bool, Instant)>,
     command_retried: bool,
+    #[cfg(test)]
     capture: capture::Controller,
     fullscreen: fullscreen::Controller,
     occlusion: occlusion::Controller,
@@ -385,7 +398,7 @@ impl StreamPlayer {
             });
 
         let builder = builder.with_initialization_script_for_main_only(
-            capture::clock_script(&player_url.origin().ascii_serialization()),
+            clock_script(&player_url.origin().ascii_serialization()),
             false,
         );
 
@@ -489,6 +502,7 @@ impl StreamPlayer {
             pending_seek: initial_seek.map(|target| (target, !paused, created)),
             pending_playback: initial_seek.map(|_| (!paused, created)),
             command_retried: false,
+            #[cfg(test)]
             capture: capture::Controller::default(),
             fullscreen: fullscreen::Controller::new(ctx),
             #[cfg(target_os = "linux")]
@@ -695,6 +709,7 @@ impl StreamPlayer {
                 }
             }
         }
+        #[cfg(test)]
         self.capture.cancel();
         *self
             .allowed_url
@@ -747,6 +762,7 @@ impl StreamPlayer {
     pub fn set_visible(&self, visible: bool) {
         if !visible {
             self.occlusion.cover_for_fullscreen(false);
+            #[cfg(test)]
             self.capture.cancel();
             self.exit_fullscreen();
         }
@@ -769,6 +785,7 @@ impl StreamPlayer {
     #[cfg(test)]
     pub fn enter_fullscreen(&self) {
         if self.visible.get() {
+            #[cfg(test)]
             self.capture.cancel();
             self.fullscreen.enter();
         }
@@ -776,6 +793,7 @@ impl StreamPlayer {
 
     pub fn exit_fullscreen(&self) {
         if self.fullscreen.active() {
+            #[cfg(test)]
             self.capture.cancel();
             self.fullscreen.exit(self.webview.as_ref());
         }
@@ -793,6 +811,7 @@ impl StreamPlayer {
     pub fn poll_playback(&mut self, ctx: &egui::Context) {
         let visible =
             self.visible.get() && ctx.input(|input| input.viewport().visible().unwrap_or(true));
+        #[cfg(test)]
         if let Some(view) = &self.webview {
             self.capture
                 .tick(view, &self.playback_state(), visible, ctx);
@@ -907,6 +926,7 @@ impl StreamPlayer {
     pub fn command(&mut self, command: PlaybackCommand) -> Result<(), String> {
         let call = playback_call(command)?;
         let webview = self.webview.as_ref().ok_or("The player has closed.")?;
+        #[cfg(test)]
         self.capture.cancel();
         self.command_retried = false;
         // A new native action always supersedes startup or a seek queued while
@@ -950,6 +970,7 @@ impl StreamPlayer {
     pub fn set_bounds(&mut self, rect: egui::Rect, pixels_per_point: f32) -> Result<(), String> {
         let bounds = physical_bounds(rect, pixels_per_point)?;
         if bounds != self.bounds {
+            #[cfg(test)]
             self.capture.cancel();
             self.webview
                 .as_ref()
@@ -1017,6 +1038,7 @@ impl StreamPlayer {
             self.pending_seek = None;
             self.pending_playback = None;
             self.queued_command = None;
+            #[cfg(test)]
             self.capture.cancel();
             return None;
         }
@@ -1059,40 +1081,14 @@ impl StreamPlayer {
         })
     }
 
-    pub fn request_source_frame_capture(&self, ctx: &egui::Context) -> bool {
-        self.webview.as_ref().is_some_and(|view| {
-            self.capture.request(
-                view,
-                &self.playback_state(),
-                self.visible.get() && ctx.input(|input| input.viewport().visible().unwrap_or(true)),
-                self.bounds,
-                true,
-                ctx,
-            )
-        })
-    }
-
-    pub fn prepare_marker_quality(&self, enabled: bool) {
-        if let Some(view) = &self.webview {
-            let _ = view.evaluate_script(&format!("window.brickMedia?.prepareSync?.({enabled})"));
-        }
-    }
-
+    #[cfg(test)]
     pub fn take_frame_capture(&self) -> Option<Result<FrameCapture, String>> {
         self.capture.take()
     }
 
+    #[cfg(test)]
     pub fn frame_capture_pending(&self) -> bool {
         self.capture.pending()
-    }
-
-    pub fn cancel_frame_capture(&self) {
-        self.capture.cancel();
-    }
-
-    /// Compare with FrameCapture.generation before accepting downstream OCR.
-    pub fn frame_capture_generation(&self) -> u64 {
-        self.capture.generation()
     }
 
     #[cfg(all(test, target_os = "linux"))]
@@ -1306,6 +1302,7 @@ fn playback_acknowledged(playing: bool, requested: Instant, state: &PlaybackStat
 
 impl Drop for StreamPlayer {
     fn drop(&mut self) {
+        #[cfg(test)]
         self.capture.cancel();
         self.fullscreen.set_enabled(false);
         if let Some(preferences) = &self.preferences {

@@ -105,12 +105,20 @@ impl Snapshot {
         let plan = self.plan(review, epoch);
         let measured: Vec<_> = self.tickets.iter().filter_map(Ticket::alignment).collect();
         let replay = &review.replay;
-        let pulls = &review.pulls;
+        let pulls: std::collections::HashMap<_, _> = review
+            .pulls
+            .iter()
+            .map(|pull| ((pull.report.as_str(), pull.id), pull))
+            .collect();
         let cap = review.content_capability.as_ref();
         review.content_timing.retain(|_, shared| {
             shared.shared_clock
                 && shared.key.auth_epoch == epoch
-                && cap.is_some_and(|cap| pulls.iter().any(|p| shared.matches(replay, p, cap)))
+                && cap.is_some_and(|cap| {
+                    pulls
+                        .get(&(shared.key.report.as_str(), shared.key.pull_id))
+                        .is_some_and(|pull| shared.matches(replay, pull, cap))
+                })
                 && !measured.iter().any(|point| {
                     point.key.same_recording_report(&shared.key)
                         && ((shared.result.video_seconds
@@ -134,10 +142,10 @@ impl Snapshot {
                 })
         });
         for alignment in plan.alignments {
-            review.content_timing.insert(
-                (alignment.key.report.clone(), alignment.key.pull_id),
-                alignment,
-            );
+            review
+                .content_timing
+                .entry((alignment.key.report.clone(), alignment.key.pull_id))
+                .or_insert(alignment);
         }
     }
 
@@ -213,6 +221,17 @@ impl Snapshot {
                 .copied()
                 .filter(|p| p.report == report)
                 .collect();
+            // A saved server clock already supplies this archive's timing.
+            // Opening it on another client must not repeat verification work.
+            if !review.replay.growing
+                && group.iter().all(|pull| {
+                    review
+                        .content_alignment(pull)
+                        .is_some_and(|alignment| alignment.shared_clock)
+                })
+            {
+                continue;
+            }
             let usable: Vec<_> = group
                 .iter()
                 .copied()
@@ -322,77 +341,12 @@ impl Snapshot {
             if plan.next.is_none() {
                 plan.next = next.cloned();
             }
-            let mut hash = Sha256::new();
-            for point in &points {
-                hash.update(point.version());
-            }
-            for gap in &missing {
-                hash.update(gap.0.to_le_bytes());
-                hash.update(gap.1.to_le_bytes());
-            }
-            let revision = format!("{:x}", hash.finalize());
+            // Only the server extrapolates recording/report offsets. The client
+            // may retain this viewer's exact GPU measurements while offline.
             for pull in &group {
-                if missing
-                    .iter()
-                    .any(|&(start, end)| pull.start_ms < end && pull.end_ms > start)
-                {
-                    continue;
-                }
-                // A directly verified pull retains only its actual coverage.
                 if let Some(exact) = ticket_for(pull).and_then(Ticket::alignment) {
                     plan.alignments.push(exact);
-                    continue;
                 }
-                // An accepted measurement supplies a usable offset immediately.
-                // The two-hour interval schedules drift checks; it does not expire
-                // playback timing. Only contradictory measurements create a gap.
-                if points.windows(2).any(|pair| {
-                    !agrees(&pair[0], &pair[1])
-                        && pull.start_ms < pair[1].key.start_ms
-                        && pull.end_ms > pair[0].key.end_ms
-                }) {
-                    continue;
-                }
-                let anchor = points
-                    .iter()
-                    .rev()
-                    .find(|point| point.key.start_ms <= pull.start_ms)
-                    .or_else(|| points.first());
-                let Some(point) = anchor else {
-                    continue;
-                };
-                let key = Key::new(&review.replay, pull, cap, epoch);
-                let origin = point.result.video_seconds
-                    + (pull.start_ms - point.key.start_ms) as f64 / 1000.0;
-                let start = (-origin).max(0.0);
-                let end = key
-                    .duration()
-                    .min(review.replay.available_seconds as f64 - origin);
-                if end <= start {
-                    continue;
-                }
-                let mut timeline = point.timeline.clone();
-                timeline.duration_seconds = review.replay.available_seconds as f64;
-                plan.alignments.push(Alignment {
-                    key,
-                    shared_clock: false,
-                    timeline,
-                    timeline_hash: point.timeline_hash.clone(),
-                    signature_revision: revision.clone(),
-                    expires_at: point.expires_at,
-                    result: ResultData {
-                        video_seconds: origin,
-                        seek_video_seconds: origin.max(0.0),
-                        clipped_start: origin < 0.0,
-                        uncertainty_seconds: point.result.uncertainty_seconds,
-                        coverage: Coverage {
-                            fight_start_seconds: start,
-                            fight_end_seconds: end,
-                        },
-                        evidence_hash: revision.clone(),
-                        method_version: cap.algorithm_revision.clone(),
-                    },
-                });
             }
         }
         // Freeze a still-valid choice across refreshes, other viewers' busy work,
@@ -407,7 +361,12 @@ impl Snapshot {
                     .find(|p| key.matches(&review.replay, p, cap))
                     .copied()
             })
-            .filter(|p| ticket_for(p).is_none() && can_sample(p))
+            .filter(|p| {
+                ticket_for(p).is_none()
+                    && can_sample(p)
+                    && (review.replay.growing
+                        || !review.content_alignment(p).is_some_and(|a| a.shared_clock))
+            })
         {
             plan.next = Some(pull.clone());
         }
@@ -443,8 +402,7 @@ mod tests {
                     p
                 })
                 .collect(),
-            marker_timing: Default::default(),
-            marker_fallback: Default::default(),
+
             content_timing: Default::default(),
             content_capability: Some(cap),
         }
@@ -512,14 +470,33 @@ mod tests {
     }
 
     #[test]
-    fn first_then_stable_later_sample_covers_a_continuous_recording() {
+    fn a_known_server_clock_opens_an_archive_without_new_viewer_jobs_or_extrapolation() {
+        let mut review = review();
+        for pull in review.pulls.clone() {
+            crate::content_alignment::test_set_timing(
+                &mut review,
+                &pull,
+                15.25 + (pull.id - 1) as f64 * 600.0,
+            );
+        }
+        let saved = Snapshot::default();
+        let plan = saved.plan(&review, 0);
+        assert!(plan.next.is_none());
+        assert!(plan.pending.is_none());
+        assert!(plan.alignments.is_empty());
+        saved.apply_to(&mut review, 0);
+        assert_eq!(review.content_timing.len(), 12);
+    }
+
+    #[test]
+    fn first_then_stable_later_sample_checks_a_continuous_recording() {
         let review = review();
         let mut saved = Snapshot::default();
         assert_eq!(saved.plan(&review, 0).next.unwrap().id, 1);
         saved.remember(ticket(&review, &review.pulls[0], 0.0));
         let plan = saved.plan(&review, 0);
-        assert_eq!(plan.alignments.len(), 12);
-        assert_eq!(plan.alignments.last().unwrap().seek(0.0), Some(6615.25));
+        assert_eq!(plan.alignments.len(), 1);
+        assert_eq!(plan.alignments[0].seek(0.0), Some(15.25));
         let later = plan.next.unwrap();
         assert!(later.id >= 7);
         saved.planned = Some(Key::new(
@@ -543,7 +520,7 @@ mod tests {
         saved.remember(ticket(&review, &later, 0.0));
         let plan = saved.plan(&review, 0);
         assert!(plan.next.is_none());
-        assert_eq!(plan.alignments.len(), 12);
+        assert_eq!(plan.alignments.len(), 2);
         for a in plan.alignments {
             assert_eq!(
                 a.seek(0.0),
@@ -552,12 +529,12 @@ mod tests {
         }
     }
     #[test]
-    fn a_single_later_measurement_maps_both_earlier_and_later_pulls() {
+    fn a_single_later_measurement_only_certifies_its_exact_pull_on_the_client() {
         let review = review();
         let mut saved = Snapshot::default();
         saved.remember(ticket(&review, &review.pulls[5], 0.0));
         let plan = saved.plan(&review, 0);
-        assert_eq!(plan.alignments.len(), review.pulls.len());
+        assert_eq!(plan.alignments.len(), 1);
         for alignment in plan.alignments {
             assert_eq!(
                 alignment.seek(0.0),
@@ -574,8 +551,8 @@ mod tests {
         saved.remember(ticket(&review, &review.pulls[10], 12.0));
         let plan = saved.plan(&review, 0);
         assert_eq!(plan.next.unwrap().id, 6);
-        assert_eq!(plan.alignments.len(), 3);
-        assert_eq!(plan.alignments.last().unwrap().seek(0.0), Some(6627.25));
+        assert_eq!(plan.alignments.len(), 2);
+        assert_eq!(plan.alignments.last().unwrap().seek(0.0), Some(6027.25));
         saved.remember(ticket(&review, &review.pulls[5], 12.0));
         let plan = saved.plan(&review, 0);
         assert!(plan.next.unwrap().id < 6);
@@ -583,7 +560,7 @@ mod tests {
             .alignments
             .iter()
             .any(|a| (2..6).contains(&a.key.pull_id)));
-        assert!(plan.alignments.iter().any(|a| a.key.pull_id == 12));
+        assert!(!plan.alignments.iter().any(|a| a.key.pull_id == 12));
     }
     #[test]
     fn missing_footage_is_a_gap_and_terminal_failures_advance_first_sample() {
@@ -607,16 +584,16 @@ mod tests {
             .alignments
             .iter()
             .any(|a| a.key.pull_id == 1 || a.key.pull_id == 6));
-        assert!(plan.alignments.iter().any(|a| a.key.pull_id == 7));
-        assert!(plan.alignments.iter().any(|a| a.key.pull_id == 12));
+        assert!(!plan.alignments.iter().any(|a| a.key.pull_id == 7));
+        assert!(!plan.alignments.iter().any(|a| a.key.pull_id == 12));
         assert_eq!(plan.next.unwrap().id, 7);
         saved.remember(ticket(&review, &review.pulls[6], 0.0));
         let resumed = saved.plan(&review, 0);
         assert!(resumed.next.is_none());
         assert!(!resumed.alignments.iter().any(|a| a.key.pull_id == 6));
-        for id in 7..=12 {
-            assert!(resumed.alignments.iter().any(|a| a.key.pull_id == id));
-        }
+        assert!(resumed.alignments.iter().any(|a| a.key.pull_id == 7));
+        assert!(resumed.alignments.iter().any(|a| a.key.pull_id == 11));
+        assert!(!resumed.alignments.iter().any(|a| a.key.pull_id == 12));
     }
     #[test]
     fn repeated_no_matches_stop_archives_and_resume_only_in_a_new_live_window() {
@@ -672,10 +649,10 @@ mod tests {
             failed.job.error = Some(error.into());
             saved.remember(failed);
             let plan = saved.plan(&review, 0);
-            assert_eq!(plan.alignments.len(), review.pulls.len());
-            assert_eq!(plan.alignments[5].seek(0.0), Some(3015.25));
+            assert_eq!(plan.alignments.len(), 1);
+            assert_eq!(plan.alignments[0].seek(0.0), Some(15.25));
             assert!(plan.alignments.iter().any(|a| a.key.pull_id == 1));
-            assert!(plan.alignments.iter().any(|a| a.key.pull_id == 11));
+            assert!(!plan.alignments.iter().any(|a| a.key.pull_id == 11));
         }
     }
 
@@ -699,10 +676,10 @@ mod tests {
         one.remember(ticket(&review, &duplicate, 0.0));
         let plan = one.plan(&review, 0);
         assert!(plan.next.unwrap().start_ms >= review.pulls[0].end_ms);
-        assert_eq!(plan.alignments.len(), review.pulls.len() - 1);
+        assert_eq!(plan.alignments.len(), 2);
     }
     #[test]
-    fn live_pull_42_keeps_the_known_offset_while_a_drift_check_is_pending() {
+    fn pending_live_drift_check_does_not_create_a_viewer_offset() {
         let mut review = review();
         review.replay.growing = true;
         let mut later = review.pulls[0].clone();
@@ -719,17 +696,10 @@ mod tests {
         let plan = saved.plan(&review, 0);
         assert_eq!(plan.pending, Some(pending));
         assert!(plan.next.is_none());
-        assert_eq!(
-            plan.alignments
-                .iter()
-                .find(|a| a.key.pull_id == 42)
-                .unwrap()
-                .seek(0.0),
-            Some(14415.25)
-        );
+        assert!(!plan.alignments.iter().any(|a| a.key.pull_id == 42));
     }
     #[test]
-    fn live_sampling_checks_after_two_hours_without_expiring_known_timing() {
+    fn live_sampling_checks_after_two_hours_without_client_extrapolation() {
         let mut review = review();
         review.replay.growing = true;
         let mut extra = review.pulls.last().unwrap().clone();
@@ -742,19 +712,12 @@ mod tests {
         review.pulls.push(extra.clone());
         assert_eq!(saved.plan(&review, 0).next.unwrap().id, 13);
         let plan = saved.plan(&review, 0);
-        assert_eq!(
-            plan.alignments
-                .iter()
-                .find(|a| a.key.pull_id == 13)
-                .unwrap()
-                .seek(0.0),
-            Some(7215.25)
-        );
+        assert!(!plan.alignments.iter().any(|a| a.key.pull_id == 13));
         saved.remember(ticket(&review, &extra, 0.0));
         assert!(saved.plan(&review, 0).next.is_none());
     }
     #[test]
-    fn expiry_account_and_media_changes_remove_derived_timing() {
+    fn expiry_account_and_media_changes_remove_exact_viewer_timing() {
         let review = review();
         let mut saved = Snapshot::default();
         let mut first = ticket(&review, &review.pulls[0], 0.0);
@@ -762,16 +725,16 @@ mod tests {
         let expiry = first.job.expires_at;
         saved.remember(first);
         saved.remember(ticket(&review, &review.pulls[10], 0.0));
-        assert_eq!(saved.plan(&review, 0).alignments[1].expires_at, expiry);
+        assert_eq!(saved.plan(&review, 0).alignments[0].expires_at, expiry);
         assert!(saved.plan(&review, 1).alignments.is_empty());
         let mut changed = review.clone();
         changed.replay.timeline_revision = Some("f".repeat(64));
         assert!(saved.plan(&changed, 0).alignments.is_empty());
         saved.tickets[0].job.expires_at = 1;
         let plan = saved.plan(&review, 0);
-        assert_eq!(plan.alignments.len(), review.pulls.len());
+        assert_eq!(plan.alignments.len(), 1);
         assert!(plan.alignments.iter().all(|a| a.expires_at > now_ms()));
-        assert_eq!(plan.alignments[0].seek(0.0), Some(15.25));
+        assert_eq!(plan.alignments[0].seek(0.0), Some(6015.25));
     }
     #[test]
     fn pending_samples_survive_catalogue_refresh_and_do_not_queue_other_pulls() {

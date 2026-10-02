@@ -175,8 +175,7 @@ pub struct RaidEvent {
 pub struct Review {
     pub replay: Replay,
     pub pulls: Vec<Pull>,
-    pub marker_timing: HashMap<(String, u64), crate::replay_sync::Alignment>,
-    pub marker_fallback: HashMap<(String, u64), crate::content_alignment::Ticket>,
+
     pub content_capability: Option<crate::content_alignment::Capability>,
     pub content_timing: HashMap<(String, u64), crate::content_alignment::Alignment>,
 }
@@ -201,11 +200,6 @@ impl Review {
         candidates.next().is_none().then_some(first)
     }
 
-    pub fn marker_alignment(&self, pull: &Pull) -> Option<crate::replay_sync::Alignment> {
-        self.marker_timing
-            .get(&(pull.report.clone(), pull.id))
-            .copied()
-    }
     pub fn content_alignment(&self, pull: &Pull) -> Option<&crate::content_alignment::Alignment> {
         let capability = self.content_capability.as_ref()?;
         self.content_timing
@@ -215,27 +209,12 @@ impl Review {
     pub fn content_required(&self) -> bool {
         self.content_capability.is_some() || self.replay.start_ms().is_err()
     }
-    pub fn marker_backup_allowed(&self, pull: &Pull) -> bool {
-        self.replay.start_ms().is_ok()
-            && self.content_capability.as_ref().is_some_and(|cap| {
-                self.marker_fallback
-                    .get(&(pull.report.clone(), pull.id))
-                    .is_some_and(|ticket| {
-                        ticket.permits_marker_backup()
-                            && ticket.key.matches(&self.replay, pull, cap)
-                    })
-            })
-    }
-    pub fn uses_content_timing(&self, pull: &Pull) -> bool {
+
+    pub fn uses_content_timing(&self, _pull: &Pull) -> bool {
         self.content_required()
-            && (self.content_alignment(pull).is_some() || !self.marker_backup_allowed(pull))
     }
     pub fn has_precise_timing(&self, pull: &Pull) -> bool {
-        if self.uses_content_timing(pull) {
-            self.content_alignment(pull).is_some()
-        } else {
-            self.marker_alignment(pull).is_some()
-        }
+        self.content_alignment(pull).is_some()
     }
     /// Provider time is an estimate for immediate playback, never certified or
     /// stored as an alignment. Unknown-origin uploads remain watchable from zero.
@@ -248,20 +227,9 @@ impl Review {
     }
 
     pub fn pull_video_start(&self, pull: &Pull) -> f64 {
-        if self.uses_content_timing(pull) {
-            return self.content_alignment(pull).map_or_else(
-                || self.estimated_video_start(pull),
-                |a| a.result.video_seconds,
-            );
-        }
-        if self.marker_backup_allowed(pull) {
-            return self
-                .marker_alignment(pull)
-                .map_or_else(|| self.estimated_video_start(pull), |a| a.video_seconds);
-        }
-        self.marker_alignment(pull).map_or_else(
-            || (pull.start_ms - self.replay.start_ms().unwrap_or(pull.start_ms)) as f64 / 1000.0,
-            |alignment| alignment.video_seconds,
+        self.content_alignment(pull).map_or_else(
+            || self.estimated_video_start(pull),
+            |a| a.result.video_seconds,
         )
     }
     pub fn video_seconds(&self, pull: &Pull, elapsed: f64) -> Option<f64> {
@@ -1235,11 +1203,7 @@ impl Client {
             self.review_replay(replay)?
         };
         review.content_capability = capability;
-        if playback && !review.content_required() {
-            while_current(&self.cancel, || {
-                crate::replay_library::lookup(discord_token, &mut review, preferred_pull)
-            })?;
-        }
+
         if playback && review.content_required() {
             let clocks =
                 self.saved_recording_clocks(discord_token, &mut review, preferred_pull, &[]);
@@ -1297,6 +1261,30 @@ impl Client {
             crate::content_alignment::recording_clock(access, key, &self.cancel)
                 .unwrap_or_else(|_| fallback())
         })
+    }
+
+    pub(crate) fn refresh_content_timing(
+        &mut self,
+        access: &crate::guild::Access,
+        stream: &Stream,
+        mut review: Review,
+    ) -> Result<Review, String> {
+        let previous = self
+            .prepared
+            .lock()
+            .ok()
+            .and_then(|cache| cache.for_display(stream))
+            .map(|entry| entry.clocks)
+            .unwrap_or_default();
+        let clocks = self.saved_recording_clocks(access, &mut review, None, &previous);
+        check_cancelled(&self.cancel)?;
+        if let Some(cache) = &mut self.review_cache {
+            cache.update_clocks(access, stream, &clocks);
+        }
+        if let Ok(mut cache) = self.prepared.lock() {
+            cache.refresh_clocks(stream, review.clone(), clocks);
+        }
+        Ok(review)
     }
 
     pub(crate) fn save_samples(
@@ -1385,8 +1373,6 @@ impl Client {
         Ok(Review {
             replay,
             pulls,
-            marker_timing: HashMap::new(),
-            marker_fallback: Default::default(),
             content_capability: None,
             content_timing: HashMap::new(),
         })
@@ -1729,8 +1715,6 @@ impl Client {
             return Ok(Review {
                 replay,
                 pulls: Vec::new(),
-                marker_timing: HashMap::new(),
-                marker_fallback: Default::default(),
                 content_capability: None,
                 content_timing: HashMap::new(),
             });
@@ -1837,8 +1821,6 @@ impl Client {
         check_cancelled(&self.cancel)?;
         self.recording_match_complete = complete;
         Ok(Review {
-            marker_timing: HashMap::new(),
-            marker_fallback: Default::default(),
             content_capability: None,
             content_timing: HashMap::new(),
             replay,
@@ -2267,7 +2249,7 @@ mod tests {
 
     #[test]
     fn cross_report_pull_matching_requires_a_unique_fight_but_keeps_exact_identity() {
-        let selected = crate::replay_marker::tests::pull();
+        let selected = crate::content_alignment::test_ticket().1;
         let mut first = selected.clone();
         first.report = "DifferentReport1".into();
         first.id += 100;
@@ -2280,8 +2262,6 @@ mod tests {
         let mut review = Review {
             replay: replay(),
             pulls: vec![first.clone(), second],
-            marker_timing: HashMap::new(),
-            marker_fallback: Default::default(),
             content_capability: None,
             content_timing: HashMap::new(),
         };

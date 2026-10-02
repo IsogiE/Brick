@@ -169,7 +169,6 @@ pub(crate) fn resume_pending() -> Result<bool, String> {
 fn reset_with(plan: &Plan, erase_vault: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     reset_using(plan, &WRITES, erase_vault, || {
         crate::protected_cache::forget_keys();
-        crate::replay_library::forget_local_cache();
         crate::autostart::clear_for_erasure()
     })
 }

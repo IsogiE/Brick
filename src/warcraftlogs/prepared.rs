@@ -413,8 +413,7 @@ mod tests {
             replay,
             pulls: vec![pull],
             content_capability: Some(cap),
-            marker_timing: Default::default(),
-            marker_fallback: Default::default(),
+
             content_timing: Default::default(),
         };
         (stream, review, vec![(ticket.key, test_recording_clock())])

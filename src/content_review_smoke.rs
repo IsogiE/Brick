@@ -165,17 +165,7 @@ impl Driver {
                     self.viewer.select(first);
                     self.viewer.sync_content_selection();
                     let playback = self.viewer.playback.as_ref().unwrap();
-                    if !playback.content_timing
-                        || playback.seconds != self.origin
-                        || !self
-                            .viewer
-                            .review
-                            .as_ref()
-                            .unwrap()
-                            .marker_timing
-                            .is_empty()
-                        || self.viewer.marker_sync.busy()
-                    {
+                    if !playback.content_timing || playback.seconds != self.origin {
                         return Err("Content playback used the wrong timing source".into());
                     }
                     // A different viewer sharing this account's metadata cache
@@ -574,8 +564,6 @@ pub(crate) fn run_native_content() {
     viewer.review = Some(Review {
         replay: fixture.replay,
         pulls: vec![pull.clone()],
-        marker_timing: Default::default(),
-        marker_fallback: Default::default(),
         content_capability: Some(cap),
         content_timing: Default::default(),
     });

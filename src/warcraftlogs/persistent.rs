@@ -145,8 +145,7 @@ impl Cache {
                     .filter_map(|(report, id)| self.document.reports.get(report)?.get(id).cloned())
                     .collect(),
             ),
-            marker_timing: Default::default(),
-            marker_fallback: Default::default(),
+
             content_capability: capability.cloned(),
             content_timing: Default::default(),
         };
@@ -522,8 +521,6 @@ mod tests {
         let review = Review {
             replay,
             pulls: vec![pull],
-            marker_timing: Default::default(),
-            marker_fallback: Default::default(),
             content_capability: None,
             content_timing: Default::default(),
         };
