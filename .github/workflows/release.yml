@@ -209,6 +209,11 @@ jobs:
     - name: Prepare verified Certum login automation
       shell: pwsh
       run: ./scripts/prepare-certum-action.ps1
+    - name: Check Windows signing runner time
+      shell: pwsh
+      run: |
+        . ./scripts/sync-signing-clock.ps1
+        Sync-BrickSigningClock
     - name: Connect Certum SimplySign
       timeout-minutes: 12
       uses: dismine/windows-app-signing-setup-action@89ae3b032d4bc7a5b98d1a42a34e61ecb6faad64

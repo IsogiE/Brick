@@ -2,7 +2,7 @@ param([string]$ActionScriptPath)
 $ErrorActionPreference = 'Stop'
 
 # Reviewed adaptation of the pinned upstream action. Fail closed if upstream
-# bytes differ; authentication, TOTP generation and certificate checks stay intact.
+# bytes differ; credentials, TOTP algorithm and certificate checks stay intact.
 $revision = '89ae3b032d4bc7a5b98d1a42a34e61ecb6faad64'
 if (-not $ActionScriptPath) {
     if (-not $env:RUNNER_WORKSPACE) { throw 'The Actions workspace is required.' }
@@ -50,6 +50,27 @@ foreach ($h in $Windows) {
 Replace-Once 'if ($windows.Count -gt 0) {' 'if ((Get-LoginWindow -Windows $windows) -ne [IntPtr]::Zero) {'
 Replace-Once 'if ($windows.Count -eq 0) {' 'if ((Get-LoginWindow -Windows $windows) -eq [IntPtr]::Zero) {'
 Replace-Once 'SimplySign Desktop did not open any windows within $maxWaitSeconds seconds' 'SimplySign Desktop did not expose its two-field login form within $maxWaitSeconds seconds'
+
+# Use freshly verified UTC for every initial/recovery token window. Embed the
+# reviewed helper so the action never depends on its working directory.
+$clockHelper = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'sync-signing-clock.ps1')).Replace([string][char]13, '')
+Replace-Once 'function Get-FreshTotpCode {' ($clockHelper + [char]10 + 'function Get-FreshTotpCode {')
+Replace-Once @'
+    $secondsLeft = $Period - ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() % $Period)
+    Write-Host "TOTP window: $secondsLeft s remaining (period: $Period s)"
+    if ($secondsLeft -lt 20) {
+        $wait = $secondsLeft + 1
+        Write-Host "Under 20s left — waiting ${wait}s for a fresh period to submit early in the window..."
+        Start-Sleep -Seconds $wait
+    }
+'@ '    Wait-BrickSigningTotpWindow -Period $Period'
+Replace-Once @'
+    while ((Get-TotpPeriod) -le $script:lastSubmitPeriod) {
+        $secondsLeft = $Period - ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() % $Period)
+        Write-Host "Waiting ${secondsLeft}s for a new TOTP period (last submit used period $($script:lastSubmitPeriod))..."
+        Start-Sleep -Seconds ($secondsLeft + 1)
+    }
+'@ '    Wait-BrickSigningTotpWindow -Period $Period -AfterPeriod $script:lastSubmitPeriod'
 
 [IO.File]::WriteAllText($ActionScriptPath, $source, [Text.UTF8Encoding]::new($false))
 Write-Host 'Verified pinned SimplySign action and applied the reviewed login readiness fix.'
