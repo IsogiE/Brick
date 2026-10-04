@@ -94,8 +94,7 @@ fn pull_start_time(start_ms: i64) -> Option<(time::OffsetDateTime, &'static str)
                 .assume_utc(),
         )
     };
-    let summer =
-        utc >= transition(time::Month::March)? && utc < transition(time::Month::October)?;
+    let summer = utc >= transition(time::Month::March)? && utc < transition(time::Month::October)?;
     let (hours, zone) = if summer { (2, "CEST") } else { (1, "CET") };
     let local = utc.checked_to_offset(time::UtcOffset::from_hms(hours, 0, 0).ok()?)?;
     Some((local, zone))
@@ -515,8 +514,8 @@ pub fn pull(
                         at.minute(),
                         at.second()
                     ))
-                        .size(11.0)
-                        .color(MUTED),
+                    .size(11.0)
+                    .color(MUTED),
                 );
             }
             if !dungeon {
@@ -563,11 +562,8 @@ mod tests {
         }
     }
     fn timestamp(text: &str) -> i64 {
-        let at = time::OffsetDateTime::parse(
-            text,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .unwrap();
+        let at = time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+            .unwrap();
         (at.unix_timestamp_nanos() / 1_000_000) as i64
     }
 
@@ -596,7 +592,12 @@ mod tests {
     #[test]
     fn pull_time_search_uses_the_displayed_local_date_and_preserves_other_terms() {
         let pull = pull("exampleLog", 7, 4, timestamp("2026-09-10T22:15:32Z"));
-        for query in ["", "ula examplelog 7", "11 SEP 00:15 CEST", "2026-09-11 00:15:32"] {
+        for query in [
+            "",
+            "ula examplelog 7",
+            "11 SEP 00:15 CEST",
+            "2026-09-11 00:15:32",
+        ] {
             assert!(pull_matches_search(&pull, query), "{query}");
         }
         for query in ["2026-09-10", "22:15", "00:15 CET", "12 Sep"] {
@@ -618,12 +619,21 @@ mod tests {
                 }));
             }
             let output = output.unwrap();
-            let text = output.shapes.iter().find_map(|shape| match &shape.shape {
-                egui::Shape::Text(text) if text.galley.text() == pull_start_label(&pull) => Some(text),
-                _ => None,
-            }).expect("Each card displays its Warcraft Logs start time");
+            let text = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == pull_start_label(&pull) => {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .expect("Each card displays its Warcraft Logs start time");
             let text_bounds = egui::Rect::from_min_size(text.pos, text.galley.size());
-            assert!(bounds.contains_rect(text_bounds), "{width}: {bounds:?}, {text_bounds:?}");
+            assert!(
+                bounds.contains_rect(text_bounds),
+                "{width}: {bounds:?}, {text_bounds:?}"
+            );
             assert!(text_bounds.top() > bounds.top() + 23.0);
             assert!(text_bounds.bottom() < bounds.bottom() - 5.0);
         }

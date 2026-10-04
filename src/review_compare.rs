@@ -405,9 +405,9 @@ impl Controller {
         {
             return None;
         }
-        let [Some(primary), Some(secondary)] =
-            std::array::from_fn(|side| self.clocks[side].observed_encounter_ms(states[side].seconds))
-        else {
+        let [Some(primary), Some(secondary)] = std::array::from_fn(|side| {
+            self.clocks[side].observed_encounter_ms(states[side].seconds)
+        }) else {
             return None;
         };
         let observed_range =
@@ -425,9 +425,9 @@ impl Controller {
         {
             return None;
         }
-        let [Some(primary), Some(secondary)] =
-            std::array::from_fn(|side| self.clocks[side].observed_encounter_ms(states[side].seconds))
-        else {
+        let [Some(primary), Some(secondary)] = std::array::from_fn(|side| {
+            self.clocks[side].observed_encounter_ms(states[side].seconds)
+        }) else {
             return None;
         };
         let [Some([first_start, first_end]), Some([second_start, second_end])] =
@@ -496,7 +496,8 @@ impl Controller {
             if let Some(leader) = self.provider_leader {
                 let state = states[leader];
                 if Self::settled(state, self.sample_epoch, state.playing) {
-                    if let Some(position) = self.clocks[leader].observed_encounter_ms(state.seconds) {
+                    if let Some(position) = self.clocks[leader].observed_encounter_ms(state.seconds)
+                    {
                         // A failed peer stays held. Its controlling VOD and the
                         // timeline keep following real samples without retries.
                         self.at_ms = position.clamp(self.range[0], self.range[1]);
@@ -1500,8 +1501,8 @@ mod tests {
                         );
                         assert!(matches!(commands.secondary, Some(PlaybackCommand::Play)));
                     }
-                    let running =
-                        clocks.map(|clock| sample(clock.video_seconds(START).unwrap() + 0.25, true));
+                    let running = clocks
+                        .map(|clock| sample(clock.video_seconds(START).unwrap() + 0.25, true));
                     c.tick([&running[0], &running[1]], test_now());
                     assert_eq!(c.status(), Status::Playing);
                     assert!(c.wants_playing());
@@ -1515,7 +1516,8 @@ mod tests {
     fn covered_start_still_requires_fresh_settled_samples_within_tolerance() {
         for invalid in 0..6 {
             let clocks = clocks().map(|clock| clock.with_relative_coverage(0.0, 300.0).unwrap());
-            let mut c = Controller::new(clocks, [START, START + 300_000], START, true, test_now()).unwrap();
+            let mut c =
+                Controller::new(clocks, [START, START + 300_000], START, true, test_now()).unwrap();
             let empty = PlaybackState::default();
             c.tick([&empty, &empty], test_now());
             let mut paused = clocks.map(|clock| sample(clock.video_seconds(START).unwrap(), false));
