@@ -71,13 +71,23 @@ impl RecordingClock {
     }
 
     pub fn encounter_ms(self, seconds: f64) -> Option<i64> {
+        self.encounter_ms_with_tolerance(seconds, 0.0)
+    }
+
+    fn observed_encounter_ms(self, seconds: f64) -> Option<i64> {
+        // Decoders can land just before a requested boundary. Apply the same
+        // settlement tolerance to observations without extending seek coverage.
+        self.encounter_ms_with_tolerance(seconds, SETTLED_TOLERANCE_MS as f64 / 1000.0)
+    }
+
+    fn encounter_ms_with_tolerance(self, seconds: f64, tolerance: f64) -> Option<i64> {
         if !seconds.is_finite() || !(0.0..=self.available_seconds).contains(&seconds) {
             return None;
         }
         let elapsed = seconds - self.reference_seconds;
         if self
             .relative_coverage
-            .is_some_and(|(first, last)| elapsed < first || elapsed > last)
+            .is_some_and(|(first, last)| elapsed < first - tolerance || elapsed > last + tolerance)
         {
             return None;
         }
@@ -379,7 +389,7 @@ impl Controller {
 
     fn position(&self, side: usize, state: &PlaybackState) -> Option<i64> {
         (state.ready && state.is_fresh_after(self.sample_epoch) && state.seeking.is_none())
-            .then(|| self.clocks[side].encounter_ms(state.seconds))
+            .then(|| self.clocks[side].observed_encounter_ms(state.seconds))
             .flatten()
             .map(|at| at.clamp(self.range[0], self.range[1]))
     }
@@ -395,15 +405,17 @@ impl Controller {
         {
             return None;
         }
-        let [Some(primary), Some(secondary)] =
-            std::array::from_fn(|side| self.clocks[side].encounter_ms(states[side].seconds))
-        else {
+        let [Some(primary), Some(secondary)] = std::array::from_fn(|side| {
+            self.clocks[side].observed_encounter_ms(states[side].seconds)
+        }) else {
             return None;
         };
-        ((self.range[0]..=self.range[1]).contains(&primary)
-            && (self.range[0]..=self.range[1]).contains(&secondary)
+        let observed_range =
+            self.range[0] - SETTLED_TOLERANCE_MS..=self.range[1] + SETTLED_TOLERANCE_MS;
+        (observed_range.contains(&primary)
+            && observed_range.contains(&secondary)
             && (primary - secondary).abs() <= SETTLED_TOLERANCE_MS)
-            .then_some(primary)
+            .then_some(primary.clamp(self.range[0], self.range[1]))
     }
 
     fn playback_drift(&self, states: [&PlaybackState; PLAYER_COUNT]) -> Option<[f64; 2]> {
@@ -413,9 +425,9 @@ impl Controller {
         {
             return None;
         }
-        let [Some(primary), Some(secondary)] =
-            std::array::from_fn(|side| self.clocks[side].encounter_ms(states[side].seconds))
-        else {
+        let [Some(primary), Some(secondary)] = std::array::from_fn(|side| {
+            self.clocks[side].observed_encounter_ms(states[side].seconds)
+        }) else {
             return None;
         };
         let [Some([first_start, first_end]), Some([second_start, second_end])] =
@@ -456,7 +468,7 @@ impl Controller {
                 && state.is_fresh_after(since)
                 && state.playback_intent != Some(true);
             (Self::settled(state, since, true) || provider_gesture)
-                .then(|| self.clocks[side].encounter_ms(state.seconds))
+                .then(|| self.clocks[side].observed_encounter_ms(state.seconds))
                 .flatten()
                 .map(|at| at.clamp(self.range[0], self.range[1]))
         })?;
@@ -484,7 +496,8 @@ impl Controller {
             if let Some(leader) = self.provider_leader {
                 let state = states[leader];
                 if Self::settled(state, self.sample_epoch, state.playing) {
-                    if let Some(position) = self.clocks[leader].encounter_ms(state.seconds) {
+                    if let Some(position) = self.clocks[leader].observed_encounter_ms(state.seconds)
+                    {
                         // A failed peer stays held. Its controlling VOD and the
                         // timeline keep following real samples without retries.
                         self.at_ms = position.clamp(self.range[0], self.range[1]);
@@ -550,7 +563,8 @@ impl Controller {
             } => {
                 let follower = 1 - leader;
                 if Self::settled(states[leader], self.sample_epoch, states[leader].playing) {
-                    if let Some(position) = self.clocks[leader].encounter_ms(states[leader].seconds)
+                    if let Some(position) =
+                        self.clocks[leader].observed_encounter_ms(states[leader].seconds)
                     {
                         self.at_ms = position.clamp(self.range[0], self.range[1]);
                     }
@@ -665,7 +679,7 @@ impl Controller {
                                 self.clocks[side].encounter_ms(target) == Some(self.at_ms)
                             })
                             && self.clocks[side]
-                                .encounter_ms(state.seconds)
+                                .observed_encounter_ms(state.seconds)
                                 .is_some_and(|at| (at - self.at_ms).abs() <= SETTLED_TOLERANCE_MS)
                     })
                 {
@@ -690,7 +704,7 @@ impl Controller {
                 let ready = states.iter().enumerate().all(|(side, state)| {
                     Self::settled(state, since, false)
                         && self.clocks[side]
-                            .encounter_ms(state.seconds)
+                            .observed_encounter_ms(state.seconds)
                             .is_some_and(|at| (at - self.at_ms).abs() <= SETTLED_TOLERANCE_MS)
                 });
                 if !ready {
@@ -1449,6 +1463,80 @@ mod tests {
         prepared(&mut c, true);
         assert_eq!(c.status(), Status::Playing);
         assert_eq!(clocks()[1].encounter_ms(913.25), Some(START + 12_375));
+    }
+
+    #[test]
+    fn seeking_to_pull_start_handles_early_decoder_samples_and_pause_then_play() {
+        for covered in [false, true] {
+            for playing in [false, true] {
+                for early_side in 0..2 {
+                    let clocks = clocks().map(|clock| {
+                        if covered {
+                            clock.with_relative_coverage(0.0, 300.0).unwrap()
+                        } else {
+                            clock
+                        }
+                    });
+                    let mut c = controller(true);
+                    c.clocks = clocks;
+                    c.seek(START, playing, test_now()).unwrap();
+                    let empty = PlaybackState::default();
+                    let commands = c.tick([&empty, &empty], test_now());
+                    assert_eq!(command_seconds(commands.primary), 100.125);
+                    assert_eq!(command_seconds(commands.secondary), 900.875);
+                    let mut paused =
+                        clocks.map(|clock| sample(clock.video_seconds(START).unwrap(), false));
+                    paused[early_side].seconds -= 0.125;
+                    let commands = c.tick([&paused[0], &paused[1]], test_now());
+                    if playing {
+                        assert!(matches!(commands.primary, Some(PlaybackCommand::Play)));
+                        assert!(matches!(commands.secondary, Some(PlaybackCommand::Play)));
+                    } else {
+                        assert_eq!(c.status(), Status::Paused);
+                        c.set_playing(true, test_now());
+                        let commands = c.tick([&paused[0], &paused[1]], test_now());
+                        assert!(
+                            matches!(commands.primary, Some(PlaybackCommand::Play)),
+                            "Play at zero must resume without another seek"
+                        );
+                        assert!(matches!(commands.secondary, Some(PlaybackCommand::Play)));
+                    }
+                    let running = clocks
+                        .map(|clock| sample(clock.video_seconds(START).unwrap() + 0.25, true));
+                    c.tick([&running[0], &running[1]], test_now());
+                    assert_eq!(c.status(), Status::Playing);
+                    assert!(c.wants_playing());
+                    assert!(c.position_ms() >= START);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn covered_start_still_requires_fresh_settled_samples_within_tolerance() {
+        for invalid in 0..6 {
+            let clocks = clocks().map(|clock| clock.with_relative_coverage(0.0, 300.0).unwrap());
+            let mut c =
+                Controller::new(clocks, [START, START + 300_000], START, true, test_now()).unwrap();
+            let empty = PlaybackState::default();
+            c.tick([&empty, &empty], test_now());
+            let mut paused = clocks.map(|clock| sample(clock.video_seconds(START).unwrap(), false));
+            paused[1].seconds -= 0.125;
+            match invalid {
+                0 => paused[1].mark_polled_at(c.sample_epoch),
+                1 => paused[1].buffering = true,
+                2 => paused[1].blocked = true,
+                3 => paused[1].seeking = Some(900.875),
+                4 => paused[1].playback_intent = Some(false),
+                _ => paused[1].seconds = 900.374,
+            }
+            let waiting = c.tick([&paused[0], &paused[1]], test_now());
+            assert!(waiting.primary.is_none() && waiting.secondary.is_none());
+            assert_eq!(c.status(), Status::Preparing);
+            assert!(c.wants_playing());
+            assert_eq!(clocks[1].encounter_ms(900.75), None);
+            assert_eq!(clocks[1].video_seconds(START - 1), None);
+        }
     }
 
     #[test]
