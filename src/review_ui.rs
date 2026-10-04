@@ -3821,7 +3821,7 @@ impl ReviewUi {
         ui.add_space(4.0);
         ui.add(
             egui::TextEdit::singleline(&mut self.pull_search)
-                .hint_text("Boss, log or pull…")
+                .hint_text("Boss, log, pull or time…")
                 .margin(egui::vec2(8.0, 7.0))
                 .desired_width(ui.available_width()),
         );
@@ -3859,26 +3859,23 @@ impl ReviewUi {
                         let filtered: Vec<_> = group
                             .iter()
                             .filter(|p| {
-                                query.split_whitespace().all(|q| {
-                                    format!("{} {} {}", p.name, p.report, p.id)
-                                        .to_lowercase()
-                                        .contains(q)
-                                }) && match if p.difficulty == 10 {
-                                    0
-                                } else {
-                                    self.pull_filter
-                                } {
-                                    1 => {
-                                        best.is_some()
-                                            && if p.kill {
-                                                best == Some(0.0)
-                                            } else {
-                                                p.remaining == best
-                                            }
+                                crate::stream_widgets::pull_matches_search(p, &query)
+                                    && match if p.difficulty == 10 {
+                                        0
+                                    } else {
+                                        self.pull_filter
+                                    } {
+                                        1 => {
+                                            best.is_some()
+                                                && if p.kill {
+                                                    best == Some(0.0)
+                                                } else {
+                                                    p.remaining == best
+                                                }
+                                        }
+                                        2 => p.kill,
+                                        _ => true,
                                     }
-                                    2 => p.kill,
-                                    _ => true,
-                                }
                             })
                             .collect();
                         if filtered.is_empty() {

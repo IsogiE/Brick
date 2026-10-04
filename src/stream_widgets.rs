@@ -74,6 +74,70 @@ pub fn encounter_label(pull: &crate::warcraftlogs::Pull) -> String {
     }
 }
 
+// Warcraft Logs stores absolute pull starts in UTC milliseconds. Use the
+// current EU rules (since 2002): last Sundays of March/October at 01:00 UTC.
+// https://eur-lex.europa.eu/eli/dir/2000/84/oj
+fn pull_start_time(start_ms: i64) -> Option<(time::OffsetDateTime, &'static str)> {
+    let utc =
+        time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(start_ms) * 1_000_000).ok()?;
+    if utc.year() < 2002 {
+        return None;
+    }
+    let transition = |month| {
+        let last = time::Date::from_calendar_date(utc.year(), month, 31).ok()?;
+        let sunday = 31 - last.weekday().number_days_from_sunday();
+        Some(
+            time::Date::from_calendar_date(utc.year(), month, sunday)
+                .ok()?
+                .with_hms(1, 0, 0)
+                .ok()?
+                .assume_utc(),
+        )
+    };
+    let summer =
+        utc >= transition(time::Month::March)? && utc < transition(time::Month::October)?;
+    let (hours, zone) = if summer { (2, "CEST") } else { (1, "CET") };
+    let local = utc.checked_to_offset(time::UtcOffset::from_hms(hours, 0, 0).ok()?)?;
+    Some((local, zone))
+}
+
+fn pull_start_label(pull: &crate::warcraftlogs::Pull) -> String {
+    pull_start_time(pull.start_ms)
+        .map(|(at, zone)| {
+            format!(
+                "{} {} · {:02}:{:02}:{:02} {zone}",
+                at.day(),
+                &at.month().to_string()[..3],
+                at.hour(),
+                at.minute(),
+                at.second()
+            )
+        })
+        .unwrap_or_else(|| "Start time unavailable".into())
+}
+
+pub fn pull_matches_search(pull: &crate::warcraftlogs::Pull, query: &str) -> bool {
+    if query.trim().is_empty() {
+        return true;
+    }
+    let date = pull_start_time(pull.start_ms)
+        .map(|(at, _)| at.date().to_string())
+        .unwrap_or_default();
+    let text = format!(
+        "{} {} {} {} {}",
+        pull.name,
+        pull.report,
+        pull.id,
+        pull_start_label(pull),
+        date
+    )
+    .to_lowercase();
+    query
+        .to_lowercase()
+        .split_whitespace()
+        .all(|word| text.contains(word))
+}
+
 // Reserve real space for list scrollbars; floating bars cover card outlines.
 pub fn list_scroll_style(ui: &mut egui::Ui) {
     ui.visuals_mut().widgets.inactive.fg_stroke.color = MUTED;
@@ -299,7 +363,7 @@ pub fn pull(
     best: bool,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 54.0), egui::Sense::click());
     let painter = ui.painter_at(rect);
     painter.rect_filled(
         rect,
@@ -366,9 +430,16 @@ pub fn pull(
         egui::FontId::proportional(10.0),
         MUTED,
     );
+    painter.text(
+        egui::pos2(left, rect.top() + 34.0),
+        egui::Align2::LEFT_CENTER,
+        pull_start_label(pull),
+        egui::FontId::proportional(10.0),
+        MUTED,
+    );
     // A best marker does not change the outcome color or compete with selection.
     if best && !pull.kill && !dungeon {
-        painter.circle_filled(egui::pos2(left + 2.0, rect.bottom() - 12.0), 2.0, outcome);
+        painter.circle_filled(egui::pos2(right - 2.0, rect.top() + 34.0), 2.0, outcome);
     }
     painter.rect_stroke(
         rect,
@@ -406,11 +477,12 @@ pub fn pull(
             true,
             selected,
             format!(
-                "{} {} {} {}",
+                "{} {} {} {} {}",
                 pull.name,
                 if dungeon { "segment" } else { "fight" },
                 pull.id,
-                result
+                result,
+                pull_start_label(pull)
             ),
         )
     });
@@ -434,6 +506,19 @@ pub fn pull(
                 .size(11.0)
                 .color(MUTED),
             );
+            if let Some((at, zone)) = pull_start_time(pull.start_ms) {
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {:02}:{:02}:{:02} {zone}",
+                        at.date(),
+                        at.hour(),
+                        at.minute(),
+                        at.second()
+                    ))
+                        .size(11.0)
+                        .color(MUTED),
+                );
+            }
             if !dungeon {
                 ui.label(
                     RichText::new(if pull.kill {
@@ -477,6 +562,73 @@ mod tests {
             seconds: 247,
         }
     }
+    fn timestamp(text: &str) -> i64 {
+        let at = time::OffsetDateTime::parse(
+            text,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        (at.unix_timestamp_nanos() / 1_000_000) as i64
+    }
+
+    #[test]
+    fn pull_times_use_central_european_dates_and_exact_dst_boundaries() {
+        for (utc, expected) in [
+            ("2026-09-10T16:01:05Z", "10 Sep · 18:01:05 CEST"),
+            ("2026-09-10T22:15:00Z", "11 Sep · 00:15:00 CEST"),
+            ("2026-01-10T16:01:05Z", "10 Jan · 17:01:05 CET"),
+            ("2026-03-29T00:59:59Z", "29 Mar · 01:59:59 CET"),
+            ("2026-03-29T01:00:00Z", "29 Mar · 03:00:00 CEST"),
+            ("2026-10-25T00:59:59Z", "25 Oct · 02:59:59 CEST"),
+            ("2026-10-25T01:00:00Z", "25 Oct · 02:00:00 CET"),
+            ("2025-03-30T01:00:00Z", "30 Mar · 03:00:00 CEST"),
+            ("2025-10-26T01:00:00Z", "26 Oct · 02:00:00 CET"),
+            ("2026-09-10T18:01:05+02:00", "10 Sep · 18:01:05 CEST"),
+        ] {
+            let pull = pull("report", 7, 4, timestamp(utc));
+            assert_eq!(pull_start_label(&pull), expected, "{utc}");
+        }
+        for invalid in [0, -1, i64::MIN, i64::MAX] {
+            assert_eq!(pull_start_time(invalid), None);
+        }
+    }
+
+    #[test]
+    fn pull_time_search_uses_the_displayed_local_date_and_preserves_other_terms() {
+        let pull = pull("exampleLog", 7, 4, timestamp("2026-09-10T22:15:32Z"));
+        for query in ["", "ula examplelog 7", "11 SEP 00:15 CEST", "2026-09-11 00:15:32"] {
+            assert!(pull_matches_search(&pull, query), "{query}");
+        }
+        for query in ["2026-09-10", "22:15", "00:15 CET", "12 Sep"] {
+            assert!(!pull_matches_search(&pull, query), "{query}");
+        }
+    }
+
+    #[test]
+    fn pull_cards_show_start_time_on_its_own_line_without_overlapping_progress() {
+        let pull = pull("report", 7, 4, timestamp("2026-09-10T16:01:05Z"));
+        for width in [220.0, 300.0, 420.0] {
+            let ctx = egui::Context::default();
+            let mut bounds = egui::Rect::NOTHING;
+            let mut output = None;
+            for _ in 0..2 {
+                output = Some(ctx.run_ui(Default::default(), |ui| {
+                    ui.set_width(width);
+                    bounds = super::pull(ui, &pull, false, true).rect;
+                }));
+            }
+            let output = output.unwrap();
+            let text = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == pull_start_label(&pull) => Some(text),
+                _ => None,
+            }).expect("Each card displays its Warcraft Logs start time");
+            let text_bounds = egui::Rect::from_min_size(text.pos, text.galley.size());
+            assert!(bounds.contains_rect(text_bounds), "{width}: {bounds:?}, {text_bounds:?}");
+            assert!(text_bounds.top() > bounds.top() + 23.0);
+            assert!(text_bounds.bottom() < bounds.bottom() - 5.0);
+        }
+    }
+
     #[test]
     fn same_boss_across_reports_has_one_group_and_preserves_navigation() {
         let mut kill = pull("first", 69, 5, 900_000);
