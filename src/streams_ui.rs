@@ -2323,7 +2323,7 @@ fn recording_labels(vods: &[Vod], povs: &[Stream]) -> crate::review_ui::Recordin
             let when = crate::stream_time::recording_local_time(vod)
                 .map(|(at, zone)| {
                     format!(
-                        "{} {} ? {:02}:{:02} {zone}",
+                        "{} {} · {:02}:{:02} {zone}",
                         at.day(),
                         &at.month().to_string()[..3],
                         at.hour(),
@@ -3036,9 +3036,9 @@ mod tests {
     #[test]
     fn pov_labels_and_review_heading_use_the_same_local_day_as_pull_cards() {
         for (stamp, expected_day, expected_when) in [
-            ("2026-09-30T22:06:00Z", "2026-10-01", "1 Oct ? 00:06 CEST"),
-            ("2026-12-31T23:06:00Z", "2027-01-01", "1 Jan ? 00:06 CET"),
-            ("2026-10-25T01:30:00Z", "2026-10-25", "25 Oct ? 02:30 CET"),
+            ("2026-09-30T22:06:00Z", "2026-10-01", "1 Oct · 00:06 CEST"),
+            ("2026-12-31T23:06:00Z", "2027-01-01", "1 Jan · 00:06 CET"),
+            ("2026-10-25T01:30:00Z", "2026-10-25", "25 Oct · 02:30 CET"),
         ] {
             let mut vod = recording("987", "1");
             vod.started_at = Some(stamp.into());
