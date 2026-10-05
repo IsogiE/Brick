@@ -48,6 +48,8 @@ fn clock_script(origin: &str) -> String {
 const WRAPPER_LOAD_TIMEOUT: Duration = Duration::from_secs(25);
 const COMMAND_RETRY_AFTER: Duration = Duration::from_secs(4);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+// Native seek acknowledgement and paired playback use the same decoder limit.
+pub(crate) const SEEK_SETTLEMENT_TOLERANCE_MS: i64 = 500;
 const VISIBLE_STATE_INTERVAL: Duration = Duration::from_millis(100);
 const HIDDEN_STATE_INTERVAL: Duration = Duration::from_millis(500);
 const STATE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1275,6 +1277,7 @@ fn seek_acknowledged(target: f64, resume: bool, requested: Instant, state: &Play
 }
 
 fn seek_landed(target: f64, resume: bool, elapsed: Duration, state: &PlaybackState) -> bool {
+    let tolerance = SEEK_SETTLEMENT_TOLERANCE_MS as f64 / 1000.0;
     state.ready
         && state.decoded != Some(false)
         && state.playing == resume
@@ -1284,10 +1287,10 @@ fn seek_landed(target: f64, resume: bool, elapsed: Duration, state: &PlaybackSta
             // A busy provider can return its first useful sample after video
             // has advanced. This only acknowledges the observed SDK position;
             // the UI continues to display that position, never a local clock.
-            (target - 0.25..=target + (elapsed.as_secs_f64() + 0.5).clamp(2.0, 15.0))
+            (target - tolerance..=target + (elapsed.as_secs_f64() + tolerance).clamp(2.0, 15.0))
                 .contains(&state.seconds)
         } else {
-            (state.seconds - target).abs() <= 0.25
+            (state.seconds - target).abs() <= tolerance
         }
 }
 
@@ -2270,6 +2273,59 @@ mod tests {
         state.seconds = 120.0;
         state.ready = false;
         assert!(!seek_landed(120.0, false, Duration::ZERO, &state));
+    }
+
+    #[test]
+    fn native_seek_acknowledgements_release_the_comparison_start_barrier_for_early_frames() {
+        use crate::review_compare::{Controller, RecordingClock, Status};
+        for early in [0.125, 0.3, 0.5] {
+            let now = Instant::now() - Duration::from_millis(100);
+            let start = 1_700_000_000_000;
+            let clocks = [120.375, 420.375].map(|offset| {
+                RecordingClock::new(start, offset, 1000.0)
+                    .unwrap()
+                    .with_relative_coverage(0.0, 300.0)
+                    .unwrap()
+            });
+            let mut controller =
+                Controller::new(clocks, [start, start + 300_000], start, true, now).unwrap();
+            let empty = PlaybackState::default();
+            let commands = controller.tick([&empty, &empty], now);
+            let mut states = [PlaybackState::default(), PlaybackState::default()];
+            for (side, command) in [commands.primary, commands.secondary]
+                .into_iter()
+                .enumerate()
+            {
+                let Some(PlaybackCommand::SeekPaused(target)) = command else {
+                    panic!("Expected a paused seek");
+                };
+                let state = &mut states[side];
+                state.ready = true;
+                state.decoded = Some(true);
+                state.seconds = target - early;
+                state.seeking = Some(target);
+                state.playback_intent = Some(false);
+                state.mark_polled_at(now + Duration::from_millis(1));
+                assert!(
+                    seek_acknowledged(target, false, now, state),
+                    "Native pending seek rejected an early {early}s frame"
+                );
+                assert!(playback_acknowledged(false, now, state));
+                state.seeking = None;
+                state.playback_intent = None;
+            }
+            let commands =
+                controller.tick([&states[0], &states[1]], now + Duration::from_millis(2));
+            assert!(matches!(commands.primary, Some(PlaybackCommand::Play)));
+            assert!(matches!(commands.secondary, Some(PlaybackCommand::Play)));
+            for (side, state) in states.iter_mut().enumerate() {
+                state.playing = true;
+                state.seconds = clocks[side].video_seconds(start).unwrap() + 0.125;
+                state.mark_polled_at(now + Duration::from_millis(3));
+            }
+            controller.tick([&states[0], &states[1]], now + Duration::from_millis(4));
+            assert_eq!(controller.status(), Status::Playing);
+        }
     }
 
     #[test]

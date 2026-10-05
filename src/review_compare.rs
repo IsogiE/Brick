@@ -1,9 +1,10 @@
-use crate::stream_player::{PlaybackCommand, PlaybackState};
+use crate::stream_player::{
+    PlaybackCommand, PlaybackState, SEEK_SETTLEMENT_TOLERANCE_MS as SETTLED_TOLERANCE_MS,
+};
 use std::time::{Duration, Instant};
 
 pub const PLAYER_COUNT: usize = 2;
 const MAX_VIDEO_SECONDS: f64 = 604_800.0;
-const SETTLED_TOLERANCE_MS: i64 = 500;
 // Applied after accounting for the SDK observation windows, so uneven poll
 // timing is not mistaken for media drift. Explicit seeks retain milliseconds.
 const DRIFT_TOLERANCE_MS: i64 = 1_000;
