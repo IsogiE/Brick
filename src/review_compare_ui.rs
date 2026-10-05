@@ -724,7 +724,12 @@ impl Comparison {
             .comparison_metadata()
             .zip(self.metadata.comparison_metadata())
             .and_then(|(primary, secondary)| {
-                provider_target([primary, secondary], side, state.seconds)
+                provider_target(
+                    [primary, secondary],
+                    side,
+                    state.seconds,
+                    review.comparison_context().map(|(_, pull)| pull),
+                )
             });
         let Some((selected, clocks, at_ms)) = target else {
             self.controller = None;
@@ -1039,19 +1044,35 @@ fn provider_target(
     reviews: [&Review; 2],
     side: usize,
     seconds: f64,
+    current: Option<&Pull>,
 ) -> Option<(Pull, [RecordingClock; 2], i64)> {
     let source = *reviews.get(side)?;
-    let source_pull = source.pulls.iter().find(|pull| {
-        let start = source.pull_video_start(pull);
-        seconds >= start && seconds < start + (pull.end_ms - pull.start_ms) as f64 / 1000.0
-    })?;
+    // Prefer an exact pull match before allowing a decoder's slightly early
+    // landing at the start. Genuine gaps and unavailable coverage remain gaps.
+    let source_pull = source
+        .pulls
+        .iter()
+        .find(|pull| {
+            let start = source.pull_video_start(pull);
+            seconds >= start && seconds < start + (pull.end_ms - pull.start_ms) as f64 / 1000.0
+        })
+        .or_else(|| {
+            matching_pull(source, current?).filter(|pull| {
+                recording_clock(source, pull)
+                    .ok()
+                    .and_then(|clock| {
+                        clock.observed_pull_moment(seconds, [pull.start_ms, pull.end_ms])
+                    })
+                    .is_some()
+            })
+        })?;
     let selected = matching_pull(reviews[0], source_pull)?;
     let secondary = matching_pull(reviews[1], source_pull)?;
     let clocks = [
         recording_clock(reviews[0], selected).ok()?,
         recording_clock(reviews[1], secondary).ok()?,
     ];
-    let at_ms = clocks[side].encounter_ms(seconds)?;
+    let at_ms = clocks[side].observed_pull_moment(seconds, [selected.start_ms, selected.end_ms])?;
     if at_ms < selected.start_ms
         || at_ms >= selected.end_ms
         || clocks
@@ -1259,6 +1280,41 @@ mod tests {
                     assert_eq!(controller.status(), Status::Paused);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn direct_provider_seek_at_pull_start_accepts_decoder_settlement_without_extending_coverage() {
+        let (mut reviews, pull) = timing_reviews();
+        for side in 0..2 {
+            crate::content_alignment::test_set_timing(
+                &mut reviews[side],
+                &pull,
+                100.375 + side as f64 * 500.0,
+            );
+        }
+        for side in 0..2 {
+            let start = reviews[side].pull_video_start(&pull);
+            for early in [0.0, 0.125, 0.5] {
+                let (selected, clocks, at_ms) =
+                    provider_target([&reviews[0], &reviews[1]], side, start - early, Some(&pull))
+                        .expect(
+                            "A decoder landing within settlement tolerance should stay in the pull",
+                        );
+                assert_eq!(selected.id, pull.id);
+                assert_eq!(at_ms, pull.start_ms);
+                assert!(clocks
+                    .iter()
+                    .all(|clock| clock.video_seconds(at_ms).is_some()));
+                assert!(
+                    clocks[side].encounter_ms(start - 0.125).is_none(),
+                    "Seek requests remain strict"
+                );
+            }
+            assert!(
+                provider_target([&reviews[0], &reviews[1]], side, start - 0.501, Some(&pull))
+                    .is_none()
+            );
         }
     }
 

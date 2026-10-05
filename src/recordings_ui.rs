@@ -25,6 +25,7 @@ pub enum Action {
 
 struct Entry {
     index: usize,
+    instant: Option<i128>,
     search: String,
     month: String,
     day: String,
@@ -93,20 +94,20 @@ impl Library {
         let mut members: HashMap<&str, Member> = HashMap::new();
         let mut months: HashMap<String, String> = HashMap::new();
         for (index, vod) in source.iter().enumerate() {
-            let stamp = timestamp(vod);
-            let day = stamp
-                .get(..10)
-                .filter(|day| parse_date(day).is_some())
-                .unwrap_or("");
-            let month = stamp.get(..7).unwrap_or("").to_owned();
-            let date = date_label(day);
-            let clock = stamp
-                .get(11..16)
-                .map(|clock| format!("{clock} UTC"))
+            let at = crate::stream_time::recording_time(vod);
+            let local = at.and_then(crate::stream_time::central_european);
+            let day = local
+                .map(|(at, _)| at.date().to_string())
+                .unwrap_or_default();
+            let month = day.get(..7).unwrap_or("").to_owned();
+            let date = date_label(&day);
+            let clock = local
+                .map(|(at, zone)| format!("{:02}:{:02} {zone}", at.hour(), at.minute()))
                 .unwrap_or_default();
             let detail = format!("{} · {}", vod.name, vod.provider.label());
             self.entries.push(Entry {
                 index,
+                instant: at.map(|at| at.unix_timestamp_nanos()),
                 search: format!(
                     "{} {} {} {} {} {}",
                     title(vod),
@@ -144,7 +145,7 @@ impl Library {
                 std::cmp::Reverse(entry.day.clone()),
                 profile::role_order(vod.raid_role),
                 vod.name.to_lowercase(),
-                std::cmp::Reverse(timestamp(vod).to_owned()),
+                std::cmp::Reverse(entry.instant),
                 vod.id.clone(),
             )
         });
@@ -820,12 +821,6 @@ fn title(vod: &Vod) -> &str {
         &vod.title
     }
 }
-fn timestamp(vod: &Vod) -> &str {
-    vod.started_at
-        .as_deref()
-        .or(vod.ended_at.as_deref())
-        .unwrap_or("")
-}
 
 fn month_parts(stamp: &str) -> Option<(i32, time::Month)> {
     let year = stamp.get(..4)?.parse().ok()?;
@@ -916,6 +911,89 @@ mod tests {
         library.filter(&source);
         assert!(library.filtered.is_empty());
         assert_eq!(library.builds, 1);
+    }
+
+    #[test]
+    fn local_dates_clocks_calendar_and_search_agree_across_month_boundaries() {
+        let mut items: Vec<_> = (0..3).map(archive).collect();
+        for (vod, stamp) in items.iter_mut().zip([
+            "2026-09-30T22:06:00Z",
+            "2026-10-01T00:06:00+02:00",
+            "2026-09-30T21:06:00Z",
+        ]) {
+            vod.started_at = Some(stamp.into());
+        }
+        let source = Rc::new(items);
+        let mut library = Library::default();
+        library.prepare(&source);
+        assert_eq!(
+            library.months,
+            [
+                ("2026-10".into(), "October 2026".into()),
+                ("2026-09".into(), "September 2026".into())
+            ]
+        );
+        for entry in library.entries.iter().filter(|entry| entry.index < 2) {
+            assert_eq!(entry.day, "2026-10-01");
+            assert_eq!(entry.date, "1 Oct 2026");
+            assert_eq!(entry.clock, "00:06 CEST");
+        }
+        library.month = Some("2026-10".into());
+        library.calendar_day = Some("2026-10-01".into());
+        library.query = "1 Oct 2026 00:06 CEST".into();
+        library.dirty = true;
+        library.filter(&source);
+        assert_eq!(library.filtered.len(), 2);
+        for query in ["2026-09-30", "22:06 UTC", "00:06 CET"] {
+            library.query = query.into();
+            library.dirty = true;
+            library.filter(&source);
+            assert!(library.filtered.is_empty(), "{query}");
+        }
+        library.query.clear();
+        library.month = Some("2026-09".into());
+        library.calendar_day = Some("2026-09-30".into());
+        library.dirty = true;
+        library.filter(&source);
+        assert_eq!(
+            library
+                .filtered
+                .iter()
+                .map(|i| library.entries[*i].index)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(library.builds, 1);
+    }
+
+    #[test]
+    fn repeated_dst_clock_times_sort_by_instant_and_bad_timestamps_stay_undated() {
+        let mut items: Vec<_> = (0..4).map(archive).collect();
+        for (vod, stamp) in items.iter_mut().zip([
+            "2026-10-25T02:30:00+02:00",
+            "2026-10-25T01:30:00Z",
+            "2026-10-25T00:15:00Z",
+            "2026-02-30T17:00:00Z",
+        ]) {
+            vod.started_at = Some(stamp.into());
+            vod.name = "Same player".into();
+        }
+        let source = Rc::new(items);
+        let mut library = Library::default();
+        library.prepare(&source);
+        assert_eq!(
+            library
+                .entries
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            [1, 0, 2, 3]
+        );
+        assert_eq!(library.entries[0].clock, "02:30 CET");
+        assert_eq!(library.entries[1].clock, "02:30 CEST");
+        assert_eq!(library.entries[3].date, "Date unavailable");
+        assert!(library.entries[3].clock.is_empty());
+        assert!(library.entries[3].month.is_empty());
     }
 
     #[test]
@@ -1527,7 +1605,7 @@ impl Library {
             egui::vec2(ui.available_width(), 25.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(RichText::new("Dates in UTC").size(10.0).color(MUTED));
+                ui.label(RichText::new("Dates in CET/CEST").size(10.0).color(MUTED));
                 if crate::stream_widgets::button(
                     ui,
                     RichText::new("All dates").size(11.0).color(TEXT),

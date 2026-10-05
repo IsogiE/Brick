@@ -29,6 +29,7 @@ mod review_ui;
 mod single_instance;
 mod stream_player;
 mod stream_preferences;
+mod stream_time;
 mod stream_widgets;
 mod streams;
 mod streams_ui;

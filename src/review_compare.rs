@@ -1,9 +1,10 @@
-use crate::stream_player::{PlaybackCommand, PlaybackState};
+use crate::stream_player::{
+    PlaybackCommand, PlaybackState, SEEK_SETTLEMENT_TOLERANCE_MS as SETTLED_TOLERANCE_MS,
+};
 use std::time::{Duration, Instant};
 
 pub const PLAYER_COUNT: usize = 2;
 const MAX_VIDEO_SECONDS: f64 = 604_800.0;
-const SETTLED_TOLERANCE_MS: i64 = 500;
 // Applied after accounting for the SDK observation windows, so uneven poll
 // timing is not mistaken for media drift. Explicit seeks retain milliseconds.
 const DRIFT_TOLERANCE_MS: i64 = 1_000;
@@ -72,6 +73,23 @@ impl RecordingClock {
 
     pub fn encounter_ms(self, seconds: f64) -> Option<i64> {
         self.encounter_ms_with_tolerance(seconds, 0.0)
+    }
+
+    pub(crate) fn observed_pull_moment(self, seconds: f64, range: [i64; 2]) -> Option<i64> {
+        if range[1] <= range[0] {
+            return None;
+        }
+        let mut at_ms = self.observed_encounter_ms(seconds)?;
+        if at_ms < range[0] {
+            if range[0].checked_sub(at_ms)? > SETTLED_TOLERANCE_MS {
+                return None;
+            }
+            at_ms = range[0];
+        }
+        if at_ms >= range[1] || self.video_seconds(at_ms).is_none() {
+            return None;
+        }
+        Some(at_ms)
     }
 
     fn observed_encounter_ms(self, seconds: f64) -> Option<i64> {
