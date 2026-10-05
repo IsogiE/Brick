@@ -2584,6 +2584,23 @@ impl ReviewUi {
             .as_ref()
             .filter(|pull| contains(pull))
             .or_else(|| review.pulls.iter().find(|pull| contains(pull)))
+            .or_else(|| {
+                provider_seek
+                    .then(|| {
+                        self.pull.as_ref().filter(|pull| {
+                            crate::review_compare_ui::recording_clock(review, pull)
+                                .ok()
+                                .and_then(|clock| {
+                                    clock.observed_pull_moment(
+                                        state.seconds,
+                                        [pull.start_ms, pull.end_ms],
+                                    )
+                                })
+                                .is_some()
+                        })
+                    })
+                    .flatten()
+            })
             .cloned();
         let changed = self.pull.as_ref().map(pull_key) != selected.as_ref().map(pull_key);
         if changed || provider_seek {
@@ -5449,6 +5466,25 @@ mod tests {
         state.provider_seek_generation = Some(generation);
         state.mark_polled_at(provider_test_now());
         state
+    }
+
+    #[test]
+    fn direct_provider_seek_start_keeps_the_pull_for_early_decoder_frames_in_single_view() {
+        for playing in [false, true] {
+            let (mut ui, _, first, _) = provider_review_fixture();
+            crate::content_alignment::test_set_timing(ui.review.as_mut().unwrap(), &first, 120.375);
+            let start = pull_video_start(ui.review.as_ref().unwrap(), &first);
+            ui.observe_provider_playback(&provider_sample(start + 10.0, playing, 0));
+            let state = provider_sample(start - 0.5, playing, 1);
+            ui.observe_provider_playback(&state);
+            assert_eq!(ui.pull.as_ref().map(pull_key), Some(pull_key(&first)));
+            assert_eq!(ui.playback.as_ref().unwrap().autoplay, playing);
+            assert_eq!(ui.timeline_position, Some(state.seconds));
+            assert!(ui.pause_at_pull_end(&state).is_none());
+            let gap = provider_sample(start - 0.501, playing, 2);
+            ui.observe_provider_playback(&gap);
+            assert!(ui.pull.is_none(), "Actual gaps are still outside a pull");
+        }
     }
 
     #[test]

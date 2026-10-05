@@ -1516,7 +1516,7 @@ impl StreamsUi {
                 "{} · {} · {}",
                 vod.name,
                 vod.provider.label(),
-                recording_day_label(recording_day(&vod))
+                recording_day_label(&recording_day(&vod))
             ));
             ui.add_space(8.0);
             ui.label(format!(
@@ -2189,13 +2189,6 @@ fn member_row(
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn recording_time(vod: &Vod) -> &str {
-    vod.started_at
-        .as_deref()
-        .or(vod.ended_at.as_deref())
-        .unwrap_or("")
-}
-
 fn recording_title(vod: &Vod) -> &str {
     if vod.title.trim().is_empty() {
         "VOD"
@@ -2327,22 +2320,17 @@ fn recording_labels(vods: &[Vod], povs: &[Stream]) -> crate::review_ui::Recordin
             if !wanted.contains(&key) {
                 return None;
             }
-            let when = time::OffsetDateTime::parse(
-                recording_time(vod),
-                &time::format_description::well_known::Rfc3339,
-            )
-            .ok()
-            .map(|at| {
-                let at = at.to_offset(time::UtcOffset::UTC);
-                format!(
-                    "{} {} · {:02}:{:02} UTC",
-                    at.day(),
-                    &at.month().to_string()[..3],
-                    at.hour(),
-                    at.minute()
-                )
-            })
-            .unwrap_or_else(|| "VOD date unavailable".into());
+            let when = crate::stream_time::recording_local_time(vod)
+                .map(|(at, zone)| {
+                    format!(
+                        "{} {} ? {:02}:{:02} {zone}",
+                        at.day(),
+                        &at.month().to_string()[..3],
+                        at.hour(),
+                        at.minute()
+                    )
+                })
+                .unwrap_or_else(|| "VOD date unavailable".into());
             Some((
                 key,
                 crate::review_ui::RecordingLabel {
@@ -2354,8 +2342,10 @@ fn recording_labels(vods: &[Vod], povs: &[Stream]) -> crate::review_ui::Recordin
         .collect()
 }
 
-fn recording_day(vod: &Vod) -> &str {
-    recording_time(vod).get(..10).unwrap_or("")
+fn recording_day(vod: &Vod) -> String {
+    crate::stream_time::recording_local_time(vod)
+        .map(|(at, _)| at.date().to_string())
+        .unwrap_or_default()
 }
 
 fn recording_day_label(day: &str) -> String {
@@ -3039,8 +3029,40 @@ mod tests {
         let b = crate::review_ui::recording_label(&labels, &povs[1]).unwrap();
         assert_ne!(a.when, b.when);
         assert_eq!(b.title, "Second recording");
-        assert!(b.when.contains("16:15 UTC"));
+        assert!(b.when.contains("18:15 CEST"));
         assert_eq!(povs[0].name, povs[1].name);
+    }
+
+    #[test]
+    fn pov_labels_and_review_heading_use_the_same_local_day_as_pull_cards() {
+        for (stamp, expected_day, expected_when) in [
+            ("2026-09-30T22:06:00Z", "2026-10-01", "1 Oct ? 00:06 CEST"),
+            ("2026-12-31T23:06:00Z", "2027-01-01", "1 Jan ? 00:06 CET"),
+            ("2026-10-25T01:30:00Z", "2026-10-25", "25 Oct ? 02:30 CET"),
+        ] {
+            let mut vod = recording("987", "1");
+            vod.started_at = Some(stamp.into());
+            let stream = vod.as_stream();
+            let original_start = stream.replay_start_ms;
+            let labels =
+                recording_labels(std::slice::from_ref(&vod), std::slice::from_ref(&stream));
+            assert_eq!(
+                crate::review_ui::recording_label(&labels, &stream)
+                    .unwrap()
+                    .when,
+                expected_when
+            );
+            assert_eq!(recording_day(&vod), expected_day);
+            assert_eq!(
+                crate::stream_time::pull_start_time(original_start.unwrap())
+                    .unwrap()
+                    .0
+                    .date()
+                    .to_string(),
+                expected_day
+            );
+            assert_eq!(vod.as_stream().replay_start_ms, original_start);
+        }
     }
 
     #[test]
@@ -3725,7 +3747,7 @@ mod tests {
         ])).unwrap();
         assert_eq!(recording_day(&vods[1]), recording_day(&vods[2]));
         assert_eq!(
-            recording_day_label(recording_day(&vods[0])),
+            recording_day_label(&recording_day(&vods[0])),
             "8 September 2026"
         );
         assert_eq!(recording_day_label("2026-02-30"), "Date unavailable");

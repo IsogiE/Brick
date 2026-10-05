@@ -1,3 +1,4 @@
+use crate::stream_time::pull_start_time;
 use eframe::egui::{self, Color32, RichText, Stroke};
 pub const ACCENT: Color32 = Color32::from_rgb(244, 100, 56);
 pub const SOFT: Color32 = Color32::from_rgb(63, 38, 32);
@@ -72,32 +73,6 @@ pub fn encounter_label(pull: &crate::warcraftlogs::Pull) -> String {
     } else {
         format!("{} · {}", pull.name, difficulty)
     }
-}
-
-// Warcraft Logs stores absolute pull starts in UTC milliseconds. Use the
-// current EU rules (since 2002): last Sundays of March/October at 01:00 UTC.
-// https://eur-lex.europa.eu/eli/dir/2000/84/oj
-fn pull_start_time(start_ms: i64) -> Option<(time::OffsetDateTime, &'static str)> {
-    let utc =
-        time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(start_ms) * 1_000_000).ok()?;
-    if utc.year() < 2002 {
-        return None;
-    }
-    let transition = |month| {
-        let last = time::Date::from_calendar_date(utc.year(), month, 31).ok()?;
-        let sunday = 31 - last.weekday().number_days_from_sunday();
-        Some(
-            time::Date::from_calendar_date(utc.year(), month, sunday)
-                .ok()?
-                .with_hms(1, 0, 0)
-                .ok()?
-                .assume_utc(),
-        )
-    };
-    let summer = utc >= transition(time::Month::March)? && utc < transition(time::Month::October)?;
-    let (hours, zone) = if summer { (2, "CEST") } else { (1, "CET") };
-    let local = utc.checked_to_offset(time::UtcOffset::from_hms(hours, 0, 0).ok()?)?;
-    Some((local, zone))
 }
 
 fn pull_start_label(pull: &crate::warcraftlogs::Pull) -> String {

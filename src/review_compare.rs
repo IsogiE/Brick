@@ -74,6 +74,23 @@ impl RecordingClock {
         self.encounter_ms_with_tolerance(seconds, 0.0)
     }
 
+    pub(crate) fn observed_pull_moment(self, seconds: f64, range: [i64; 2]) -> Option<i64> {
+        if range[1] <= range[0] {
+            return None;
+        }
+        let mut at_ms = self.observed_encounter_ms(seconds)?;
+        if at_ms < range[0] {
+            if range[0].checked_sub(at_ms)? > SETTLED_TOLERANCE_MS {
+                return None;
+            }
+            at_ms = range[0];
+        }
+        if at_ms >= range[1] || self.video_seconds(at_ms).is_none() {
+            return None;
+        }
+        Some(at_ms)
+    }
+
     fn observed_encounter_ms(self, seconds: f64) -> Option<i64> {
         // Decoders can land just before a requested boundary. Apply the same
         // settlement tolerance to observations without extending seek coverage.
