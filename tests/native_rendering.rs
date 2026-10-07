@@ -6,6 +6,14 @@
 #[path = "native_rendering/modal.rs"]
 mod modal;
 
+#[cfg(target_os = "windows")]
+#[path = "native_rendering/trace.rs"]
+mod trace;
+
+#[cfg(target_os = "windows")]
+#[path = "native_rendering/completion.rs"]
+mod completion;
+
 #[cfg(not(target_os = "windows"))]
 fn main() {
     println!("Native Windows rendering regression is skipped on this platform.");
@@ -59,7 +67,8 @@ mod windows {
 
     impl eframe::App for App {
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-            self.state.frames.fetch_add(1, SeqCst);
+            let count = self.state.frames.fetch_add(1, SeqCst) + 1;
+            crate::trace::ui_begin(ui.ctx(), count);
             let revision = self.state.revision.load(SeqCst);
             self.state.seen_revision.store(revision, SeqCst);
             *self.state.last_size.lock().unwrap() = ui.ctx().content_rect().size();
@@ -117,9 +126,12 @@ mod windows {
         }
     }
 
-    fn settle(state: &State) {
+    fn settle(state: &State, ctx: &egui::Context, completion: &crate::completion::Completion) {
+        log::trace!(target: "native_rendering", "settle_begin count={}", state.frames.load(SeqCst));
         let deadline = Instant::now() + Duration::from_secs(5);
+        let legacy_settle = std::env::var("BRICK_RENDERING_LEGACY_SETTLE").as_deref() == Ok("1");
         let mut previous = state.frames.load(SeqCst);
+        let mut previous_completed = None;
         let mut unchanged = Instant::now();
         loop {
             thread::sleep(Duration::from_millis(20));
@@ -128,18 +140,49 @@ mod windows {
                 previous = current;
                 unchanged = Instant::now();
             }
+            let completed = if legacy_settle {
+                Some((0, current))
+            } else {
+                completion.idle_snapshot(current)
+            };
+            if !legacy_settle
+                && (completed.is_none()
+                    || completed != previous_completed
+                    || ctx.has_requested_repaint_for(&egui::ViewportId::ROOT))
+            {
+                unchanged = Instant::now();
+            }
+            previous_completed = completed;
             if unchanged.elapsed() >= Duration::from_millis(250) {
-                return;
+                // The context query can briefly wait for a newly-started UI pass.
+                // Recheck completion afterward instead of accepting a stale snapshot.
+                if legacy_settle || completion.idle_snapshot(state.frames.load(SeqCst)) == completed
+                {
+                    log::trace!(target: "native_rendering", "settle_end count={current}");
+                    return;
+                }
+                unchanged = Instant::now();
             }
             assert!(Instant::now() < deadline, "Static window kept repainting");
         }
     }
 
-    fn drive(hwnd: HWND, ctx: &egui::Context, state: &State, legacy: bool, modal: bool) {
+    fn drive(
+        hwnd: HWND,
+        ctx: &egui::Context,
+        state: &State,
+        completion: &crate::completion::Completion,
+        legacy: bool,
+        modal: bool,
+    ) {
         wait_for("initial frame", || state.frames.load(SeqCst) > 0);
-        settle(state);
+        crate::trace::phase(1);
+        settle(state, ctx, completion);
+        crate::trace::phase(2);
         let before = state.frames.load(SeqCst);
+        log::trace!(target: "native_rendering", "measurement_begin count={before}");
         for step in 0..32 {
+            log::trace!(target: "native_rendering", "programmatic_step {step}");
             // Only our test HWND is moved. Do not move the user's pointer or inject global input.
             unsafe {
                 assert_ne!(
@@ -157,8 +200,9 @@ mod windows {
             }
             thread::sleep(Duration::from_millis(25));
         }
-        settle(state);
+        settle(state, ctx, completion);
         let movement_frames = state.frames.load(SeqCst) - before;
+        log::trace!(target: "native_rendering", "measurement_end delta={movement_frames}");
         if legacy {
             assert!(
                 movement_frames >= 16,
@@ -179,8 +223,13 @@ mod windows {
             (173, 80),
             "Native position handling was lost"
         );
+        crate::trace::phase(3);
         let modal_frames = if modal {
-            let painted = crate::modal::drag(hwnd, || state.frames.load(SeqCst), || settle(state));
+            let painted = crate::modal::drag(
+                hwnd,
+                || state.frames.load(SeqCst),
+                || settle(state, ctx, completion),
+            );
             if legacy {
                 assert!(
                     painted >= 16,
@@ -201,6 +250,7 @@ mod windows {
             assert_ne!(GetWindowRect(hwnd, &mut rect), 0);
         }
 
+        crate::trace::phase(4);
         let before = state.frames.load(SeqCst);
         unsafe {
             assert_ne!(PostMessageW(hwnd, WM_MOUSEMOVE, 0, (40 << 16) | 40), 0);
@@ -214,8 +264,9 @@ mod windows {
             );
         }
         wait_for("keyboard input", || state.key_events.load(SeqCst) > 0);
-        settle(state);
+        settle(state, ctx, completion);
 
+        crate::trace::phase(5);
         let old_size = *state.last_size.lock().unwrap();
         unsafe {
             assert_ne!(
@@ -234,8 +285,9 @@ mod windows {
         wait_for("resized content", || {
             state.last_size.lock().unwrap().x > old_size.x + 20.0
         });
-        settle(state);
+        settle(state, ctx, completion);
 
+        crate::trace::phase(6);
         let before = state.frames.load(SeqCst);
         unsafe {
             assert_ne!(
@@ -244,8 +296,9 @@ mod windows {
             );
         }
         wait_for("real OS paint", || state.frames.load(SeqCst) > before);
-        settle(state);
+        settle(state, ctx, completion);
         unsafe {
+            crate::trace::phase(7);
             ShowWindow(hwnd, SW_HIDE);
         }
         thread::sleep(Duration::from_millis(100));
@@ -254,15 +307,17 @@ mod windows {
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         wait_for("restored paint", || state.frames.load(SeqCst) > before);
-        settle(state);
+        settle(state, ctx, completion);
 
+        crate::trace::phase(8);
         state.revision.store(1, SeqCst);
         ctx.request_repaint_of(egui::ViewportId::ROOT);
         wait_for("new app content", || state.seen_revision.load(SeqCst) == 1);
-        settle(state);
+        settle(state, ctx, completion);
 
         // Repeatedly share the context with a different surface, drop it, recreate
         // the same viewport ID, and read the root framebuffer after repainting.
+        crate::trace::phase(9);
         for _ in 0..4 {
             let child_before = state.child_frames.load(SeqCst);
             state.show_child.store(true, SeqCst);
@@ -272,7 +327,7 @@ mod windows {
             });
             state.show_child.store(false, SeqCst);
             ctx.request_repaint_of(egui::ViewportId::ROOT);
-            settle(state);
+            settle(state, ctx, completion);
             let screenshot_before = state.screenshots.load(SeqCst);
             ctx.send_viewport_cmd_to(
                 egui::ViewportId::ROOT,
@@ -284,8 +339,9 @@ mod windows {
                 ctx.request_repaint_of(egui::ViewportId::ROOT);
                 state.screenshots.load(SeqCst) > screenshot_before
             });
-            settle(state);
+            settle(state, ctx, completion);
         }
+        crate::trace::phase(10);
         println!(
             "{}",
             serde_json::json!({
@@ -301,6 +357,7 @@ mod windows {
     }
 
     pub fn run() {
+        crate::trace::init();
         let (legacy, modal) = match std::env::args().nth(1).as_deref() {
             None | Some("optimized") => (false, false),
             Some("legacy") => (true, false),
@@ -309,6 +366,9 @@ mod windows {
             Some(other) => panic!("Unknown rendering policy: {other}"),
         };
         let state = Arc::new(State::default());
+        let completion = Arc::new(crate::completion::Completion::default());
+        let observed_state = state.clone();
+        let worker_completion = completion.clone();
         let worker = Arc::new(Mutex::new(None));
         let worker_slot = worker.clone();
         let options = eframe::NativeOptions {
@@ -321,7 +381,10 @@ mod windows {
             repaint_on_window_move: legacy,
             ..Default::default()
         };
-        eframe::run_native(
+        let mut event_loop = winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event()
+            .build()
+            .unwrap();
+        let application = eframe::create_native(
             "Brick rendering regression",
             options,
             Box::new(move |cc| {
@@ -329,6 +392,7 @@ mod windows {
                     panic!("Expected Win32 window");
                 };
                 let hwnd = handle.hwnd.get();
+                crate::trace::observe_native(hwnd as HWND);
                 if let Some(gl) = &cc.gl {
                     unsafe {
                         println!(
@@ -343,16 +407,31 @@ mod windows {
                 let worker_state = state.clone();
                 *worker_slot.lock().unwrap() = Some(thread::spawn(move || {
                     let outcome = catch_unwind(AssertUnwindSafe(|| {
-                        drive(hwnd as HWND, &ctx, &worker_state, legacy, modal)
+                        drive(
+                            hwnd as HWND,
+                            &ctx,
+                            &worker_state,
+                            &worker_completion,
+                            legacy,
+                            modal,
+                        )
                     }));
                     ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
                     outcome
                 }));
                 Ok(Box::new(App { state }))
             }),
-        )
-        .unwrap();
+            &event_loop,
+        );
+        let mut application =
+            crate::completion::ObservedApplication::new(application, completion, move || {
+                observed_state.frames.load(SeqCst)
+            });
+        use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
+        event_loop.run_app_on_demand(&mut application).unwrap();
         let outcome = worker.lock().unwrap().take().unwrap().join().unwrap();
+        crate::trace::dump();
+        crate::trace::assert_renderer_succeeded();
         if let Err(error) = outcome {
             std::panic::resume_unwind(error);
         }
