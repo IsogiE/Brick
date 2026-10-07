@@ -81,6 +81,12 @@ def main():
         data = (ROOT / "security" / name).read_bytes()
         assert hashlib.sha256(data).hexdigest() == digest, f"Reviewed patch changed: {name}"
         apply_patch(expected, data)
+    for name, digest in (
+        ("eframe-LICENSE-APACHE", "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90"),
+        ("eframe-LICENSE-MIT", "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"),
+    ):
+        license_data = (ROOT / "security/licenses" / name).read_bytes()
+        assert hashlib.sha256(license_data).hexdigest() == digest, f"Upstream license changed: {name}"
     actual = {}
     vendor = ROOT / "vendor/eframe-0.34.3"
     for path in vendor.rglob("*"):

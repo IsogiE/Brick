@@ -4064,7 +4064,10 @@ mod tests {
         drop(writer);
         ui.tick(&egui::Context::default(), Some(&stream));
         assert!(ui.review.is_some());
-        assert!(ui.work.is_none());
+        assert!(
+            !matches!(ui.work_action, Some(Action::Refresh | Action::Report(..))),
+            "restored review may request pull events, but not duplicate metadata"
+        );
     }
 
     #[test]

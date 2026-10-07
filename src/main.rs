@@ -126,7 +126,7 @@ fn main() -> Result<(), eframe::Error> {
             Ok(Box::new(ui::BrickApp::new(
                 cc,
                 sync_lock.clone(),
-                startup_mode,
+                start_hidden,
             )))
         }),
     )

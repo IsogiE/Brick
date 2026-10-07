@@ -2,6 +2,10 @@
 //! Run each policy in its own process: `native_rendering optimized` and `native_rendering legacy`.
 //! This creates only test windows and never loads Brick settings, accounts, or workers.
 
+#[cfg(target_os = "windows")]
+#[path = "native_rendering/modal.rs"]
+mod modal;
+
 #[cfg(not(target_os = "windows"))]
 fn main() {
     println!("Native Windows rendering regression is skipped on this platform.");
@@ -131,7 +135,7 @@ mod windows {
         }
     }
 
-    fn drive(hwnd: HWND, ctx: &egui::Context, state: &State, legacy: bool) {
+    fn drive(hwnd: HWND, ctx: &egui::Context, state: &State, legacy: bool, modal: bool) {
         wait_for("initial frame", || state.frames.load(SeqCst) > 0);
         settle(state);
         let before = state.frames.load(SeqCst);
@@ -166,15 +170,36 @@ mod windows {
                 "Pure native movement requested unnecessary full frames"
             );
         }
+        let mut programmatic_rect = RECT::default();
+        unsafe {
+            assert_ne!(GetWindowRect(hwnd, &mut programmatic_rect), 0);
+        }
+        assert_eq!(
+            (programmatic_rect.left, programmatic_rect.top),
+            (173, 80),
+            "Native position handling was lost"
+        );
+        let modal_frames = if modal {
+            let painted = crate::modal::drag(hwnd, || state.frames.load(SeqCst), || settle(state));
+            if legacy {
+                assert!(
+                    painted >= 16,
+                    "Legacy modal drag did not reproduce repainting: {painted}"
+                );
+            } else {
+                assert_eq!(
+                    painted, 0,
+                    "Native titlebar drag requested unnecessary full frames"
+                );
+            }
+            Some(painted)
+        } else {
+            None
+        };
         let mut rect = RECT::default();
         unsafe {
             assert_ne!(GetWindowRect(hwnd, &mut rect), 0);
         }
-        assert_eq!(
-            (rect.left, rect.top),
-            (173, 80),
-            "Native position handling was lost"
-        );
 
         let before = state.frames.load(SeqCst);
         unsafe {
@@ -254,18 +279,33 @@ mod windows {
                 egui::ViewportCommand::Screenshot(egui::UserData::default()),
             );
             wait_for("root framebuffer screenshot", || {
+                // Capture is queued after rendering; request the next input pass
+                // explicitly so an otherwise-idle window delivers its result.
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
                 state.screenshots.load(SeqCst) > screenshot_before
             });
             settle(state);
         }
-        println!("{{\"policy\":\"{}\",\"move_events\":32,\"movement_frames\":{},\"viewport_cycles\":4,\"input_resize_os_paint_restore_content\":\"passed\"}}",
-            if legacy { "legacy" } else { "optimized" }, movement_frames);
+        println!(
+            "{}",
+            serde_json::json!({
+                "policy": if legacy { "legacy" } else { "optimized" },
+                "move_events": 32,
+                "movement_frames": movement_frames,
+                "modal": modal,
+                "modal_frames": modal_frames,
+                "viewport_cycles": 4,
+                "input_resize_os_paint_restore_content": "passed"
+            })
+        );
     }
 
     pub fn run() {
-        let legacy = match std::env::args().nth(1).as_deref() {
-            None | Some("optimized") => false,
-            Some("legacy") => true,
+        let (legacy, modal) = match std::env::args().nth(1).as_deref() {
+            None | Some("optimized") => (false, false),
+            Some("legacy") => (true, false),
+            Some("modal-optimized") => (false, true),
+            Some("modal-legacy") => (true, true),
             Some(other) => panic!("Unknown rendering policy: {other}"),
         };
         let state = Arc::new(State::default());
@@ -303,7 +343,7 @@ mod windows {
                 let worker_state = state.clone();
                 *worker_slot.lock().unwrap() = Some(thread::spawn(move || {
                     let outcome = catch_unwind(AssertUnwindSafe(|| {
-                        drive(hwnd as HWND, &ctx, &worker_state, legacy)
+                        drive(hwnd as HWND, &ctx, &worker_state, legacy, modal)
                     }));
                     ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
                     outcome

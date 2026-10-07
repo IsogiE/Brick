@@ -36,7 +36,7 @@ impl Request {
 pub(crate) struct Snapshot {
     pub(crate) view: AppView,
     pub(crate) message: Option<String>,
-    operation_succeeded: bool,
+    pub(crate) operation_succeeded: bool,
 }
 
 pub(crate) struct Completion {

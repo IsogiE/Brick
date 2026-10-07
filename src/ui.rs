@@ -31,6 +31,7 @@ const IDLE_REPAINT_MAX_SECS: u64 = 60;
 
 pub struct BrickApp {
     view: AppView,
+    view_initialized: bool,
     status: String,
     view_error: Option<String>,
     view_work: ViewWork,
@@ -125,25 +126,13 @@ impl BrickApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         sync_lock: Arc<Mutex<()>>,
-        startup_mode: bool,
+        start_hidden: bool,
     ) -> Self {
         configure_style(&cc.egui_ctx);
         let brick_texture = load_texture(&cc.egui_ctx);
         let show_request_rx = spawn_show_request_wake(&cc.egui_ctx);
 
         let erasure = crate::account_erasure_ui::ErasureUi::new();
-        let (view, status) = match if erasure.blocks_normal_use() {
-            Ok(AppView::default())
-        } else {
-            addon::load_view()
-        } {
-            Ok(view) => (view, "Ready".to_string()),
-            Err(error) => {
-                let _ = addon::record_log(LogLevel::Error, error.clone());
-                (AppView::default(), error)
-            }
-        };
-
         let auth_state = match if erasure.blocks_normal_use() {
             Ok(SessionStatus::SignedOut)
         } else {
@@ -160,12 +149,12 @@ impl BrickApp {
             crate::guild::activate(&user.guild_id, &user.user_id);
         }
 
-        let window_visible = !(startup_mode && view.settings.startup_minimized);
-        let view_error = status_needs_attention(&status).then(|| status.clone());
+        let window_visible = !start_hidden;
         let mut app = Self {
-            view,
-            status,
-            view_error,
+            view: AppView::default(),
+            view_initialized: false,
+            status: "Ready".into(),
+            view_error: None,
             view_work: ViewWork::default(),
             egui_ctx: cc.egui_ctx.clone(),
             sync_lock,
@@ -212,8 +201,12 @@ impl BrickApp {
             app.start_auth_refresh();
         }
         app.start_app_update_check();
-        if app.auth_state.is_authorized() {
-            app.refresh_view_and_sync(true);
+        if !app.erasure.blocks_normal_use() {
+            if app.auth_state.is_authorized() {
+                app.refresh_view_and_sync(true);
+            } else {
+                app.refresh_view();
+            }
         }
         app
     }
@@ -243,7 +236,11 @@ impl BrickApp {
             return;
         };
         let sync = completion.sync;
+        let mut operation_error = None;
         let result = completion.result.map(|snapshot| {
+            if !snapshot.operation_succeeded {
+                operation_error = snapshot.message.clone();
+            }
             if let Some(message) = snapshot.message {
                 self.status = message;
             }
@@ -251,12 +248,16 @@ impl BrickApp {
         });
         let successful = result.is_ok();
         self.apply_view_refresh(result);
+        if let Some(error) = operation_error {
+            self.view_error = Some(error);
+        }
         if successful && sync && self.auth_state.is_authorized() && !self.view.setup_required {
             self.start_sync();
         }
     }
 
     fn apply_view_refresh(&mut self, result: Result<AppView, String>) {
+        self.view_initialized = true;
         // Failed reads must wait for the next interval too.
         self.last_view_refresh = Instant::now();
         match result {
@@ -1043,6 +1044,18 @@ impl BrickApp {
     }
 
     fn draw_updates_tab(&mut self, ui: &mut egui::Ui) {
+        if !self.view_initialized {
+            panel_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    busy_indicator(ui, 16.0, info_accent());
+                    ui.label("Loading your settings...");
+                });
+            });
+            if privacy_links(ui) {
+                self.erasure.show(ui.ctx());
+            }
+            return;
+        }
         self.draw_status_panel(ui);
         ui.add_space(18.0);
         self.draw_installs_section(ui);
@@ -1646,10 +1659,14 @@ impl BrickApp {
     fn display_status(&self) -> DisplayStatus {
         let version = current_version(&self.view.settings.clients);
 
-        if settings_problem(&self.status) && status_needs_attention(&self.status) {
+        let settings_error = self.view_error.as_deref().or_else(|| {
+            (settings_problem(&self.status) && status_needs_attention(&self.status))
+                .then_some(self.status.as_str())
+        });
+        if let Some(error) = settings_error {
             return DisplayStatus {
                 title: "Settings need attention".to_string(),
-                detail: friendly_problem(&self.status),
+                detail: friendly_problem(error),
                 accent: error_accent(),
                 accent_soft: Color32::from_rgb(62, 32, 36),
                 // A failed settings save can leave the cached version behind
@@ -2818,6 +2835,7 @@ pub(crate) mod tests {
         let now = Instant::now();
         let mut app = BrickApp {
             view: AppView::default(),
+            view_initialized: true,
             status: "Ready".into(),
             view_error: None,
             view_work: ViewWork::default(),
@@ -3474,9 +3492,19 @@ pub(crate) mod tests {
     fn failed_view_read_waits_before_retrying() {
         let mut app = app();
         app.last_view_refresh = overdue();
+        app.view_initialized = false;
         app.apply_view_refresh(Err("Unreadable settings".into()));
+        assert!(
+            app.view_initialized,
+            "an initial failure must leave the loading state"
+        );
         assert_eq!(app.status, "Unreadable settings");
+        assert_eq!(app.display_status().title, "Settings need attention");
+        app.status = "Up to date".into();
+        assert_eq!(app.display_status().title, "Settings need attention");
         assert!(app.next_repaint_after() > Duration::from_secs(50));
+        app.apply_view_refresh(Ok(AppView::default()));
+        assert!(app.view_error.is_none());
     }
 
     #[test]

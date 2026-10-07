@@ -1,3 +1,4 @@
 # Preserve audited dependency and patch bytes on every build host.
 vendor/eframe-0.34.3/** -text
 security/eframe-*.patch -text
+security/licenses/eframe-LICENSE-* -text

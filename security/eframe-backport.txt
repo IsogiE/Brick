@@ -1,7 +1,10 @@
 eframe 0.34.3 rendering backport
 
-vendor/eframe-0.34.3 contains the complete MIT/Apache-2.0 crates.io package,
-including its original license files. Original package SHA-256:
+vendor/eframe-0.34.3 contains the complete MIT/Apache-2.0 crates.io package.
+The published crate omits license texts; security/licenses/eframe-LICENSE-MIT
+and eframe-LICENSE-APACHE preserve the upstream repository licenses from its
+recorded source revision 65cb282a198d2dd72b6ca2346cc73eba45b7a830. Their hashes
+are checked by the verifier. Original package SHA-256:
 f98fe83b2589105b69dd25ca1e0fa2135a6e864d502fd8e08978f937e128cfef
 
 Two separately reviewable changes are applied:
