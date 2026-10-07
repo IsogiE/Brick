@@ -75,7 +75,8 @@ pub struct StreamsUi {
     recording_peer: crate::review_ui::ReviewUi,
     preparation_peer: crate::review_ui::ReviewUi,
     preparation: crate::recording_preparation::Preparation,
-    preparation_catalog: Vec<Stream>,
+    preparation_catalog: Rc<Vec<Stream>>,
+    preparation_candidates: crate::recording_preparation::CandidateList,
     can_delete_recordings: bool,
     confirm_remove_recording: Option<Vod>,
     pov_revision: u64,
@@ -133,7 +134,8 @@ impl Default for StreamsUi {
             recording_peer,
             preparation_peer,
             preparation: Default::default(),
-            preparation_catalog: Vec::new(),
+            preparation_catalog: Rc::default(),
+            preparation_candidates: Default::default(),
             can_delete_recordings: false,
             confirm_remove_recording: None,
             pov_revision: 0,
@@ -473,7 +475,7 @@ impl StreamsUi {
                     }
                     Ok(ResultData::Recordings(recordings)) => {
                         self.preparation_catalog =
-                            recordings.vods.iter().take(8).map(Vod::as_stream).collect();
+                            Rc::new(recordings.vods.iter().take(8).map(Vod::as_stream).collect());
                         self.recording_checks
                             .catalog_received(recordings.log_checks);
                         self.recordings_retry_at = None;
@@ -501,7 +503,7 @@ impl StreamsUi {
                     }
                     Ok(ResultData::RecordingChecks(recordings)) => {
                         self.preparation_catalog =
-                            recordings.vods.iter().take(8).map(Vod::as_stream).collect();
+                            Rc::new(recordings.vods.iter().take(8).map(Vod::as_stream).collect());
                         let checks = recordings.log_checks;
                         // Background results only replenish checks. The catalog
                         // already on screen stays stable until the next load.
@@ -553,57 +555,31 @@ impl StreamsUi {
         // One metadata-only observer finds new raid pulls while Brick is idle.
         // No background video decoder is created on the client.
         // The selected review takes over while watching.
+        self.preparation_candidates
+            .update(crate::recording_preparation::CandidateInputs {
+                snapshot: self.snapshot.as_ref(),
+                recordings: self.recordings.as_ref(),
+                catalog: &self.preparation_catalog,
+                visible_indices: self.recordings_library.preparation_candidates(),
+                active,
+                recordings_open: self.recordings_open,
+                selected: self.selected.is_some(),
+            });
         let warmup_stream = self
             .snapshot
             .as_ref()
             .filter(|_| !active || (!self.recordings_open && self.selected.is_none()))
             .and_then(|snapshot| {
-                snapshot
-                    .streams
-                    .iter()
-                    .filter(|s| s.status == Status::Live)
-                    .min_by_key(|s| (&s.user_id, s.provider.key(), &s.channel_id))
+                self.preparation_candidates
+                    .warmup_index
+                    .and_then(|index| snapshot.streams.get(index))
             });
         self.warmup.tick(ctx, warmup_stream);
-        let mut preparation_candidates: Vec<_> = self
-            .recordings
-            .as_ref()
-            .filter(|_| active && self.recordings_open)
-            .map(|recordings| {
-                self.recordings_library
-                    .preparation_candidates()
-                    .iter()
-                    .filter_map(|index| recordings.get(*index))
-                    .map(Vod::as_stream)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !self.recordings_open {
-            if let Some(snapshot) = &self.snapshot {
-                preparation_candidates.extend(
-                    snapshot
-                        .streams
-                        .iter()
-                        .filter(|stream| stream.status == Status::Live)
-                        .cloned(),
-                );
-            }
-        }
-        let visible_count = preparation_candidates.len();
-        if !active || self.recordings_open || self.selected.is_none() {
-            for stream in &self.preparation_catalog {
-                if !preparation_candidates.iter().any(|candidate| {
-                    streams::review_path(candidate).ok() == streams::review_path(stream).ok()
-                }) {
-                    preparation_candidates.push(stream.clone());
-                }
-            }
-        }
-        preparation_candidates.truncate(8);
         self.preparation.tick(
             ctx,
-            &preparation_candidates,
-            visible_count,
+            &self.preparation_candidates.streams,
+            self.preparation_candidates.visible_count,
+            self.preparation_candidates.revision,
             self.selected
                 .as_ref()
                 .filter(|_| active && !self.recordings_open),

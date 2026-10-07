@@ -1,0 +1,63 @@
+--- a/src/epi.rs
++++ b/src/epi.rs
+@@ -335,6 +335,15 @@
+     /// Only affects the `glow` backend.
+     pub vsync: bool,
+ 
++    /// Request a repaint when a native window moves on Windows.
++    ///
++    /// Defaults to `true`. Apps whose client content does not depend on the window's
++    /// desktop position can set this to `false`, letting the desktop compositor
++    /// reuse the presented image during a move. Native position events are still
++    /// processed; resize, DPI changes, input, OS paint and app repaint requests
++    /// continue to work normally. Other platforms ignore this option.
++    pub repaint_on_window_move: bool,
++
+     /// Set the level of the multisampling anti-aliasing (MSAA).
+     ///
+     /// Must be a power-of-two. Higher = more smooth 3D.
+@@ -477,6 +486,7 @@
+             viewport: Default::default(),
+ 
+             vsync: true,
++            repaint_on_window_move: true,
+             multisampling: 0,
+             depth_buffer: 0,
+             stencil_buffer: 0,
+--- a/src/native/epi_integration.rs
++++ b/src/native/epi_integration.rs
+@@ -162,6 +162,7 @@
+     close: bool,
+ 
+     can_drag_window: bool,
++    repaint_on_window_move: bool,
+     #[cfg(feature = "persistence")]
+     persist_window: bool,
+     app_icon_setter: super::app_icon::AppTitleIconSetter,
+@@ -219,6 +220,7 @@
+             pending_full_output: Default::default(),
+             close: false,
+             can_drag_window: false,
++            repaint_on_window_move: native_options.repaint_on_window_move,
+             #[cfg(feature = "persistence")]
+             persist_window: native_options.persist_window,
+             app_icon_setter,
+@@ -251,7 +253,17 @@
+             self.can_drag_window = true;
+         }
+ 
+-        egui_winit.on_window_event(window, event)
++        let mut response = egui_winit.on_window_event(window, event);
++        if cfg!(target_os = "windows")
++            && !self.repaint_on_window_move
++            && matches!(event, WindowEvent::Moved(_))
++        {
++            // Moving an unchanged client area does not invalidate its pixels.
++            // Only suppress the integration's extra repaint: keep native messages,
++            // geometry handling, genuine OS paints and egui repaint requests.
++            response.repaint = false;
++        }
++        response
+     }
+ 
+     pub fn pre_update(&mut self) {

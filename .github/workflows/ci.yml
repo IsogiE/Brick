@@ -86,6 +86,10 @@ jobs:
           rustfmt --check --edition 2021 src/app_modules.rs
           rustfmt --check --edition 2021 packaging/linux/apprun.rs
 
+      - name: Verify renderer backport provenance
+        if: runner.os == 'Linux'
+        run: python3 scripts/verify-eframe-backport.py
+
       - name: Check
         env:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
@@ -235,6 +239,12 @@ jobs:
           BRICK_PRESENCE_API_URL: 'http://127.0.0.1:18083'
         run: cargo test --locked --bin brick --no-run
 
+      - name: Build native rendering regression
+        if: runner.os == 'Windows'
+        env:
+          RUSTFLAGS: '-D warnings -C target-feature=+crt-static'
+        run: cargo test --locked --test native_rendering --no-run
+
       - name: Retain Windows native test binaries
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -242,5 +252,6 @@ jobs:
           name: brick-windows-native-tests
           path: |
             target/debug/deps/brick-*.exe
+            target/debug/deps/native_rendering-*.exe
           if-no-files-found: error
           retention-days: 7

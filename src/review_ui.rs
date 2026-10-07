@@ -647,34 +647,37 @@ impl ReviewUi {
         self.preparing_recordings = enabled;
     }
 
+    pub(crate) fn with_prepared<R>(
+        &self,
+        read: impl FnOnce(&crate::warcraftlogs::prepared::Cache) -> R,
+    ) -> Option<R> {
+        self.prepared.try_lock().ok().map(|cache| read(&cache))
+    }
+
+    #[cfg(test)]
     pub(crate) fn prepared_metadata(&self, stream: &Stream) -> bool {
-        self.prepared
-            .lock()
-            .ok()
-            .is_some_and(|cache| cache.background_contains(stream))
+        self.with_prepared(|cache| cache.background_contains(stream))
+            .unwrap_or(false)
     }
 
-    pub(crate) fn prepared_recording(&self, stream: &Stream) -> bool {
-        self.prepared
-            .lock()
-            .ok()
-            .is_some_and(|cache| cache.ready(stream))
-    }
-
-    fn restore_prepared_recording(&mut self, stream: &Stream) -> bool {
+    fn try_restore_prepared_recording(&mut self, stream: &Stream) -> Option<bool> {
         if self.recording_housekeeping || self.content.manual_report.is_some() {
-            return false;
+            return Some(false);
         }
-        let entry = self.prepared.lock().ok().and_then(|cache| {
-            let entry = if self.metadata_only {
-                cache.get(stream)
-            } else {
-                cache.for_display(stream)
-            };
-            entry.map(|entry| (entry, cache.preferences.clone()))
-        });
+        let entry = match self.prepared.try_lock() {
+            Ok(cache) => {
+                let entry = if self.metadata_only {
+                    cache.get(stream)
+                } else {
+                    cache.for_display(stream)
+                };
+                entry.map(|entry| (entry, cache.preferences.clone()))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(_)) => return Some(false),
+        };
         let Some((entry, preferences)) = entry else {
-            return false;
+            return Some(false);
         };
         // An estimated cached review must first ask the server for already saved
         // GPU timing. Warm precise reviews still open without the WCL worker.
@@ -686,7 +689,7 @@ impl ReviewUi {
                 .first()
                 .is_some_and(|pull| entry.review.content_alignment(pull).is_none())
         {
-            return false;
+            return Some(false);
         }
         self.recording_match_status = Some(entry.status);
         self.connected = true;
@@ -696,7 +699,12 @@ impl ReviewUi {
         self.accept_cooldown_preferences(preferences);
         self.accept_review(entry.review);
         self.restore_pov_position();
-        true
+        Some(true)
+    }
+
+    #[cfg(test)]
+    fn restore_prepared_recording(&mut self, stream: &Stream) -> bool {
+        self.try_restore_prepared_recording(stream).unwrap_or(false)
     }
 
     pub(crate) fn metadata_busy(&self) -> bool {
@@ -901,7 +909,16 @@ impl ReviewUi {
         }
         if self.review.is_none() {
             if let Some(stream) = stream {
-                changed |= self.restore_prepared_recording(stream);
+                match self.try_restore_prepared_recording(stream) {
+                    Some(restored) => changed |= restored,
+                    None => {
+                        // A worker is publishing/hydrating cached metadata. Wait
+                        // for that snapshot without blocking or starting a
+                        // duplicate request behind the same worker.
+                        ctx.request_repaint_after(Duration::from_millis(250));
+                        return changed;
+                    }
+                }
             }
         }
         changed |= self.sync_content_selection();
@@ -3978,6 +3995,130 @@ mod tests {
     use crate::warcraftlogs::Replay;
 
     #[test]
+    #[ignore = "manual optimized preparation timing; run with --release --ignored --nocapture"]
+    fn preparation_maximum_cache_timing() {
+        let (mut review, stream, _) = prepared_fixture(Provider::Youtube);
+        let template = review.pulls[0].clone();
+        review.pulls = (0..512)
+            .map(|index| {
+                let mut pull = template.clone();
+                pull.id += index;
+                pull
+            })
+            .collect();
+        review.content_timing.clear();
+        let clock = crate::content_alignment::test_recording_clock();
+        let clocks =
+            crate::warcraftlogs::prepared::clocks(&mut review, None, 0, |_| Some(clock.clone()));
+        let mut sample_review = review.clone();
+        sample_review.pulls.truncate(64);
+        let samples = crate::content_alignment::sampling::test_samples(&sample_review, 0);
+        let mut peer = ReviewUi::default().preparation_peer();
+        let mut candidates = Vec::new();
+        for index in 0..8 {
+            let mut stream = stream.clone();
+            stream.user_id = (101 + index).to_string();
+            let mut cache = peer.prepared.lock().unwrap();
+            cache.insert(&stream, review.clone(), (0, true), clocks.clone());
+            cache.set_samples(&stream, samples.clone());
+            assert!(cache.ready(&stream));
+            candidates.push(stream);
+        }
+        let ctx = egui::Context::default();
+        let mut preparation = crate::recording_preparation::Preparation::default();
+        let first = Instant::now();
+        preparation.tick(&ctx, &candidates, 8, 1, None, &mut peer);
+        let first = first.elapsed();
+        let repeated = Instant::now();
+        for _ in 0..2000 {
+            preparation.tick(&ctx, &candidates, 8, 1, None, &mut peer);
+        }
+        let repeated = repeated.elapsed();
+        assert_eq!(preparation.scans, 1);
+        let previous = Instant::now();
+        for _ in 0..200 {
+            let cache = peer.prepared.lock().unwrap();
+            for stream in &candidates {
+                assert!(cache.ready(stream));
+            }
+        }
+        let previous = previous.elapsed();
+        eprintln!("preparation timing: 8 archives, 4096 pulls, 64 tickets/archive; first_scan_us={} warm_2000_ticks_us={} prior_200_scans_us={} scans={}",
+            first.as_micros(), repeated.as_micros(), previous.as_micros(), preparation.scans);
+    }
+
+    #[test]
+    fn cached_review_restore_waits_for_writer_without_blocking_or_duplicate_work() {
+        let (review, stream, clocks) = prepared_fixture(Provider::Youtube);
+        let mut ui = ReviewUi::default();
+        ui.prepared
+            .lock()
+            .unwrap()
+            .insert(&stream, review, (0, true), clocks);
+        let shared = ui.prepared.clone();
+        let writer = shared.lock().unwrap();
+        ui.open_recording();
+        ui.tick(&egui::Context::default(), Some(&stream));
+        assert!(ui.review.is_none());
+        assert!(ui.work.is_none());
+        drop(writer);
+        ui.tick(&egui::Context::default(), Some(&stream));
+        assert!(ui.review.is_some());
+        assert!(
+            !matches!(ui.work_action, Some(Action::Refresh | Action::Report(..))),
+            "restored review may request pull events, but not duplicate metadata"
+        );
+    }
+
+    #[test]
+    fn populated_preparation_ignores_repaints_and_observes_model_changes() {
+        let mut peer = ReviewUi::default().preparation_peer();
+        let mut candidates = Vec::new();
+        for index in 0..8 {
+            let (review, mut stream, clocks) = prepared_fixture(Provider::Youtube);
+            stream.user_id = format!("{}", 101 + index);
+            let epoch = clocks[0].0.auth_epoch;
+            let samples = crate::content_alignment::sampling::test_samples(&review, epoch);
+            let mut cache = peer.prepared.lock().unwrap();
+            cache.insert(&stream, review, (epoch, true), clocks);
+            cache.set_samples(&stream, samples);
+            assert!(cache.background_contains(&stream));
+            assert!(cache.ready(&stream));
+            candidates.push(stream);
+        }
+        let ctx = egui::Context::default();
+        let mut preparation = crate::recording_preparation::Preparation::default();
+        for _ in 0..200 {
+            preparation.tick(&ctx, &candidates, 8, 1, None, &mut peer);
+        }
+        assert_eq!(preparation.scans, 1);
+        assert_eq!(preparation.readiness_checks, 8);
+        assert!(!peer.metadata_busy());
+        preparation.tick(&ctx, &candidates, 8, 2, None, &mut peer);
+        assert_eq!(
+            preparation.scans, 2,
+            "changed inputs must be observed immediately"
+        );
+        peer.prepared
+            .lock()
+            .unwrap()
+            .age_for_test(Duration::from_secs(1));
+        preparation.tick(&ctx, &candidates, 8, 2, None, &mut peer);
+        assert_eq!(
+            preparation.scans, 3,
+            "worker cache publication invalidates readiness"
+        );
+        // A cache writer cannot stall the UI thread, even on invalidation.
+        let shared = peer.prepared.clone();
+        let writer = shared.lock().unwrap();
+        preparation.tick(&ctx, &candidates, 8, 3, None, &mut peer);
+        assert_eq!(preparation.scans, 3);
+        drop(writer);
+        preparation.tick(&ctx, &candidates, 8, 3, None, &mut peer);
+        assert_eq!(preparation.scans, 4);
+    }
+
+    #[test]
     fn selecting_a_review_cancels_unrelated_background_preparation() {
         let (_, _, stream) = fixture();
         let mut selected = stream.clone();
@@ -3994,6 +4135,7 @@ mod tests {
             &egui::Context::default(),
             &[stream],
             1,
+            0,
             Some(&selected),
             &mut peer,
         );

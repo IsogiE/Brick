@@ -104,6 +104,9 @@ fn main() -> Result<(), eframe::Error> {
 
     let options = eframe::NativeOptions {
         viewport,
+        // Windows moves the retained surface. Content, resize and DPI events
+        // still request their own paints.
+        repaint_on_window_move: !cfg!(target_os = "windows"),
         #[cfg(target_os = "linux")]
         event_loop_builder: Some(Box::new(|builder| {
             // Winit's Wayland backend cannot hide or restore a window. Use
@@ -123,7 +126,7 @@ fn main() -> Result<(), eframe::Error> {
             Ok(Box::new(ui::BrickApp::new(
                 cc,
                 sync_lock.clone(),
-                startup_mode,
+                start_hidden,
             )))
         }),
     )

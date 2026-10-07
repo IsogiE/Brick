@@ -1,0 +1,44 @@
+eframe 0.34.3 rendering backport
+
+vendor/eframe-0.34.3 contains the complete MIT/Apache-2.0 crates.io package.
+The published crate omits license texts; security/licenses/eframe-LICENSE-MIT
+and eframe-LICENSE-APACHE preserve the upstream repository licenses from its
+recorded source revision 65cb282a198d2dd72b6ca2346cc73eba45b7a830. Their hashes
+are checked by the verifier. Original package SHA-256:
+f98fe83b2589105b69dd25ca1e0fa2135a6e864d502fd8e08978f937e128cfef
+
+Two separately reviewable changes are applied:
+
+1. security/eframe-8461.patch is the exact diff from the final merged upstream
+   fix, applied to 0.34.3 with line offsets only:
+   https://github.com/emilk/egui/commit/983155456c964fcc92c951ed6b1c721cc24a205c
+   https://github.com/emilk/egui/pull/8461
+   SHA-256: 27d8bb44be01756e9d794fdeeb34a366263f6987afd2d7c84334e0e22039bf27
+   This is the final viewport/surface tracking fix, including invalidation when
+   surfaces are dropped or recreated. It is not the earlier viewport-count guard.
+
+2. security/eframe-window-move.patch adds NativeOptions.repaint_on_window_move,
+   default true. Brick opts out on Windows. Native move messages still pass
+   through egui/winit; only the automatic repaint response for WindowEvent::Moved
+   is disabled. Resize, DPI, focus/input, OS paint, explicit and timed app repaint
+   requests retain their existing behavior. Both native renderers share the policy.
+   SHA-256: e9cc02e6c956a7beef4f01eac6d1327f766909f84a316d9c9cd0233e78744efd
+
+scripts/verify-eframe-backport.py checks all vendor files against the original
+checksum-pinned package plus exactly these two checksum-pinned patches. It can
+use --crate for offline validation; otherwise it downloads the small original
+package in memory. Run it in dependency/security CI alongside the GLib verifier.
+
+The opt-out is appropriate for applications whose client pixels do not depend on
+their desktop position. It does not discard OS painting or pause animation while
+dragging. Geometry is queried normally before the next requested UI frame.
+
+The isolated tests/native_rendering.rs main-thread target compares legacy and
+optimized movement, verifies input/resize/OS paint/restore/content updates, and
+repeatedly recreates a child GL surface while checking the root framebuffer.
+Native hardware evidence and machine-specific measurements stay in local docs.
+
+Retire the context patch when upgrading to an upstream release containing the
+final fix. Review/remove the local move policy when upstream provides equivalent
+invalidation control. No graphics API, VSync default, or global driver setting is
+changed by these patches.
