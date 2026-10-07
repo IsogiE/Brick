@@ -1,6 +1,6 @@
 [package]
 name = "brick"
-version = "0.7.5"
+version = "0.7.6"
 description = "Advance"
 authors = ["Advance Raid Tools"]
 license = "MIT"
@@ -11,6 +11,12 @@ edition = "2021"
 [[test]]
 name = "native_player"
 path = "src/native_player_tests.rs"
+harness = false
+test = false
+
+[[test]]
+name = "native_rendering"
+path = "tests/native_rendering.rs"
 harness = false
 test = false
 
@@ -69,3 +75,5 @@ opt-level = "z"
 # GTK3/WebKit still requires GLib 0.18. Backport the reviewed upstream pointer fix.
 [patch.crates-io]
 glib = { path = "vendor/glib-0.18.5" }
+# Audited Windows context-lifecycle backport and compositor move invalidation.
+eframe = { path = "vendor/eframe-0.34.3" }

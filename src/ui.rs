@@ -11,13 +11,13 @@ use eframe::egui::{self, Color32, RichText, Stroke, TextureHandle};
 use crate::{
     addon::{self, AppView, LogLevel, SyncSummary, WowClient},
     app_update::{self, AvailableAppUpdate},
-    autostart,
     discord_auth::{self, AuthorizedUser, RefreshError, SessionStatus},
     presence::{self, Roster, RosterMember},
     profile::{self, ProfileUi, RaidRole},
     single_instance,
     streams_ui::StreamsUi,
     tray,
+    view_work::{Request as ViewRequest, ViewWork},
 };
 
 const ICON_BYTES: &[u8] = include_bytes!("assets/brick.png");
@@ -33,6 +33,7 @@ pub struct BrickApp {
     view: AppView,
     status: String,
     view_error: Option<String>,
+    view_work: ViewWork,
     egui_ctx: egui::Context,
     sync_lock: Arc<Mutex<()>>,
     auth_state: AuthUiState,
@@ -165,6 +166,7 @@ impl BrickApp {
             view,
             status,
             view_error,
+            view_work: ViewWork::default(),
             egui_ctx: cc.egui_ctx.clone(),
             sync_lock,
             auth_state,
@@ -211,16 +213,47 @@ impl BrickApp {
         }
         app.start_app_update_check();
         if app.auth_state.is_authorized() {
-            app.reconcile_autostart();
-        }
-        if app.auth_state.is_authorized() && !app.view.setup_required {
-            app.start_sync();
+            app.refresh_view_and_sync(true);
         }
         app
     }
 
     fn refresh_view(&mut self) {
-        self.apply_view_refresh(addon::load_view());
+        self.view_work.request(
+            ViewRequest::Refresh {
+                reconcile_startup: false,
+                sync: false,
+            },
+            &self.egui_ctx,
+        );
+    }
+
+    fn refresh_view_and_sync(&mut self, reconcile_startup: bool) {
+        self.view_work.request(
+            ViewRequest::Refresh {
+                reconcile_startup,
+                sync: true,
+            },
+            &self.egui_ctx,
+        );
+    }
+
+    fn poll_view(&mut self) {
+        let Some(completion) = self.view_work.poll(&self.egui_ctx) else {
+            return;
+        };
+        let sync = completion.sync;
+        let result = completion.result.map(|snapshot| {
+            if let Some(message) = snapshot.message {
+                self.status = message;
+            }
+            snapshot.view
+        });
+        let successful = result.is_ok();
+        self.apply_view_refresh(result);
+        if successful && sync && self.auth_state.is_authorized() && !self.view.setup_required {
+            self.start_sync();
+        }
     }
 
     fn apply_view_refresh(&mut self, result: Result<AppView, String>) {
@@ -244,6 +277,7 @@ impl BrickApp {
     fn refresh_view_if_stale(&mut self) {
         if !self.window_visible
             || self.sync_rx.is_some()
+            || self.view_work.busy()
             || self.last_view_refresh.elapsed() < Duration::from_secs(VIEW_REFRESH_INTERVAL_SECS)
         {
             return;
@@ -283,99 +317,27 @@ impl BrickApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        self.refresh_view();
-
-        if !self.view.setup_required {
-            self.start_sync();
-        }
-    }
-
-    fn reconcile_autostart(&mut self) {
-        if self.view.setup_required {
-            return;
-        }
-
-        if let Err(error) = autostart::reconcile_enabled(self.view.settings.startup_enabled) {
-            let _ = addon::record_log(LogLevel::Warn, error.clone());
-            self.status = error;
-        }
+        self.refresh_view_and_sync(false);
     }
 
     fn add_wow_folders(&mut self, paths: Vec<PathBuf>) {
-        let before = self.view.settings.clients.len();
-        match addon::add_wow_paths(&paths) {
-            Ok(view) => {
-                self.view = view;
-                match autostart::set_enabled(self.view.settings.startup_enabled) {
-                    Ok(()) => {
-                        let added = self.view.settings.clients.len().saturating_sub(before);
-                        self.status = if added == 0 {
-                            "That WoW folder is already set up.".to_string()
-                        } else {
-                            "WoW folder saved.".to_string()
-                        };
-                    }
-                    Err(error) => {
-                        let _ = addon::record_log(LogLevel::Warn, error.clone());
-                        self.status = error;
-                    }
-                }
-                self.start_sync();
-            }
-            Err(error) => {
-                let _ = addon::record_log(LogLevel::Error, error.clone());
-                self.status = error;
-                self.refresh_view();
-            }
-        }
+        self.view_work
+            .request(ViewRequest::AddFolders(paths), &self.egui_ctx);
     }
 
     fn remove_client(&mut self, id: &str) {
-        match addon::remove_client(id) {
-            Ok(view) => {
-                self.view = view;
-                self.status = "WoW folder removed.".to_string();
-            }
-            Err(error) => self.status = error,
-        }
+        self.view_work
+            .request(ViewRequest::RemoveFolder(id.into()), &self.egui_ctx);
     }
 
     fn set_startup_enabled(&mut self, enabled: bool) {
-        match addon::set_startup_enabled(enabled) {
-            Ok(view) => self.view = view,
-            Err(error) => {
-                self.status = error;
-                return;
-            }
-        }
-
-        match autostart::set_enabled(enabled) {
-            Ok(()) => {
-                self.status = if enabled {
-                    "Brick will open at login.".to_string()
-                } else {
-                    "Brick will stay closed at login.".to_string()
-                };
-            }
-            Err(error) => {
-                let _ = addon::record_log(LogLevel::Warn, error.clone());
-                self.status = error;
-            }
-        }
+        self.view_work
+            .request(ViewRequest::StartupEnabled(enabled), &self.egui_ctx);
     }
 
     fn set_startup_minimized(&mut self, enabled: bool) {
-        match addon::set_startup_minimized(enabled) {
-            Ok(view) => {
-                self.view = view;
-                self.status = if enabled {
-                    "Brick will start minimized.".to_string()
-                } else {
-                    "Brick will open at login.".to_string()
-                };
-            }
-            Err(error) => self.status = error,
-        }
+        self.view_work
+            .request(ViewRequest::StartupMinimized(enabled), &self.egui_ctx);
     }
 
     fn start_discord_login(&mut self) {
@@ -457,11 +419,7 @@ impl BrickApp {
                 self.auth_state = AuthUiState::Authorized(user);
                 self.auth_rx = None;
                 self.status = "Discord access verified.".to_string();
-                self.refresh_view();
-                self.reconcile_autostart();
-                if !self.view.setup_required {
-                    self.start_sync();
-                }
+                self.refresh_view_and_sync(true);
             }
             Ok(Err(error)) => {
                 crate::guild::invalidate();
@@ -1508,6 +1466,12 @@ impl BrickApp {
     }
 
     fn draw_installs_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_enabled_ui(!self.view_work.mutating(), |ui| {
+            self.draw_installs_contents(ui)
+        });
+    }
+
+    fn draw_installs_contents(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             section_title(ui, "World of Warcraft");
             if !self.view.settings.clients.is_empty() {
@@ -1611,17 +1575,19 @@ impl BrickApp {
         ui.add_space(8.0);
 
         panel_frame().show(ui, |ui| {
-            let startup_enabled = self.view.settings.startup_enabled;
-            if settings_toggle_row(ui, "Open at login", startup_enabled) {
-                self.set_startup_enabled(!startup_enabled);
-            }
+            ui.add_enabled_ui(!self.view_work.mutating(), |ui| {
+                let startup_enabled = self.view.settings.startup_enabled;
+                if settings_toggle_row(ui, "Open at login", startup_enabled) {
+                    self.set_startup_enabled(!startup_enabled);
+                }
 
-            ui.separator();
+                ui.separator();
 
-            let startup_minimized = self.view.settings.startup_minimized;
-            if settings_toggle_row(ui, "Start minimized", startup_minimized) {
-                self.set_startup_minimized(!startup_minimized);
-            }
+                let startup_minimized = self.view.settings.startup_minimized;
+                if settings_toggle_row(ui, "Start minimized", startup_minimized) {
+                    self.set_startup_minimized(!startup_minimized);
+                }
+            });
 
             if let AuthUiState::Authorized(user) = self.auth_state.clone() {
                 ui.separator();
@@ -1785,7 +1751,7 @@ impl BrickApp {
             ));
         }
         if self.auth_state.is_authorized() {
-            if self.window_visible && self.sync_rx.is_none() {
+            if self.window_visible && self.sync_rx.is_none() && !self.view_work.busy() {
                 next = next.min(time_until(
                     self.last_view_refresh,
                     VIEW_REFRESH_INTERVAL_SECS,
@@ -1860,6 +1826,7 @@ impl eframe::App for BrickApp {
             return;
         }
         self.poll_auth();
+        self.poll_view();
         self.poll_guilds();
         if self.auth_state.is_authorized()
             && self.last_guild_check.elapsed() >= Duration::from_secs(300)
@@ -1949,6 +1916,7 @@ impl eframe::App for BrickApp {
             self.presence_state = initial_presence_state();
             self.roster_notice = None;
             self.confirm_logout = false;
+            self.view_work.stop();
             self.view = AppView::default();
             self.view_error = None;
             self.status.clear();
@@ -2852,6 +2820,7 @@ pub(crate) mod tests {
             view: AppView::default(),
             status: "Ready".into(),
             view_error: None,
+            view_work: ViewWork::default(),
             egui_ctx: egui::Context::default(),
             sync_lock: Arc::new(Mutex::new(())),
             auth_state: AuthUiState::Authorized(AuthorizedUser {

@@ -43,13 +43,23 @@ pub(crate) fn source_identity(stream: &Stream) -> Option<String> {
 pub(crate) struct Cache {
     entries: Vec<Entry>,
     suspended: bool,
+    revision: u64,
     pub preferences: crate::defensives::Preferences,
 }
 impl Cache {
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     pub fn set_connected(&mut self, connected: bool) {
         self.entries.clear();
         self.preferences = Default::default();
         self.suspended = !connected;
+        self.changed();
     }
 
     pub fn contains(&self, stream: &Stream) -> bool {
@@ -58,33 +68,37 @@ impl Cache {
 
     pub fn background_contains(&self, stream: &Stream) -> bool {
         self.retained(stream).is_some_and(|entry| {
-            let old_archive = stream.status != crate::streams::Status::Live
-                && !entry.review.replay.growing
-                && entry
-                    .review
-                    .replay
-                    .start_ms()
-                    .ok()
-                    .and_then(|start| {
-                        start.checked_add(
-                            i64::try_from(entry.review.replay.available_seconds)
-                                .ok()?
-                                .checked_mul(1000)?,
-                        )
-                    })
-                    .or(stream.replay_end_ms)
-                    .is_some_and(|end| {
-                        end < time::OffsetDateTime::now_utc()
-                            .unix_timestamp()
-                            .saturating_mul(1000)
-                            .saturating_sub(24 * 60 * 60 * 1000)
-                    });
-            if old_archive {
-                entry.at.elapsed() < Duration::from_secs(6 * 60 * 60)
+            if background_lifetime(entry, stream) > TTL {
+                entry.at.elapsed() < background_lifetime(entry, stream)
             } else {
                 self.contains(stream)
             }
         })
+    }
+
+    /// Wake when age or a validated timing result can change readiness, rather
+    /// than recalculating the sampling plan for every pointer/render event.
+    pub(crate) fn background_recheck_after(&self, stream: &Stream) -> Option<Duration> {
+        let entry = self.retained(stream)?;
+        let mut wait = background_lifetime(entry, stream).saturating_sub(entry.at.elapsed());
+        let now = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+        for expiry in entry
+            .clocks
+            .iter()
+            .map(|(_, clock)| clock.expires_at)
+            .chain(
+                entry
+                    .sampling
+                    .tickets
+                    .iter()
+                    .map(|ticket| ticket.job.expires_at),
+            )
+        {
+            if let Ok(millis) = u64::try_from(i128::from(expiry) - now) {
+                wait = wait.min(Duration::from_millis(millis));
+            }
+        }
+        Some(wait)
     }
 
     pub fn ready(&self, stream: &Stream) -> bool {
@@ -108,6 +122,7 @@ impl Cache {
         {
             samples.apply_to(&mut entry.review, entry.status.0);
             entry.sampling = samples;
+            self.changed();
         }
     }
 
@@ -127,6 +142,7 @@ impl Cache {
         }) {
             samples.apply_to(&mut entry.review, entry.status.0);
             entry.sampling = samples;
+            self.changed();
         }
     }
 
@@ -165,6 +181,7 @@ impl Cache {
         for entry in &mut self.entries {
             entry.at = Instant::now() - age;
         }
+        self.changed();
     }
 
     fn retained(&self, stream: &Stream) -> Option<&Entry> {
@@ -225,6 +242,7 @@ impl Cache {
             generation,
             source_identity,
         });
+        self.changed();
     }
 
     #[cfg(test)]
@@ -256,6 +274,7 @@ impl Cache {
                 entry.clocks.push((key.clone(), clock.clone()));
             }
         }
+        self.changed();
     }
 
     /// Refresh only timing, preserving the metadata age and this viewer's samples.
@@ -277,6 +296,7 @@ impl Cache {
             entry.sampling.apply_to(&mut review, entry.status.0);
             entry.review = review;
             entry.clocks = clocks;
+            self.changed();
         }
     }
 
@@ -334,6 +354,38 @@ impl Cache {
             generation,
             source_identity: identity,
         });
+        self.changed();
+    }
+}
+
+fn background_lifetime(entry: &Entry, stream: &Stream) -> Duration {
+    let old_archive = stream.status != crate::streams::Status::Live
+        && !entry.review.replay.growing
+        && entry
+            .review
+            .replay
+            .start_ms()
+            .ok()
+            .and_then(|start| {
+                start.checked_add(
+                    i64::try_from(entry.review.replay.available_seconds)
+                        .ok()?
+                        .checked_mul(1000)?,
+                )
+            })
+            .or(stream.replay_end_ms)
+            .is_some_and(|end| {
+                end < time::OffsetDateTime::now_utc()
+                    .unix_timestamp()
+                    .saturating_mul(1000)
+                    .saturating_sub(24 * 60 * 60 * 1000)
+            });
+    if old_archive {
+        Duration::from_secs(6 * 60 * 60)
+    } else if entry.review.replay.growing {
+        LIVE_TTL
+    } else {
+        TTL
     }
 }
 

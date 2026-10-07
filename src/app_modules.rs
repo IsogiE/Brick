@@ -37,6 +37,7 @@ mod tray;
 mod twitch_account;
 mod twitch_account_ui;
 mod ui;
+mod view_work;
 mod warcraftlogs;
 #[cfg(target_os = "windows")]
 mod windows_launch;
