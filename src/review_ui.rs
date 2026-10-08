@@ -3903,6 +3903,13 @@ impl ReviewUi {
         let current = self.pull.as_ref().map(|p| (p.report.clone(), p.id));
         let follow = current != self.scroll_pull;
         self.scroll_pull = current;
+        // Number the complete recording before grouping or filtering, exactly
+        // like the workspace/fullscreen selector. Logger fight IDs are keys.
+        let numbers: std::collections::HashMap<_, _> = pulls
+            .iter()
+            .enumerate()
+            .map(|(index, pull)| ((pull.report.clone(), pull.id), index + 1))
+            .collect();
         let groups = crate::stream_widgets::encounter_groups(pulls);
         let mut selected = None;
         ui.scope(|ui| {
@@ -3924,23 +3931,26 @@ impl ReviewUi {
                         let filtered: Vec<_> = group
                             .iter()
                             .filter(|p| {
-                                crate::stream_widgets::pull_matches_search(p, &query)
-                                    && match if p.difficulty == 10 {
-                                        0
-                                    } else {
-                                        self.pull_filter
-                                    } {
-                                        1 => {
-                                            best.is_some()
-                                                && if p.kill {
-                                                    best == Some(0.0)
-                                                } else {
-                                                    p.remaining == best
-                                                }
-                                        }
-                                        2 => p.kill,
-                                        _ => true,
+                                crate::stream_widgets::pull_matches_search(
+                                    p,
+                                    numbers[&(p.report.clone(), p.id)],
+                                    &query,
+                                ) && match if p.difficulty == 10 {
+                                    0
+                                } else {
+                                    self.pull_filter
+                                } {
+                                    1 => {
+                                        best.is_some()
+                                            && if p.kill {
+                                                best == Some(0.0)
+                                            } else {
+                                                p.remaining == best
+                                            }
                                     }
+                                    2 => p.kill,
+                                    _ => true,
+                                }
                             })
                             .collect();
                         if filtered.is_empty() {
@@ -3991,8 +4001,13 @@ impl ReviewUi {
                                             p.report == pull.report && p.id == pull.id
                                         });
                                         let is_best = best.is_some() && pull.remaining == best;
-                                        let response =
-                                            crate::stream_widgets::pull(ui, pull, active, is_best);
+                                        let response = crate::stream_widgets::pull(
+                                            ui,
+                                            pull,
+                                            numbers[&(pull.report.clone(), pull.id)],
+                                            active,
+                                            is_best,
+                                        );
                                         if active && follow {
                                             response.scroll_to_me(Some(egui::Align::Center));
                                         }
@@ -4024,6 +4039,79 @@ mod tests {
     use super::*;
     use crate::streams::{Provider, Status};
     use crate::warcraftlogs::Replay;
+
+    #[test]
+    fn pull_cards_keep_recording_numbers_through_filters_and_mixed_log_ids() {
+        let (mut review, template, _) = fixture();
+        review.pulls = [3, 1, 2]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut pull = template.clone();
+                pull.id = id;
+                pull.report = format!("DifferentReport{}", index);
+                pull.start_ms += index as i64 * 300_000;
+                pull.end_ms += index as i64 * 300_000;
+                pull.kill = index == 2;
+                pull.remaining = Some(if pull.kill { 0.0 } else { 70.0 });
+                pull
+            })
+            .collect();
+        for (filter, query, expected) in [
+            (0, "", vec![1, 2, 3]),
+            (0, "#2", vec![2]),
+            (1, "", vec![3]),
+            (2, "", vec![3]),
+        ] {
+            let mut review_ui = ReviewUi::default();
+            review_ui.review = Some(review.clone());
+            review_ui.pull_filter = filter;
+            review_ui.pull_search = query.into();
+            let ctx = egui::Context::default();
+            let mut output = None;
+            for _ in 0..2 {
+                output = Some(ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(340.0, 1000.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        review_ui.draw_pulls(ui, false);
+                    },
+                ));
+            }
+            let labels: Vec<_> = output
+                .unwrap()
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => text
+                        .galley
+                        .text()
+                        .strip_prefix('#')
+                        .filter(|label| label.contains("   "))
+                        .and_then(|s| s.split_whitespace().next())
+                        .and_then(|s| s.parse::<usize>().ok()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(labels, expected, "filter={filter}, query={query}");
+            assert_eq!(
+                review_ui
+                    .review
+                    .as_ref()
+                    .unwrap()
+                    .pulls
+                    .iter()
+                    .map(|p| p.id)
+                    .collect::<Vec<_>>(),
+                vec![3, 1, 2]
+            );
+        }
+    }
 
     #[test]
     #[ignore = "manual optimized preparation timing; run with --release --ignored --nocapture"]

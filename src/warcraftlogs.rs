@@ -2062,7 +2062,8 @@ fn partition_pulls(pulls: Vec<Pull>, verified: impl Fn(&Pull) -> bool) -> (Vec<P
             }
         }
     }
-    visible.sort_by_key(|p| (p.start_ms, p.report.clone(), p.id));
+    // Frozen groups already follow chronological first-observed bounds. A
+    // logger's small timestamp shift must not renumber neighboring pulls.
     (visible, alternatives)
 }
 
@@ -2380,6 +2381,40 @@ fn number_ms(value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verified_logger_choice_preserves_chronological_group_numbers() {
+        let first = crate::content_alignment::test_ticket().1;
+        let mut different = first.clone();
+        different.id += 1;
+        different.encounter += 1;
+        different.start_ms += 1_000;
+        different.end_ms += 1_000;
+        let mut alternative = first.clone();
+        alternative.report = "DifferentReport1".into();
+        alternative.id = 1;
+        alternative.start_ms += 2_000;
+        alternative.end_ms += 2_000;
+        let mut candidates = vec![different.clone(), alternative.clone(), first.clone()];
+        for verified in [false, true, true, false] {
+            let (visible, hidden) =
+                partition_pulls(candidates, |p| verified && p.report == alternative.report);
+            assert_eq!(visible.len(), 2);
+            assert_eq!(
+                visible[0].report,
+                if verified {
+                    alternative.report.clone()
+                } else {
+                    first.report.clone()
+                }
+            );
+            assert_eq!(visible[1].encounter, different.encounter);
+            let groups = crate::stream_widgets::encounter_groups(visible.clone());
+            assert_eq!(groups[0].1[0].encounter, first.encounter);
+            assert_eq!(groups[1].1[0].encounter, different.encounter);
+            candidates = visible.into_iter().chain(hidden).collect();
+        }
+    }
 
     #[test]
     fn duplicate_clock_preference_never_bridges_ambiguous_boundaries() {
