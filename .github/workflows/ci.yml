@@ -244,8 +244,7 @@ jobs:
         env:
           RUSTFLAGS: '-D warnings -C target-feature=+crt-static'
         run: |
-          cargo test --locked --test native_rendering --no-run
-          cargo test --locked --test native_window_geometry --no-run
+          cargo test --locked --test native_rendering --test native_window_geometry --no-run
 
       - name: Retain Windows native test binaries
         if: runner.os == 'Windows'
