@@ -716,6 +716,28 @@ mod tests {
     }
 
     #[test]
+    fn retry_participant_ids_from_other_reports_do_not_change_this_lineup() {
+        let mut review = review();
+        for pull in &mut review.pulls {
+            pull.friendly_players = Some(vec![1, 2]);
+        }
+        review.pulls[5].friendly_players = Some(vec![1, 3]);
+        review.pulls[11].friendly_players = Some(vec![1, 4]);
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &review.pulls[0]);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 12);
+        // Actor 4 in a different report is unrelated to actor 4 here.
+        let mut unrelated = review.pulls[0].clone();
+        unrelated.report = "QrStUvWxYz123456".into();
+        unrelated.friendly_players = Some(vec![4]);
+        review.pulls.push(unrelated.clone());
+        fail(&mut saved, &review, &unrelated);
+        let next = saved.plan(&review, 0).next.unwrap();
+        assert_eq!(next.report, review.pulls[0].report);
+        assert_eq!(next.id, 12);
+    }
+
+    #[test]
     fn unknown_attendance_falls_back_to_encounter_then_time_without_exclusions() {
         let mut review = review();
         let mut saved = Snapshot::default();

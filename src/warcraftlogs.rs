@@ -2350,6 +2350,7 @@ mod tests {
             json!([0]),
             json!([-1]),
             json!([1.5]),
+            json!([true]),
             json!([1, "2"]),
             json!([2147483648u64]),
             json!(vec![1; 101]),
