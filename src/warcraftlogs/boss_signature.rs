@@ -683,15 +683,15 @@ fn safe_integer(value: &Value) -> Result<u64, String> {
         .ok_or_else(|| invalid_error("safe_integer"))
 }
 fn projected_health(row: &Value, hp: &Value, max_hp: u64) -> Result<(u64, bool), String> {
-    // WCL can expose below-zero target HP on a lethal damage event. Positive
-    // overkill establishes lethality; preserve that observation as physical
-    // zero HP, not a missing row. Unexplained negatives remain invalid.
-    // https://www.warcraftlogs.com/help/pins (resources and overkill fields)
+    // WCL's amount is effective damage, excluding absorbs and overkill. It
+    // cannot bound the negative HP magnitude, and may be zero on a lethal event.
+    // Positive overkill on target damage establishes zero HP; retain that
+    // observation. Unexplained negatives remain invalid.
+    // https://www.warcraftlogs.com/scripting-api-docs/warcraft/interfaces/RpgLogs.DamageEvent.html
+    // https://www.warcraftlogs.com/help/pins (effective damage and overkill)
     if let Some(negative) = hp.as_i64().filter(|n| *n < 0) {
         let magnitude = negative.unsigned_abs();
-        let amount = row["amount"]
-            .as_u64()
-            .filter(|n| *n > 0 && *n <= MAX_SAFE_INTEGER);
+        let amount = row["amount"].as_u64().filter(|n| *n <= MAX_SAFE_INTEGER);
         let overkill = row["overkill"]
             .as_u64()
             .filter(|n| *n > 0 && *n <= MAX_SAFE_INTEGER);
@@ -700,7 +700,7 @@ fn projected_health(row: &Value, hp: &Value, max_hp: u64) -> Result<(u64, bool),
             && max_hp <= MAX_SAFE_INTEGER
             && row["type"] == "damage"
             && row["resourceActor"].as_u64() == Some(2)
-            && amount.is_some_and(|n| magnitude <= n)
+            && amount.is_some()
             && overkill.is_some()
         {
             return Ok((0, true));
@@ -1438,21 +1438,28 @@ mod tests {
     }
 
     #[test]
-    fn lethal_negative_target_health_preserves_all_pages_and_observations() {
+    fn lethal_negative_target_health_preserves_all_pages_and_npc_instances() {
         let mut first = health(1200, 0);
-        first["hitPoints"] = json!(-17789);
-        first["amount"] = json!(17790);
-        first["overkill"] = json!(24401);
-        let mut later = health(10999, 0);
+        first["hitPoints"] = json!(-16811);
+        first["maxHitPoints"] = json!(376085795);
+        first["amount"] = json!(396);
+        first["overkill"] = json!(4885);
+        let mut living_other = health(5000, 200);
+        living_other["targetID"] = json!(11);
+        living_other["targetInstance"] = json!(2);
+        let mut later = living_other.clone();
+        later["timestamp"] = json!(10999);
         later["hitPoints"] = json!(-1298);
-        later["amount"] = json!(1299);
+        later["amount"] = json!(0);
         later["overkill"] = json!(14455);
+        let mut other_instance = later.clone();
+        other_instance["targetInstance"] = json!(3);
         let rows = vec![
             metadata(),
             pages()[1].clone(),
             page(vec![health(1100, 900), first], json!(1201)),
             page(
-                vec![health(5000, 200), later, health(11000, 0)],
+                vec![living_other, later, other_instance, health(11000, 0)],
                 Value::Null,
             ),
             metadata(),
@@ -1460,48 +1467,83 @@ mod tests {
         let signature = run(rows, Limits::default()).unwrap();
         assert!(signature.complete && signature.coverage.health.complete);
         assert_eq!(signature.coverage.health.pages, 2);
-        assert_eq!(signature.health.len(), 5);
+        assert_eq!(signature.health.len(), 6);
         assert_eq!(
             signature
                 .health
                 .iter()
                 .map(|h| h.hit_points)
                 .collect::<Vec<_>>(),
-            vec![900, 0, 200, 0, 0]
+            vec![900, 0, 200, 0, 0, 0]
         );
         assert_eq!(signature.health[1].seconds, 0.2);
-        assert_eq!(signature.health[3].seconds, 9.999);
+        assert_eq!(signature.health[1].max_hit_points, 376085795);
         assert_eq!(signature.health[1].actor_id, 10);
         assert_eq!(signature.health[1].instance, Some(1));
+        for (index, instance) in [(3, 2), (4, 3)] {
+            assert_eq!(signature.health[index].seconds, 9.999);
+            assert_eq!(signature.health[index].actor_id, 11);
+            assert_eq!(signature.health[index].instance, Some(instance));
+        }
         // No near-end threshold: the first confirmed lethal instance is early.
     }
 
     #[test]
-    fn negative_health_requires_consistent_safe_lethal_target_damage() {
+    fn lethal_health_does_not_compare_hp_deficit_with_effective_damage() {
+        for (hp, amount, overkill) in [
+            (-16811, 396, 4885),
+            (-12, 0, 1),
+            (-100, 1, 2),
+            (
+                -(MAX_SAFE_INTEGER as i64),
+                MAX_SAFE_INTEGER,
+                MAX_SAFE_INTEGER,
+            ),
+        ] {
+            let mut row = health(1200, 0);
+            row["hitPoints"] = json!(hp);
+            row["amount"] = json!(amount);
+            row["overkill"] = json!(overkill);
+            assert_eq!(
+                projected_health(&row, &row["hitPoints"], 1000).unwrap(),
+                (0, true)
+            );
+        }
+    }
+
+    #[test]
+    fn negative_health_requires_safe_lethal_target_damage() {
         let mut base = health(1200, 0);
         base["hitPoints"] = json!(-12);
         base["amount"] = json!(20);
         base["overkill"] = json!(30);
-        assert_eq!(
-            projected_health(&base, &base["hitPoints"], 1000).unwrap(),
-            (0, true)
-        );
         for (field, value) in [
             ("overkill", Value::Null),
+            ("overkill", json!(true)),
+            ("overkill", json!("30")),
             ("overkill", json!(0)),
             ("overkill", json!(-1)),
             ("overkill", json!(1.5)),
+            ("overkill", json!(30.0)),
             ("overkill", json!(MAX_SAFE_INTEGER + 1)),
-            ("amount", json!(0)),
-            ("amount", json!(11)),
+            ("amount", Value::Null),
+            ("amount", json!(true)),
+            ("amount", json!("20")),
             ("amount", json!(-20)),
+            ("amount", json!(1.5)),
             ("amount", json!(20.0)),
             ("amount", json!(MAX_SAFE_INTEGER + 1)),
             ("type", json!("heal")),
             ("type", json!("unknown")),
             ("resourceActor", json!(1)),
+            ("resourceActor", json!(2.0)),
+            ("resourceActor", json!(true)),
             ("resourceActor", Value::Null),
+            ("hitPoints", Value::Null),
+            ("hitPoints", json!(true)),
+            ("hitPoints", json!("-12")),
             ("hitPoints", json!(-12.0)),
+            ("hitPoints", json!(-1.5)),
             ("hitPoints", json!(-(MAX_SAFE_INTEGER as i64) - 1)),
             ("hitPoints", json!(i64::MIN)),
         ] {
@@ -1515,12 +1557,28 @@ mod tests {
         for max_hp in [0, MAX_SAFE_INTEGER + 1] {
             assert!(projected_health(&base, &base["hitPoints"], max_hp).is_err());
         }
-        let mut missing = base.clone();
-        missing.as_object_mut().unwrap().remove("overkill");
-        assert!(projected_health(&missing, &missing["hitPoints"], 1000).is_err());
-        let mut rows = pages();
-        rows[2]["reportData"]["report"]["events"]["data"][0] = missing;
-        assert_eq!(run(rows, Limits::default()).unwrap_err(), INVALID);
+        for field in ["amount", "overkill", "resourceActor", "type", "hitPoints"] {
+            let mut missing = base.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(projected_health(&missing, &missing["hitPoints"], 1000).is_err());
+        }
+        for (field, value) in [
+            ("overkill", Value::Null),
+            ("amount", json!(-1)),
+            ("maxHitPoints", json!(1000.0)),
+            ("maxHitPoints", json!(true)),
+            ("targetInstance", json!(i32::MAX as u64 + 1)),
+        ] {
+            let mut malformed = base.clone();
+            malformed[field] = value;
+            let mut rows = pages();
+            rows[2]["reportData"]["report"]["events"]["data"][0] = malformed;
+            assert_eq!(
+                run(rows, Limits::default()).unwrap_err(),
+                INVALID,
+                "{field}"
+            );
+        }
     }
 
     #[test]
