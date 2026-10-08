@@ -31,6 +31,8 @@ struct Recording {
     complete: bool,
     #[serde(default)]
     candidate_revision: u8,
+    #[serde(default)]
+    complete_reports: BTreeSet<String>,
     updated_at: u64,
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -139,6 +141,11 @@ impl Cache {
             return;
         }
         let mut review = Review {
+            complete_reports: if recording.candidate_revision == 2 {
+                recording.complete_reports.clone()
+            } else {
+                BTreeSet::new()
+            },
             alternative_pulls: Default::default(),
             replay: recording.replay.clone(),
             pulls: super::same_report_pulls(
@@ -181,7 +188,7 @@ impl Cache {
             Duration::from_secs(now - recording.updated_at).max(Duration::from_secs(
                 // Older snapshots discarded duplicate logger candidates. Keep
                 // their display/evidence, but rediscover their directory once.
-                if recording.candidate_revision == 1 {
+                if recording.candidate_revision == 2 {
                     61
                 } else {
                     6 * 60 * 60 + 1
@@ -303,7 +310,8 @@ impl Cache {
                 .map(|r| r.sampling.clone())
                 .unwrap_or_default(),
             complete,
-            candidate_revision: 1,
+            candidate_revision: 2,
+            complete_reports: review.complete_reports.clone(),
             updated_at: previous.as_ref().map_or(now, |r| r.updated_at),
         };
         recording.pulls.sort_unstable();
@@ -435,6 +443,10 @@ fn decode(bytes: &[u8]) -> Option<Document> {
                 || !valid_replay(&r.replay)
                 || r.pulls.len() > MAX_PULLS
                 || r.clocks.len() > MAX_REPORTS
+                || r.complete_reports.len() > MAX_REPORTS
+                || r.complete_reports
+                    .iter()
+                    .any(|report| !super::report_code(report))
                 || r.sampling.tickets.len() > 64
                 || r.pulls
                     .iter()
@@ -533,6 +545,7 @@ mod tests {
             seconds: 60,
         };
         let review = Review {
+            complete_reports: Default::default(),
             alternative_pulls: Default::default(),
             replay,
             pulls: vec![pull],
@@ -540,6 +553,62 @@ mod tests {
             content_timing: Default::default(),
         };
         (cache, stream, review)
+    }
+
+    #[test]
+    fn bridge_restart_keeps_raw_sources_but_requires_new_authoritative_absence() {
+        let (mut disk, mut stream, _) = fixture();
+        let (mut review, key, clock) = prepared::bridge_fixture();
+        let early = review.pulls[0].clone();
+        let clocks = prepared::apply_bridge_fixture(&mut review, &key, &clock);
+        stream.provider = review.replay.provider.clone();
+        stream.recording_id = Some(review.replay.video_id.clone());
+        stream.status = Status::Offline;
+        // Unrelated unavailable directory rows do not erase per-report proof.
+        disk.merge(&stream, &review, false, &clocks, super::super::now_secs());
+        let bytes = serde_json::to_vec(&disk.document).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("provenance"));
+        assert_eq!(disk.document.recordings[0].clocks.len(), 1);
+        disk.document = decode(&bytes).unwrap();
+        let mut hot = prepared::Cache::default();
+        disk.hydrate(
+            &mut hot,
+            review.content_capability.as_ref(),
+            0,
+            &Access::from("fixture"),
+        );
+        let mut restored = hot.for_display(&stream).unwrap().review;
+        assert_eq!(restored.complete_reports, review.complete_reports);
+        assert!(restored.content_alignment(&early).is_none());
+        assert!(!restored
+            .content_timing
+            .values()
+            .any(|a| a.derived.is_some()));
+        prepared::clocks(&mut restored, None, 0, |wanted| {
+            crate::content_alignment::RecordingLookup::Unavailable(
+                (wanted.report == key.report).then(|| clock.clone()),
+            )
+        });
+        assert!(restored.content_alignment(&early).is_none());
+        prepared::apply_bridge_fixture(&mut restored, &key, &clock);
+        assert!(restored.content_alignment(&early).is_some());
+
+        // A legacy snapshot lacks per-report completeness and schedules normal
+        // metadata discovery while keeping the playable direct source.
+        let saved = &mut disk.document.recordings[0];
+        saved.candidate_revision = 1;
+        saved.complete_reports.clear();
+        let mut legacy = prepared::Cache::default();
+        disk.hydrate(
+            &mut legacy,
+            review.content_capability.as_ref(),
+            0,
+            &Access::from("fixture"),
+        );
+        let entry = legacy.for_display(&stream).unwrap();
+        assert!(entry.review.complete_reports.is_empty());
+        assert!(!legacy.background_contains(&stream));
+        assert!(entry.review.content_timing.values().any(|a| a.shared_clock));
     }
 
     #[test]
@@ -625,12 +694,16 @@ mod tests {
             replay,
             pulls: vec![first.clone(), second.clone()],
             alternative_pulls: vec![],
+            complete_reports: Default::default(),
             content_capability: Some(cap.clone()),
             content_timing: Default::default(),
         };
         let clock = crate::content_alignment::test_recording_clock();
         let clocks = prepared::clocks(&mut review, None, ticket.key.auth_epoch, |key| {
-            (key.report == second.report).then(|| clock.clone())
+            (key.report == second.report).then(|| clock.clone()).map_or(
+                crate::content_alignment::RecordingLookup::Absent,
+                crate::content_alignment::RecordingLookup::Valid,
+            )
         });
         cache.merge(&stream, &review, true, &clocks, super::super::now_secs());
         cache.document = decode(&serde_json::to_vec(&cache.document).unwrap()).unwrap();

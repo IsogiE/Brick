@@ -154,7 +154,7 @@ impl Snapshot {
             .collect();
         let cap = review.content_capability.as_ref();
         review.content_timing.retain(|_, shared| {
-            shared.shared_clock
+            shared.recording_timing()
                 && shared.key.auth_epoch == epoch
                 && cap.is_some_and(|cap| {
                     pulls
@@ -188,6 +188,22 @@ impl Snapshot {
                 .content_timing
                 .entry((alignment.key.report.clone(), alignment.key.pull_id))
                 .or_insert(alignment);
+        }
+        let invalid: Vec<_> = review
+            .content_timing
+            .iter()
+            .filter(|(_, alignment)| alignment.derived.is_some())
+            .filter(|(_, alignment)| {
+                !review.pull_candidates().any(|pull| {
+                    pull.report == alignment.key.report
+                        && pull.id == alignment.key.pull_id
+                        && review.content_alignment(pull).is_some()
+                })
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in invalid {
+            review.content_timing.remove(&key);
         }
         review.prefer_verified_pulls();
     }
@@ -270,7 +286,7 @@ impl Snapshot {
                 && group.iter().all(|pull| {
                     review
                         .content_alignment(pull)
-                        .is_some_and(|alignment| alignment.shared_clock)
+                        .is_some_and(|alignment| alignment.recording_timing())
                 })
             {
                 continue;
@@ -439,7 +455,7 @@ impl Snapshot {
                         next.report == p.report && next.id == p.id
                     }))
                     && (review.replay.growing
-                        || !review.content_alignment(p).is_some_and(|a| a.shared_clock))
+                        || !review.content_alignment(p).is_some_and(|a| a.recording_timing()))
             })
         {
             plan.next = Some(pull.clone());
@@ -466,6 +482,7 @@ mod tests {
         let (mut replay, pull, cap, _) = test_ticket();
         replay.available_seconds = 20_000;
         Review {
+            complete_reports: Default::default(),
             alternative_pulls: Default::default(),
             replay,
             pulls: (0..12)

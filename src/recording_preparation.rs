@@ -323,6 +323,7 @@ mod tests {
         (
             stream,
             Review {
+                complete_reports: Default::default(),
                 alternative_pulls: Default::default(),
                 replay,
                 pulls: vec![pull],

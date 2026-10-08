@@ -322,6 +322,7 @@ mod tests {
         ui.connected = true;
         ui.connection_checked = true;
         ui.review = Some(Review {
+            complete_reports: Default::default(),
             alternative_pulls: Default::default(),
             replay,
             pulls: vec![pull.clone()],
@@ -353,7 +354,9 @@ mod tests {
         // A completed job's recording lookup supplies the authoritative mapping.
         let mut refreshed = ui.review.clone().unwrap();
         let clock = crate::content_alignment::test_recording_clock();
-        crate::warcraftlogs::prepared::clocks(&mut refreshed, None, 0, |_| Some(clock.clone()));
+        crate::warcraftlogs::prepared::clocks(&mut refreshed, None, 0, |_| {
+            crate::content_alignment::RecordingLookup::Valid(clock.clone())
+        });
         ui.accept_review(refreshed);
         ui.sync_content_selection();
         ui.select(later);

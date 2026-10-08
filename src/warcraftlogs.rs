@@ -1,5 +1,6 @@
 //! Private reports are fetched directly with the viewer's WCL authorization.
 pub(crate) mod boss_signature;
+pub(crate) mod clock_bridge;
 mod data_cache;
 mod persistent;
 pub(crate) mod prepared;
@@ -204,6 +205,8 @@ pub struct Review {
     pub pulls: Vec<Pull>,
     /// Other logger candidates remain available for their own clock lookups.
     pub alternative_pulls: Vec<Pull>,
+    /// All applicable report rows were validated, including duplicate loggers.
+    pub complete_reports: BTreeSet<String>,
 
     pub content_capability: Option<crate::content_alignment::Capability>,
     pub content_timing: HashMap<(String, u64), crate::content_alignment::Alignment>,
@@ -219,11 +222,28 @@ impl Review {
     }
 
     pub(crate) fn prefer_verified_pulls(&mut self) {
+        let priority: HashMap<_, _> = self
+            .pull_candidates()
+            .map(|pull| {
+                let rank = self.content_alignment(pull).map_or(0u8, |alignment| {
+                    if alignment.shared_clock {
+                        2
+                    } else if alignment.derived.is_some() {
+                        1
+                    } else {
+                        0
+                    }
+                });
+                ((pull.report.clone(), pull.id), rank)
+            })
+            .collect();
         let mut candidates = std::mem::take(&mut self.pulls);
         candidates.append(&mut self.alternative_pulls);
         let (pulls, alternatives) = partition_pulls(candidates, |pull| {
-            self.content_alignment(pull)
-                .is_some_and(|alignment| alignment.shared_clock)
+            priority
+                .get(&(pull.report.clone(), pull.id))
+                .copied()
+                .unwrap_or(0)
         });
         self.pulls = pulls;
         self.alternative_pulls = alternatives;
@@ -256,7 +276,32 @@ impl Review {
         let capability = self.content_capability.as_ref()?;
         self.content_timing
             .get(&(pull.report.clone(), pull.id))
-            .filter(|alignment| alignment.matches(&self.replay, pull, capability))
+            .filter(|alignment| {
+                alignment.matches(&self.replay, pull, capability)
+                    && alignment.derived.as_ref().is_none_or(|derived| {
+                        self.complete_reports.contains(&alignment.key.report)
+                            && derived.proof.matches_key(&alignment.key)
+                            && derived.sources.iter().all(|(key, version)| {
+                                self.complete_reports.contains(&key.report)
+                                    && self
+                                        .content_timing
+                                        .get(&(key.report.clone(), key.pull_id))
+                                        .is_some_and(|source| {
+                                            source.shared_clock
+                                                && source.derived.is_none()
+                                                && source.key == *key
+                                                && source.version() == *version
+                                                && self.pull_candidates().any(|candidate| {
+                                                    source.matches(
+                                                        &self.replay,
+                                                        candidate,
+                                                        capability,
+                                                    )
+                                                })
+                                        })
+                            })
+                    })
+            })
     }
     pub fn content_required(&self) -> bool {
         self.content_capability.is_some() || self.replay.start_ms().is_err()
@@ -1309,10 +1354,14 @@ impl Client {
                     .map(|(_, clock)| clock.clone())
             };
             if Instant::now() >= deadline || self.cancel.load(Ordering::Relaxed) {
-                return fallback();
+                return crate::content_alignment::RecordingLookup::Unavailable(fallback());
             }
-            crate::content_alignment::recording_clock(access, key, &self.cancel)
-                .unwrap_or_else(|_| fallback())
+            match crate::content_alignment::recording_clock(access, key, &self.cancel) {
+                crate::content_alignment::RecordingLookup::Unavailable(_) => {
+                    crate::content_alignment::RecordingLookup::Unavailable(fallback())
+                }
+                state => state,
+            }
         })
     }
 
@@ -1419,11 +1468,16 @@ impl Client {
         let data = self.query("query($code:String!){reportData{report(code:$code){code startTime fights{id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime friendlyPlayers}}}}",json!({"code":code}))?;
         let report = &data["reportData"]["report"];
         let pulls = map_explicit_report_pulls(report, code)?;
+        let complete_reports = complete_fight_list(report)
+            .then(|| code.to_owned())
+            .into_iter()
+            .collect();
         // Explicit report selection may include unrelated unsupported/partial
         // encounters. Valid selected pulls remain usable; this never establishes
         // a complete no-match or permits automatic recording removal.
         check_cancelled(&self.cancel)?;
         Ok(Review {
+            complete_reports,
             alternative_pulls: Default::default(),
             replay,
             pulls,
@@ -1767,6 +1821,7 @@ impl Client {
         }
         let Ok(start) = replay.start_ms() else {
             return Ok(Review {
+                complete_reports: Default::default(),
                 alternative_pulls: Default::default(),
                 replay,
                 pulls: Vec::new(),
@@ -1847,6 +1902,7 @@ impl Client {
         self.reports
             .retain(|_, (at, _)| at.elapsed() < Duration::from_secs(120));
         let mut pulls = Vec::new();
+        let mut complete_reports = BTreeSet::new();
         for report in reports {
             check_cancelled(&self.cancel)?;
             let code = report["code"]
@@ -1869,13 +1925,18 @@ impl Client {
                     .insert(code.to_owned(), (Instant::now(), report));
             }
             let report = &self.reports[code].1;
-            complete &= complete_fight_list(report);
+            let report_complete = complete_fight_list(report);
+            complete &= report_complete;
+            if report_complete {
+                complete_reports.insert(code.to_owned());
+            }
             pulls.extend(map_pulls(report, &replay)?);
         }
         let unique = same_report_pulls(pulls);
         check_cancelled(&self.cancel)?;
         self.recording_match_complete = complete;
         Ok(Review {
+            complete_reports,
             alternative_pulls: Default::default(),
             content_capability: None,
             content_timing: HashMap::new(),
@@ -1996,7 +2057,10 @@ fn duplicate_pull(left: &Pull, right: &Pull) -> bool {
         && left.end_ms.abs_diff(right.end_ms) < 3_000
 }
 
-fn partition_pulls(pulls: Vec<Pull>, verified: impl Fn(&Pull) -> bool) -> (Vec<Pull>, Vec<Pull>) {
+fn partition_pulls<R: Ord + Default + Copy>(
+    pulls: Vec<Pull>,
+    verified: impl Fn(&Pull) -> R,
+) -> (Vec<Pull>, Vec<Pull>) {
     // Freeze groups before considering clocks: choosing a different logger must
     // not join a chain of overlapping bounds that describe different pulls.
     let mut groups: Vec<Vec<Pull>> = Vec::new();
@@ -2025,8 +2089,9 @@ fn partition_pulls(pulls: Vec<Pull>, verified: impl Fn(&Pull) -> bool) -> (Vec<P
         .map(|(index, group)| {
             group
                 .iter()
-                .position(|pull| {
-                    verified(pull)
+                .enumerate()
+                .filter(|(_, pull)| {
+                    verified(pull) > R::default()
                         && group
                             .iter()
                             .all(|old| old.report == pull.report || duplicate_pull(old, pull))
@@ -2048,7 +2113,8 @@ fn partition_pulls(pulls: Vec<Pull>, verified: impl Fn(&Pull) -> bool) -> (Vec<P
                                 })
                         }
                 })
-                .unwrap_or(0)
+                .max_by_key(|(i, pull)| (verified(pull), std::cmp::Reverse(*i)))
+                .map_or(0, |(i, _)| i)
         })
         .collect();
     let mut visible = Vec::new();
@@ -2477,6 +2543,7 @@ mod tests {
             replay: replay(),
             pulls: vec![],
             alternative_pulls: vec![],
+            complete_reports: Default::default(),
             content_capability: None,
             content_timing: HashMap::new(),
         };
@@ -2508,6 +2575,7 @@ mod tests {
         second.start_ms = selected.start_ms - 1_000;
         second.end_ms = selected.end_ms - 1_000;
         let mut review = Review {
+            complete_reports: Default::default(),
             alternative_pulls: Default::default(),
             replay: replay(),
             pulls: vec![first.clone(), second],

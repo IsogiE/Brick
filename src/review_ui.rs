@@ -1062,7 +1062,7 @@ impl ReviewUi {
                 if let Some(alignment) = old.content_alignment(pull).filter(|alignment| {
                     // Shared timing is supplied by the refreshed server answer.
                     // Never revive an absent or conflicting cached clock.
-                    if alignment.shared_clock {
+                    if alignment.recording_timing() {
                         return false;
                     }
                     if self
@@ -4127,8 +4127,9 @@ mod tests {
             .collect();
         review.content_timing.clear();
         let clock = crate::content_alignment::test_recording_clock();
-        let clocks =
-            crate::warcraftlogs::prepared::clocks(&mut review, None, 0, |_| Some(clock.clone()));
+        let clocks = crate::warcraftlogs::prepared::clocks(&mut review, None, 0, |_| {
+            crate::content_alignment::RecordingLookup::Valid(clock.clone())
+        });
         let mut sample_review = review.clone();
         sample_review.pulls.truncate(64);
         let samples = crate::content_alignment::sampling::test_samples(&sample_review, 0);
@@ -4385,6 +4386,7 @@ mod tests {
         };
         (
             Review {
+                complete_reports: Default::default(),
                 alternative_pulls: Default::default(),
                 content_capability: None,
                 content_timing: Default::default(),
@@ -4420,6 +4422,7 @@ mod tests {
         later.start_ms += 60_000;
         later.end_ms += 60_000;
         let mut review = Review {
+            complete_reports: Default::default(),
             alternative_pulls: Default::default(),
             replay,
             pulls: vec![pull, later],
@@ -4430,7 +4433,7 @@ mod tests {
         let clocks =
             crate::warcraftlogs::prepared::clocks(&mut review, None, ticket.key.auth_epoch, |_| {
                 calls += 1;
-                Some(clock.clone())
+                crate::content_alignment::RecordingLookup::Valid(clock.clone())
             });
         assert_eq!(calls, 1);
         assert_eq!(review.content_timing.len(), 2);
@@ -4495,7 +4498,7 @@ mod tests {
             if !absent {
                 clocks[0].1.video_seconds += 4.0;
                 crate::warcraftlogs::prepared::clocks(&mut fresh, None, epoch, |_| {
-                    Some(clocks[0].1.clone())
+                    crate::content_alignment::RecordingLookup::Valid(clocks[0].1.clone())
                 });
             }
             let expected = fresh.content_timing.clone();
@@ -4512,6 +4515,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn derived_timing_opens_cached_vod_without_jobs_and_is_not_revived_after_conflict() {
+        let (mut review, key, clock) = crate::warcraftlogs::prepared::bridge_fixture();
+        let early = review.pulls[0].clone();
+        let clocks = crate::warcraftlogs::prepared::apply_bridge_fixture(&mut review, &key, &clock);
+        let (_, mut stream, _) = prepared_fixture(review.replay.provider.clone());
+        stream.recording_id = Some(review.replay.video_id.clone());
+        let mut ui = ReviewUi::default();
+        ui.prepared
+            .lock()
+            .unwrap()
+            .insert(&stream, review.clone(), (0, false), clocks);
+        ui.open_recording();
+        assert!(ui.restore_prepared_recording(&stream));
+        ui.sync_content_selection();
+        assert!(!ui.content_waiting());
+        assert!(ui.next_content_action().is_none());
+        assert_eq!(
+            ui.playback.as_ref().unwrap().seconds,
+            review
+                .content_alignment(&early)
+                .unwrap()
+                .result
+                .seek_video_seconds
+        );
+        let native_before = ui.playback.as_ref().unwrap().seconds;
+        crate::warcraftlogs::prepared::clocks(&mut review, None, 0, |_| {
+            crate::content_alignment::RecordingLookup::Conflict
+        });
+        ui.accept_review(review);
+        assert!(ui
+            .review
+            .as_ref()
+            .unwrap()
+            .content_alignment(&early)
+            .is_none());
+        assert_eq!(
+            ui.playback.as_ref().unwrap().seconds,
+            native_before,
+            "Metadata revocation does not seek the watched video"
+        );
     }
 
     #[test]

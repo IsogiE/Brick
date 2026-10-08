@@ -1207,6 +1207,7 @@ mod tests {
                 replay.broadcast_id = "different12".into();
             }
             Review {
+                complete_reports: Default::default(),
                 alternative_pulls: Default::default(),
                 content_capability: None,
                 content_timing: Default::default(),
@@ -1231,6 +1232,34 @@ mod tests {
         state.playing = playing;
         state.mark_polled_at(test_now());
         state
+    }
+
+    #[test]
+    fn comparison_uses_derived_target_coordinates_and_drops_revoked_source_timing() {
+        let (mut review, key, clock) = crate::warcraftlogs::prepared::bridge_fixture();
+        let early = review.pulls[0].clone();
+        crate::warcraftlogs::prepared::apply_bridge_fixture(&mut review, &key, &clock);
+        let expected = review
+            .content_alignment(&early)
+            .unwrap()
+            .result
+            .video_seconds;
+        let compared = recording_clock(&review, &early).unwrap();
+        assert_eq!(compared.video_seconds(early.start_ms).unwrap(), expected);
+        assert_eq!(
+            compared.video_seconds(early.start_ms + 1000).unwrap(),
+            expected + 1.0
+        );
+        review
+            .content_timing
+            .remove(&(key.report.clone(), key.pull_id));
+        assert!(!review.has_precise_timing(&early));
+        let fallback = recording_clock(&review, &early).unwrap();
+        assert_eq!(
+            fallback.video_seconds(early.start_ms).unwrap(),
+            review.estimated_video_start(&early)
+        );
+        assert_ne!(fallback.video_seconds(early.start_ms).unwrap(), expected);
     }
 
     #[test]
