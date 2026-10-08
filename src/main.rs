@@ -90,8 +90,8 @@ fn main() -> Result<(), eframe::Error> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Brick")
-        .with_inner_size([1440.0, 980.0])
-        .with_min_inner_size([980.0, 720.0])
+        .with_inner_size(window_geometry::INITIAL_INNER_SIZE)
+        .with_min_inner_size(window_geometry::MIN_INNER_SIZE)
         .with_clamp_size_to_monitor_size(true)
         .with_app_id("dev.isogi.brick");
 
@@ -123,6 +123,10 @@ fn main() -> Result<(), eframe::Error> {
         "Brick",
         options,
         Box::new(move |cc| {
+            #[cfg(target_os = "windows")]
+            if let Err(error) = window_geometry::fit_initial_window(cc) {
+                eprintln!("Could not fit Brick to the monitor work area: {error}");
+            }
             Ok(Box::new(ui::BrickApp::new(
                 cc,
                 sync_lock.clone(),
