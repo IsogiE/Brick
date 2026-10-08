@@ -8065,7 +8065,7 @@ mod tests {
         replacement.report = "DifferentReport1".into();
         replacement.id += 10;
         replacement.start_ms += 1_127;
-        replacement.end_ms += 1_127;
+        replacement.end_ms += 1_117;
         review.pulls = vec![replacement.clone()];
         review.alternative_pulls = vec![original.clone()];
         review.content_timing.clear();

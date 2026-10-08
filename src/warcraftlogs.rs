@@ -244,7 +244,12 @@ impl Review {
         let first = candidates.next()?;
         // Separate reports can contain nearby or overlapping entries. Never
         // choose a comparison or alignment target by their incidental order.
-        candidates.next().is_none().then_some(first)
+        (candidates.next().is_none()
+            && self
+                .pull_candidates()
+                .filter(|pull| equivalent_pull(pull, selected))
+                .all(|pull| equivalent_pull(pull, first)))
+        .then_some(first)
     }
 
     pub fn content_alignment(&self, pull: &Pull) -> Option<&crate::content_alignment::Alignment> {
@@ -2414,6 +2419,45 @@ mod tests {
             3,
             "Ambiguous logger candidates cannot erase distinct report fights"
         );
+    }
+
+    #[test]
+    fn hidden_candidates_cannot_turn_an_ambiguous_chain_into_unique_navigation() {
+        let first = crate::content_alignment::test_ticket().1;
+        let mut candidates = vec![first.clone()];
+        for (report, delta) in [
+            ("DifferentReport1", 2_000),
+            ("DifferentReport2", 4_000),
+            ("DifferentReport3", 6_000),
+        ] {
+            let mut pull = first.clone();
+            pull.report = report.into();
+            pull.start_ms += delta;
+            pull.end_ms += delta;
+            candidates.push(pull);
+        }
+        let hidden = candidates[1].clone();
+        let last = candidates[3].clone();
+        let mut review = Review {
+            replay: replay(),
+            pulls: vec![],
+            alternative_pulls: vec![],
+            content_capability: None,
+            content_timing: HashMap::new(),
+        };
+        for _ in 0..3 {
+            (review.pulls, review.alternative_pulls) =
+                partition_pulls(candidates, |p| p.report == last.report);
+            assert_eq!(review.pulls.len(), 2);
+            assert_eq!(review.pulls[1].report, last.report);
+            assert!(review.matching_pull(&hidden).is_none());
+            assert_eq!(review.matching_pull(&first).unwrap().report, first.report);
+            assert_eq!(review.matching_pull(&last).unwrap().report, last.report);
+            candidates = review.pull_candidates().cloned().collect();
+        }
+        (review.pulls, review.alternative_pulls) =
+            partition_pulls(vec![first.clone(), hidden.clone()], |_| false);
+        assert_eq!(review.matching_pull(&hidden).unwrap().report, first.report);
     }
 
     #[test]

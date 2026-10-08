@@ -362,7 +362,8 @@ impl Controller {
     ) -> Result<(), Error> {
         let slot = self.clocks.get_mut(side).ok_or(Error::InvalidClock)?;
         let same_mapping = slot.available_seconds == clock.available_seconds
-            && slot.relative_coverage == clock.relative_coverage
+            && slot.video_seconds(self.at_ms).is_some()
+            && clock.video_seconds(self.at_ms).is_some()
             && (slot.reference_seconds + (clock.reference_ms - slot.reference_ms) as f64 / 1000.0
                 - clock.reference_seconds)
                 .abs()
@@ -1109,6 +1110,31 @@ mod tests {
         } else {
             matches!(values[side], Some(PlaybackCommand::Pause))
         });
+    }
+
+    #[test]
+    fn newly_available_clock_coverage_recovers_failed_comparison() {
+        let mut controller = controller(true);
+        let unavailable = clocks()[0].with_relative_coverage(100.0, 200.0).unwrap();
+        assert_eq!(
+            controller.replace_clock(0, unavailable, test_now()),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(controller.status(), Status::Failed(Error::Unavailable));
+        controller
+            .replace_clock(0, clocks()[0], test_now())
+            .unwrap();
+        assert_eq!(controller.status(), Status::Preparing);
+        let empty = PlaybackState::default();
+        let commands = controller.tick([&empty, &empty], test_now());
+        assert!(matches!(
+            commands.primary,
+            Some(PlaybackCommand::SeekPaused(_))
+        ));
+        assert!(matches!(
+            commands.secondary,
+            Some(PlaybackCommand::SeekPaused(_))
+        ));
     }
 
     #[test]
