@@ -121,6 +121,13 @@ pub struct Pull {
     pub id: u64,
     pub encounter: u64,
     pub difficulty: u64,
+    /// Report-scoped attendance only; this does not identify the recording owner.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_friendly_players",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub friendly_players: Option<Vec<u64>>,
     pub report_start_ms: i64,
     pub remaining: Option<f64>,
     pub name: String,
@@ -132,6 +139,26 @@ pub struct Pull {
     #[cfg(test)]
     #[serde(skip)]
     pub seconds: u64,
+}
+
+fn parse_friendly_players(value: &Value) -> Option<Vec<u64>> {
+    let rows = value
+        .as_array()
+        .filter(|rows| !rows.is_empty() && rows.len() <= 100)?;
+    let mut players = rows
+        .iter()
+        .map(|id| id.as_u64().filter(|id| (1..=i32::MAX as u64).contains(id)))
+        .collect::<Option<Vec<_>>>()?;
+    players.sort_unstable();
+    players.dedup();
+    Some(players)
+}
+
+fn deserialize_friendly_players<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<u64>>, D::Error> {
+    // Old and partially populated caches remain usable without attendance.
+    Ok(parse_friendly_players(&Value::deserialize(deserializer)?))
 }
 
 impl Pull {
@@ -1363,7 +1390,7 @@ impl Client {
     }
     fn review_explicit_report(&mut self, replay: Replay, code: &str) -> Result<Review, String> {
         self.recording_match_complete = false;
-        let data = self.query("query($code:String!){reportData{report(code:$code){code startTime fights{id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime}}}}",json!({"code":code}))?;
+        let data = self.query("query($code:String!){reportData{report(code:$code){code startTime fights{id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime friendlyPlayers}}}}",json!({"code":code}))?;
         let report = &data["reportData"]["report"];
         let pulls = map_explicit_report_pulls(report, code)?;
         // Explicit report selection may include unrelated unsupported/partial
@@ -1507,7 +1534,7 @@ impl Client {
         let report = if let Some((_, report)) = self.reports.get(&pull.report) {
             report.clone()
         } else {
-            let data = self.query_with_timeout("query($code:String!){reportData{report(code:$code){code startTime endTime fights{id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime}}}}", json!({"code":pull.report}), event_request_timeout(deadline, Instant::now())?)?;
+            let data = self.query_with_timeout("query($code:String!){reportData{report(code:$code){code startTime endTime fights{id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime friendlyPlayers}}}}", json!({"code":pull.report}), event_request_timeout(deadline, Instant::now())?)?;
             let report = data["reportData"]["report"].clone();
             check_cancelled(&self.cancel)?;
             self.reports
@@ -1803,7 +1830,7 @@ impl Client {
                 .get(code)
                 .is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(15))
             {
-                let data = self.query("query($code:String!){reportData{report(code:$code){code startTime endTime fights{ id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime }}}}", json!({"code":code}))?;
+                let data = self.query("query($code:String!){reportData{report(code:$code){code startTime endTime fights{ id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime friendlyPlayers }}}}", json!({"code":code}))?;
                 let report = data["reportData"]["report"].clone();
                 if report.is_null() {
                     complete = false;
@@ -1981,6 +2008,7 @@ fn map_report_pulls(report: &Value, range: Option<(i64, i64)>) -> Result<Vec<Pul
             id,
             encounter,
             difficulty: fight["difficulty"].as_u64().unwrap_or(0),
+            friendly_players: parse_friendly_players(&fight["friendlyPlayers"]),
             report_start_ms: start,
             remaining: fight["fightPercentage"]
                 .as_f64()
@@ -2294,6 +2322,64 @@ mod tests {
             json!([{"encounterID":0,"difficulty":null},{"encounterID":1,"difficulty":10}]);
         assert!(complete_fight_list(&report));
         assert!(!complete_fight_list(&Value::Null));
+    }
+
+    #[test]
+    fn attendance_is_optional_bounded_and_report_scoped() {
+        let mut report = json!({"code":"abcdefghABCDEFGH","startTime":1_700_000_000_000i64,"fights":[
+            {"id":1,"encounterID":123,"difficulty":5,"name":"Raid boss","startTime":1000,"endTime":21000}
+        ]});
+        let unknown = map_explicit_report_pulls(&report, "abcdefghABCDEFGH").unwrap();
+        assert_eq!(unknown[0].friendly_players, None);
+        for value in [json!([3, 1, 3, 2]), json!([])] {
+            report["fights"][0]["friendlyPlayers"] = value;
+            let pulls = map_explicit_report_pulls(&report, "abcdefghABCDEFGH").unwrap();
+            assert_eq!(
+                pulls[0].friendly_players,
+                parse_friendly_players(&report["fights"][0]["friendlyPlayers"])
+            );
+        }
+        assert_eq!(
+            parse_friendly_players(&json!([3, 1, 3, 2])),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(parse_friendly_players(&json!([])), None);
+        for malformed in [
+            Value::Null,
+            json!("unknown"),
+            json!([0]),
+            json!([-1]),
+            json!([1.5]),
+            json!([1, "2"]),
+            json!([2147483648u64]),
+            json!(vec![1; 101]),
+        ] {
+            report["fights"][0]["friendlyPlayers"] = malformed;
+            let pulls = map_explicit_report_pulls(&report, "abcdefghABCDEFGH").unwrap();
+            assert_eq!(pulls.len(), 1, "Attendance never removes a playable pull");
+            assert_eq!(pulls[0].friendly_players, None);
+        }
+        assert_eq!(
+            parse_friendly_players(&json!((1..=100).collect::<Vec<_>>()))
+                .unwrap()
+                .len(),
+            100
+        );
+        let mut cached = serde_json::to_value(&unknown[0]).unwrap();
+        cached.as_object_mut().unwrap().remove("friendly_players");
+        assert_eq!(
+            serde_json::from_value::<Pull>(cached.clone())
+                .unwrap()
+                .friendly_players,
+            None
+        );
+        cached["friendly_players"] = json!([1, "invalid"]);
+        assert_eq!(
+            serde_json::from_value::<Pull>(cached)
+                .unwrap()
+                .friendly_players,
+            None
+        );
     }
 
     #[test]
@@ -2802,6 +2888,7 @@ mod tests {
             id: 1,
             encounter: 1,
             difficulty: 5,
+            friendly_players: None,
             report_start_ms: 1_000_000,
             remaining: Some(50.0),
             name: "Boss".into(),

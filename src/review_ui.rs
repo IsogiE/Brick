@@ -4237,6 +4237,7 @@ mod tests {
             id: 1,
             encounter: 1,
             difficulty: 5,
+            friendly_players: None,
             report_start_ms: start - 50_000,
             remaining: Some(75.8),
             last_phase: Some(2),

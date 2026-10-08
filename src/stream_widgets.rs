@@ -525,6 +525,7 @@ mod tests {
             id,
             encounter: 3178,
             difficulty,
+            friendly_players: None,
             report_start_ms: 0,
             remaining: Some(70.3),
             name: "Ula'tek".into(),

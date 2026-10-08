@@ -508,6 +508,7 @@ mod tests {
             id: 1,
             encounter: 3135,
             difficulty: 5,
+            friendly_players: None,
             report_start_ms: 1_790_000_000_000,
             remaining: Some(75.0),
             name: "Boss".into(),
@@ -590,6 +591,40 @@ mod tests {
         assert!(hot.for_display(&stream).is_none());
         hot.set_connected(false);
         assert!(hot.for_display(&stream).is_none());
+    }
+
+    #[test]
+    fn attendance_survives_shared_report_cache_without_becoming_pov_ownership() {
+        let (mut cache, mut stream, mut review) = fixture();
+        review.pulls[0].friendly_players = Some(vec![7, 9]);
+        let now = super::super::now_secs();
+        for id in [101, 102] {
+            stream.user_id = id.to_string();
+            cache.merge(&stream, &review, true, &[], now);
+        }
+        let mut document = serde_json::to_value(&cache.document).unwrap();
+        cache.document = decode(&serde_json::to_vec(&document).unwrap()).unwrap();
+        assert_eq!(cache.document.reports.len(), 1);
+        assert_eq!(cache.document.reports["abcdefghijklmnop"].len(), 1);
+        let mut hot = prepared::Cache::default();
+        cache.hydrate(&mut hot, None, 4, &Access::from("fixture"));
+        for id in [101, 102] {
+            stream.user_id = id.to_string();
+            let entry = hot.for_display(&stream).unwrap();
+            assert_eq!(entry.review.pulls[0].friendly_players, Some(vec![7, 9]));
+            assert_eq!(entry.review.pulls.len(), 1);
+        }
+        document["reports"]["abcdefghijklmnop"]["1"]
+            .as_object_mut()
+            .unwrap()
+            .remove("friendly_players");
+        cache.document = decode(&serde_json::to_vec(&document).unwrap()).unwrap();
+        let mut legacy = prepared::Cache::default();
+        cache.hydrate(&mut legacy, None, 4, &Access::from("fixture"));
+        assert_eq!(
+            legacy.for_display(&stream).unwrap().review.pulls[0].friendly_players,
+            None
+        );
     }
 
     #[test]

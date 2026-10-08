@@ -43,6 +43,47 @@ fn random_later<'a>(review: &Review, options: impl Iterator<Item = &'a Pull>) ->
         <[u8; 32]>::from(hash.finalize())
     })
 }
+/// Spread retries across observed lineups and raid time without guessing which
+/// character owns a recording. Missing attendance can never exclude a pull.
+fn diverse_retry<'a>(
+    options: impl Iterator<Item = &'a Pull>,
+    attempted: &[&Pull],
+) -> Option<&'a Pull> {
+    use std::{cmp::Reverse, collections::BTreeSet};
+    let known = attempted.iter().any(|pull| pull.friendly_players.is_some());
+    let seen: BTreeSet<_> = attempted
+        .iter()
+        .filter_map(|pull| pull.friendly_players.as_ref())
+        .flatten()
+        .copied()
+        .collect();
+    let encounters: BTreeSet<_> = attempted.iter().map(|pull| pull.encounter).collect();
+    options.min_by_key(|pull| {
+        let newcomers = if known {
+            pull.friendly_players
+                .iter()
+                .flatten()
+                .filter(|id| !seen.contains(*id))
+                .count()
+        } else {
+            0
+        };
+        let gap = attempted
+            .iter()
+            .map(|old| pull.start_ms.abs_diff(old.start_ms))
+            .min()
+            .unwrap_or(0);
+        (
+            Reverse(newcomers),
+            Reverse(!encounters.contains(&pull.encounter)),
+            Reverse(gap),
+            pull.start_ms,
+            pull.report.as_str(),
+            pull.id,
+        )
+    })
+}
+
 impl Snapshot {
     pub fn remember(&mut self, ticket: Ticket) {
         self.tickets.retain(|old| {
@@ -242,7 +283,28 @@ impl Snapshot {
                     )
                 })
                 .collect();
-            let Some(first) = usable.first().copied() else {
+            let attempted: Vec<_> = group
+                .iter()
+                .copied()
+                .filter(|pull| ticket_for(pull).is_some())
+                .collect();
+            let retry = attempted.iter().any(|pull| {
+                ticket_for(pull).is_some_and(|ticket| {
+                    matches!(ticket.job.status, Status::Failed | Status::Canceled)
+                })
+            });
+            let first = if retry {
+                // A successful diversified retry is now the anchor; do not go
+                // back and scan every earlier pull while its shared clock loads.
+                usable
+                    .iter()
+                    .copied()
+                    .find(|pull| ticket_for(pull).and_then(Ticket::alignment).is_some())
+                    .or_else(|| diverse_retry(usable.iter().copied(), &attempted))
+            } else {
+                usable.first().copied()
+            };
+            let Some(first) = first else {
                 continue;
             };
             let last = group.last().unwrap();
@@ -274,13 +336,15 @@ impl Snapshot {
                         .copied()
                         .find(|p| p.start_ms >= due && ticket_for(p).is_none());
                 } else if !checked_later {
-                    next = random_later(
-                        review,
-                        usable
-                            .iter()
-                            .copied()
-                            .filter(|p| later(p) && ticket_for(p).is_none()),
-                    );
+                    let options = usable
+                        .iter()
+                        .copied()
+                        .filter(|p| later(p) && ticket_for(p).is_none());
+                    next = if retry {
+                        diverse_retry(options, &attempted)
+                    } else {
+                        random_later(review, options)
+                    };
                 }
             }
             // Conflicting checks leave a gap. Additional checks narrow that gap,
@@ -364,6 +428,14 @@ impl Snapshot {
             .filter(|p| {
                 ticket_for(p).is_none()
                     && can_sample(p)
+                    // An old unsubmitted chronological retry must not override
+                    // the better choice learned from a failed sample.
+                    && (!tickets.iter().any(|ticket| {
+                        ticket.key.report == p.report
+                            && matches!(ticket.job.status, Status::Failed | Status::Canceled)
+                    }) || plan.next.as_ref().is_some_and(|next| {
+                        next.report == p.report && next.id == p.id
+                    }))
                     && (review.replay.growing
                         || !review.content_alignment(p).is_some_and(|a| a.shared_clock))
             })
@@ -571,7 +643,7 @@ mod tests {
         absent.job.result = None;
         absent.job.error = Some("missing_footage".into());
         saved.remember(absent);
-        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 2);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 12);
         saved.remember(ticket(&review, &review.pulls[1], 0.0));
         saved.remember(ticket(&review, &review.pulls[10], 0.0));
         let mut gap = ticket(&review, &review.pulls[5], 0.0);
@@ -595,6 +667,122 @@ mod tests {
         assert!(resumed.alignments.iter().any(|a| a.key.pull_id == 11));
         assert!(!resumed.alignments.iter().any(|a| a.key.pull_id == 12));
     }
+    fn fail(saved: &mut Snapshot, review: &Review, pull: &Pull) {
+        let mut failed = ticket(review, pull, 0.0);
+        failed.job.status = Status::Failed;
+        failed.job.result = None;
+        failed.job.error = Some("alignment_not_found".into());
+        saved.remember(failed);
+    }
+
+    #[test]
+    fn retries_cover_changed_lineups_instead_of_three_adjacent_pulls() {
+        let mut review = review();
+        for (index, pull) in review.pulls.iter_mut().enumerate() {
+            pull.friendly_players = Some(match index {
+                0..=3 => vec![1, 2],
+                4..=7 => vec![1, 3],
+                _ => vec![4, 5],
+            });
+        }
+        let mut saved = Snapshot::default();
+        let mut tried = Vec::new();
+        for _ in 0..MAX_FAILED_SAMPLES {
+            let next = saved.plan(&review, 0).next.unwrap();
+            tried.push(next.id);
+            fail(&mut saved, &review, &next);
+        }
+        assert_eq!(tried, [1, 12, 6]);
+        assert!(saved.plan(&review, 0).next.is_none());
+        assert_eq!(saved.tickets.len(), 3);
+        assert!(saved.plan(&review, 0).alignments.is_empty());
+    }
+
+    #[test]
+    fn retry_lineup_novelty_uses_all_attempts_before_encounter_and_time() {
+        let mut review = review();
+        for pull in &mut review.pulls {
+            pull.friendly_players = Some(vec![1, 2]);
+        }
+        review.pulls[11].friendly_players = Some(vec![3, 4]);
+        review.pulls[5].friendly_players = Some(vec![4, 5]);
+        review.pulls[1].encounter += 1;
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &review.pulls[0]);
+        fail(&mut saved, &review, &review.pulls[11]);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 6);
+        review.pulls.reverse();
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 6);
+    }
+
+    #[test]
+    fn unknown_attendance_falls_back_to_encounter_then_time_without_exclusions() {
+        let mut review = review();
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &review.pulls[0]);
+        // No known attempted lineup means that a candidate's known roster
+        // cannot supply evidence that its participants are new.
+        review.pulls[1].friendly_players = Some(vec![20, 21, 22]);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 12);
+        review.pulls[3].encounter += 1;
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 4);
+        fail(&mut saved, &review, &review.pulls[3]);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 12);
+        assert_eq!(review.pulls.len(), 12);
+    }
+
+    #[test]
+    fn same_lineup_and_encounter_retries_spread_over_time_with_earliest_ties() {
+        let mut review = review();
+        for pull in &mut review.pulls {
+            pull.friendly_players = Some(vec![1, 2]);
+        }
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &review.pulls[0]);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 12);
+        fail(&mut saved, &review, &review.pulls[11]);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 6);
+    }
+
+    #[test]
+    fn restored_unsubmitted_retry_cannot_override_new_diversity_evidence() {
+        let review = review();
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &review.pulls[0]);
+        saved.planned = Some(Key::new(
+            &review.replay,
+            &review.pulls[1],
+            review.content_capability.as_ref().unwrap(),
+            0,
+        ));
+        let mut saved: Snapshot =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 12);
+        saved.remember(ticket(&review, &review.pulls[11], 0.0));
+        let plan = saved.plan(&review, 0);
+        assert!(plan.next.is_none(), "Keep a successful retry as the anchor");
+        assert_eq!(plan.alignments.len(), 1);
+        assert_eq!(plan.alignments[0].key.pull_id, 12);
+        assert_eq!(saved.tickets.len(), 2, "Retain the old failure receipt");
+    }
+
+    #[test]
+    fn pending_retry_survives_a_more_diverse_catalogue() {
+        let mut review = review();
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &review.pulls[0]);
+        let mut pending = ticket(&review, &review.pulls[1], 0.0);
+        pending.job.status = Status::Running;
+        pending.job.result = None;
+        saved.remember(pending.clone());
+        review.pulls[11].friendly_players = Some(vec![30, 31]);
+        review.pulls[11].encounter += 1;
+        let plan = saved.plan(&review, 0);
+        assert!(plan.next.is_none());
+        assert_eq!(plan.pending, Some(pending));
+        assert_eq!(saved.tickets.len(), 2);
+    }
+
     #[test]
     fn repeated_no_matches_stop_archives_and_resume_only_in_a_new_live_window() {
         let mut review = review();
