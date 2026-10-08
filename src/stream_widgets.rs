@@ -30,11 +30,12 @@ pub fn outcome_color(kill: bool, remaining: Option<f64>) -> Color32 {
     )
 }
 
+/// Group normalized review pulls without changing their recording-wide order.
 pub fn encounter_groups(
     pulls: Vec<crate::warcraftlogs::Pull>,
 ) -> Vec<((u64, u64, String), Vec<crate::warcraftlogs::Pull>)> {
     let mut groups: Vec<((u64, u64, String), Vec<crate::warcraftlogs::Pull>)> = Vec::new();
-    for pull in crate::warcraftlogs::canonical_pulls(pulls) {
+    for pull in pulls {
         let key = (
             pull.encounter,
             pull.difficulty,
@@ -90,7 +91,7 @@ fn pull_start_label(pull: &crate::warcraftlogs::Pull) -> String {
         .unwrap_or_else(|| "Start time unavailable".into())
 }
 
-pub fn pull_matches_search(pull: &crate::warcraftlogs::Pull, query: &str) -> bool {
+pub fn pull_matches_search(pull: &crate::warcraftlogs::Pull, number: usize, query: &str) -> bool {
     if query.trim().is_empty() {
         return true;
     }
@@ -98,10 +99,11 @@ pub fn pull_matches_search(pull: &crate::warcraftlogs::Pull, query: &str) -> boo
         .map(|(at, _)| at.date().to_string())
         .unwrap_or_default();
     let text = format!(
-        "{} {} {} {} {}",
+        "{} {} {} #{} {} {}",
         pull.name,
         pull.report,
-        pull.id,
+        number,
+        number,
         pull_start_label(pull),
         date
     )
@@ -333,6 +335,7 @@ pub fn encounter_header(
 pub fn pull(
     ui: &mut egui::Ui,
     pull: &crate::warcraftlogs::Pull,
+    number: usize,
     selected: bool,
     best: bool,
 ) -> egui::Response {
@@ -381,7 +384,7 @@ pub fn pull(
     painter.text(
         egui::pos2(left, rect.top() + 15.0),
         egui::Align2::LEFT_CENTER,
-        format!("#{}   {}:{:02}", pull.id, seconds / 60, seconds % 60),
+        format!("#{number}   {}:{:02}", seconds / 60, seconds % 60),
         egui::FontId::proportional(12.0),
         TEXT,
     );
@@ -453,8 +456,8 @@ pub fn pull(
             format!(
                 "{} {} {} {} {}",
                 pull.name,
-                if dungeon { "segment" } else { "fight" },
-                pull.id,
+                if dungeon { "segment" } else { "pull" },
+                number,
                 result,
                 pull_start_label(pull)
             ),
@@ -473,7 +476,7 @@ pub fn pull(
                 RichText::new(format!(
                     "{} {} · {}:{:02}",
                     if dungeon { "Segment" } else { "Pull" },
-                    pull.id,
+                    number,
                     seconds / 60,
                     seconds % 60,
                 ))
@@ -525,6 +528,7 @@ mod tests {
             id,
             encounter: 3178,
             difficulty,
+            friendly_players: None,
             report_start_ms: 0,
             remaining: Some(70.3),
             name: "Ula'tek".into(),
@@ -573,11 +577,21 @@ mod tests {
             "11 SEP 00:15 CEST",
             "2026-09-11 00:15:32",
         ] {
-            assert!(pull_matches_search(&pull, query), "{query}");
+            assert!(pull_matches_search(&pull, 7, query), "{query}");
         }
         for query in ["2026-09-10", "22:15", "00:15 CET", "12 Sep"] {
-            assert!(!pull_matches_search(&pull, query), "{query}");
+            assert!(!pull_matches_search(&pull, 7, query), "{query}");
         }
+    }
+
+    #[test]
+    fn pull_search_uses_the_displayed_number_without_relabeling_source_identity() {
+        let pull = pull("exampleLog", 91, 4, timestamp("2026-09-10T22:15:32Z"));
+        assert!(pull_matches_search(&pull, 2, "#2"));
+        assert!(pull_matches_search(&pull, 2, "ula examplelog #2"));
+        assert!(!pull_matches_search(&pull, 2, "#91"));
+        assert_eq!(pull.id, 91);
+        assert_eq!(pull.report, "exampleLog");
     }
 
     #[test]
@@ -590,10 +604,12 @@ mod tests {
             for _ in 0..2 {
                 output = Some(ctx.run_ui(Default::default(), |ui| {
                     ui.set_width(width);
-                    bounds = super::pull(ui, &pull, false, true).rect;
+                    bounds = super::pull(ui, &pull, 2, false, true).rect;
                 }));
             }
             let output = output.unwrap();
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == "#2   4:07")));
             let text = output
                 .shapes
                 .iter()
@@ -621,7 +637,12 @@ mod tests {
         kill.remaining = Some(0.0);
         let other = pull("second", 7, 5, 100_000);
         let duplicate_log = pull("third", 22, 5, 101_000);
-        let groups = encounter_groups(vec![kill, other.clone(), duplicate_log, other]);
+        let groups = encounter_groups(crate::warcraftlogs::canonical_pulls(vec![
+            kill,
+            other.clone(),
+            duplicate_log,
+            other,
+        ]));
         assert_eq!(groups.len(), 1);
         let group = &groups[0].1;
         assert_eq!(group.len(), 2);
@@ -704,7 +725,7 @@ mod tests {
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 egui::CentralPanel::default().show_inside(ui, |ui| {
                     encounter_header(ui, &dungeon, 2, Some(70.3), kill, true);
-                    super::pull(ui, &dungeon, false, true);
+                    super::pull(ui, &dungeon, 2, false, true);
                 });
             });
             let mut labels = Vec::new();

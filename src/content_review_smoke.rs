@@ -562,6 +562,8 @@ pub(crate) fn run_native_content() {
     viewer.connection_checked = true;
     viewer.recording_match_status = Some((0, false));
     viewer.review = Some(Review {
+        complete_reports: Default::default(),
+        alternative_pulls: Default::default(),
         replay: fixture.replay,
         pulls: vec![pull.clone()],
         content_capability: Some(cap),

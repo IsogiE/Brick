@@ -1041,6 +1041,7 @@ mod tests {
             id: 21,
             encounter: 100,
             difficulty: 5,
+            friendly_players: None,
             report_start_ms: 1_700_000_000_000,
             remaining: None,
             name: "Boss".into(),

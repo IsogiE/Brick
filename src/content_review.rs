@@ -96,6 +96,15 @@ impl ReviewUi {
             return;
         };
         self.content.samples.apply_to(review, epoch);
+        if self.pull.as_ref().is_some_and(|selected| {
+            review
+                .alternative_pulls
+                .iter()
+                .any(|candidate| pull_key(candidate) == pull_key(selected))
+        }) {
+            let review = self.review.take().unwrap();
+            self.accept_review(review);
+        }
     }
 
     pub(super) fn check_recording_clock_selection(&mut self, _pull: &Pull) {
@@ -109,8 +118,7 @@ impl ReviewUi {
         }
         let review = self.review.as_ref()?;
         let pull = review
-            .pulls
-            .iter()
+            .pull_candidates()
             .find(|p| p.report == key.report && p.id == key.pull_id)?;
         // Playback may already inherit a known offset. A planned drift check
         // still needs its own measurement and must continue submitting/polling.
@@ -171,8 +179,7 @@ impl ReviewUi {
         };
         let key = (alignment.key.report.clone(), alignment.key.pull_id);
         let Some(pull) = review
-            .pulls
-            .iter()
+            .pull_candidates()
             .find(|p| p.report == key.0 && p.id == key.1)
             .cloned()
         else {
@@ -315,6 +322,8 @@ mod tests {
         ui.connected = true;
         ui.connection_checked = true;
         ui.review = Some(Review {
+            complete_reports: Default::default(),
+            alternative_pulls: Default::default(),
             replay,
             pulls: vec![pull.clone()],
             content_capability: Some(cap),
@@ -345,7 +354,9 @@ mod tests {
         // A completed job's recording lookup supplies the authoritative mapping.
         let mut refreshed = ui.review.clone().unwrap();
         let clock = crate::content_alignment::test_recording_clock();
-        crate::warcraftlogs::prepared::clocks(&mut refreshed, None, 0, |_| Some(clock.clone()));
+        crate::warcraftlogs::prepared::clocks(&mut refreshed, None, 0, |_| {
+            crate::content_alignment::RecordingLookup::Valid(clock.clone())
+        });
         ui.accept_review(refreshed);
         ui.sync_content_selection();
         ui.select(later);

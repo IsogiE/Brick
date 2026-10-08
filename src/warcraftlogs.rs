@@ -1,5 +1,6 @@
 //! Private reports are fetched directly with the viewer's WCL authorization.
 pub(crate) mod boss_signature;
+pub(crate) mod clock_bridge;
 mod data_cache;
 mod persistent;
 pub(crate) mod prepared;
@@ -121,6 +122,13 @@ pub struct Pull {
     pub id: u64,
     pub encounter: u64,
     pub difficulty: u64,
+    /// Report-scoped attendance only; this does not identify the recording owner.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_friendly_players",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub friendly_players: Option<Vec<u64>>,
     pub report_start_ms: i64,
     pub remaining: Option<f64>,
     pub name: String,
@@ -132,6 +140,26 @@ pub struct Pull {
     #[cfg(test)]
     #[serde(skip)]
     pub seconds: u64,
+}
+
+fn parse_friendly_players(value: &Value) -> Option<Vec<u64>> {
+    let rows = value
+        .as_array()
+        .filter(|rows| !rows.is_empty() && rows.len() <= 100)?;
+    let mut players = rows
+        .iter()
+        .map(|id| id.as_u64().filter(|id| (1..=i32::MAX as u64).contains(id)))
+        .collect::<Option<Vec<_>>>()?;
+    players.sort_unstable();
+    players.dedup();
+    Some(players)
+}
+
+fn deserialize_friendly_players<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<u64>>, D::Error> {
+    // Old and partially populated caches remain usable without attendance.
+    Ok(parse_friendly_players(&Value::deserialize(deserializer)?))
 }
 
 impl Pull {
@@ -175,12 +203,52 @@ pub struct RaidEvent {
 pub struct Review {
     pub replay: Replay,
     pub pulls: Vec<Pull>,
+    /// Other logger candidates remain available for their own clock lookups.
+    pub alternative_pulls: Vec<Pull>,
+    /// All applicable report rows were validated, including duplicate loggers.
+    pub complete_reports: BTreeSet<String>,
 
     pub content_capability: Option<crate::content_alignment::Capability>,
     pub content_timing: HashMap<(String, u64), crate::content_alignment::Alignment>,
 }
 
 impl Review {
+    pub(crate) fn pull_candidates(&self) -> impl Iterator<Item = &Pull> {
+        self.pulls.iter().chain(&self.alternative_pulls)
+    }
+
+    pub(crate) fn candidate_count(&self) -> usize {
+        self.pulls.len() + self.alternative_pulls.len()
+    }
+
+    pub(crate) fn prefer_verified_pulls(&mut self) {
+        let priority: HashMap<_, _> = self
+            .pull_candidates()
+            .map(|pull| {
+                let rank = self.content_alignment(pull).map_or(0u8, |alignment| {
+                    if alignment.shared_clock {
+                        3
+                    } else if alignment.derived.is_some() {
+                        1
+                    } else {
+                        2
+                    }
+                });
+                ((pull.report.clone(), pull.id), rank)
+            })
+            .collect();
+        let mut candidates = std::mem::take(&mut self.pulls);
+        candidates.append(&mut self.alternative_pulls);
+        let (pulls, alternatives) = partition_pulls(candidates, |pull| {
+            priority
+                .get(&(pull.report.clone(), pull.id))
+                .copied()
+                .unwrap_or(0)
+        });
+        self.pulls = pulls;
+        self.alternative_pulls = alternatives;
+    }
+
     pub(crate) fn matching_pull(&self, selected: &Pull) -> Option<&Pull> {
         if let Some(exact) = self
             .pulls
@@ -189,22 +257,51 @@ impl Review {
         {
             return Some(exact);
         }
-        let mut candidates = self.pulls.iter().filter(|pull| {
-            pull.encounter == selected.encounter
-                && pull.difficulty == selected.difficulty
-                && pull.start_ms.abs_diff(selected.start_ms) <= 3_000
-        });
+        let mut candidates = self
+            .pulls
+            .iter()
+            .filter(|pull| equivalent_pull(pull, selected));
         let first = candidates.next()?;
         // Separate reports can contain nearby or overlapping entries. Never
         // choose a comparison or alignment target by their incidental order.
-        candidates.next().is_none().then_some(first)
+        (candidates.next().is_none()
+            && self
+                .pull_candidates()
+                .filter(|pull| equivalent_pull(pull, selected))
+                .all(|pull| equivalent_pull(pull, first)))
+        .then_some(first)
     }
 
     pub fn content_alignment(&self, pull: &Pull) -> Option<&crate::content_alignment::Alignment> {
         let capability = self.content_capability.as_ref()?;
         self.content_timing
             .get(&(pull.report.clone(), pull.id))
-            .filter(|alignment| alignment.matches(&self.replay, pull, capability))
+            .filter(|alignment| {
+                alignment.matches(&self.replay, pull, capability)
+                    && alignment.derived.as_ref().is_none_or(|derived| {
+                        self.complete_reports.contains(&alignment.key.report)
+                            && derived.proof.matches_key(&alignment.key)
+                            && derived.sources.iter().all(|(key, version)| {
+                                self.complete_reports.contains(&key.report)
+                                    && self
+                                        .content_timing
+                                        .get(&(key.report.clone(), key.pull_id))
+                                        .is_some_and(|source| {
+                                            source.shared_clock
+                                                && source.derived.is_none()
+                                                && source.key == *key
+                                                && source.version() == *version
+                                                && self.pull_candidates().any(|candidate| {
+                                                    source.matches(
+                                                        &self.replay,
+                                                        candidate,
+                                                        capability,
+                                                    )
+                                                })
+                                        })
+                            })
+                    })
+            })
     }
     pub fn content_required(&self) -> bool {
         self.content_capability.is_some() || self.replay.start_ms().is_err()
@@ -1229,6 +1326,7 @@ impl Client {
                 }
             }
         }
+        review.prefer_verified_pulls();
         Ok(review)
     }
 
@@ -1256,10 +1354,14 @@ impl Client {
                     .map(|(_, clock)| clock.clone())
             };
             if Instant::now() >= deadline || self.cancel.load(Ordering::Relaxed) {
-                return fallback();
+                return crate::content_alignment::RecordingLookup::Unavailable(fallback());
             }
-            crate::content_alignment::recording_clock(access, key, &self.cancel)
-                .unwrap_or_else(|_| fallback())
+            match crate::content_alignment::recording_clock(access, key, &self.cancel) {
+                crate::content_alignment::RecordingLookup::Unavailable(_) => {
+                    crate::content_alignment::RecordingLookup::Unavailable(fallback())
+                }
+                state => state,
+            }
         })
     }
 
@@ -1363,14 +1465,20 @@ impl Client {
     }
     fn review_explicit_report(&mut self, replay: Replay, code: &str) -> Result<Review, String> {
         self.recording_match_complete = false;
-        let data = self.query("query($code:String!){reportData{report(code:$code){code startTime fights{id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime}}}}",json!({"code":code}))?;
+        let data = self.query("query($code:String!){reportData{report(code:$code){code startTime fights{id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime friendlyPlayers}}}}",json!({"code":code}))?;
         let report = &data["reportData"]["report"];
         let pulls = map_explicit_report_pulls(report, code)?;
+        let complete_reports = complete_fight_list(report)
+            .then(|| code.to_owned())
+            .into_iter()
+            .collect();
         // Explicit report selection may include unrelated unsupported/partial
         // encounters. Valid selected pulls remain usable; this never establishes
         // a complete no-match or permits automatic recording removal.
         check_cancelled(&self.cancel)?;
         Ok(Review {
+            complete_reports,
+            alternative_pulls: Default::default(),
             replay,
             pulls,
             content_capability: None,
@@ -1507,7 +1615,7 @@ impl Client {
         let report = if let Some((_, report)) = self.reports.get(&pull.report) {
             report.clone()
         } else {
-            let data = self.query_with_timeout("query($code:String!){reportData{report(code:$code){code startTime endTime fights{id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime}}}}", json!({"code":pull.report}), event_request_timeout(deadline, Instant::now())?)?;
+            let data = self.query_with_timeout("query($code:String!){reportData{report(code:$code){code startTime endTime fights{id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime friendlyPlayers}}}}", json!({"code":pull.report}), event_request_timeout(deadline, Instant::now())?)?;
             let report = data["reportData"]["report"].clone();
             check_cancelled(&self.cancel)?;
             self.reports
@@ -1713,6 +1821,8 @@ impl Client {
         }
         let Ok(start) = replay.start_ms() else {
             return Ok(Review {
+                complete_reports: Default::default(),
+                alternative_pulls: Default::default(),
                 replay,
                 pulls: Vec::new(),
                 content_capability: None,
@@ -1792,6 +1902,7 @@ impl Client {
         self.reports
             .retain(|_, (at, _)| at.elapsed() < Duration::from_secs(120));
         let mut pulls = Vec::new();
+        let mut complete_reports = BTreeSet::new();
         for report in reports {
             check_cancelled(&self.cancel)?;
             let code = report["code"]
@@ -1803,7 +1914,7 @@ impl Client {
                 .get(code)
                 .is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(15))
             {
-                let data = self.query("query($code:String!){reportData{report(code:$code){code startTime endTime fights{ id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime }}}}", json!({"code":code}))?;
+                let data = self.query("query($code:String!){reportData{report(code:$code){code startTime endTime fights{ id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime friendlyPlayers }}}}", json!({"code":code}))?;
                 let report = data["reportData"]["report"].clone();
                 if report.is_null() {
                     complete = false;
@@ -1814,13 +1925,19 @@ impl Client {
                     .insert(code.to_owned(), (Instant::now(), report));
             }
             let report = &self.reports[code].1;
-            complete &= complete_fight_list(report);
+            let report_complete = complete_fight_list(report);
+            complete &= report_complete;
+            if report_complete {
+                complete_reports.insert(code.to_owned());
+            }
             pulls.extend(map_pulls(report, &replay)?);
         }
-        let unique = canonical_pulls(pulls);
+        let unique = same_report_pulls(pulls);
         check_cancelled(&self.cancel)?;
         self.recording_match_complete = complete;
         Ok(Review {
+            complete_reports,
+            alternative_pulls: Default::default(),
             content_capability: None,
             content_timing: HashMap::new(),
             replay,
@@ -1905,36 +2022,119 @@ fn exact_duplicate_pulls(report: &Value, pull: &Pull) -> Result<Vec<Pull>, Strin
     Ok(alternatives)
 }
 
-// Exact duplicate rows within a report describe the same logged encounter.
-// Keep the original (lowest) fight ID, independent of response order. Reports
-// from different loggers retain the existing three-second overlap tolerance.
-// This also normalizes restored catalogues without deleting encrypted history.
-pub(super) fn canonical_pulls(mut pulls: Vec<Pull>) -> Vec<Pull> {
+/// Cross-report choices refer to one physical pull only when both bounds agree.
+/// Within a report, only identical bounds can alias a different fight ID.
+pub(crate) fn equivalent_pull(left: &Pull, right: &Pull) -> bool {
+    left.encounter == right.encounter
+        && left.difficulty == right.difficulty
+        && left.start_ms.abs_diff(right.start_ms) <= 3_000
+        && left.end_ms.abs_diff(right.end_ms) <= 3_000
+        && (left.report != right.report
+            || (left.start_ms == right.start_ms && left.end_ms == right.end_ms))
+}
+
+// Same-report duplicates keep the lowest fight ID. Cross-report candidates must
+// survive until their own clocks are known, including through encrypted caches.
+fn same_report_pulls(mut pulls: Vec<Pull>) -> Vec<Pull> {
     pulls.sort_by_key(|p| (p.start_ms, p.report.clone(), p.id));
-    let mut unique: Vec<Pull> = Vec::new();
-    let mut same_report = std::collections::HashSet::new();
-    for pull in pulls {
-        if !same_report.insert((
+    let mut seen = std::collections::HashSet::new();
+    pulls.retain(|pull| {
+        seen.insert((
             pull.report.clone(),
             pull.encounter,
             pull.difficulty,
             pull.start_ms,
             pull.end_ms,
-        )) {
-            continue;
+        ))
+    });
+    pulls
+}
+
+fn duplicate_pull(left: &Pull, right: &Pull) -> bool {
+    left.report != right.report
+        && equivalent_pull(left, right)
+        && left.start_ms.abs_diff(right.start_ms) < 3_000
+        && left.end_ms.abs_diff(right.end_ms) < 3_000
+}
+
+fn partition_pulls<R: Ord + Default + Copy>(
+    pulls: Vec<Pull>,
+    verified: impl Fn(&Pull) -> R,
+) -> (Vec<Pull>, Vec<Pull>) {
+    // Freeze groups before considering clocks: choosing a different logger must
+    // not join a chain of overlapping bounds that describe different pulls.
+    let mut groups: Vec<Vec<Pull>> = Vec::new();
+    for pull in same_report_pulls(pulls) {
+        let matches: Vec<_> = groups
+            .iter()
+            .enumerate()
+            .rev()
+            .take_while(|(_, group)| group[0].start_ms > pull.start_ms.saturating_sub(3_000))
+            .filter(|(_, group)| duplicate_pull(&group[0], &pull))
+            .map(|(index, _)| index)
+            .collect();
+        if matches.len() == 1
+            && groups[matches[0]]
+                .iter()
+                .all(|old| old.report != pull.report)
+        {
+            groups[matches[0]].push(pull);
+        } else {
+            groups.push(vec![pull]);
         }
-        if unique.iter().rev().take(12).any(|p| {
-            p.report != pull.report
-                && p.encounter == pull.encounter
-                && p.difficulty == pull.difficulty
-                && p.start_ms.abs_diff(pull.start_ms) < 3000
-                && p.end_ms.abs_diff(pull.end_ms) < 3000
-        }) {
-            continue;
-        }
-        unique.push(pull);
     }
-    unique
+    let chosen: Vec<_> = groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| {
+            group
+                .iter()
+                .enumerate()
+                .filter(|(_, pull)| {
+                    verified(pull) > R::default()
+                        && group
+                            .iter()
+                            .all(|old| old.report == pull.report || duplicate_pull(old, pull))
+                        && {
+                            // Every group member starts within 3s of its first
+                            // row. Only nearby groups can make this choice ambiguous.
+                            let begin = groups.partition_point(|g| {
+                                g[0].start_ms <= pull.start_ms.saturating_sub(6_000)
+                            });
+                            let end = groups.partition_point(|g| {
+                                g[0].start_ms < pull.start_ms.saturating_add(3_000)
+                            });
+                            !groups[begin..end]
+                                .iter()
+                                .enumerate()
+                                .any(|(other, candidates)| {
+                                    begin + other != index
+                                        && candidates.iter().any(|old| duplicate_pull(old, pull))
+                                })
+                        }
+                })
+                .max_by_key(|(i, pull)| (verified(pull), std::cmp::Reverse(*i)))
+                .map_or(0, |(i, _)| i)
+        })
+        .collect();
+    let mut visible = Vec::new();
+    let mut alternatives = Vec::new();
+    for (group, chosen) in groups.into_iter().zip(chosen) {
+        for (index, pull) in group.into_iter().enumerate() {
+            if index == chosen {
+                visible.push(pull);
+            } else {
+                alternatives.push(pull);
+            }
+        }
+    }
+    // Frozen groups already follow chronological first-observed bounds. A
+    // logger's small timestamp shift must not renumber neighboring pulls.
+    (visible, alternatives)
+}
+
+pub(super) fn canonical_pulls(pulls: Vec<Pull>) -> Vec<Pull> {
+    partition_pulls(pulls, |_| false).0
 }
 
 fn map_report_pulls(report: &Value, range: Option<(i64, i64)>) -> Result<Vec<Pull>, String> {
@@ -1981,6 +2181,7 @@ fn map_report_pulls(report: &Value, range: Option<(i64, i64)>) -> Result<Vec<Pul
             id,
             encounter,
             difficulty: fight["difficulty"].as_u64().unwrap_or(0),
+            friendly_players: parse_friendly_players(&fight["friendlyPlayers"]),
             report_start_ms: start,
             remaining: fight["fightPercentage"]
                 .as_f64()
@@ -2248,6 +2449,120 @@ mod tests {
     use super::*;
 
     #[test]
+    fn verified_logger_choice_preserves_chronological_group_numbers() {
+        let first = crate::content_alignment::test_ticket().1;
+        let mut different = first.clone();
+        different.id += 1;
+        different.encounter += 1;
+        different.start_ms += 1_000;
+        different.end_ms += 1_000;
+        let mut alternative = first.clone();
+        alternative.report = "DifferentReport1".into();
+        alternative.id = 1;
+        alternative.start_ms += 2_000;
+        alternative.end_ms += 2_000;
+        let mut candidates = vec![different.clone(), alternative.clone(), first.clone()];
+        for verified in [false, true, true, false] {
+            let (visible, hidden) =
+                partition_pulls(candidates, |p| verified && p.report == alternative.report);
+            assert_eq!(visible.len(), 2);
+            assert_eq!(
+                visible[0].report,
+                if verified {
+                    alternative.report.clone()
+                } else {
+                    first.report.clone()
+                }
+            );
+            assert_eq!(visible[1].encounter, different.encounter);
+            let groups = crate::stream_widgets::encounter_groups(visible.clone());
+            assert_eq!(groups[0].1[0].encounter, first.encounter);
+            assert_eq!(groups[1].1[0].encounter, different.encounter);
+            candidates = visible.into_iter().chain(hidden).collect();
+        }
+    }
+
+    #[test]
+    fn duplicate_clock_preference_never_bridges_ambiguous_boundaries() {
+        let first = crate::content_alignment::test_ticket().1;
+        let mut middle = first.clone();
+        middle.report = "DifferentReport1".into();
+        middle.start_ms += 2_000;
+        middle.end_ms += 2_000;
+        let mut last = first.clone();
+        last.report = "DifferentReport2".into();
+        last.start_ms += 4_000;
+        last.end_ms += 4_000;
+        let mut candidates = vec![last.clone(), middle.clone(), first.clone()];
+        for _ in 0..3 {
+            let (visible, alternatives) =
+                partition_pulls(candidates, |pull| pull.report == middle.report);
+            assert_eq!(
+                visible
+                    .iter()
+                    .map(|p| p.report.as_str())
+                    .collect::<Vec<_>>(),
+                vec![first.report.as_str(), last.report.as_str()]
+            );
+            assert_eq!(alternatives.len(), 1);
+            candidates = visible.into_iter().chain(alternatives).collect();
+        }
+        let mut nearby_same_report = first.clone();
+        nearby_same_report.id += 1;
+        nearby_same_report.start_ms += 2_000;
+        nearby_same_report.end_ms += 2_000;
+        let (visible, _) = partition_pulls(
+            vec![first.clone(), nearby_same_report, middle.clone()],
+            |p| p.report == middle.report,
+        );
+        assert_eq!(
+            visible.len(),
+            3,
+            "Ambiguous logger candidates cannot erase distinct report fights"
+        );
+    }
+
+    #[test]
+    fn hidden_candidates_cannot_turn_an_ambiguous_chain_into_unique_navigation() {
+        let first = crate::content_alignment::test_ticket().1;
+        let mut candidates = vec![first.clone()];
+        for (report, delta) in [
+            ("DifferentReport1", 2_000),
+            ("DifferentReport2", 4_000),
+            ("DifferentReport3", 6_000),
+        ] {
+            let mut pull = first.clone();
+            pull.report = report.into();
+            pull.start_ms += delta;
+            pull.end_ms += delta;
+            candidates.push(pull);
+        }
+        let hidden = candidates[1].clone();
+        let last = candidates[3].clone();
+        let mut review = Review {
+            replay: replay(),
+            pulls: vec![],
+            alternative_pulls: vec![],
+            complete_reports: Default::default(),
+            content_capability: None,
+            content_timing: HashMap::new(),
+        };
+        for _ in 0..3 {
+            (review.pulls, review.alternative_pulls) =
+                partition_pulls(candidates, |p| p.report == last.report);
+            assert_eq!(review.pulls.len(), 2);
+            assert_eq!(review.pulls[1].report, last.report);
+            assert!(review.matching_pull(&hidden).is_none());
+            assert_eq!(review.matching_pull(&first).unwrap().report, first.report);
+            assert_eq!(review.matching_pull(&last).unwrap().report, last.report);
+            candidates = review.pull_candidates().cloned().collect();
+        }
+        (review.pulls, review.alternative_pulls) =
+            partition_pulls(vec![first.clone(), hidden.clone()], |_| false);
+        assert_eq!(review.matching_pull(&hidden).unwrap().report, first.report);
+    }
+
+    #[test]
     fn cross_report_pull_matching_requires_a_unique_fight_but_keeps_exact_identity() {
         let selected = crate::content_alignment::test_ticket().1;
         let mut first = selected.clone();
@@ -2260,6 +2575,8 @@ mod tests {
         second.start_ms = selected.start_ms - 1_000;
         second.end_ms = selected.end_ms - 1_000;
         let mut review = Review {
+            complete_reports: Default::default(),
+            alternative_pulls: Default::default(),
             replay: replay(),
             pulls: vec![first.clone(), second],
             content_capability: None,
@@ -2294,6 +2611,65 @@ mod tests {
             json!([{"encounterID":0,"difficulty":null},{"encounterID":1,"difficulty":10}]);
         assert!(complete_fight_list(&report));
         assert!(!complete_fight_list(&Value::Null));
+    }
+
+    #[test]
+    fn attendance_is_optional_bounded_and_report_scoped() {
+        let mut report = json!({"code":"abcdefghABCDEFGH","startTime":1_700_000_000_000i64,"fights":[
+            {"id":1,"encounterID":123,"difficulty":5,"name":"Raid boss","startTime":1000,"endTime":21000}
+        ]});
+        let unknown = map_explicit_report_pulls(&report, "abcdefghABCDEFGH").unwrap();
+        assert_eq!(unknown[0].friendly_players, None);
+        for value in [json!([3, 1, 3, 2]), json!([])] {
+            report["fights"][0]["friendlyPlayers"] = value;
+            let pulls = map_explicit_report_pulls(&report, "abcdefghABCDEFGH").unwrap();
+            assert_eq!(
+                pulls[0].friendly_players,
+                parse_friendly_players(&report["fights"][0]["friendlyPlayers"])
+            );
+        }
+        assert_eq!(
+            parse_friendly_players(&json!([3, 1, 3, 2])),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(parse_friendly_players(&json!([])), None);
+        for malformed in [
+            Value::Null,
+            json!("unknown"),
+            json!([0]),
+            json!([-1]),
+            json!([1.5]),
+            json!([true]),
+            json!([1, "2"]),
+            json!([2147483648u64]),
+            json!(vec![1; 101]),
+        ] {
+            report["fights"][0]["friendlyPlayers"] = malformed;
+            let pulls = map_explicit_report_pulls(&report, "abcdefghABCDEFGH").unwrap();
+            assert_eq!(pulls.len(), 1, "Attendance never removes a playable pull");
+            assert_eq!(pulls[0].friendly_players, None);
+        }
+        assert_eq!(
+            parse_friendly_players(&json!((1..=100).collect::<Vec<_>>()))
+                .unwrap()
+                .len(),
+            100
+        );
+        let mut cached = serde_json::to_value(&unknown[0]).unwrap();
+        cached.as_object_mut().unwrap().remove("friendly_players");
+        assert_eq!(
+            serde_json::from_value::<Pull>(cached.clone())
+                .unwrap()
+                .friendly_players,
+            None
+        );
+        cached["friendly_players"] = json!([1, "invalid"]);
+        assert_eq!(
+            serde_json::from_value::<Pull>(cached)
+                .unwrap()
+                .friendly_players,
+            None
+        );
     }
 
     #[test]
@@ -2802,6 +3178,7 @@ mod tests {
             id: 1,
             encounter: 1,
             difficulty: 5,
+            friendly_players: None,
             report_start_ms: 1_000_000,
             remaining: Some(50.0),
             name: "Boss".into(),

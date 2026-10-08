@@ -29,6 +29,10 @@ struct Recording {
     #[serde(default)]
     sampling: crate::content_alignment::sampling::Snapshot,
     complete: bool,
+    #[serde(default)]
+    candidate_revision: u8,
+    #[serde(default)]
+    complete_reports: BTreeSet<String>,
     updated_at: u64,
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -137,8 +141,14 @@ impl Cache {
             return;
         }
         let mut review = Review {
+            complete_reports: if recording.candidate_revision == 2 {
+                recording.complete_reports.clone()
+            } else {
+                BTreeSet::new()
+            },
+            alternative_pulls: Default::default(),
             replay: recording.replay.clone(),
-            pulls: super::canonical_pulls(
+            pulls: super::same_report_pulls(
                 recording
                     .pulls
                     .iter()
@@ -167,6 +177,7 @@ impl Cache {
                 }
             }
         }
+        review.prefer_verified_pulls();
         let samples = recording.sampling.rebound(&review, epoch, access);
         cache.restore_snapshot(
             recording.path.clone(),
@@ -174,7 +185,15 @@ impl Cache {
             review,
             (epoch, recording.complete),
             clocks,
-            Duration::from_secs(now - recording.updated_at).max(Duration::from_secs(61)),
+            Duration::from_secs(now - recording.updated_at).max(Duration::from_secs(
+                // Older snapshots lack candidates or per-report validation.
+                // Keep display/evidence, but rediscover their metadata once.
+                if recording.candidate_revision == 2 {
+                    61
+                } else {
+                    6 * 60 * 60 + 1
+                },
+            )),
         );
         cache.restore_samples(&recording.identity, samples);
     }
@@ -255,9 +274,9 @@ impl Cache {
         clocks: &[(Key, RecordingClock)],
         now: u64,
     ) {
-        if review.pulls.len() > MAX_PULLS
+        if review.candidate_count() > MAX_PULLS
             || !valid_replay(&review.replay)
-            || !review.pulls.iter().all(valid_pull)
+            || !review.pull_candidates().all(valid_pull)
         {
             return;
         }
@@ -279,8 +298,7 @@ impl Cache {
             path,
             replay: review.replay.clone(),
             pulls: review
-                .pulls
-                .iter()
+                .pull_candidates()
                 .map(|p| (p.report.clone(), p.id))
                 .collect(),
             clocks: clocks
@@ -292,9 +310,12 @@ impl Cache {
                 .map(|r| r.sampling.clone())
                 .unwrap_or_default(),
             complete,
+            candidate_revision: 2,
+            complete_reports: review.complete_reports.clone(),
             updated_at: previous.as_ref().map_or(now, |r| r.updated_at),
         };
-        let metadata_changed = review.pulls.iter().any(|pull| {
+        recording.pulls.sort_unstable();
+        let metadata_changed = review.pull_candidates().any(|pull| {
             self.document
                 .reports
                 .get(&pull.report)
@@ -322,7 +343,7 @@ impl Cache {
         {
             recording.updated_at = now;
         }
-        for pull in &review.pulls {
+        for pull in review.pull_candidates() {
             self.document
                 .reports
                 .entry(pull.report.clone())
@@ -422,6 +443,10 @@ fn decode(bytes: &[u8]) -> Option<Document> {
                 || !valid_replay(&r.replay)
                 || r.pulls.len() > MAX_PULLS
                 || r.clocks.len() > MAX_REPORTS
+                || r.complete_reports.len() > MAX_REPORTS
+                || r.complete_reports
+                    .iter()
+                    .any(|report| !super::report_code(report))
                 || r.sampling.tickets.len() > 64
                 || r.pulls
                     .iter()
@@ -508,6 +533,7 @@ mod tests {
             id: 1,
             encounter: 3135,
             difficulty: 5,
+            friendly_players: None,
             report_start_ms: 1_790_000_000_000,
             remaining: Some(75.0),
             name: "Boss".into(),
@@ -519,12 +545,70 @@ mod tests {
             seconds: 60,
         };
         let review = Review {
+            complete_reports: Default::default(),
+            alternative_pulls: Default::default(),
             replay,
             pulls: vec![pull],
             content_capability: None,
             content_timing: Default::default(),
         };
         (cache, stream, review)
+    }
+
+    #[test]
+    fn bridge_restart_keeps_raw_sources_but_requires_new_authoritative_absence() {
+        let (mut disk, mut stream, _) = fixture();
+        let (mut review, key, clock) = prepared::bridge_fixture();
+        let early = review.pulls[0].clone();
+        let clocks = prepared::apply_bridge_fixture(&mut review, &key, &clock);
+        stream.provider = review.replay.provider.clone();
+        stream.recording_id = Some(review.replay.video_id.clone());
+        stream.status = Status::Offline;
+        // Unrelated unavailable directory rows do not erase per-report proof.
+        disk.merge(&stream, &review, false, &clocks, super::super::now_secs());
+        let bytes = serde_json::to_vec(&disk.document).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("provenance"));
+        assert_eq!(disk.document.recordings[0].clocks.len(), 1);
+        disk.document = decode(&bytes).unwrap();
+        let mut hot = prepared::Cache::default();
+        disk.hydrate(
+            &mut hot,
+            review.content_capability.as_ref(),
+            0,
+            &Access::from("fixture"),
+        );
+        let mut restored = hot.for_display(&stream).unwrap().review;
+        assert_eq!(restored.complete_reports, review.complete_reports);
+        assert!(restored.content_alignment(&early).is_none());
+        assert!(!restored
+            .content_timing
+            .values()
+            .any(|a| a.derived.is_some()));
+        prepared::clocks(&mut restored, None, 0, |wanted| {
+            crate::content_alignment::RecordingLookup::Unavailable(
+                (wanted.report == key.report).then(|| clock.clone()),
+            )
+        });
+        assert!(restored.content_alignment(&early).is_none());
+        prepared::apply_bridge_fixture(&mut restored, &key, &clock);
+        assert!(restored.content_alignment(&early).is_some());
+
+        // A legacy snapshot lacks per-report completeness and schedules normal
+        // metadata discovery while keeping the playable direct source.
+        let saved = &mut disk.document.recordings[0];
+        saved.candidate_revision = 1;
+        saved.complete_reports.clear();
+        let mut legacy = prepared::Cache::default();
+        disk.hydrate(
+            &mut legacy,
+            review.content_capability.as_ref(),
+            0,
+            &Access::from("fixture"),
+        );
+        let entry = legacy.for_display(&stream).unwrap();
+        assert!(entry.review.complete_reports.is_empty());
+        assert!(!legacy.background_contains(&stream));
+        assert!(entry.review.content_timing.values().any(|a| a.shared_clock));
     }
 
     #[test]
@@ -590,6 +674,138 @@ mod tests {
         assert!(hot.for_display(&stream).is_none());
         hot.set_connected(false);
         assert!(hot.for_display(&stream).is_none());
+    }
+
+    #[test]
+    fn duplicate_candidates_and_their_own_clocks_survive_restart() {
+        let (mut cache, mut stream, _) = fixture();
+        let (replay, mut first, cap, ticket) = crate::content_alignment::test_ticket();
+        stream.provider = replay.provider.clone();
+        stream.recording_id = Some(replay.video_id.clone());
+        stream.status = Status::Offline;
+        first.friendly_players = Some(vec![1, 3]);
+        let mut second = first.clone();
+        second.report = "DifferentReport1".into();
+        second.id += 10;
+        second.start_ms += 1_000;
+        second.end_ms += 1_000;
+        second.friendly_players = Some(vec![4, 8]);
+        let mut review = Review {
+            replay,
+            pulls: vec![first.clone(), second.clone()],
+            alternative_pulls: vec![],
+            complete_reports: Default::default(),
+            content_capability: Some(cap.clone()),
+            content_timing: Default::default(),
+        };
+        let clock = crate::content_alignment::test_recording_clock();
+        let clocks = prepared::clocks(&mut review, None, ticket.key.auth_epoch, |key| {
+            (key.report == second.report).then(|| clock.clone()).map_or(
+                crate::content_alignment::RecordingLookup::Absent,
+                crate::content_alignment::RecordingLookup::Valid,
+            )
+        });
+        cache.merge(&stream, &review, true, &clocks, super::super::now_secs());
+        cache.document = decode(&serde_json::to_vec(&cache.document).unwrap()).unwrap();
+        assert_eq!(cache.document.recordings[0].pulls.len(), 2);
+        let mut hot = prepared::Cache::default();
+        cache.hydrate(
+            &mut hot,
+            Some(&cap),
+            ticket.key.auth_epoch,
+            &Access::from("fixture"),
+        );
+        let restored = hot.for_display(&stream).unwrap().review;
+        assert_eq!(restored.pulls[0].report, second.report);
+        assert_eq!(restored.pulls[0].friendly_players, Some(vec![4, 8]));
+        assert_eq!(
+            restored.alternative_pulls[0].friendly_players,
+            Some(vec![1, 3])
+        );
+        assert!(restored.content_alignment(&first).is_none());
+        assert_eq!(
+            restored.content_alignment(&second).unwrap().key.report,
+            second.report
+        );
+        cache.document.recordings[0].clocks.clear();
+        cache.hydrate(
+            &mut hot,
+            Some(&cap),
+            ticket.key.auth_epoch,
+            &Access::from("fixture"),
+        );
+        let restored = hot.for_display(&stream).unwrap().review;
+        assert_eq!(restored.pulls[0].report, first.report);
+        assert!(restored.content_timing.is_empty());
+        assert_eq!(restored.candidate_count(), 2);
+    }
+
+    #[test]
+    fn legacy_archive_keeps_offline_evidence_but_requires_candidate_rediscovery() {
+        let (mut cache, mut stream, mut review) = fixture();
+        stream.status = Status::Offline;
+        stream.recording_id = Some(review.replay.video_id.clone());
+        review.replay.growing = false;
+        review.replay.started_at = "2020-01-01T00:00:00Z".into();
+        let now = super::super::now_secs();
+        cache.merge(&stream, &review, true, &[], now);
+        let mut legacy = serde_json::to_value(&cache.document).unwrap();
+        legacy["recordings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidate_revision");
+        cache.document = decode(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let mut hot = prepared::Cache::default();
+        cache.hydrate(&mut hot, None, 0, &Access::from("fixture"));
+        assert!(
+            hot.for_display(&stream).is_some(),
+            "Offline display must remain available"
+        );
+        assert!(
+            !hot.background_contains(&stream),
+            "An old archive must rediscover missing logger candidates"
+        );
+        assert!(!hot.contains(&stream));
+        cache.merge(&stream, &review, true, &[], now);
+        cache.hydrate(&mut hot, None, 0, &Access::from("fixture"));
+        assert!(
+            hot.background_contains(&stream),
+            "The completed format migration must not repeat every pass"
+        );
+    }
+
+    #[test]
+    fn attendance_survives_shared_report_cache_without_becoming_pov_ownership() {
+        let (mut cache, mut stream, mut review) = fixture();
+        review.pulls[0].friendly_players = Some(vec![7, 9]);
+        let now = super::super::now_secs();
+        for id in [101, 102] {
+            stream.user_id = id.to_string();
+            cache.merge(&stream, &review, true, &[], now);
+        }
+        let mut document = serde_json::to_value(&cache.document).unwrap();
+        cache.document = decode(&serde_json::to_vec(&document).unwrap()).unwrap();
+        assert_eq!(cache.document.reports.len(), 1);
+        assert_eq!(cache.document.reports["abcdefghijklmnop"].len(), 1);
+        let mut hot = prepared::Cache::default();
+        cache.hydrate(&mut hot, None, 4, &Access::from("fixture"));
+        for id in [101, 102] {
+            stream.user_id = id.to_string();
+            let entry = hot.for_display(&stream).unwrap();
+            assert_eq!(entry.review.pulls[0].friendly_players, Some(vec![7, 9]));
+            assert_eq!(entry.review.pulls.len(), 1);
+        }
+        document["reports"]["abcdefghijklmnop"]["1"]
+            .as_object_mut()
+            .unwrap()
+            .remove("friendly_players");
+        cache.document = decode(&serde_json::to_vec(&document).unwrap()).unwrap();
+        let mut legacy = prepared::Cache::default();
+        cache.hydrate(&mut legacy, None, 4, &Access::from("fixture"));
+        assert_eq!(
+            legacy.for_display(&stream).unwrap().review.pulls[0].friendly_players,
+            None
+        );
     }
 
     #[test]

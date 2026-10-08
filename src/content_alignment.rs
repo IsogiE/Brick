@@ -181,13 +181,25 @@ pub(crate) struct Ticket {
 pub(crate) struct Alignment {
     pub key: Key,
     pub shared_clock: bool,
+    /// Local proof from direct clocks and matching report metadata; never serialized.
+    pub derived: Option<std::sync::Arc<DerivedTiming>>,
     pub result: ResultData,
     pub timeline: Timeline,
     pub signature_revision: String,
     pub timeline_hash: String,
     pub expires_at: i64,
 }
+#[derive(Clone, Debug)]
+pub(crate) struct DerivedTiming {
+    pub proof: crate::warcraftlogs::clock_bridge::Derived,
+    pub evidence_hash: String,
+    /// Direct source alignment versions, scoped to their original report keys.
+    pub sources: Vec<(Key, [u8; 32])>,
+}
 impl Alignment {
+    pub fn recording_timing(&self) -> bool {
+        self.shared_clock || self.derived.is_some()
+    }
     pub fn matches(&self, replay: &Replay, pull: &Pull, capability: &Capability) -> bool {
         self.key.matches(replay, pull, capability) && self.expires_at > now_ms()
     }
@@ -307,6 +319,7 @@ impl RecordingClock {
         Some(Alignment {
             key: key.clone(),
             shared_clock: true,
+            derived: None,
             timeline: self.timeline.clone(),
             timeline_hash: self.timeline_hash.clone(),
             // This is a recording-clock measurement, not another submitted signature.
@@ -480,6 +493,7 @@ impl Ticket {
         Some(Alignment {
             key: self.key.clone(),
             shared_clock: false,
+            derived: None,
             result: self.job.result.clone()?,
             timeline: scope.timeline.clone(),
             signature_revision: scope.signature_revision.clone(),
@@ -506,7 +520,26 @@ struct RecordingResponse {
     conflict: bool,
 }
 
-fn parse_recording_clock(bytes: &[u8], key: &Key) -> Result<Option<RecordingClock>, String> {
+#[derive(Clone, Debug)]
+pub(crate) enum RecordingLookup {
+    Valid(RecordingClock),
+    Absent,
+    Pending(Option<RecordingClock>),
+    Conflict,
+    Unavailable(Option<RecordingClock>),
+    Invalid,
+}
+impl RecordingLookup {
+    pub fn clock(&self) -> Option<&RecordingClock> {
+        match self {
+            Self::Valid(clock) => Some(clock),
+            Self::Pending(clock) | Self::Unavailable(clock) => clock.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+fn parse_recording_clock(bytes: &[u8], key: &Key) -> Result<RecordingLookup, String> {
     if bytes.len() > 32 * 1024 {
         return Err(INVALID.into());
     }
@@ -519,7 +552,15 @@ fn parse_recording_clock(bytes: &[u8], key: &Key) -> Result<Option<RecordingCloc
             return Err(INVALID.into());
         }
     }
-    Ok(response.clock)
+    Ok(if response.conflict {
+        RecordingLookup::Conflict
+    } else if response.pending {
+        RecordingLookup::Pending(response.clock)
+    } else if let Some(clock) = response.clock {
+        RecordingLookup::Valid(clock)
+    } else {
+        RecordingLookup::Absent
+    })
 }
 
 /// Fetch a measured recording/report clock without exporting events or creating a job.
@@ -528,7 +569,18 @@ pub(crate) fn recording_clock(
     access: &guild::Access,
     key: &Key,
     cancel: &AtomicBool,
-) -> Result<Option<RecordingClock>, String> {
+) -> RecordingLookup {
+    match fetch_recording_clock(access, key, cancel) {
+        Ok(state) => state,
+        Err(error) if error == INVALID => RecordingLookup::Invalid,
+        Err(_) => RecordingLookup::Unavailable(None),
+    }
+}
+fn fetch_recording_clock(
+    access: &guild::Access,
+    key: &Key,
+    cancel: &AtomicBool,
+) -> Result<RecordingLookup, String> {
     current(access, key, cancel)?;
     let url = access
         .endpoint(&format!("{PATH}/recording"))
@@ -659,6 +711,7 @@ pub(crate) fn test_ticket() -> (Replay, Pull, Capability, Ticket) {
         id: 21,
         encounter: 100,
         difficulty: 5,
+        friendly_players: None,
         report_start_ms: 1_700_000_000_000,
         remaining: None,
         name: "Boss".into(),
@@ -1091,7 +1144,9 @@ mod tests {
             &serde_json::json!({"clock":clock,"pending":false,"conflict":false}),
         )
         .unwrap();
-        let received = parse_recording_clock(&bytes, &key).unwrap().unwrap();
+        let RecordingLookup::Valid(received) = parse_recording_clock(&bytes, &key).unwrap() else {
+            panic!("expected direct clock");
+        };
         let alignment = received.alignment(&key).unwrap();
         assert!(alignment.shared_clock);
         assert!((alignment.result.video_seconds - 1071.73475).abs() < 0.000001);
@@ -1106,11 +1161,21 @@ mod tests {
             }
             assert!(parse_recording_clock(&bytes, &wrong).is_err());
         }
-        assert!(
+        assert!(matches!(
             parse_recording_clock(br#"{"clock":null,"pending":false,"conflict":true}"#, &key)
-                .unwrap()
-                .is_none()
-        );
+                .unwrap(),
+            RecordingLookup::Conflict
+        ));
+        assert!(matches!(
+            parse_recording_clock(br#"{"clock":null,"pending":false,"conflict":false}"#, &key)
+                .unwrap(),
+            RecordingLookup::Absent
+        ));
+        assert!(matches!(
+            parse_recording_clock(br#"{"clock":null,"pending":true,"conflict":false}"#, &key)
+                .unwrap(),
+            RecordingLookup::Pending(None)
+        ));
         assert!(
             parse_recording_clock(br#"{"clock":null,"pending":true,"conflict":true}"#, &key)
                 .is_err()

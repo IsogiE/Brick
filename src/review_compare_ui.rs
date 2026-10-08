@@ -47,6 +47,7 @@ pub(crate) struct Comparison {
     attempted: bool,
     navigating: bool,
     primary_key: String,
+    primary_pull: Option<Pull>,
     secondary_key: String,
     clock_versions: Option<[ClockVersion; 2]>,
     controller: Option<Controller>,
@@ -136,7 +137,12 @@ impl Comparison {
             let secondary = self.metadata.comparison_metadata().unwrap();
             let clocks = [
                 recording_clock(review, pull).unwrap(),
-                recording_clock(secondary, matching_pull(secondary, pull).unwrap()).unwrap(),
+                recording_clock_at(
+                    secondary,
+                    matching_pull(secondary, pull).unwrap(),
+                    pull.start_ms,
+                )
+                .unwrap(),
             ];
             self.controller = Some(
                 Controller::new(
@@ -180,6 +186,7 @@ impl Comparison {
             attempted: false,
             navigating: true,
             primary_key: String::new(),
+            primary_pull: None,
             secondary_key: String::new(),
             clock_versions: None,
             controller: None,
@@ -583,7 +590,8 @@ impl Comparison {
                 return;
             };
             let clocks = recording_clock(primary_review, pull).and_then(|first| {
-                recording_clock(secondary_review, secondary_pull).map(|second| [first, second])
+                recording_clock_at(secondary_review, secondary_pull, pull.start_ms)
+                    .map(|second| [first, second])
             });
             let range = [pull.start_ms, pull.end_ms];
             match clocks.and_then(|clocks| {
@@ -780,9 +788,32 @@ impl Comparison {
     ) -> Result<(), String> {
         let key = context_key(primary_review, pull);
         if key != self.primary_key {
-            self.controller = None;
-            self.clock_versions = None;
+            let previous = self
+                .primary_pull
+                .as_ref()
+                .filter(|old| {
+                    !self.primary_key.is_empty()
+                        && crate::warcraftlogs::equivalent_pull(old, pull)
+                        && primary_review.matching_pull(old).is_some_and(|matched| {
+                            matched.report == pull.report && matched.id == pull.id
+                        })
+                })
+                .map(|old| old.start_ms);
+            if let Some(origin) = previous {
+                self.save_position();
+                let delta = pull.start_ms - origin;
+                self.desired.0 = self.desired.0.saturating_add(delta);
+                if let Some(controller) = &mut self.controller {
+                    controller
+                        .rebase_timeline(delta, [pull.start_ms, pull.end_ms])
+                        .map_err(|error| error.to_string())?;
+                }
+            } else {
+                self.controller = None;
+                self.clock_versions = None;
+            }
             self.primary_key = key;
+            self.primary_pull = Some(pull.clone());
         }
         let Some(secondary_review) = self.metadata.comparison_metadata() else {
             return Ok(());
@@ -796,7 +827,7 @@ impl Comparison {
         ];
         let clocks = [
             recording_clock(primary_review, pull)?,
-            recording_clock(secondary_review, secondary_pull)?,
+            recording_clock_at(secondary_review, secondary_pull, pull.start_ms)?,
         ];
         if let Some(previous) = self.clock_versions.replace(versions) {
             if previous != versions {
@@ -852,7 +883,7 @@ impl Comparison {
         if !self.navigating {
             return;
         }
-        let target = recording_clock(metadata, secondary_pull)
+        let target = recording_clock_at(metadata, secondary_pull, pull.start_ms)
             .ok()
             .and_then(|clock| clock.video_seconds(self.desired.0));
         let Some(target) = target else {
@@ -1017,9 +1048,19 @@ fn replace_changed_clocks(
 }
 
 pub(crate) fn recording_clock(review: &Review, pull: &Pull) -> Result<RecordingClock, String> {
+    recording_clock_at(review, pull, pull.start_ms)
+}
+
+// Comparison coordinates use the primary pull's origin. The video start and
+// coverage always come from this POV's own report/key; nothing is persisted.
+fn recording_clock_at(
+    review: &Review,
+    pull: &Pull,
+    origin_ms: i64,
+) -> Result<RecordingClock, String> {
     if let Some(alignment) = review.content_alignment(pull) {
         return RecordingClock::new(
-            pull.start_ms,
+            origin_ms,
             alignment.result.video_seconds,
             alignment.timeline.duration_seconds,
         )
@@ -1032,12 +1073,8 @@ pub(crate) fn recording_clock(review: &Review, pull: &Pull) -> Result<RecordingC
         .map_err(|e| e.to_string());
     }
     let seconds = review.pull_video_start(pull);
-    RecordingClock::new(
-        pull.start_ms,
-        seconds,
-        review.replay.available_seconds as f64,
-    )
-    .map_err(|e| e.to_string())
+    RecordingClock::new(origin_ms, seconds, review.replay.available_seconds as f64)
+        .map_err(|e| e.to_string())
 }
 
 fn provider_target(
@@ -1070,7 +1107,7 @@ fn provider_target(
     let secondary = matching_pull(reviews[1], source_pull)?;
     let clocks = [
         recording_clock(reviews[0], selected).ok()?,
-        recording_clock(reviews[1], secondary).ok()?,
+        recording_clock_at(reviews[1], secondary, selected.start_ms).ok()?,
     ];
     let at_ms = clocks[side].observed_pull_moment(seconds, [selected.start_ms, selected.end_ms])?;
     if at_ms < selected.start_ms
@@ -1090,7 +1127,7 @@ fn matching_pull<'a>(review: &'a Review, selected: &Pull) -> Option<&'a Pull> {
 
 fn covers_moment(review: &Review, selected: &Pull, at_ms: i64) -> bool {
     matching_pull(review, selected)
-        .and_then(|pull| recording_clock(review, pull).ok())
+        .and_then(|pull| recording_clock_at(review, pull, selected.start_ms).ok())
         .and_then(|clock| clock.video_seconds(at_ms))
         .is_some()
 }
@@ -1152,6 +1189,7 @@ mod tests {
             id: 1,
             encounter: 1,
             difficulty: 5,
+            friendly_players: None,
             report_start_ms: start - 50_000,
             remaining: Some(25.0),
             last_phase: None,
@@ -1169,6 +1207,8 @@ mod tests {
                 replay.broadcast_id = "different12".into();
             }
             Review {
+                complete_reports: Default::default(),
+                alternative_pulls: Default::default(),
                 content_capability: None,
                 content_timing: Default::default(),
                 replay,
@@ -1192,6 +1232,71 @@ mod tests {
         state.playing = playing;
         state.mark_polled_at(test_now());
         state
+    }
+
+    #[test]
+    fn comparison_uses_derived_target_coordinates_and_drops_revoked_source_timing() {
+        let (mut review, key, clock) = crate::warcraftlogs::prepared::bridge_fixture();
+        let early = review.pulls[0].clone();
+        crate::warcraftlogs::prepared::apply_bridge_fixture(&mut review, &key, &clock);
+        let expected = review
+            .content_alignment(&early)
+            .unwrap()
+            .result
+            .video_seconds;
+        let compared = recording_clock(&review, &early).unwrap();
+        assert_eq!(compared.video_seconds(early.start_ms).unwrap(), expected);
+        assert_eq!(
+            compared.video_seconds(early.start_ms + 1000).unwrap(),
+            expected + 1.0
+        );
+        review
+            .content_timing
+            .remove(&(key.report.clone(), key.pull_id));
+        assert!(!review.has_precise_timing(&early));
+        let fallback = recording_clock(&review, &early).unwrap();
+        assert_eq!(
+            fallback.video_seconds(early.start_ms).unwrap(),
+            review.estimated_video_start(&early)
+        );
+        assert_ne!(fallback.video_seconds(early.start_ms).unwrap(), expected);
+    }
+
+    #[test]
+    fn comparison_and_provider_navigation_use_each_povs_own_report_clock() {
+        let (mut reviews, primary) = timing_reviews();
+        let mut secondary = primary.clone();
+        secondary.report = "DifferentReport1".into();
+        secondary.id += 10;
+        secondary.report_start_ms += 5_000;
+        secondary.start_ms += 1_127;
+        secondary.end_ms += 1_117;
+        reviews[1].pulls = vec![secondary.clone()];
+        crate::content_alignment::test_set_timing(&mut reviews[0], &primary, 123.25);
+        crate::content_alignment::test_set_timing(&mut reviews[1], &secondary, 456.75);
+        let at_ms = primary.start_ms + 37_125;
+        for (side, seconds) in [(0, 160.375), (1, 493.875)] {
+            let (selected, clocks, moment) =
+                provider_target([&reviews[0], &reviews[1]], side, seconds, Some(&primary)).unwrap();
+            assert_eq!(selected.report, primary.report);
+            assert_eq!(moment, at_ms);
+            assert_eq!(clocks[0].video_seconds(moment), Some(160.375));
+            assert_eq!(clocks[1].video_seconds(moment), Some(493.875));
+        }
+        assert!(covers_moment(&reviews[1], &primary, at_ms));
+        assert!(reviews[1].content_alignment(&primary).is_none());
+        assert_eq!(
+            reviews[1].content_alignment(&secondary).unwrap().key.report,
+            secondary.report
+        );
+        assert_eq!(
+            reviews[1]
+                .content_alignment(&secondary)
+                .unwrap()
+                .result
+                .video_seconds,
+            456.75
+        );
     }
 
     #[test]

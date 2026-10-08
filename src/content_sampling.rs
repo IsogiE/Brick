@@ -23,6 +23,17 @@ fn same_pull(key: &Key, pull: &Pull) -> bool {
         && key.start_ms == pull.start_ms
         && key.end_ms == pull.end_ms
 }
+fn current_ticket(ticket: &Ticket, review: &Review, cap: &Capability, epoch: u64) -> bool {
+    ticket.key.auth_epoch == epoch
+        && ticket.key.guild_generation == guild::request_generation()
+        && review
+            .pull_candidates()
+            .any(|pull| ticket.key.matches(&review.replay, pull, cap))
+        && ticket
+            .job
+            .validate(&ticket.key, &ticket.guild_id, &ticket.member_hash, None)
+            .is_ok()
+}
 fn agrees(left: &Alignment, right: &Alignment) -> bool {
     let expected =
         left.result.video_seconds + (right.key.start_ms - left.key.start_ms) as f64 / 1000.0;
@@ -43,6 +54,47 @@ fn random_later<'a>(review: &Review, options: impl Iterator<Item = &'a Pull>) ->
         <[u8; 32]>::from(hash.finalize())
     })
 }
+/// Spread retries across observed lineups and raid time without guessing which
+/// character owns a recording. Missing attendance can never exclude a pull.
+fn diverse_retry<'a>(
+    options: impl Iterator<Item = &'a Pull>,
+    attempted: &[&Pull],
+) -> Option<&'a Pull> {
+    use std::{cmp::Reverse, collections::BTreeSet};
+    let known = attempted.iter().any(|pull| pull.friendly_players.is_some());
+    let seen: BTreeSet<_> = attempted
+        .iter()
+        .filter_map(|pull| pull.friendly_players.as_ref())
+        .flatten()
+        .copied()
+        .collect();
+    let encounters: BTreeSet<_> = attempted.iter().map(|pull| pull.encounter).collect();
+    options.min_by_key(|pull| {
+        let newcomers = if known {
+            pull.friendly_players
+                .iter()
+                .flatten()
+                .filter(|id| !seen.contains(*id))
+                .count()
+        } else {
+            0
+        };
+        let gap = attempted
+            .iter()
+            .map(|old| pull.start_ms.abs_diff(old.start_ms))
+            .min()
+            .unwrap_or(0);
+        (
+            Reverse(newcomers),
+            Reverse(!encounters.contains(&pull.encounter)),
+            Reverse(gap),
+            pull.start_ms,
+            pull.report.as_str(),
+            pull.id,
+        )
+    })
+}
+
 impl Snapshot {
     pub fn remember(&mut self, ticket: Ticket) {
         self.tickets.retain(|old| {
@@ -70,7 +122,7 @@ impl Snapshot {
             return Self::default();
         };
         let rebind = |key: &Key| {
-            let pull = review.pulls.iter().find(|pull| same_pull(key, pull))?;
+            let pull = review.pull_candidates().find(|pull| same_pull(key, pull))?;
             let mut old = key.clone();
             old.guild_generation = guild::request_generation();
             old.auth_epoch = epoch;
@@ -102,17 +154,30 @@ impl Snapshot {
     /// Keep server clocks independent of this viewer's sparse sample tickets.
     /// A fresh conflicting measurement or confirmed missing range still takes precedence.
     pub fn apply_to(&self, review: &mut Review, epoch: u64) {
-        let plan = self.plan(review, epoch);
-        let measured: Vec<_> = self.tickets.iter().filter_map(Ticket::alignment).collect();
+        let tickets: Vec<_> = self
+            .tickets
+            .iter()
+            .filter(|ticket| {
+                review
+                    .content_capability
+                    .as_ref()
+                    .is_some_and(|cap| current_ticket(ticket, review, cap, epoch))
+            })
+            .collect();
+        let measured: Vec<_> = tickets
+            .iter()
+            .filter_map(|ticket| ticket.alignment())
+            .collect();
         let replay = &review.replay;
         let pulls: std::collections::HashMap<_, _> = review
             .pulls
             .iter()
+            .chain(&review.alternative_pulls)
             .map(|pull| ((pull.report.as_str(), pull.id), pull))
             .collect();
         let cap = review.content_capability.as_ref();
         review.content_timing.retain(|_, shared| {
-            shared.shared_clock
+            shared.recording_timing()
                 && shared.key.auth_epoch == epoch
                 && cap.is_some_and(|cap| {
                     pulls
@@ -128,7 +193,7 @@ impl Snapshot {
                             > (shared.result.uncertainty_seconds + point.result.uncertainty_seconds)
                                 .max(0.1)
                 })
-                && !self.tickets.iter().any(|ticket| {
+                && !tickets.iter().any(|ticket| {
                     !ticket.expired()
                         && ticket.key.same_recording_report(&shared.key)
                         && ticket.job.status == Status::Failed
@@ -141,12 +206,44 @@ impl Snapshot {
                         && ticket.key.end_ms > shared.key.start_ms
                 })
         });
-        for alignment in plan.alignments {
+        let invalid: Vec<_> = review
+            .content_timing
+            .iter()
+            .filter(|(_, alignment)| alignment.derived.is_some())
+            .filter(|(_, alignment)| {
+                !review.pull_candidates().any(|pull| {
+                    pull.report == alignment.key.report
+                        && pull.id == alignment.key.pull_id
+                        && review.content_alignment(pull).is_some()
+                })
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in invalid {
+            review.content_timing.remove(&key);
+        }
+        // Exact current measurements supersede local derivations immediately.
+        // Agreeing direct server clocks retain their report-wide provenance.
+        for alignment in measured {
+            let key = (alignment.key.report.clone(), alignment.key.pull_id);
+            if review
+                .content_timing
+                .get(&key)
+                .is_none_or(|old| old.derived.is_some())
+            {
+                review.content_timing.insert(key, alignment);
+            }
+        }
+        review.prefer_verified_pulls();
+        // Plan from the post-revocation model, so a completed target ticket is
+        // usable in this update even when its previous derived clock was ready.
+        for alignment in self.plan(review, epoch).alignments {
             review
                 .content_timing
                 .entry((alignment.key.report.clone(), alignment.key.pull_id))
                 .or_insert(alignment);
         }
+        review.prefer_verified_pulls();
     }
 
     pub fn plan(&self, review: &Review, epoch: u64) -> Plan {
@@ -158,7 +255,7 @@ impl Snapshot {
         let Some(cap) = review.content_capability.as_ref() else {
             return plan;
         };
-        if review.pulls.len() > 4096 || self.tickets.len() > MAX_SAMPLES {
+        if review.candidate_count() > 4096 || self.tickets.len() > MAX_SAMPLES {
             return plan;
         }
         let now = now_ms();
@@ -171,17 +268,7 @@ impl Snapshot {
         let tickets: Vec<_> = self
             .tickets
             .iter()
-            .filter(|ticket| {
-                ticket.key.auth_epoch == epoch
-                    && ticket.key.guild_generation == guild::request_generation()
-                    && pulls
-                        .iter()
-                        .any(|pull| ticket.key.matches(&review.replay, pull, cap))
-                    && ticket
-                        .job
-                        .validate(&ticket.key, &ticket.guild_id, &ticket.member_hash, None)
-                        .is_ok()
-            })
+            .filter(|ticket| current_ticket(ticket, review, cap, epoch))
             .collect();
         let ticket_for = |pull: &Pull| {
             tickets
@@ -189,9 +276,23 @@ impl Snapshot {
                 .find(|ticket| same_pull(&ticket.key, pull))
                 .copied()
         };
+        let precise = |pull: &Pull| {
+            review.content_alignment(pull).is_some_and(|alignment| {
+                alignment.key.auth_epoch == epoch
+                    && (alignment.recording_timing()
+                        || ticket_for(pull)
+                            .and_then(Ticket::alignment)
+                            .is_some_and(|exact| {
+                                exact.key == alignment.key && exact.version() == alignment.version()
+                            }))
+            })
+        };
         // Failed searches are not evidence of an offset. Bound automatic
         // fallback per report; a growing stream may try a fresh two-hour window.
         let can_sample = |pull: &Pull| {
+            if !review.replay.growing && precise(pull) {
+                return false;
+            }
             tickets
                 .iter()
                 .filter(|t| {
@@ -221,15 +322,9 @@ impl Snapshot {
                 .copied()
                 .filter(|p| p.report == report)
                 .collect();
-            // A saved server clock already supplies this archive's timing.
-            // Opening it on another client must not repeat verification work.
-            if !review.replay.growing
-                && group.iter().all(|pull| {
-                    review
-                        .content_alignment(pull)
-                        .is_some_and(|alignment| alignment.shared_clock)
-                })
-            {
+            // Exact measurements and reusable clocks can jointly cover an
+            // archive. Do not submit a sample for already precise footage.
+            if !review.replay.growing && group.iter().all(|pull| precise(pull)) {
                 continue;
             }
             let usable: Vec<_> = group
@@ -242,7 +337,28 @@ impl Snapshot {
                     )
                 })
                 .collect();
-            let Some(first) = usable.first().copied() else {
+            let attempted: Vec<_> = group
+                .iter()
+                .copied()
+                .filter(|pull| ticket_for(pull).is_some())
+                .collect();
+            let retry = attempted.iter().any(|pull| {
+                ticket_for(pull).is_some_and(|ticket| {
+                    matches!(ticket.job.status, Status::Failed | Status::Canceled)
+                })
+            });
+            let first = if retry {
+                // A successful diversified retry is now the anchor; do not go
+                // back and scan every earlier pull while its shared clock loads.
+                usable
+                    .iter()
+                    .copied()
+                    .find(|pull| ticket_for(pull).and_then(Ticket::alignment).is_some())
+                    .or_else(|| diverse_retry(usable.iter().copied(), &attempted))
+            } else {
+                usable.first().copied()
+            };
+            let Some(first) = first else {
                 continue;
             };
             let last = group.last().unwrap();
@@ -274,13 +390,15 @@ impl Snapshot {
                         .copied()
                         .find(|p| p.start_ms >= due && ticket_for(p).is_none());
                 } else if !checked_later {
-                    next = random_later(
-                        review,
-                        usable
-                            .iter()
-                            .copied()
-                            .filter(|p| later(p) && ticket_for(p).is_none()),
-                    );
+                    let options = usable
+                        .iter()
+                        .copied()
+                        .filter(|p| later(p) && ticket_for(p).is_none());
+                    next = if retry {
+                        diverse_retry(options, &attempted)
+                    } else {
+                        random_later(review, options)
+                    };
                 }
             }
             // Conflicting checks leave a gap. Additional checks narrow that gap,
@@ -341,8 +459,8 @@ impl Snapshot {
             if plan.next.is_none() {
                 plan.next = next.cloned();
             }
-            // Only the server extrapolates recording/report offsets. The client
-            // may retain this viewer's exact GPU measurements while offline.
+            // The sampler retains exact viewer measurements. Report-wide
+            // timing comes from independently validated recording timing.
             for pull in &group {
                 if let Some(exact) = ticket_for(pull).and_then(Ticket::alignment) {
                     plan.alignments.push(exact);
@@ -364,8 +482,16 @@ impl Snapshot {
             .filter(|p| {
                 ticket_for(p).is_none()
                     && can_sample(p)
+                    // An old unsubmitted chronological retry must not override
+                    // the better choice learned from a failed sample.
+                    && (!tickets.iter().any(|ticket| {
+                        ticket.key.report == p.report
+                            && matches!(ticket.job.status, Status::Failed | Status::Canceled)
+                    }) || plan.next.as_ref().is_some_and(|next| {
+                        next.report == p.report && next.id == p.id
+                    }))
                     && (review.replay.growing
-                        || !review.content_alignment(p).is_some_and(|a| a.shared_clock))
+                        || !review.content_alignment(p).is_some_and(|a| a.recording_timing()))
             })
         {
             plan.next = Some(pull.clone());
@@ -392,6 +518,8 @@ mod tests {
         let (mut replay, pull, cap, _) = test_ticket();
         replay.available_seconds = 20_000;
         Review {
+            complete_reports: Default::default(),
+            alternative_pulls: Default::default(),
             replay,
             pulls: (0..12)
                 .map(|i| {
@@ -432,6 +560,146 @@ mod tests {
             .unwrap();
         ticket
     }
+    fn measured_ticket(review: &Review, pull: &Pull, seconds: f64) -> Ticket {
+        let (_, _, _, mut ticket) = test_ticket();
+        ticket.key = Key::new(
+            &review.replay,
+            pull,
+            review.content_capability.as_ref().unwrap(),
+            0,
+        );
+        let scope = ticket.job.scope.as_mut().unwrap();
+        scope.report = pull.report.clone();
+        scope.pull_id = pull.id;
+        scope.duration_seconds = ticket.key.duration();
+        scope.timeline.duration_seconds = review.replay.available_seconds as f64;
+        let result = ticket.job.result.as_mut().unwrap();
+        result.video_seconds = seconds;
+        result.seek_video_seconds = seconds;
+        result.uncertainty_seconds = 0.1;
+        result.coverage.fight_end_seconds = ticket.key.duration();
+        ticket
+    }
+
+    #[test]
+    fn completed_target_measurement_supersedes_derived_timing_in_one_update() {
+        for delta in [0.0, 5.0] {
+            let (mut review, source, clock) = crate::warcraftlogs::prepared::bridge_fixture();
+            let target = review.pulls[0].clone();
+            crate::warcraftlogs::prepared::apply_bridge_fixture(&mut review, &source, &clock);
+            let seconds = review
+                .content_alignment(&target)
+                .unwrap()
+                .result
+                .video_seconds
+                + delta;
+            let ticket = measured_ticket(&review, &target, seconds);
+            assert!(ticket.alignment().is_some());
+            let mut snapshot = Snapshot::default();
+            snapshot.remember(ticket);
+            snapshot.apply_to(&mut review, 0);
+            let exact = review.content_alignment(&target).unwrap();
+            assert!(exact.derived.is_none());
+            assert_eq!(exact.result.video_seconds, seconds);
+            if delta != 0.0 {
+                assert!(!review
+                    .content_timing
+                    .values()
+                    .any(|a| a.key.report == target.report && a.derived.is_some()));
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_exact_and_derived_archive_timing_does_not_queue_covered_pulls() {
+        let (mut review, source, clock) = crate::warcraftlogs::prepared::bridge_fixture();
+        let first = review.pulls[0].clone();
+        let mut second = first.clone();
+        second.id = 99;
+        second.start_ms += 500_000;
+        second.end_ms += 500_000;
+        review.pulls.push(second.clone());
+        crate::warcraftlogs::prepared::apply_bridge_fixture(&mut review, &source, &clock);
+        let seconds = review
+            .content_alignment(&first)
+            .unwrap()
+            .result
+            .video_seconds;
+        let mut snapshot = Snapshot::default();
+        snapshot.remember(measured_ticket(&review, &first, seconds));
+        snapshot.apply_to(&mut review, 0);
+        assert!(review.content_alignment(&first).unwrap().derived.is_none());
+        assert!(review.content_alignment(&second).unwrap().derived.is_some());
+        assert!(snapshot.plan(&review, 0).next.is_none());
+        // A real remaining gap is still eligible, without rescanning the earlier
+        // covered pull just because it has no viewer-owned ticket.
+        review
+            .content_timing
+            .remove(&(second.report.clone(), second.id));
+        assert_eq!(snapshot.plan(&review, 0).next.unwrap().id, second.id);
+    }
+
+    #[test]
+    fn invalid_target_tickets_cannot_revoke_or_replace_valid_bridge() {
+        for (invalid, failed) in
+            (0..4).flat_map(|invalid| [false, true].map(|failed| (invalid, failed)))
+        {
+            let (mut review, source, clock) = crate::warcraftlogs::prepared::bridge_fixture();
+            let target = review.pulls[0].clone();
+            crate::warcraftlogs::prepared::apply_bridge_fixture(&mut review, &source, &clock);
+            let before = review.content_alignment(&target).unwrap().version();
+            let mut ticket = measured_ticket(&review, &target, 11680.0);
+            if failed {
+                ticket.job.status = Status::Failed;
+                ticket.job.error = Some("missing_footage".into());
+                ticket.job.result = None;
+            }
+            match invalid {
+                0 => ticket.job.expires_at = 1,
+                1 => ticket.key.auth_epoch += 1,
+                2 => ticket.key.guild_generation = ticket.key.guild_generation.wrapping_add(1),
+                _ => {
+                    ticket.key.start_ms += 1;
+                    ticket.key.end_ms += 1;
+                }
+            }
+            let snapshot = Snapshot {
+                tickets: vec![ticket],
+                planned: None,
+            };
+            snapshot.apply_to(&mut review, 0);
+            let alignment = review.content_alignment(&target).unwrap();
+            assert!(alignment.derived.is_some());
+            assert_eq!(alignment.version(), before);
+        }
+    }
+
+    #[test]
+    fn hidden_exact_logger_measurement_is_promoted_above_a_derived_candidate() {
+        let (mut review, source, clock) = crate::warcraftlogs::prepared::bridge_fixture();
+        let target = review.pulls[0].clone();
+        let mut exact = target.clone();
+        exact.report = "MeasuredReport01".into();
+        exact.start_ms -= 100;
+        exact.end_ms -= 100;
+        review.pulls.push(exact.clone());
+        crate::warcraftlogs::prepared::apply_bridge_fixture(&mut review, &source, &clock);
+        assert_eq!(review.pulls[0].report, target.report);
+        assert!(review
+            .alternative_pulls
+            .iter()
+            .any(|p| p.report == exact.report));
+        let ticket = measured_ticket(&review, &exact, 11671.05);
+        let mut snapshot = Snapshot::default();
+        snapshot.remember(ticket.clone());
+        snapshot.apply_to(&mut review, 0);
+        assert_eq!(review.pulls[0].report, exact.report);
+        assert_eq!(review.pulls[0].id, exact.id);
+        let alignment = review.content_alignment(&exact).unwrap();
+        assert_eq!(alignment.key, ticket.key);
+        assert!(alignment.derived.is_none());
+    }
+
     #[test]
     fn shared_clock_survives_empty_or_unsuccessful_samples_but_excludes_confirmed_gaps() {
         for outcome in [None, Some("alignment_not_found"), Some("missing_footage")] {
@@ -571,7 +839,7 @@ mod tests {
         absent.job.result = None;
         absent.job.error = Some("missing_footage".into());
         saved.remember(absent);
-        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 2);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 12);
         saved.remember(ticket(&review, &review.pulls[1], 0.0));
         saved.remember(ticket(&review, &review.pulls[10], 0.0));
         let mut gap = ticket(&review, &review.pulls[5], 0.0);
@@ -595,6 +863,144 @@ mod tests {
         assert!(resumed.alignments.iter().any(|a| a.key.pull_id == 11));
         assert!(!resumed.alignments.iter().any(|a| a.key.pull_id == 12));
     }
+    fn fail(saved: &mut Snapshot, review: &Review, pull: &Pull) {
+        let mut failed = ticket(review, pull, 0.0);
+        failed.job.status = Status::Failed;
+        failed.job.result = None;
+        failed.job.error = Some("alignment_not_found".into());
+        saved.remember(failed);
+    }
+
+    #[test]
+    fn retries_cover_changed_lineups_instead_of_three_adjacent_pulls() {
+        let mut review = review();
+        for (index, pull) in review.pulls.iter_mut().enumerate() {
+            pull.friendly_players = Some(match index {
+                0..=3 => vec![1, 2],
+                4..=7 => vec![1, 3],
+                _ => vec![4, 5],
+            });
+        }
+        let mut saved = Snapshot::default();
+        let mut tried = Vec::new();
+        for _ in 0..MAX_FAILED_SAMPLES {
+            let next = saved.plan(&review, 0).next.unwrap();
+            tried.push(next.id);
+            fail(&mut saved, &review, &next);
+        }
+        assert_eq!(tried, [1, 12, 6]);
+        assert!(saved.plan(&review, 0).next.is_none());
+        assert_eq!(saved.tickets.len(), 3);
+        assert!(saved.plan(&review, 0).alignments.is_empty());
+    }
+
+    #[test]
+    fn retry_lineup_novelty_uses_all_attempts_before_encounter_and_time() {
+        let mut review = review();
+        for pull in &mut review.pulls {
+            pull.friendly_players = Some(vec![1, 2]);
+        }
+        review.pulls[11].friendly_players = Some(vec![3, 4]);
+        review.pulls[5].friendly_players = Some(vec![4, 5]);
+        review.pulls[1].encounter += 1;
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &review.pulls[0]);
+        fail(&mut saved, &review, &review.pulls[11]);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 6);
+        review.pulls.reverse();
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 6);
+    }
+
+    #[test]
+    fn retry_participant_ids_from_other_reports_do_not_change_this_lineup() {
+        let mut review = review();
+        for pull in &mut review.pulls {
+            pull.friendly_players = Some(vec![1, 2]);
+        }
+        review.pulls[5].friendly_players = Some(vec![1, 3]);
+        review.pulls[11].friendly_players = Some(vec![1, 4]);
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &review.pulls[0]);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 12);
+        // Actor 4 in a different report is unrelated to actor 4 here.
+        let mut unrelated = review.pulls[0].clone();
+        unrelated.report = "QrStUvWxYz123456".into();
+        unrelated.friendly_players = Some(vec![4]);
+        review.pulls.push(unrelated.clone());
+        fail(&mut saved, &review, &unrelated);
+        let next = saved.plan(&review, 0).next.unwrap();
+        assert_eq!(next.report, review.pulls[0].report);
+        assert_eq!(next.id, 12);
+    }
+
+    #[test]
+    fn unknown_attendance_falls_back_to_encounter_then_time_without_exclusions() {
+        let mut review = review();
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &review.pulls[0]);
+        // No known attempted lineup means that a candidate's known roster
+        // cannot supply evidence that its participants are new.
+        review.pulls[1].friendly_players = Some(vec![20, 21, 22]);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 12);
+        review.pulls[3].encounter += 1;
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 4);
+        fail(&mut saved, &review, &review.pulls[3]);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 12);
+        assert_eq!(review.pulls.len(), 12);
+    }
+
+    #[test]
+    fn same_lineup_and_encounter_retries_spread_over_time_with_earliest_ties() {
+        let mut review = review();
+        for pull in &mut review.pulls {
+            pull.friendly_players = Some(vec![1, 2]);
+        }
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &review.pulls[0]);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 12);
+        fail(&mut saved, &review, &review.pulls[11]);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 6);
+    }
+
+    #[test]
+    fn restored_unsubmitted_retry_cannot_override_new_diversity_evidence() {
+        let review = review();
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &review.pulls[0]);
+        saved.planned = Some(Key::new(
+            &review.replay,
+            &review.pulls[1],
+            review.content_capability.as_ref().unwrap(),
+            0,
+        ));
+        let mut saved: Snapshot =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 12);
+        saved.remember(ticket(&review, &review.pulls[11], 0.0));
+        let plan = saved.plan(&review, 0);
+        assert!(plan.next.is_none(), "Keep a successful retry as the anchor");
+        assert_eq!(plan.alignments.len(), 1);
+        assert_eq!(plan.alignments[0].key.pull_id, 12);
+        assert_eq!(saved.tickets.len(), 2, "Retain the old failure receipt");
+    }
+
+    #[test]
+    fn pending_retry_survives_a_more_diverse_catalogue() {
+        let mut review = review();
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &review.pulls[0]);
+        let mut pending = ticket(&review, &review.pulls[1], 0.0);
+        pending.job.status = Status::Running;
+        pending.job.result = None;
+        saved.remember(pending.clone());
+        review.pulls[11].friendly_players = Some(vec![30, 31]);
+        review.pulls[11].encounter += 1;
+        let plan = saved.plan(&review, 0);
+        assert!(plan.next.is_none());
+        assert_eq!(plan.pending, Some(pending));
+        assert_eq!(saved.tickets.len(), 2);
+    }
+
     #[test]
     fn repeated_no_matches_stop_archives_and_resume_only_in_a_new_live_window() {
         let mut review = review();

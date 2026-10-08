@@ -313,6 +313,45 @@ impl Controller {
         self.clocks[0].video_seconds(self.at_ms)
     }
 
+    /// Rename the encounter coordinate origin without moving either video.
+    pub(crate) fn rebase_timeline(&mut self, delta: i64, range: [i64; 2]) -> Result<(), Error> {
+        let shift = |value: i64| {
+            value
+                .checked_add(delta)
+                .filter(|v| *v >= 0)
+                .ok_or(Error::InvalidRange)
+        };
+        if range[0] < 0 || range[1] <= range[0] || range[1] - range[0] > 604_800_000 {
+            return Err(Error::InvalidRange);
+        }
+        let at_ms = shift(self.at_ms)?;
+        let references = [
+            shift(self.clocks[0].reference_ms)?,
+            shift(self.clocks[1].reference_ms)?,
+        ];
+        let recovered = self.recovered_from_ms.map(shift).transpose()?;
+        let phase = match self.phase {
+            Phase::CatchingUp {
+                ahead,
+                since,
+                held_at: Some((at, instant)),
+            } => Phase::CatchingUp {
+                ahead,
+                since,
+                held_at: Some((shift(at)?, instant)),
+            },
+            phase => phase,
+        };
+        self.range = range;
+        self.at_ms = at_ms;
+        self.recovered_from_ms = recovered;
+        self.phase = phase;
+        for (clock, reference) in self.clocks.iter_mut().zip(references) {
+            clock.reference_ms = reference;
+        }
+        Ok(())
+    }
+
     /// Replace one selected POV after its metadata is ready. Caller must supply
     /// this before exposing samples from its newly navigated native child.
     pub fn replace_clock(
@@ -322,7 +361,17 @@ impl Controller {
         now: Instant,
     ) -> Result<(), Error> {
         let slot = self.clocks.get_mut(side).ok_or(Error::InvalidClock)?;
+        let same_mapping = slot.available_seconds == clock.available_seconds
+            && slot.video_seconds(self.at_ms).is_some()
+            && clock.video_seconds(self.at_ms).is_some()
+            && (slot.reference_seconds + (clock.reference_ms - slot.reference_ms) as f64 / 1000.0
+                - clock.reference_seconds)
+                .abs()
+                < 0.000_001;
         *slot = clock;
+        if same_mapping {
+            return Ok(());
+        }
         match self.seek(self.at_ms, self.wants_playing, now) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -1061,6 +1110,47 @@ mod tests {
         } else {
             matches!(values[side], Some(PlaybackCommand::Pause))
         });
+    }
+
+    #[test]
+    fn newly_available_clock_coverage_recovers_failed_comparison() {
+        let mut controller = controller(true);
+        let unavailable = clocks()[0].with_relative_coverage(100.0, 200.0).unwrap();
+        assert_eq!(
+            controller.replace_clock(0, unavailable, test_now()),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(controller.status(), Status::Failed(Error::Unavailable));
+        controller
+            .replace_clock(0, clocks()[0], test_now())
+            .unwrap();
+        assert_eq!(controller.status(), Status::Preparing);
+        let empty = PlaybackState::default();
+        let commands = controller.tick([&empty, &empty], test_now());
+        assert!(matches!(
+            commands.primary,
+            Some(PlaybackCommand::SeekPaused(_))
+        ));
+        assert!(matches!(
+            commands.secondary,
+            Some(PlaybackCommand::SeekPaused(_))
+        ));
+    }
+
+    #[test]
+    fn logger_rebase_keeps_video_mapping_and_adopts_unequal_end_bounds() {
+        for end_delta in [-1_000, 1_900] {
+            let mut controller = running_before_observations(Instant::now());
+            let previous = controller.position_ms();
+            let seconds = controller.primary_seconds();
+            let range = [START + 1_127, START + 300_000 + end_delta];
+            controller.rebase_timeline(1_127, range).unwrap();
+            assert_eq!(controller.range, range);
+            assert_eq!(controller.position_ms(), previous + 1_127);
+            assert_eq!(controller.primary_seconds(), seconds);
+            assert_eq!(controller.status(), Status::Playing);
+            assert!(controller.wants_playing());
+        }
     }
 
     #[test]
