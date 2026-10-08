@@ -259,12 +259,28 @@ impl Snapshot {
             return plan;
         }
         let now = now_ms();
-        let mut pulls: Vec<_> = review
+        let mut visible: Vec<_> = review
             .pulls
             .iter()
             .filter(|p| p.end_ms > p.start_ms && (!review.replay.growing || p.end_ms <= now))
             .collect();
-        pulls.sort_by_key(|p| (p.start_ms, p.report.as_str(), p.id));
+        visible.sort_by_key(|p| (p.start_ms, p.report.as_str(), p.id));
+        let visible_keys: std::collections::BTreeSet<_> = visible
+            .iter()
+            .map(|pull| (pull.report.as_str(), pull.id))
+            .collect();
+        let mut pulls = visible.clone();
+        if !review.replay.growing {
+            // A hidden logger can supply a different sample for its own report.
+            // Keep live drift checks on their existing displayed-pull schedule.
+            pulls.extend(
+                review
+                    .alternative_pulls
+                    .iter()
+                    .filter(|p| p.end_ms > p.start_ms),
+            );
+            pulls.sort_by_key(|p| (p.start_ms, p.report.as_str(), p.id));
+        }
         let tickets: Vec<_> = self
             .tickets
             .iter()
@@ -308,15 +324,18 @@ impl Snapshot {
             .iter()
             .find(|ticket| ticket.pending())
             .map(|t| (*t).clone());
-        // Process every report independently: different logger clocks must never
-        // inherit each other's offset merely because their raid times overlap.
+        // Displayed gaps determine which archive reports need a clock. Once a
+        // report needs one, all its original candidates can supply the sample;
+        // already-covered or entirely hidden reports create no extra work.
+        // Different logger clocks still retain their own keys and failure limits.
         let mut reports = Vec::new();
-        for pull in &pulls {
-            if !reports.contains(&pull.report.as_str()) {
+        for pull in &visible {
+            if (review.replay.growing || !precise(pull)) && !reports.contains(&pull.report.as_str())
+            {
                 reports.push(pull.report.as_str());
             }
         }
-        for report in reports {
+        for &report in &reports {
             let group: Vec<_> = pulls
                 .iter()
                 .copied()
@@ -361,7 +380,19 @@ impl Snapshot {
             let Some(first) = first else {
                 continue;
             };
-            let last = group.last().unwrap();
+            // Already-covered hidden duplicates must not move the later-check
+            // midpoint past a displayed gap. Keep the displayed extent and all
+            // actual attempts, plus useful unverified hidden candidates.
+            let last = group
+                .iter()
+                .rev()
+                .copied()
+                .find(|pull| {
+                    visible_keys.contains(&(pull.report.as_str(), pull.id))
+                        || ticket_for(pull).is_some()
+                        || !precise(pull)
+                })
+                .unwrap_or(first);
             let mut points: Vec<_> = group
                 .iter()
                 .filter_map(|p| ticket_for(p).and_then(Ticket::alignment))
@@ -482,6 +513,7 @@ impl Snapshot {
             .filter(|p| {
                 ticket_for(p).is_none()
                     && can_sample(p)
+                    && (review.replay.growing || reports.contains(&p.report.as_str()))
                     // An old unsubmitted chronological retry must not override
                     // the better choice learned from a failed sample.
                     && (!tickets.iter().any(|ticket| {
@@ -869,6 +901,207 @@ mod tests {
         failed.job.result = None;
         failed.job.error = Some("alignment_not_found".into());
         saved.remember(failed);
+    }
+
+    fn review_with_hidden_report_samples() -> (Review, Vec<Pull>) {
+        let mut review = review();
+        let originals = review.pulls.clone();
+        for pull in &originals[1..] {
+            let mut duplicate = pull.clone();
+            duplicate.report = "CalibratedReport".into();
+            duplicate.id += 100;
+            duplicate.start_ms -= 500;
+            duplicate.end_ms -= 500;
+            let mut alignment = ticket(&review, &duplicate, 0.0).alignment().unwrap();
+            alignment.shared_clock = true;
+            review
+                .content_timing
+                .insert((duplicate.report.clone(), duplicate.id), alignment);
+            review.pulls.push(duplicate);
+        }
+        review.prefer_verified_pulls();
+        assert_eq!(review.pulls.len(), originals.len());
+        assert_eq!(review.alternative_pulls.len(), originals.len() - 1);
+        (review, originals)
+    }
+
+    #[test]
+    fn archive_retry_uses_hidden_report_candidates_without_changing_display() {
+        let (review, originals) = review_with_hidden_report_samples();
+        let visible: Vec<_> = review.pulls.iter().map(|p| (&p.report, p.id)).collect();
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &originals[0]);
+        let next = saved.plan(&review, 0).next.unwrap();
+        assert_eq!(
+            (next.report.as_str(), next.id),
+            (originals[11].report.as_str(), 12)
+        );
+        assert!(review
+            .alternative_pulls
+            .iter()
+            .any(|p| p.report == next.report && p.id == next.id));
+        assert_eq!(next.start_ms, originals[11].start_ms);
+        assert_eq!(saved.tickets.len(), 1);
+        assert_eq!(
+            visible,
+            review
+                .pulls
+                .iter()
+                .map(|p| (&p.report, p.id))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn hidden_attempts_share_diversity_history_and_the_report_failure_budget() {
+        let (review, originals) = review_with_hidden_report_samples();
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &originals[0]);
+        fail(&mut saved, &review, &originals[11]);
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 6);
+        fail(&mut saved, &review, &originals[5]);
+        saved.planned = Some(Key::new(
+            &review.replay,
+            &originals[6],
+            review.content_capability.as_ref().unwrap(),
+            0,
+        ));
+        assert!(saved.plan(&review, 0).next.is_none());
+        assert_eq!(saved.tickets.len(), MAX_FAILED_SAMPLES);
+        let restored: Snapshot =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert!(restored.plan(&review, 0).next.is_none());
+    }
+
+    #[test]
+    fn hidden_pending_sample_survives_coverage_and_prevents_new_work() {
+        let (mut review, originals) = review_with_hidden_report_samples();
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &originals[0]);
+        let mut pending = ticket(&review, &originals[11], 0.0);
+        pending.job.status = Status::Running;
+        pending.job.result = None;
+        saved.remember(pending.clone());
+        let plan = saved.plan(&review, 0);
+        assert_eq!(plan.pending, Some(pending.clone()));
+        assert!(plan.next.is_none());
+        // A new exact measurement can cover the only displayed gap while the
+        // hidden job is active. Keep following the existing job nonetheless.
+        saved.remember(ticket(&review, &originals[0], 0.0));
+        saved.apply_to(&mut review, 0);
+        let plan = saved.plan(&review, 0);
+        assert_eq!(plan.pending, Some(pending));
+        assert!(plan.next.is_none());
+    }
+
+    #[test]
+    fn hidden_archive_plan_restores_only_while_its_original_key_is_current() {
+        let (review, originals) = review_with_hidden_report_samples();
+        let mut saved = Snapshot {
+            tickets: vec![],
+            planned: Some(Key::new(
+                &review.replay,
+                &originals[5],
+                review.content_capability.as_ref().unwrap(),
+                0,
+            )),
+        };
+        let restored: Snapshot =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(restored.plan(&review, 0).next.unwrap().id, 6);
+        saved.planned.as_mut().unwrap().start_ms += 1;
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 1);
+        saved.planned.as_mut().unwrap().start_ms -= 1;
+        fail(&mut saved, &review, &originals[0]);
+        // A stale, unsubmitted adjacent choice cannot override the diversified
+        // retry learned from the visible failure.
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 12);
+    }
+
+    #[test]
+    fn covered_archive_does_not_sample_hidden_reports_or_restore_their_plans() {
+        let (mut review, originals) = review_with_hidden_report_samples();
+        let mut saved = Snapshot {
+            tickets: vec![],
+            planned: Some(Key::new(
+                &review.replay,
+                &originals[5],
+                review.content_capability.as_ref().unwrap(),
+                0,
+            )),
+        };
+        saved.remember(ticket(&review, &originals[0], 0.0));
+        saved.apply_to(&mut review, 0);
+        assert!(saved.plan(&review, 0).next.is_none());
+        assert!(review.content_alignment(&originals[0]).is_some());
+        assert!(review.content_alignment(&originals[5]).is_none());
+        // An expired exact ticket cannot keep an otherwise uncovered report
+        // ready through the retained clone of its alignment.
+        saved.tickets[0].job.expires_at = 1;
+        assert_eq!(saved.plan(&review, 0).next.unwrap().id, 6);
+        // Entirely hidden reports also create no work when all displayed pulls
+        // belong to another calibrated logger.
+        review.pulls.retain(|pull| pull.id != originals[0].id);
+        saved.tickets.clear();
+        assert!(saved.plan(&review, 0).next.is_none());
+    }
+
+    #[test]
+    fn hidden_measurement_establishes_its_own_clock_without_reordering_pulls() {
+        let (mut review, originals) = review_with_hidden_report_samples();
+        let visible = serde_json::to_value(&review.pulls).unwrap();
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &originals[0]);
+        let measured = ticket(&review, &originals[11], 0.0);
+        saved.remember(measured.clone());
+        saved.apply_to(&mut review, 0);
+        assert_eq!(serde_json::to_value(&review.pulls).unwrap(), visible);
+        assert!(review.content_alignment(&originals[11]).is_some());
+        assert!(review.content_alignment(&originals[0]).is_none());
+        assert!(saved.plan(&review, 0).next.is_none());
+        let clock_from = |alignment: &Alignment| RecordingClock {
+            report_start_ms: alignment.key.report_start_ms,
+            report_seconds: (alignment.key.start_ms - alignment.key.report_start_ms) as f64
+                / 1000.0,
+            video_seconds: alignment.result.video_seconds,
+            uncertainty_seconds: alignment.result.uncertainty_seconds,
+            evidence_hash: alignment.result.evidence_hash.clone(),
+            algorithm_revision: alignment.key.algorithm_revision.clone(),
+            timeline: alignment.timeline.clone(),
+            timeline_hash: alignment.timeline_hash.clone(),
+            expires_at: alignment.expires_at,
+        };
+        let own_clock = clock_from(&measured.alignment().unwrap());
+        let other_clock = clock_from(review.content_alignment(&review.pulls[1]).unwrap());
+        crate::warcraftlogs::prepared::clocks(&mut review, None, 0, |key| {
+            RecordingLookup::Valid(if key.report == originals[0].report {
+                own_clock.clone()
+            } else {
+                other_clock.clone()
+            })
+        });
+        saved.apply_to(&mut review, 0);
+        assert_eq!(serde_json::to_value(&review.pulls).unwrap(), visible);
+        assert!(
+            review
+                .content_alignment(&originals[0])
+                .unwrap()
+                .shared_clock
+        );
+        assert!(saved.plan(&review, 0).next.is_none());
+        assert_eq!(saved.tickets.len(), 2);
+    }
+
+    #[test]
+    fn live_drift_sampling_keeps_its_existing_visible_candidate_set() {
+        let mut review = review();
+        review.replay.growing = true;
+        let hidden = review.pulls[11].clone();
+        review.pulls.truncate(1);
+        review.alternative_pulls.push(hidden);
+        let mut saved = Snapshot::default();
+        fail(&mut saved, &review, &review.pulls[0]);
+        assert!(saved.plan(&review, 0).next.is_none());
     }
 
     #[test]
