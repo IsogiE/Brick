@@ -186,8 +186,8 @@ impl Cache {
             (epoch, recording.complete),
             clocks,
             Duration::from_secs(now - recording.updated_at).max(Duration::from_secs(
-                // Older snapshots discarded duplicate logger candidates. Keep
-                // their display/evidence, but rediscover their directory once.
+                // Older snapshots lack candidates or per-report validation.
+                // Keep display/evidence, but rediscover their metadata once.
                 if recording.candidate_revision == 2 {
                     61
                 } else {

@@ -227,11 +227,11 @@ impl Review {
             .map(|pull| {
                 let rank = self.content_alignment(pull).map_or(0u8, |alignment| {
                     if alignment.shared_clock {
-                        2
+                        3
                     } else if alignment.derived.is_some() {
                         1
                     } else {
-                        0
+                        2
                     }
                 });
                 ((pull.report.clone(), pull.id), rank)

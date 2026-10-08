@@ -114,7 +114,7 @@ impl Cache {
                         entry
                             .review
                             .content_alignment(pull)
-                            .is_some_and(Alignment::recording_timing)
+                            .is_some_and(|alignment| alignment.key.auth_epoch == entry.status.0)
                     }))
         })
     }
