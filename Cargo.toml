@@ -20,6 +20,12 @@ path = "tests/native_rendering.rs"
 harness = false
 test = false
 
+[[test]]
+name = "native_window_geometry"
+path = "tests/native_window_geometry.rs"
+harness = false
+test = false
+
 [dependencies]
 auto-launch = "0.6"
 base64 = "0.23"

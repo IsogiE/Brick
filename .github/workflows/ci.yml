@@ -243,7 +243,8 @@ jobs:
         if: runner.os == 'Windows'
         env:
           RUSTFLAGS: '-D warnings -C target-feature=+crt-static'
-        run: cargo test --locked --test native_rendering --no-run
+        run: |
+          cargo test --locked --test native_rendering --test native_window_geometry --no-run
 
       - name: Retain Windows native test binaries
         if: runner.os == 'Windows'
@@ -253,5 +254,6 @@ jobs:
           path: |
             target/debug/deps/brick-*.exe
             target/debug/deps/native_rendering-*.exe
+            target/debug/deps/native_window_geometry-*.exe
           if-no-files-found: error
           retention-days: 7

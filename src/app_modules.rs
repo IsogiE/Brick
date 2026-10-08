@@ -39,6 +39,7 @@ mod twitch_account_ui;
 mod ui;
 mod view_work;
 mod warcraftlogs;
+mod window_geometry;
 #[cfg(target_os = "windows")]
 mod windows_launch;
 mod youtube_account;
