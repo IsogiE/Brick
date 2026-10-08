@@ -29,6 +29,8 @@ struct Recording {
     #[serde(default)]
     sampling: crate::content_alignment::sampling::Snapshot,
     complete: bool,
+    #[serde(default)]
+    candidate_revision: u8,
     updated_at: u64,
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -137,8 +139,9 @@ impl Cache {
             return;
         }
         let mut review = Review {
+            alternative_pulls: Default::default(),
             replay: recording.replay.clone(),
-            pulls: super::canonical_pulls(
+            pulls: super::same_report_pulls(
                 recording
                     .pulls
                     .iter()
@@ -167,6 +170,7 @@ impl Cache {
                 }
             }
         }
+        review.prefer_verified_pulls();
         let samples = recording.sampling.rebound(&review, epoch, access);
         cache.restore_snapshot(
             recording.path.clone(),
@@ -174,7 +178,15 @@ impl Cache {
             review,
             (epoch, recording.complete),
             clocks,
-            Duration::from_secs(now - recording.updated_at).max(Duration::from_secs(61)),
+            Duration::from_secs(now - recording.updated_at).max(Duration::from_secs(
+                // Older snapshots discarded duplicate logger candidates. Keep
+                // their display/evidence, but rediscover their directory once.
+                if recording.candidate_revision == 1 {
+                    61
+                } else {
+                    6 * 60 * 60 + 1
+                },
+            )),
         );
         cache.restore_samples(&recording.identity, samples);
     }
@@ -255,9 +267,9 @@ impl Cache {
         clocks: &[(Key, RecordingClock)],
         now: u64,
     ) {
-        if review.pulls.len() > MAX_PULLS
+        if review.candidate_count() > MAX_PULLS
             || !valid_replay(&review.replay)
-            || !review.pulls.iter().all(valid_pull)
+            || !review.pull_candidates().all(valid_pull)
         {
             return;
         }
@@ -279,8 +291,7 @@ impl Cache {
             path,
             replay: review.replay.clone(),
             pulls: review
-                .pulls
-                .iter()
+                .pull_candidates()
                 .map(|p| (p.report.clone(), p.id))
                 .collect(),
             clocks: clocks
@@ -292,9 +303,11 @@ impl Cache {
                 .map(|r| r.sampling.clone())
                 .unwrap_or_default(),
             complete,
+            candidate_revision: 1,
             updated_at: previous.as_ref().map_or(now, |r| r.updated_at),
         };
-        let metadata_changed = review.pulls.iter().any(|pull| {
+        recording.pulls.sort_unstable();
+        let metadata_changed = review.pull_candidates().any(|pull| {
             self.document
                 .reports
                 .get(&pull.report)
@@ -322,7 +335,7 @@ impl Cache {
         {
             recording.updated_at = now;
         }
-        for pull in &review.pulls {
+        for pull in review.pull_candidates() {
             self.document
                 .reports
                 .entry(pull.report.clone())
@@ -520,6 +533,7 @@ mod tests {
             seconds: 60,
         };
         let review = Review {
+            alternative_pulls: Default::default(),
             replay,
             pulls: vec![pull],
             content_capability: None,
@@ -591,6 +605,100 @@ mod tests {
         assert!(hot.for_display(&stream).is_none());
         hot.set_connected(false);
         assert!(hot.for_display(&stream).is_none());
+    }
+
+    #[test]
+    fn duplicate_candidates_and_their_own_clocks_survive_restart() {
+        let (mut cache, mut stream, _) = fixture();
+        let (replay, mut first, cap, ticket) = crate::content_alignment::test_ticket();
+        stream.provider = replay.provider.clone();
+        stream.recording_id = Some(replay.video_id.clone());
+        stream.status = Status::Offline;
+        first.friendly_players = Some(vec![1, 3]);
+        let mut second = first.clone();
+        second.report = "DifferentReport1".into();
+        second.id += 10;
+        second.start_ms += 1_000;
+        second.end_ms += 1_000;
+        second.friendly_players = Some(vec![4, 8]);
+        let mut review = Review {
+            replay,
+            pulls: vec![first.clone(), second.clone()],
+            alternative_pulls: vec![],
+            content_capability: Some(cap.clone()),
+            content_timing: Default::default(),
+        };
+        let clock = crate::content_alignment::test_recording_clock();
+        let clocks = prepared::clocks(&mut review, None, ticket.key.auth_epoch, |key| {
+            (key.report == second.report).then(|| clock.clone())
+        });
+        cache.merge(&stream, &review, true, &clocks, super::super::now_secs());
+        cache.document = decode(&serde_json::to_vec(&cache.document).unwrap()).unwrap();
+        assert_eq!(cache.document.recordings[0].pulls.len(), 2);
+        let mut hot = prepared::Cache::default();
+        cache.hydrate(
+            &mut hot,
+            Some(&cap),
+            ticket.key.auth_epoch,
+            &Access::from("fixture"),
+        );
+        let restored = hot.for_display(&stream).unwrap().review;
+        assert_eq!(restored.pulls[0].report, second.report);
+        assert_eq!(restored.pulls[0].friendly_players, Some(vec![4, 8]));
+        assert_eq!(
+            restored.alternative_pulls[0].friendly_players,
+            Some(vec![1, 3])
+        );
+        assert!(restored.content_alignment(&first).is_none());
+        assert_eq!(
+            restored.content_alignment(&second).unwrap().key.report,
+            second.report
+        );
+        cache.document.recordings[0].clocks.clear();
+        cache.hydrate(
+            &mut hot,
+            Some(&cap),
+            ticket.key.auth_epoch,
+            &Access::from("fixture"),
+        );
+        let restored = hot.for_display(&stream).unwrap().review;
+        assert_eq!(restored.pulls[0].report, first.report);
+        assert!(restored.content_timing.is_empty());
+        assert_eq!(restored.candidate_count(), 2);
+    }
+
+    #[test]
+    fn legacy_archive_keeps_offline_evidence_but_requires_candidate_rediscovery() {
+        let (mut cache, mut stream, mut review) = fixture();
+        stream.status = Status::Offline;
+        stream.recording_id = Some(review.replay.video_id.clone());
+        review.replay.growing = false;
+        review.replay.started_at = "2020-01-01T00:00:00Z".into();
+        let now = super::super::now_secs();
+        cache.merge(&stream, &review, true, &[], now);
+        let mut legacy = serde_json::to_value(&cache.document).unwrap();
+        legacy["recordings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidate_revision");
+        cache.document = decode(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let mut hot = prepared::Cache::default();
+        cache.hydrate(&mut hot, None, 0, &Access::from("fixture"));
+        assert!(
+            hot.for_display(&stream).is_some(),
+            "Offline display must remain available"
+        );
+        assert!(
+            !hot.background_contains(&stream),
+            "An old archive must rediscover missing logger candidates"
+        );
+        assert!(!hot.contains(&stream));
+        cache.merge(&stream, &review, true, &[], now);
+        cache.hydrate(&mut hot, None, 0, &Access::from("fixture"));
+        assert!(
+            hot.background_contains(&stream),
+            "The completed format migration must not repeat every pass"
+        );
     }
 
     #[test]

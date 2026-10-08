@@ -1097,12 +1097,10 @@ impl ReviewUi {
             .playback
             .as_ref()
             .is_some_and(|playback| playback.broadcast_id != review.replay.broadcast_id);
-        let current = self.pull.as_ref().and_then(|selected| {
-            review
-                .pulls
-                .iter()
-                .find(|pull| pull.report == selected.report && pull.id == selected.id)
-        });
+        let current = self
+            .pull
+            .as_ref()
+            .and_then(|selected| review.matching_pull(selected));
         let unavailable = self.pull.is_some() && current.is_none();
         if broadcast_changed || unavailable {
             self.pull = None;
@@ -1117,10 +1115,14 @@ impl ReviewUi {
             self.timeline_position = None;
             self.aligning = false;
         } else if let Some(current) = current {
-            if self
+            let changed_report = self
                 .pull
                 .as_ref()
-                .is_some_and(|old| old.start_ms != current.start_ms || old.end_ms != current.end_ms)
+                .is_some_and(|old| pull_key(old) != pull_key(current));
+            if changed_report
+                || self.pull.as_ref().is_some_and(|old| {
+                    old.start_ms != current.start_ms || old.end_ms != current.end_ms
+                })
             {
                 self.events.clear();
                 self.requested_events.clear();
@@ -1128,9 +1130,18 @@ impl ReviewUi {
                 self.event_failures.clear();
                 self.selected_event = None;
                 self.scroll_to_event = false;
-                self.range_epoch = Instant::now();
                 self.range_pause_sent = false;
-                self.timeline_position = None;
+                if changed_report {
+                    // The native player is still showing the same footage.
+                    // Adopt the chosen report's range without moving the video
+                    // or discarding its latest observed position/play intent.
+                    self.playback_range = None;
+                    self.pull_menu_cursor = None;
+                    self.scroll_pull = Some((current.report.clone(), current.id));
+                } else {
+                    self.range_epoch = Instant::now();
+                    self.timeline_position = None;
+                }
             }
             self.pull = Some(current.clone());
         }
@@ -1384,6 +1395,18 @@ impl ReviewUi {
 
         let Some(review) = &self.review else {
             return;
+        };
+        let pull = if review
+            .alternative_pulls
+            .iter()
+            .any(|candidate| pull_key(candidate) == pull_key(&pull))
+        {
+            let Some(current) = review.matching_pull(&pull) else {
+                return;
+            };
+            current.clone()
+        } else {
+            pull
         };
         let seconds = review.content_alignment(&pull).map_or_else(
             || review.estimated_video_start(&pull),
@@ -2072,8 +2095,16 @@ impl ReviewUi {
             .as_ref()
             .and_then(|review| review.matching_pull(&wanted).cloned());
         if let Some(pull) = found {
+            // Matching loggers may disagree on wall-clock time. Carry the
+            // selected encounter millisecond, using this POV's own pull/clock.
+            let mapped = at_ms
+                .checked_sub(wanted.start_ms)
+                .and_then(|elapsed| pull.start_ms.checked_add(elapsed));
             self.select(pull);
-            if self.seek_absolute_with_playback(at_ms, autoplay).is_some() {
+            if mapped
+                .and_then(|at| self.seek_absolute_with_playback(at, autoplay))
+                .is_some()
+            {
                 self.notice = None;
                 return true;
             }
@@ -4266,6 +4297,7 @@ mod tests {
         };
         (
             Review {
+                alternative_pulls: Default::default(),
                 content_capability: None,
                 content_timing: Default::default(),
                 replay,
@@ -4300,6 +4332,7 @@ mod tests {
         later.start_ms += 60_000;
         later.end_ms += 60_000;
         let mut review = Review {
+            alternative_pulls: Default::default(),
             replay,
             pulls: vec![pull, later],
             content_capability: Some(cap),
@@ -7940,6 +7973,114 @@ mod tests {
             "Comparison provider navigation skips primary alignment refresh"
         );
     }
+    #[test]
+    fn equivalent_logger_refresh_keeps_playback_and_clears_previous_report_events() {
+        let (mut review, original, _) = fixture();
+        crate::content_alignment::test_set_timing(&mut review, &original, 123.25);
+        let mut ui = ReviewUi::default();
+        ui.recording_match_status = Some((0, true));
+        ui.review = Some(review.clone());
+        ui.select(original.clone());
+        ui.seek_absolute_with_playback(original.start_ms + 37_125, false)
+            .unwrap();
+        ui.timeline_position = Some(37.125);
+        ui.loaded_events = vec![EventKind::Deaths, EventKind::Defensives];
+        let epoch = ui.range_epoch;
+        let before = ui.playback.as_ref().unwrap().seconds;
+        let mut replacement = original.clone();
+        replacement.report = "DifferentReport1".into();
+        replacement.id += 10;
+        replacement.start_ms += 1_127;
+        replacement.end_ms += 1_117;
+        review.pulls = vec![replacement.clone()];
+        review.alternative_pulls = vec![original.clone()];
+        review.content_timing.clear();
+        crate::content_alignment::test_set_timing(&mut review, &replacement, 123.25);
+        assert!(
+            !ui.accept_review(review.clone()),
+            "Metadata promotion must not reload the native player"
+        );
+        assert_eq!(pull_key(ui.pull.as_ref().unwrap()), pull_key(&replacement));
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, before);
+        assert!(!ui.playback.as_ref().unwrap().autoplay);
+        assert_eq!(ui.timeline_position, Some(37.125));
+        assert_eq!(ui.range_epoch, epoch);
+        assert!(ui.loaded_events.is_empty());
+        assert_eq!(
+            ui.scroll_pull,
+            Some((replacement.report.clone(), replacement.id))
+        );
+        assert!(ui
+            .review
+            .as_ref()
+            .unwrap()
+            .content_alignment(&original)
+            .is_none());
+        // POV restoration translates elapsed time, not one logger's wall clock.
+        ui.pending_focus = Some((original.clone(), original.start_ms + 37_125, false));
+        assert!(ui.restore_pov_position());
+        assert_eq!(ui.playback.as_ref().unwrap().seconds, before);
+        assert!(!ui.playback.as_ref().unwrap().autoplay);
+        let mut ambiguous = replacement.clone();
+        ambiguous.id += 1;
+        ambiguous.start_ms -= 2_000;
+        ambiguous.end_ms -= 2_000;
+        review.pulls.push(ambiguous);
+        ui.pull = Some(original);
+        assert!(ui.accept_review(review));
+        assert!(ui.pull.is_none() && ui.playback.is_none());
+        assert!(ui.notice.is_some());
+    }
+
+    #[test]
+    fn equivalent_logger_promotion_preserves_running_comparison_without_seek() {
+        let (mut review, original, stream) = fixture();
+        crate::content_alignment::test_set_timing(&mut review, &original, 123.25);
+        let mut ui = ReviewUi::default();
+        ui.active = true;
+        ui.recording_match_status = Some((0, true));
+        ui.review = Some(review.clone());
+        ui.select(original.clone());
+        let at_ms = original.start_ms + 37_125;
+        let mut comparison = crate::review_compare_ui::Comparison::new(&ui, stream, at_ms, true);
+        comparison.metadata_for_test().review = Some(review.clone());
+        let now = Instant::now() - Duration::from_secs(1);
+        let sample = |playing, after| {
+            let mut state = PlaybackState::default();
+            state.ready = true;
+            state.seconds = 160.375;
+            state.playing = playing;
+            state.mark_polled_at(now + Duration::from_millis(after));
+            state
+        };
+        let controller = comparison.refresh_controller_for_test(&ui, now);
+        let empty = PlaybackState::default();
+        controller.tick([&empty, &empty], now);
+        let paused = sample(false, 2);
+        controller.tick([&paused, &paused], now + Duration::from_millis(3));
+        let running = sample(true, 4);
+        controller.tick([&running, &running], now + Duration::from_millis(5));
+        assert_eq!(controller.status(), crate::review_compare::Status::Playing);
+        let mut replacement = original.clone();
+        replacement.report = "DifferentReport1".into();
+        replacement.id += 10;
+        replacement.start_ms += 1_127;
+        replacement.end_ms += 1_127;
+        review.pulls = vec![replacement.clone()];
+        review.alternative_pulls = vec![original.clone()];
+        review.content_timing.clear();
+        crate::content_alignment::test_set_timing(&mut review, &replacement, 123.25);
+        assert!(!ui.accept_review(review));
+        let controller =
+            comparison.refresh_controller_for_test(&ui, now + Duration::from_millis(6));
+        assert_eq!(controller.status(), crate::review_compare::Status::Playing);
+        assert_eq!(controller.position_ms(), at_ms + 1_127);
+        assert_eq!(controller.primary_seconds(), Some(160.375));
+        let running = sample(true, 7);
+        let commands = controller.tick([&running, &running], now + Duration::from_millis(8));
+        assert!(commands.primary.is_none() && commands.secondary.is_none());
+    }
+
     #[test]
     fn pending_pov_restores_match_accepted_at_three_second_boundary() {
         let (mut review, wanted, _) = fixture();

@@ -202,12 +202,33 @@ pub struct RaidEvent {
 pub struct Review {
     pub replay: Replay,
     pub pulls: Vec<Pull>,
+    /// Other logger candidates remain available for their own clock lookups.
+    pub alternative_pulls: Vec<Pull>,
 
     pub content_capability: Option<crate::content_alignment::Capability>,
     pub content_timing: HashMap<(String, u64), crate::content_alignment::Alignment>,
 }
 
 impl Review {
+    pub(crate) fn pull_candidates(&self) -> impl Iterator<Item = &Pull> {
+        self.pulls.iter().chain(&self.alternative_pulls)
+    }
+
+    pub(crate) fn candidate_count(&self) -> usize {
+        self.pulls.len() + self.alternative_pulls.len()
+    }
+
+    pub(crate) fn prefer_verified_pulls(&mut self) {
+        let mut candidates = std::mem::take(&mut self.pulls);
+        candidates.append(&mut self.alternative_pulls);
+        let (pulls, alternatives) = partition_pulls(candidates, |pull| {
+            self.content_alignment(pull)
+                .is_some_and(|alignment| alignment.shared_clock)
+        });
+        self.pulls = pulls;
+        self.alternative_pulls = alternatives;
+    }
+
     pub(crate) fn matching_pull(&self, selected: &Pull) -> Option<&Pull> {
         if let Some(exact) = self
             .pulls
@@ -216,11 +237,10 @@ impl Review {
         {
             return Some(exact);
         }
-        let mut candidates = self.pulls.iter().filter(|pull| {
-            pull.encounter == selected.encounter
-                && pull.difficulty == selected.difficulty
-                && pull.start_ms.abs_diff(selected.start_ms) <= 3_000
-        });
+        let mut candidates = self
+            .pulls
+            .iter()
+            .filter(|pull| equivalent_pull(pull, selected));
         let first = candidates.next()?;
         // Separate reports can contain nearby or overlapping entries. Never
         // choose a comparison or alignment target by their incidental order.
@@ -1256,6 +1276,7 @@ impl Client {
                 }
             }
         }
+        review.prefer_verified_pulls();
         Ok(review)
     }
 
@@ -1398,6 +1419,7 @@ impl Client {
         // a complete no-match or permits automatic recording removal.
         check_cancelled(&self.cancel)?;
         Ok(Review {
+            alternative_pulls: Default::default(),
             replay,
             pulls,
             content_capability: None,
@@ -1740,6 +1762,7 @@ impl Client {
         }
         let Ok(start) = replay.start_ms() else {
             return Ok(Review {
+                alternative_pulls: Default::default(),
                 replay,
                 pulls: Vec::new(),
                 content_capability: None,
@@ -1844,10 +1867,11 @@ impl Client {
             complete &= complete_fight_list(report);
             pulls.extend(map_pulls(report, &replay)?);
         }
-        let unique = canonical_pulls(pulls);
+        let unique = same_report_pulls(pulls);
         check_cancelled(&self.cancel)?;
         self.recording_match_complete = complete;
         Ok(Review {
+            alternative_pulls: Default::default(),
             content_capability: None,
             content_timing: HashMap::new(),
             replay,
@@ -1932,36 +1956,113 @@ fn exact_duplicate_pulls(report: &Value, pull: &Pull) -> Result<Vec<Pull>, Strin
     Ok(alternatives)
 }
 
-// Exact duplicate rows within a report describe the same logged encounter.
-// Keep the original (lowest) fight ID, independent of response order. Reports
-// from different loggers retain the existing three-second overlap tolerance.
-// This also normalizes restored catalogues without deleting encrypted history.
-pub(super) fn canonical_pulls(mut pulls: Vec<Pull>) -> Vec<Pull> {
+/// Cross-report choices refer to one physical pull only when both bounds agree.
+/// Within a report, only identical bounds can alias a different fight ID.
+pub(crate) fn equivalent_pull(left: &Pull, right: &Pull) -> bool {
+    left.encounter == right.encounter
+        && left.difficulty == right.difficulty
+        && left.start_ms.abs_diff(right.start_ms) <= 3_000
+        && left.end_ms.abs_diff(right.end_ms) <= 3_000
+        && (left.report != right.report
+            || (left.start_ms == right.start_ms && left.end_ms == right.end_ms))
+}
+
+// Same-report duplicates keep the lowest fight ID. Cross-report candidates must
+// survive until their own clocks are known, including through encrypted caches.
+fn same_report_pulls(mut pulls: Vec<Pull>) -> Vec<Pull> {
     pulls.sort_by_key(|p| (p.start_ms, p.report.clone(), p.id));
-    let mut unique: Vec<Pull> = Vec::new();
-    let mut same_report = std::collections::HashSet::new();
-    for pull in pulls {
-        if !same_report.insert((
+    let mut seen = std::collections::HashSet::new();
+    pulls.retain(|pull| {
+        seen.insert((
             pull.report.clone(),
             pull.encounter,
             pull.difficulty,
             pull.start_ms,
             pull.end_ms,
-        )) {
-            continue;
+        ))
+    });
+    pulls
+}
+
+fn duplicate_pull(left: &Pull, right: &Pull) -> bool {
+    left.report != right.report
+        && equivalent_pull(left, right)
+        && left.start_ms.abs_diff(right.start_ms) < 3_000
+        && left.end_ms.abs_diff(right.end_ms) < 3_000
+}
+
+fn partition_pulls(pulls: Vec<Pull>, verified: impl Fn(&Pull) -> bool) -> (Vec<Pull>, Vec<Pull>) {
+    // Freeze groups before considering clocks: choosing a different logger must
+    // not join a chain of overlapping bounds that describe different pulls.
+    let mut groups: Vec<Vec<Pull>> = Vec::new();
+    for pull in same_report_pulls(pulls) {
+        let matches: Vec<_> = groups
+            .iter()
+            .enumerate()
+            .rev()
+            .take_while(|(_, group)| group[0].start_ms > pull.start_ms.saturating_sub(3_000))
+            .filter(|(_, group)| duplicate_pull(&group[0], &pull))
+            .map(|(index, _)| index)
+            .collect();
+        if matches.len() == 1
+            && groups[matches[0]]
+                .iter()
+                .all(|old| old.report != pull.report)
+        {
+            groups[matches[0]].push(pull);
+        } else {
+            groups.push(vec![pull]);
         }
-        if unique.iter().rev().take(12).any(|p| {
-            p.report != pull.report
-                && p.encounter == pull.encounter
-                && p.difficulty == pull.difficulty
-                && p.start_ms.abs_diff(pull.start_ms) < 3000
-                && p.end_ms.abs_diff(pull.end_ms) < 3000
-        }) {
-            continue;
-        }
-        unique.push(pull);
     }
-    unique
+    let chosen: Vec<_> = groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| {
+            group
+                .iter()
+                .position(|pull| {
+                    verified(pull)
+                        && group
+                            .iter()
+                            .all(|old| old.report == pull.report || duplicate_pull(old, pull))
+                        && {
+                            // Every group member starts within 3s of its first
+                            // row. Only nearby groups can make this choice ambiguous.
+                            let begin = groups.partition_point(|g| {
+                                g[0].start_ms <= pull.start_ms.saturating_sub(6_000)
+                            });
+                            let end = groups.partition_point(|g| {
+                                g[0].start_ms < pull.start_ms.saturating_add(3_000)
+                            });
+                            !groups[begin..end]
+                                .iter()
+                                .enumerate()
+                                .any(|(other, candidates)| {
+                                    begin + other != index
+                                        && candidates.iter().any(|old| duplicate_pull(old, pull))
+                                })
+                        }
+                })
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut visible = Vec::new();
+    let mut alternatives = Vec::new();
+    for (group, chosen) in groups.into_iter().zip(chosen) {
+        for (index, pull) in group.into_iter().enumerate() {
+            if index == chosen {
+                visible.push(pull);
+            } else {
+                alternatives.push(pull);
+            }
+        }
+    }
+    visible.sort_by_key(|p| (p.start_ms, p.report.clone(), p.id));
+    (visible, alternatives)
+}
+
+pub(super) fn canonical_pulls(pulls: Vec<Pull>) -> Vec<Pull> {
+    partition_pulls(pulls, |_| false).0
 }
 
 fn map_report_pulls(report: &Value, range: Option<(i64, i64)>) -> Result<Vec<Pull>, String> {
@@ -2276,6 +2377,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn duplicate_clock_preference_never_bridges_ambiguous_boundaries() {
+        let first = crate::content_alignment::test_ticket().1;
+        let mut middle = first.clone();
+        middle.report = "DifferentReport1".into();
+        middle.start_ms += 2_000;
+        middle.end_ms += 2_000;
+        let mut last = first.clone();
+        last.report = "DifferentReport2".into();
+        last.start_ms += 4_000;
+        last.end_ms += 4_000;
+        let mut candidates = vec![last.clone(), middle.clone(), first.clone()];
+        for _ in 0..3 {
+            let (visible, alternatives) =
+                partition_pulls(candidates, |pull| pull.report == middle.report);
+            assert_eq!(
+                visible
+                    .iter()
+                    .map(|p| p.report.as_str())
+                    .collect::<Vec<_>>(),
+                vec![first.report.as_str(), last.report.as_str()]
+            );
+            assert_eq!(alternatives.len(), 1);
+            candidates = visible.into_iter().chain(alternatives).collect();
+        }
+        let mut nearby_same_report = first.clone();
+        nearby_same_report.id += 1;
+        nearby_same_report.start_ms += 2_000;
+        nearby_same_report.end_ms += 2_000;
+        let (visible, _) = partition_pulls(
+            vec![first.clone(), nearby_same_report, middle.clone()],
+            |p| p.report == middle.report,
+        );
+        assert_eq!(
+            visible.len(),
+            3,
+            "Ambiguous logger candidates cannot erase distinct report fights"
+        );
+    }
+
+    #[test]
     fn cross_report_pull_matching_requires_a_unique_fight_but_keeps_exact_identity() {
         let selected = crate::content_alignment::test_ticket().1;
         let mut first = selected.clone();
@@ -2288,6 +2429,7 @@ mod tests {
         second.start_ms = selected.start_ms - 1_000;
         second.end_ms = selected.end_ms - 1_000;
         let mut review = Review {
+            alternative_pulls: Default::default(),
             replay: replay(),
             pulls: vec![first.clone(), second],
             content_capability: None,

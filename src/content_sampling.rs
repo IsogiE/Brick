@@ -111,7 +111,7 @@ impl Snapshot {
             return Self::default();
         };
         let rebind = |key: &Key| {
-            let pull = review.pulls.iter().find(|pull| same_pull(key, pull))?;
+            let pull = review.pull_candidates().find(|pull| same_pull(key, pull))?;
             let mut old = key.clone();
             old.guild_generation = guild::request_generation();
             old.auth_epoch = epoch;
@@ -149,6 +149,7 @@ impl Snapshot {
         let pulls: std::collections::HashMap<_, _> = review
             .pulls
             .iter()
+            .chain(&review.alternative_pulls)
             .map(|pull| ((pull.report.as_str(), pull.id), pull))
             .collect();
         let cap = review.content_capability.as_ref();
@@ -188,6 +189,7 @@ impl Snapshot {
                 .entry((alignment.key.report.clone(), alignment.key.pull_id))
                 .or_insert(alignment);
         }
+        review.prefer_verified_pulls();
     }
 
     pub fn plan(&self, review: &Review, epoch: u64) -> Plan {
@@ -199,7 +201,7 @@ impl Snapshot {
         let Some(cap) = review.content_capability.as_ref() else {
             return plan;
         };
-        if review.pulls.len() > 4096 || self.tickets.len() > MAX_SAMPLES {
+        if review.candidate_count() > 4096 || self.tickets.len() > MAX_SAMPLES {
             return plan;
         }
         let now = now_ms();
@@ -215,8 +217,8 @@ impl Snapshot {
             .filter(|ticket| {
                 ticket.key.auth_epoch == epoch
                     && ticket.key.guild_generation == guild::request_generation()
-                    && pulls
-                        .iter()
+                    && review
+                        .pull_candidates()
                         .any(|pull| ticket.key.matches(&review.replay, pull, cap))
                     && ticket
                         .job
@@ -464,6 +466,7 @@ mod tests {
         let (mut replay, pull, cap, _) = test_ticket();
         replay.available_seconds = 20_000;
         Review {
+            alternative_pulls: Default::default(),
             replay,
             pulls: (0..12)
                 .map(|i| {

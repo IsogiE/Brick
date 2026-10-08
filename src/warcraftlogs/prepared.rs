@@ -210,7 +210,7 @@ impl Cache {
         let generation = crate::guild::request_generation();
         if self.suspended
             || age >= RETENTION
-            || review.pulls.len() > PULL_CAPACITY
+            || review.candidate_count() > PULL_CAPACITY
             || crate::guild::ensure_current(generation).is_err()
         {
             return;
@@ -225,9 +225,9 @@ impl Cache {
             || self
                 .entries
                 .iter()
-                .map(|e| e.review.pulls.len())
+                .map(|e| e.review.candidate_count())
                 .sum::<usize>()
-                + review.pulls.len()
+                + review.candidate_count()
                 > PULL_CAPACITY
         {
             self.entries.remove(0);
@@ -254,7 +254,12 @@ impl Cache {
             let Some(cap) = entry.review.content_capability.as_ref() else {
                 continue;
             };
-            for pull in &entry.review.pulls {
+            for pull in entry
+                .review
+                .pulls
+                .iter()
+                .chain(&entry.review.alternative_pulls)
+            {
                 let wanted = Key::new(&entry.review.replay, pull, cap, key.auth_epoch);
                 if wanted.same_recording_report(key) {
                     if let Some(alignment) = clock.alignment(&wanted) {
@@ -273,6 +278,7 @@ impl Cache {
                     .retain(|(saved, _)| !saved.same_recording_report(key));
                 entry.clocks.push((key.clone(), clock.clone()));
             }
+            entry.review.prefer_verified_pulls();
         }
         self.changed();
     }
@@ -307,7 +313,7 @@ impl Cache {
         status: (u64, bool),
         clocks: Vec<(Key, RecordingClock)>,
     ) {
-        if self.suspended || review.pulls.len() > PULL_CAPACITY {
+        if self.suspended || review.candidate_count() > PULL_CAPACITY {
             return;
         }
         let Some(identity) = source_identity(stream) else {
@@ -337,9 +343,9 @@ impl Cache {
             || self
                 .entries
                 .iter()
-                .map(|entry| entry.review.pulls.len())
+                .map(|entry| entry.review.candidate_count())
                 .sum::<usize>()
-                + review.pulls.len()
+                + review.candidate_count()
                 > PULL_CAPACITY
         {
             self.entries.remove(0);
@@ -398,11 +404,13 @@ pub(crate) fn clocks(
     mut lookup: impl FnMut(&Key) -> Option<RecordingClock>,
 ) -> Vec<(Key, RecordingClock)> {
     let Some(cap) = review.content_capability.clone() else {
+        review.prefer_verified_pulls();
         return Vec::new();
     };
+    let candidates: Vec<_> = review.pull_candidates().cloned().collect();
     let preferred = preferred.and_then(|pull| review.matching_pull(pull));
     let mut keys = Vec::new();
-    for pull in preferred.into_iter().chain(review.pulls.iter()) {
+    for pull in preferred.into_iter().chain(candidates.iter()) {
         let key = Key::new(&review.replay, pull, &cap, epoch);
         if !keys
             .iter()
@@ -423,7 +431,7 @@ pub(crate) fn clocks(
         let Some(clock) = clock else {
             continue;
         };
-        for pull in &review.pulls {
+        for pull in &candidates {
             let wanted = Key::new(&review.replay, pull, &cap, epoch);
             if wanted.same_recording_report(&key) {
                 if let Some(alignment) = clock.alignment(&wanted) {
@@ -435,6 +443,7 @@ pub(crate) fn clocks(
         }
         clocks.push((key, clock));
     }
+    review.prefer_verified_pulls();
     clocks
 }
 
@@ -462,6 +471,7 @@ mod tests {
             replay_end_ms: None,
         };
         let review = Review {
+            alternative_pulls: Default::default(),
             replay,
             pulls: vec![pull],
             content_capability: Some(cap),
@@ -572,7 +582,10 @@ mod tests {
         cache.age_for_test(Duration::from_secs(11));
         assert!(cache.get(&stream).is_none());
         assert!(!cache.contains(&stream));
-        assert_eq!(cache.for_display(&stream).unwrap().review.pulls.len(), 1);
+        assert_eq!(
+            cache.for_display(&stream).unwrap().review.candidate_count(),
+            1
+        );
         cache.age_for_test(RETENTION);
         assert!(cache.for_display(&stream).is_none());
         cache.insert(
@@ -682,6 +695,97 @@ mod tests {
         });
         assert_eq!(calls, 2);
         assert!(review.content_timing.is_empty());
+    }
+
+    #[test]
+    fn duplicate_reports_keep_own_clocks_through_refresh_without_new_jobs() {
+        let (_, mut review, saved) = fixture();
+        let original = review.pulls[0].clone();
+        let mut calibrated = original.clone();
+        calibrated.report = "ZYXWzyxw87654321".into();
+        calibrated.id += 40;
+        calibrated.report_start_ms += 5_000;
+        calibrated.start_ms += 1_127;
+        calibrated.end_ms += 1_117;
+        calibrated.friendly_players = Some(vec![17, 23]);
+        review.pulls[0].friendly_players = Some(vec![1, 2]);
+        review.pulls.push(calibrated.clone());
+        let mut own_clock = saved[0].1.clone();
+        own_clock.report_start_ms = calibrated.report_start_ms;
+        own_clock.report_seconds =
+            (calibrated.start_ms - calibrated.report_start_ms) as f64 / 1000.0;
+        own_clock.video_seconds = 73.125;
+        let epoch = saved[0].0.auth_epoch;
+        for _ in 0..2 {
+            let mut calls = Vec::new();
+            super::clocks(&mut review, None, epoch, |key| {
+                calls.push(key.report.clone());
+                (key.report == calibrated.report).then(|| own_clock.clone())
+            });
+            calls.sort();
+            calls.dedup();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(review.pulls.len(), 1);
+            assert_eq!(review.pulls[0].report, calibrated.report);
+            assert_eq!(review.pulls[0].id, calibrated.id);
+            assert_eq!(review.pulls[0].friendly_players, Some(vec![17, 23]));
+            assert_eq!(
+                review.alternative_pulls[0].friendly_players,
+                Some(vec![1, 2])
+            );
+            let alignment = review.content_alignment(&calibrated).unwrap();
+            assert_eq!(alignment.key.report, calibrated.report);
+            assert_eq!(alignment.result.video_seconds, 73.125);
+            assert!(review.content_alignment(&original).is_none());
+            let plan = crate::content_alignment::sampling::Snapshot::default().plan(&review, epoch);
+            assert!(plan.next.is_none() && plan.pending.is_none());
+        }
+        for invalid in 0..4 {
+            let mut wrong = own_clock.clone();
+            match invalid {
+                0 => wrong.report_start_ms += 1,
+                1 => wrong.timeline.duration_seconds += 1.0,
+                2 => wrong.timeline.revision = "0".repeat(64),
+                _ => wrong.expires_at = 0,
+            }
+            super::clocks(&mut review, None, epoch, |key| {
+                (key.report == calibrated.report).then(|| wrong.clone())
+            });
+            assert_eq!(review.pulls[0].report, original.report);
+            assert!(review.content_timing.is_empty());
+            assert_eq!(review.candidate_count(), 2);
+        }
+        super::clocks(&mut review, None, epoch, |key| {
+            (key.report == calibrated.report).then(|| own_clock.clone())
+        });
+        assert_eq!(review.pulls[0].report, calibrated.report);
+        super::clocks(&mut review, None, epoch, |_| None);
+        assert_eq!(review.pulls[0].report, original.report);
+        assert!(review.content_timing.is_empty());
+    }
+
+    #[test]
+    fn promotion_retains_pending_sample_under_its_original_report() {
+        let (_, mut review, saved) = fixture();
+        let mut alternative = review.pulls[0].clone();
+        alternative.report = "ZYXWzyxw87654321".into();
+        alternative.start_ms += 1_000;
+        alternative.end_ms += 1_000;
+        review.pulls.push(alternative.clone());
+        super::clocks(&mut review, None, saved[0].0.auth_epoch, |key| {
+            (key.report == alternative.report).then(|| saved[0].1.clone())
+        });
+        let mut ticket = crate::content_alignment::test_ticket().3;
+        ticket.job.status = crate::content_alignment::Status::Running;
+        ticket.job.result = None;
+        let samples = crate::content_alignment::sampling::Snapshot {
+            tickets: vec![ticket.clone()],
+            planned: None,
+        };
+        let plan = samples.plan(&review, saved[0].0.auth_epoch);
+        assert_eq!(plan.pending.unwrap().key.report, ticket.key.report);
+        assert_eq!(review.alternative_pulls[0].report, ticket.key.report);
+        assert!(plan.next.is_none());
     }
 
     #[test]
