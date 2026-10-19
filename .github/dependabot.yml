@@ -1,6 +1,9 @@
 version: 2
 updates:
   - package-ecosystem: github-actions
+    # Review dependency updates during active development.
+    open-pull-requests-limit: 0
+    rebase-strategy: disabled
     directory: /
     schedule:
       interval: weekly
@@ -9,6 +12,9 @@ updates:
         patterns:
           - "github/codeql-action/*"
   - package-ecosystem: cargo
+    # Review dependency updates during active development.
+    open-pull-requests-limit: 0
+    rebase-strategy: disabled
     directory: /
     schedule:
       interval: weekly
