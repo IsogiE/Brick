@@ -3,6 +3,11 @@ unsound = "all"
 # GTK3/WebKit's build-time macro stack requires this crate. This advisory is
 # maintenance status, not a reported vulnerability; no compatible fix exists.
 # Revisit when Wry/WebKit can migrate off gtk-rs 0.18. Other advisories stay fatal.
+# These three notices report upstream crate consolidation, not vulnerabilities.
+# Accessibility/tray dependencies still require zbus 5; revisit when they support zbus 6.
 ignore = [
   { id = "RUSTSEC-2024-0370", reason = "Required build-time proc-macro-error in GTK3/WebKit; no compatible maintained replacement is available upstream." },
+  { id = "RUSTSEC-2026-0370", reason = "Maintenance-only: zvariant was merged into zbus 6; current accessibility/tray dependencies still require zbus 5 and zvariant 5." },
+  { id = "RUSTSEC-2026-0371", reason = "Maintenance-only: zbus_names was merged into zbus 6; current accessibility dependencies still require zbus_names 4." },
+  { id = "RUSTSEC-2026-0372", reason = "Maintenance-only: zvariant_derive was merged into zbus 6; it remains required by the upstream zvariant 5 dependency." },
 ]
