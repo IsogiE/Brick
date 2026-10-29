@@ -410,7 +410,7 @@ pub(crate) fn clocks(
     review: &mut Review,
     preferred: Option<&Pull>,
     epoch: u64,
-    mut lookup: impl FnMut(&Key) -> RecordingLookup,
+    mut lookup: impl FnMut(&Key, &[Key]) -> RecordingLookup,
 ) -> Vec<(Key, RecordingClock)> {
     // Absence and bridge authority are never cached. Even skipped/failed lookups
     // revoke the old derived proof before any viewer or sampling path sees it.
@@ -440,10 +440,43 @@ pub(crate) fn clocks(
     let mut fresh = Vec::new();
     let mut absent = Vec::new();
     for key in keys {
-        let state = lookup(&key);
+        // Every candidate pull of the report goes in the one request, so the
+        // server can place each through the recording's arrival clock.
+        let pull_keys: Vec<Key> = candidates
+            .iter()
+            .filter(|pull| pull.report == key.report && pull.report_start_ms == key.report_start_ms)
+            .take(256)
+            .map(|pull| Key::new(&review.replay, pull, &cap, epoch))
+            .collect();
+        let state = lookup(&key, &pull_keys);
         review.content_timing.retain(|_, alignment| {
             !alignment.shared_clock || !alignment.key.same_recording_report(&key)
         });
+        if let RecordingLookup::Pulls(list) = &state {
+            let mut any = false;
+            for item in list {
+                let Some(clock) = &item.clock else { continue };
+                let Some(wanted) = pull_keys.iter().find(|k| k.start_ms == item.start_ms) else {
+                    continue;
+                };
+                let Some(mut alignment) = clock.alignment(wanted) else { continue };
+                alignment.needs_read = Some(item.needs_read);
+                review
+                    .content_timing
+                    .insert((wanted.report.clone(), wanted.pull_id), alignment);
+                // A per-pull clock is exact for its own pull only; the bridge
+                // keeps one source anchor per report as before.
+                if !any {
+                    fresh.push((wanted.clone(), clock.clone()));
+                }
+                clocks.push((wanted.clone(), clock.clone()));
+                any = true;
+            }
+            if !any {
+                absent.push(key.clone());
+            }
+            continue;
+        }
         if matches!(state, RecordingLookup::Absent) {
             absent.push(key.clone());
         }
@@ -573,6 +606,7 @@ fn derived_alignment(
     Some(Alignment {
         key: key.clone(),
         shared_clock: false,
+        needs_read: None,
         derived: Some(derived.clone()),
         timeline: source.timeline.clone(),
         timeline_hash: source.timeline_hash.clone(),
@@ -646,7 +680,7 @@ pub(crate) fn apply_bridge_fixture(
     key: &Key,
     clock: &RecordingClock,
 ) -> Vec<(Key, RecordingClock)> {
-    clocks(review, None, key.auth_epoch, |wanted| {
+    clocks(review, None, key.auth_epoch, |wanted, _| {
         if wanted.report == key.report {
             RecordingLookup::Valid(clock.clone())
         } else {
@@ -669,7 +703,7 @@ mod tests {
         epoch: u64,
         mut lookup: impl FnMut(&Key) -> Option<RecordingClock>,
     ) -> Vec<(Key, RecordingClock)> {
-        super::clocks(review, preferred, epoch, |key| {
+        super::clocks(review, preferred, epoch, |key, _| {
             lookup(key).map_or(RecordingLookup::Absent, RecordingLookup::Valid)
         })
     }
@@ -777,7 +811,7 @@ mod tests {
             let early = review.pulls[0].clone();
             apply_bridge_fixture(&mut review, &key, &clock);
             assert!(review.content_alignment(&early).is_some());
-            super::clocks(&mut review, None, 0, |wanted| {
+            super::clocks(&mut review, None, 0, |wanted, _| {
                 if wanted.report == key.report {
                     RecordingLookup::Valid(clock.clone())
                 } else {
@@ -790,7 +824,7 @@ mod tests {
             let (mut review, key, clock) = bridge_fixture();
             let early = review.pulls[0].clone();
             apply_bridge_fixture(&mut review, &key, &clock);
-            super::clocks(&mut review, None, 0, |wanted| {
+            super::clocks(&mut review, None, 0, |wanted, _| {
                 if wanted.report != key.report {
                     return RecordingLookup::Absent;
                 }
@@ -1019,6 +1053,69 @@ mod tests {
         assert!(cache.get(&restarted).is_some());
         cache.set_connected(false);
         assert!(cache.for_display(&restarted).is_none());
+    }
+
+    #[test]
+    fn per_pull_clocks_place_only_their_own_pulls_and_carry_the_read_flag() {
+        let (_, mut review, saved) = fixture();
+        let mut second = review.pulls[0].clone();
+        second.id += 1;
+        second.start_ms += 60_000;
+        second.end_ms += 60_000;
+        review.pulls.push(second.clone());
+        let epoch = saved[0].0.auth_epoch;
+        let base = test_recording_clock();
+        let mut asked = Vec::new();
+        let clocks = super::clocks(&mut review, None, epoch, |key, pulls| {
+            asked = pulls.iter().map(|k| k.start_ms).collect();
+            let mut placed = base.clone();
+            placed.report_seconds = (second.start_ms - key.report_start_ms) as f64 / 1000.0;
+            placed.video_seconds = base.video_seconds + 60.4;
+            RecordingLookup::Pulls(vec![
+                crate::content_alignment::PullClock {
+                    start_ms: review_start(&pulls[0]),
+                    clock: None,
+                    needs_read: true,
+                    verified: false,
+                    reads: 0,
+                },
+                crate::content_alignment::PullClock {
+                    start_ms: second.start_ms,
+                    clock: Some(placed),
+                    needs_read: true,
+                    verified: false,
+                    reads: 0,
+                },
+            ])
+        });
+        assert_eq!(asked, vec![review.pulls[0].start_ms, second.start_ms]);
+        assert!(review.content_alignment(&review.pulls[0]).is_none(), "no clock, no extrapolation");
+        let placed = review.content_alignment(&second).unwrap();
+        assert_eq!(placed.needs_read, Some(true));
+        assert!((placed.result.video_seconds - (base.video_seconds + 60.4)).abs() < 1e-6);
+        assert_eq!(clocks.len(), 1);
+        assert_eq!(clocks[0].0.pull_id, second.id, "saved per pull, not per report");
+        // No clock for any pull of the report counts as an absent report.
+        let none = super::clocks(&mut review, None, epoch, |_, pulls| {
+            RecordingLookup::Pulls(
+                pulls
+                    .iter()
+                    .map(|k| crate::content_alignment::PullClock {
+                        start_ms: k.start_ms,
+                        clock: None,
+                        needs_read: true,
+                        verified: false,
+                        reads: 0,
+                    })
+                    .collect(),
+            )
+        });
+        assert!(none.is_empty());
+        assert!(review.content_alignment(&second).is_none());
+    }
+
+    fn review_start(key: &Key) -> i64 {
+        key.start_ms
     }
 
     #[test]

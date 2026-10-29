@@ -15,6 +15,12 @@ use std::{
 const MAX_BYTES: usize = 2 * 1024 * 1024 - 128;
 const MAX_RECORDINGS: usize = 64;
 const MAX_PULLS: usize = 4096;
+
+/// Saved clocks are per pull: the server places each pull through the
+/// recording's arrival clock, so one report's clock no longer covers others.
+fn clock_key(report: &str, pull_id: u64) -> String {
+    format!("{report}#{pull_id}")
+}
 const MAX_REPORTS: usize = 128;
 pub(super) const AGE: Duration = Duration::from_secs(21 * 24 * 60 * 60);
 
@@ -163,15 +169,17 @@ impl Cache {
         if let Some(cap) = capability {
             let mut seen = BTreeSet::new();
             for pull in &review.pulls {
-                let Some(clock) = recording.clocks.get(&pull.report) else {
+                // Clocks are saved per pull; the server places each pull itself.
+                let Some(clock) = recording.clocks.get(&clock_key(&pull.report, pull.id)) else {
                     continue;
                 };
                 let key = Key::new(&review.replay, pull, cap, epoch);
-                if let Some(alignment) = clock.alignment(&key) {
+                if let Some(mut alignment) = clock.alignment(&key) {
+                    alignment.needs_read = Some(false);
                     review
                         .content_timing
                         .insert((pull.report.clone(), pull.id), alignment);
-                    if seen.insert(pull.report.clone()) {
+                    if seen.insert((pull.report.clone(), pull.id)) {
                         clocks.push((key, clock.clone()));
                     }
                 }
@@ -234,7 +242,7 @@ impl Cache {
         {
             recording.clocks = clocks
                 .iter()
-                .map(|(key, clock)| (key.report.clone(), clock.clone()))
+                .map(|(key, clock)| (clock_key(&key.report, key.pull_id), clock.clone()))
                 .collect();
             self.save(access);
         }
@@ -303,7 +311,7 @@ impl Cache {
                 .collect(),
             clocks: clocks
                 .iter()
-                .map(|(key, clock)| (key.report.clone(), clock.clone()))
+                .map(|(key, clock)| (clock_key(&key.report, key.pull_id), clock.clone()))
                 .collect(),
             sampling: previous
                 .as_ref()
@@ -442,7 +450,7 @@ fn decode(bytes: &[u8]) -> Option<Document> {
                 || !r.path.starts_with("/v1/streams/")
                 || !valid_replay(&r.replay)
                 || r.pulls.len() > MAX_PULLS
-                || r.clocks.len() > MAX_REPORTS
+                || r.clocks.len() > MAX_PULLS
                 || r.complete_reports.len() > MAX_REPORTS
                 || r.complete_reports
                     .iter()
@@ -584,7 +592,7 @@ mod tests {
             .content_timing
             .values()
             .any(|a| a.derived.is_some()));
-        prepared::clocks(&mut restored, None, 0, |wanted| {
+        prepared::clocks(&mut restored, None, 0, |wanted, _| {
             crate::content_alignment::RecordingLookup::Unavailable(
                 (wanted.report == key.report).then(|| clock.clone()),
             )
@@ -699,7 +707,7 @@ mod tests {
             content_timing: Default::default(),
         };
         let clock = crate::content_alignment::test_recording_clock();
-        let clocks = prepared::clocks(&mut review, None, ticket.key.auth_epoch, |key| {
+        let clocks = prepared::clocks(&mut review, None, ticket.key.auth_epoch, |key, _| {
             (key.report == second.report).then(|| clock.clone()).map_or(
                 crate::content_alignment::RecordingLookup::Absent,
                 crate::content_alignment::RecordingLookup::Valid,

@@ -1311,7 +1311,7 @@ impl Client {
         crate::content_alignment::RecordingClock,
     )> {
         let deadline = Instant::now() + Duration::from_secs(5);
-        prepared::clocks(review, preferred, self.recording_auth_epoch, |key| {
+        prepared::clocks(review, preferred, self.recording_auth_epoch, |key, pulls| {
             let fallback = || {
                 previous
                     .iter()
@@ -1323,7 +1323,7 @@ impl Client {
             if Instant::now() >= deadline || self.cancel.load(Ordering::Relaxed) {
                 return crate::content_alignment::RecordingLookup::Unavailable(fallback());
             }
-            match crate::content_alignment::recording_clock(access, key, &self.cancel) {
+            match crate::content_alignment::recording_clock(access, key, pulls, &self.cancel) {
                 crate::content_alignment::RecordingLookup::Unavailable(_) => {
                     crate::content_alignment::RecordingLookup::Unavailable(fallback())
                 }

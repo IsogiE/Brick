@@ -498,6 +498,41 @@ impl Snapshot {
                 }
             }
         }
+        // Per-pull clocks carry the server's read policy: a pull it flags is
+        // the next sample, and a report it has not placed at all gets its
+        // first read. Nothing else is sampled once the server places pulls.
+        let policy = review
+            .content_timing
+            .values()
+            .any(|alignment| alignment.needs_read.is_some());
+        let flagged = |pull: &Pull| {
+            review.content_alignment(pull).map_or_else(
+                || {
+                    !review
+                        .content_timing
+                        .values()
+                        .any(|a| a.key.report == pull.report && a.needs_read.is_some())
+                },
+                |alignment| alignment.needs_read == Some(true) && alignment.key.auth_epoch == epoch,
+            )
+        };
+        if policy {
+            let budget = |pull: &Pull| {
+                tickets
+                    .iter()
+                    .filter(|t| {
+                        t.key.report == pull.report
+                            && matches!(t.job.status, Status::Failed | Status::Canceled)
+                    })
+                    .count()
+                    < MAX_FAILED_SAMPLES
+            };
+            plan.next = visible
+                .iter()
+                .copied()
+                .find(|p| flagged(p) && ticket_for(p).is_none() && budget(p))
+                .cloned();
+        }
         // Freeze a still-valid choice across refreshes, other viewers' busy work,
         // and restarts. Never evict first samples and then submit them repeatedly.
         if let Some(pull) = self
@@ -524,6 +559,7 @@ impl Snapshot {
                     }))
                     && (review.replay.growing
                         || !review.content_alignment(p).is_some_and(|a| a.recording_timing()))
+                    && (!policy || flagged(p))
             })
         {
             plan.next = Some(pull.clone());
@@ -730,6 +766,43 @@ mod tests {
         let alignment = review.content_alignment(&exact).unwrap();
         assert_eq!(alignment.key, ticket.key);
         assert!(alignment.derived.is_none());
+    }
+
+    #[test]
+    fn server_read_flags_choose_the_next_sample_and_silence_the_old_schedule() {
+        let mut review = review();
+        for (i, pull) in review.pulls.clone().iter().enumerate() {
+            let mut alignment = ticket(&review, pull, 0.0).alignment().unwrap();
+            alignment.shared_clock = true;
+            alignment.needs_read = Some(i == 3);
+            review
+                .content_timing
+                .insert((pull.report.clone(), pull.id), alignment);
+        }
+        let plan = Snapshot::default().plan(&review, 0);
+        assert_eq!(plan.next.as_ref().map(|p| p.id), Some(review.pulls[3].id));
+        for alignment in review.content_timing.values_mut() {
+            alignment.needs_read = Some(false);
+        }
+        assert!(Snapshot::default().plan(&review, 0).next.is_none());
+        // A report the server has not placed at all still gets its first read,
+        // and a pending sample holds everything else.
+        let mut other = review.pulls[0].clone();
+        other.report = "OtherReport00001".into();
+        other.id = 99;
+        other.start_ms += 7_200_000;
+        other.end_ms += 7_200_000;
+        review.pulls.push(other.clone());
+        assert_eq!(
+            Snapshot::default().plan(&review, 0).next.as_ref().map(|p| p.id),
+            Some(99)
+        );
+        let mut saved = Snapshot::default();
+        let mut pending = ticket(&review, &other, 0.0);
+        pending.job.status = Status::Pending;
+        pending.job.result = None;
+        saved.remember(pending);
+        assert!(saved.plan(&review, 0).next.is_none());
     }
 
     #[test]
@@ -1073,7 +1146,7 @@ mod tests {
         };
         let own_clock = clock_from(&measured.alignment().unwrap());
         let other_clock = clock_from(review.content_alignment(&review.pulls[1]).unwrap());
-        crate::warcraftlogs::prepared::clocks(&mut review, None, 0, |key| {
+        crate::warcraftlogs::prepared::clocks(&mut review, None, 0, |key, _| {
             RecordingLookup::Valid(if key.report == originals[0].report {
                 own_clock.clone()
             } else {
