@@ -1,15 +1,46 @@
-# Manually requested candidates only; final update signing and publication run locally.
+# Releases itself: once every required check passes on main and the Cargo.toml
+# version is not yet published, this builds, signs and publishes that version.
 name: Release
 'on':
+  workflow_run:
+    workflows: [CI, Security, CodeQL analysis]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      version:
-        description: Version of the unpublished release candidate
-        required: true
+concurrency:
+  group: release
+  cancel-in-progress: false
 env:
   BRICK_WINDOWS_SIGNING: certum
 jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: read
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      commit: ${{ steps.plan.outputs.commit }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+        ref: main
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      with:
+        node-version: 22.23.2
+        package-manager-cache: false
+    - name: Decide whether main has an unpublished version
+      id: plan
+      env:
+        GH_TOKEN: ${{ github.token }}
+        BRICK_FEED_TOKEN: ${{ secrets.BRICK_RELEASE_TOKEN }}
+      run: node scripts/plan-release.mjs
   build-linux:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
     runs-on: ${{ fromJSON(vars.BRICK_RELEASE_LINUX_RUNNER || '"ubuntu-24.04"') }}
     timeout-minutes: 180
     permissions:
@@ -20,6 +51,7 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         persist-credentials: false
+        ref: ${{ needs.plan.outputs.commit }}
     - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
       with:
         node-version: 22.23.2
@@ -71,7 +103,7 @@ jobs:
         echo "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  $RUNNER_TEMP/appimage-runtime/runtime-x86_64" | sha256sum -c -
     - name: Configure version
       env:
-        BRICK_APP_VERSION: ${{ inputs.version }}
+        BRICK_APP_VERSION: ${{ needs.plan.outputs.version }}
       run: node scripts/set-app-version.mjs
     - name: Verify Twitch connection config
       env:
@@ -121,6 +153,8 @@ jobs:
         if-no-files-found: error
         retention-days: 14
   build-windows:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
     runs-on: ${{ fromJSON(vars.BRICK_RELEASE_WINDOWS_RUNNER || '"windows-latest"') }}
     timeout-minutes: 180
     permissions:
@@ -132,6 +166,7 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         persist-credentials: false
+        ref: ${{ needs.plan.outputs.commit }}
     - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
       with:
         node-version: 22.23.2
@@ -153,7 +188,7 @@ jobs:
       run: cargo install cargo-packager --version 0.11.8 --locked
     - name: Configure version
       env:
-        BRICK_APP_VERSION: ${{ inputs.version }}
+        BRICK_APP_VERSION: ${{ needs.plan.outputs.version }}
       run: node scripts/set-app-version.mjs
     - name: Verify Twitch connection config
       env:
@@ -269,3 +304,42 @@ jobs:
         path: dist/packages/*-setup.exe
         if-no-files-found: error
         retention-days: 14
+  publish:
+    needs: [plan, build-linux, build-windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      security-events: read
+      attestations: read
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+        ref: ${{ needs.plan.outputs.commit }}
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      with:
+        node-version: 22.23.2
+        package-manager-cache: false
+    - name: Install Windows publisher verification
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y osslsigncode
+    - name: Download this run's attested candidates
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/candidates"
+    - name: Verify, sign and publish the update feed
+      env:
+        GH_TOKEN: ${{ github.token }}
+        BRICK_FEED_TOKEN: ${{ secrets.BRICK_RELEASE_TOKEN }}
+        BRICK_APP_UPDATE_KEY_B64: ${{ secrets.BRICK_APP_UPDATE_KEY_B64 }}
+        VERSION: ${{ needs.plan.outputs.version }}
+        COMMIT: ${{ needs.plan.outputs.commit }}
+      run: |
+        mkdir -m 700 "$RUNNER_TEMP/signed"
+        node scripts/publish-app-feed.mjs --version "$VERSION" --commit "$COMMIT" \
+          --assets "$RUNNER_TEMP/candidates" --run "$GITHUB_RUN_ID" --output "$RUNNER_TEMP/signed" --publish

@@ -55,6 +55,8 @@ Then run `cargo packager --release --formats nsis` on Windows, or `NO_STRIP=1 ca
 
 Linux CI and releases use the prebuilt WebKit runtime pinned in `packaging/linux/runtime.lock.json`. They verify its immutable release metadata, SHA-256 and archive contents before installation. CI exercises JavaScript and H.264 playback with that runtime before compiling Brick. The separate `packaging/linux/build-runtime-artifact.sh` recipe builds a replacement runtime on Ubuntu 24.04; ordinary Brick releases do not compile WebKit.
 
+Releases are automatic. Merge a version bump (`npm run version:release` with `BRICK_APP_VERSION` set) to main; once CI, Security and CodeQL pass on that commit, the Release workflow builds on GitHub-hosted runners, signs the Windows binaries through Certum SimplySign, verifies the attested candidates and publishes them to Brick-Releases with the signed update feed. It needs the `release` environment secrets `BRICK_CERTUM_USERNAME`, `BRICK_CERTUM_OTP_URI` and `BRICK_APP_UPDATE_KEY_B64` (base64 PKCS#8 Ed25519 update key), plus the `BRICK_RELEASE_TOKEN` repository secret for Brick-Releases. Running Release by hand retries the current main commit.
+
 ## Working on the code
 
 | Path | Contents |
