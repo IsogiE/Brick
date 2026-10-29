@@ -860,8 +860,10 @@ impl ReviewUi {
                                 } else if matches!(action, Some(Action::SaveCooldowns(_))) {
                                     self.cooldown_notice = Some(error);
                                 } else {
-                                    if matches!(action, Some(Action::Refresh | Action::Report(..))) {
-                                        self.refresh_failures = self.refresh_failures.saturating_add(1);
+                                    if matches!(action, Some(Action::Refresh | Action::Report(..)))
+                                    {
+                                        self.refresh_failures =
+                                            self.refresh_failures.saturating_add(1);
                                     }
                                     self.notice = Some(error);
                                 }
@@ -5309,8 +5311,14 @@ mod tests {
         assert_eq!(fail(&mut ui, throttled), Duration::from_secs(5));
         assert!(ui.review.is_none() && ui.finding_pulls());
         assert_eq!(fail(&mut ui, throttled), Duration::from_secs(15));
-        assert_eq!(fail(&mut ui, "Couldn't reach Brick Server."), Duration::from_secs(30));
-        assert!(!ui.finding_pulls(), "A visible error is not a loading state");
+        assert_eq!(
+            fail(&mut ui, "Couldn't reach Brick Server."),
+            Duration::from_secs(30)
+        );
+        assert!(
+            !ui.finding_pulls(),
+            "A visible error is not a loading state"
+        );
         assert_eq!(fail(&mut ui, throttled), Duration::from_secs(60));
         assert_eq!(fail(&mut ui, throttled), Duration::from_secs(60));
 
