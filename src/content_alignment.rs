@@ -181,6 +181,8 @@ pub(crate) struct Ticket {
 pub(crate) struct Alignment {
     pub key: Key,
     pub shared_clock: bool,
+    /// Set when the server placed this pull itself: whether it wants a read of it.
+    pub needs_read: Option<bool>,
     /// Local proof from direct clocks and matching report metadata; never serialized.
     pub derived: Option<std::sync::Arc<DerivedTiming>>,
     pub result: ResultData,
@@ -319,6 +321,7 @@ impl RecordingClock {
         Some(Alignment {
             key: key.clone(),
             shared_clock: true,
+            needs_read: None,
             derived: None,
             timeline: self.timeline.clone(),
             timeline_hash: self.timeline_hash.clone(),
@@ -493,6 +496,7 @@ impl Ticket {
         Some(Alignment {
             key: self.key.clone(),
             shared_clock: false,
+            needs_read: None,
             derived: None,
             result: self.job.result.clone()?,
             timeline: scope.timeline.clone(),
@@ -518,11 +522,35 @@ struct RecordingResponse {
     clock: Option<RecordingClock>,
     pending: bool,
     conflict: bool,
+    /// The server describes the recording's arrival clock (fitted from
+    /// Twitch ingest stamps, or bare) next to per-pull clocks; the client
+    /// only needs the placements themselves.
+    #[serde(default, rename = "arrival")]
+    _arrival: serde::de::IgnoredAny,
+    #[serde(default)]
+    pulls: Option<Vec<PullClock>>,
+}
+/// One pull placed by the server through the recording's arrival clock and
+/// the report's reads. `needs_read` asks this client for an automatic sample.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PullClock {
+    pub start_ms: i64,
+    pub clock: Option<RecordingClock>,
+    pub needs_read: bool,
+    /// Report state the server reports alongside the placement; the client
+    /// acts on `needs_read` and keeps these for the response contract.
+    #[allow(dead_code)]
+    pub verified: bool,
+    #[allow(dead_code)]
+    pub reads: u64,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum RecordingLookup {
     Valid(RecordingClock),
+    /// Per-pull clocks for one report; every pull asked for has an entry.
+    Pulls(Vec<PullClock>),
     Absent,
     Pending(Option<RecordingClock>),
     Conflict,
@@ -539,11 +567,36 @@ impl RecordingLookup {
     }
 }
 
-fn parse_recording_clock(bytes: &[u8], key: &Key) -> Result<RecordingLookup, String> {
-    if bytes.len() > 32 * 1024 {
+fn parse_recording_clock(
+    bytes: &[u8],
+    key: &Key,
+    pulls: &[Key],
+) -> Result<RecordingLookup, String> {
+    if bytes.len() > 256 * 1024 {
         return Err(INVALID.into());
     }
     let response: RecordingResponse = serde_json::from_slice(bytes).map_err(|_| INVALID)?;
+    if let Some(list) = response.pulls {
+        if response.clock.is_some() || response.conflict || list.len() > pulls.len() {
+            return Err(INVALID.into());
+        }
+        for item in &list {
+            let Some(wanted) = pulls
+                .iter()
+                .find(|k| k.start_ms == item.start_ms && k.same_recording_report(key))
+            else {
+                return Err(INVALID.into());
+            };
+            if item
+                .clock
+                .as_ref()
+                .is_some_and(|clock| clock.alignment(wanted).is_none())
+            {
+                return Err(INVALID.into());
+            }
+        }
+        return Ok(RecordingLookup::Pulls(list));
+    }
     if response.conflict && (response.clock.is_some() || response.pending) {
         return Err(INVALID.into());
     }
@@ -568,9 +621,10 @@ fn parse_recording_clock(bytes: &[u8], key: &Key) -> Result<RecordingLookup, Str
 pub(crate) fn recording_clock(
     access: &guild::Access,
     key: &Key,
+    pulls: &[Key],
     cancel: &AtomicBool,
 ) -> RecordingLookup {
-    match fetch_recording_clock(access, key, cancel) {
+    match fetch_recording_clock(access, key, pulls, cancel) {
         Ok(state) => state,
         Err(error) if error == INVALID => RecordingLookup::Invalid,
         Err(_) => RecordingLookup::Unavailable(None),
@@ -579,30 +633,37 @@ pub(crate) fn recording_clock(
 fn fetch_recording_clock(
     access: &guild::Access,
     key: &Key,
+    pulls: &[Key],
     cancel: &AtomicBool,
 ) -> Result<RecordingLookup, String> {
     current(access, key, cancel)?;
     let url = access
         .endpoint(&format!("{PATH}/recording"))
         .map_err(|_| INVALID)?;
+    let mut body = serde_json::json!({
+        "provider": key.provider.key(), "videoId": key.video_id,
+        "report": key.report, "reportStartMs": key.report_start_ms,
+    });
+    // One request per report places every listed pull through the server's
+    // arrival clock; an empty list keeps the released single-clock answer.
+    if !pulls.is_empty() {
+        body["pulls"] = serde_json::json!(pulls.iter().map(|k| k.start_ms).collect::<Vec<_>>());
+    }
     let response = crate::presence::http_client()
         .map_err(|_| TEMPORARY)?
         .post(url)
         .timeout(std::time::Duration::from_secs(2))
         .bearer_auth(access.secret())
-        .json(&serde_json::json!({
-            "provider": key.provider.key(), "videoId": key.video_id,
-            "report": key.report, "reportStartMs": key.report_start_ms,
-        }))
+        .json(&body)
         .send()
         .map_err(|_| TEMPORARY)?;
     if !response.status().is_success() {
         return Err(TEMPORARY.into());
     }
-    let bytes = crate::download::read_response(response, 32 * 1024, "Video timing")
+    let bytes = crate::download::read_response(response, 256 * 1024, "Video timing")
         .map_err(|_| TEMPORARY)?;
     current(access, key, cancel)?;
-    parse_recording_clock(&bytes, key)
+    parse_recording_clock(&bytes, key, pulls)
 }
 
 fn parse(bytes: &[u8]) -> Result<Job, String> {
@@ -1144,7 +1205,8 @@ mod tests {
             &serde_json::json!({"clock":clock,"pending":false,"conflict":false}),
         )
         .unwrap();
-        let RecordingLookup::Valid(received) = parse_recording_clock(&bytes, &key).unwrap() else {
+        let RecordingLookup::Valid(received) = parse_recording_clock(&bytes, &key, &[]).unwrap()
+        else {
             panic!("expected direct clock");
         };
         let alignment = received.alignment(&key).unwrap();
@@ -1159,28 +1221,90 @@ mod tests {
                 2 => wrong.started_at = "2026-09-04T17:04:02Z".into(),
                 _ => wrong.timeline_revision = Some("f".repeat(64)),
             }
-            assert!(parse_recording_clock(&bytes, &wrong).is_err());
+            assert!(parse_recording_clock(&bytes, &wrong, &[]).is_err());
         }
         assert!(matches!(
-            parse_recording_clock(br#"{"clock":null,"pending":false,"conflict":true}"#, &key)
-                .unwrap(),
+            parse_recording_clock(
+                br#"{"clock":null,"pending":false,"conflict":true}"#,
+                &key,
+                &[]
+            )
+            .unwrap(),
             RecordingLookup::Conflict
         ));
         assert!(matches!(
-            parse_recording_clock(br#"{"clock":null,"pending":false,"conflict":false}"#, &key)
-                .unwrap(),
+            parse_recording_clock(
+                br#"{"clock":null,"pending":false,"conflict":false}"#,
+                &key,
+                &[]
+            )
+            .unwrap(),
             RecordingLookup::Absent
         ));
         assert!(matches!(
-            parse_recording_clock(br#"{"clock":null,"pending":true,"conflict":false}"#, &key)
-                .unwrap(),
+            parse_recording_clock(
+                br#"{"clock":null,"pending":true,"conflict":false}"#,
+                &key,
+                &[]
+            )
+            .unwrap(),
             RecordingLookup::Pending(None)
         ));
+        assert!(parse_recording_clock(
+            br#"{"clock":null,"pending":true,"conflict":true}"#,
+            &key,
+            &[]
+        )
+        .is_err());
+        assert!(parse_recording_clock(&vec![b' '; 256 * 1024 + 1], &key, &[]).is_err());
+    }
+
+    #[test]
+    fn per_pull_lookup_carries_the_servers_read_policy_for_exactly_the_pulls_asked() {
+        let (replay, pull, cap, _) = test_ticket();
+        let mut later = pull.clone();
+        later.id += 1;
+        later.start_ms += 60_000;
+        later.end_ms += 60_000;
+        let keys = [
+            Key::new(&replay, &pull, &cap, 0),
+            Key::new(&replay, &later, &cap, 0),
+        ];
+        let mut clock = test_recording_clock();
+        clock.video_seconds = 321.73475;
+        clock.uncertainty_seconds = 0.95;
+        clock.timeline.raw_started_at_ms = replay.start_ms().ok();
+        let response = serde_json::json!({"clock":null,"pending":false,"conflict":false,
+            "arrival":{"bare":false,"spans":1,"steps":0,"samples":300},
+            "pulls":[{"startMs":pull.start_ms,"clock":clock,"needsRead":true,"verified":false,"reads":1},
+                     {"startMs":later.start_ms,"clock":null,"needsRead":false,"verified":false,"reads":1}]});
+        let bytes = serde_json::to_vec(&response).unwrap();
+        let RecordingLookup::Pulls(list) = parse_recording_clock(&bytes, &keys[0], &keys).unwrap()
+        else {
+            panic!("expected per-pull clocks");
+        };
+        assert_eq!(list.len(), 2);
+        assert!(list[0].needs_read && !list[0].verified);
+        let placed = list[0].clock.as_ref().unwrap().alignment(&keys[0]).unwrap();
+        assert!((placed.result.video_seconds - 321.73475).abs() < 0.000001);
+        assert!((placed.result.uncertainty_seconds - 0.95).abs() < 0.000001);
+        assert!(list[1].clock.is_none());
+        // A pull that was not asked for, a clock that does not fit its pull,
+        // and a mixed single-clock answer are all rejected.
+        assert!(parse_recording_clock(&bytes, &keys[0], &keys[..1]).is_err());
+        let mut shifted = keys.clone();
+        shifted[0].report_start_ms += 1;
+        assert!(parse_recording_clock(&bytes, &shifted[0], &shifted).is_err());
+        let mut mixed = response.clone();
+        mixed["clock"] = serde_json::to_value(&clock).unwrap();
         assert!(
-            parse_recording_clock(br#"{"clock":null,"pending":true,"conflict":true}"#, &key)
-                .is_err()
+            parse_recording_clock(&serde_json::to_vec(&mixed).unwrap(), &keys[0], &keys).is_err()
         );
-        assert!(parse_recording_clock(&vec![b' '; 32769], &key).is_err());
+        let legacy = serde_json::json!({"clock":clock,"pending":false,"conflict":false});
+        assert!(matches!(
+            parse_recording_clock(&serde_json::to_vec(&legacy).unwrap(), &keys[0], &keys).unwrap(),
+            RecordingLookup::Valid(_)
+        ));
     }
 
     #[test]

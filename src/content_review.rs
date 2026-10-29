@@ -354,7 +354,7 @@ mod tests {
         // A completed job's recording lookup supplies the authoritative mapping.
         let mut refreshed = ui.review.clone().unwrap();
         let clock = crate::content_alignment::test_recording_clock();
-        crate::warcraftlogs::prepared::clocks(&mut refreshed, None, 0, |_| {
+        crate::warcraftlogs::prepared::clocks(&mut refreshed, None, 0, |_, _| {
             crate::content_alignment::RecordingLookup::Valid(clock.clone())
         });
         ui.accept_review(refreshed);

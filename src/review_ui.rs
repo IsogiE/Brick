@@ -4127,7 +4127,7 @@ mod tests {
             .collect();
         review.content_timing.clear();
         let clock = crate::content_alignment::test_recording_clock();
-        let clocks = crate::warcraftlogs::prepared::clocks(&mut review, None, 0, |_| {
+        let clocks = crate::warcraftlogs::prepared::clocks(&mut review, None, 0, |_, _| {
             crate::content_alignment::RecordingLookup::Valid(clock.clone())
         });
         let mut sample_review = review.clone();
@@ -4430,11 +4430,15 @@ mod tests {
             content_timing: Default::default(),
         };
         let mut calls = 0;
-        let clocks =
-            crate::warcraftlogs::prepared::clocks(&mut review, None, ticket.key.auth_epoch, |_| {
+        let clocks = crate::warcraftlogs::prepared::clocks(
+            &mut review,
+            None,
+            ticket.key.auth_epoch,
+            |_, _| {
                 calls += 1;
                 crate::content_alignment::RecordingLookup::Valid(clock.clone())
-            });
+            },
+        );
         assert_eq!(calls, 1);
         assert_eq!(review.content_timing.len(), 2);
         let (_, _, mut stream) = fixture();
@@ -4497,7 +4501,7 @@ mod tests {
             fresh.content_timing.clear();
             if !absent {
                 clocks[0].1.video_seconds += 4.0;
-                crate::warcraftlogs::prepared::clocks(&mut fresh, None, epoch, |_| {
+                crate::warcraftlogs::prepared::clocks(&mut fresh, None, epoch, |_, _| {
                     crate::content_alignment::RecordingLookup::Valid(clocks[0].1.clone())
                 });
             }
@@ -4543,7 +4547,7 @@ mod tests {
                 .seek_video_seconds
         );
         let native_before = ui.playback.as_ref().unwrap().seconds;
-        crate::warcraftlogs::prepared::clocks(&mut review, None, 0, |_| {
+        crate::warcraftlogs::prepared::clocks(&mut review, None, 0, |_, _| {
             crate::content_alignment::RecordingLookup::Conflict
         });
         ui.accept_review(review);
