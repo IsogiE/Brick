@@ -4430,11 +4430,15 @@ mod tests {
             content_timing: Default::default(),
         };
         let mut calls = 0;
-        let clocks =
-            crate::warcraftlogs::prepared::clocks(&mut review, None, ticket.key.auth_epoch, |_, _| {
+        let clocks = crate::warcraftlogs::prepared::clocks(
+            &mut review,
+            None,
+            ticket.key.auth_epoch,
+            |_, _| {
                 calls += 1;
                 crate::content_alignment::RecordingLookup::Valid(clock.clone())
-            });
+            },
+        );
         assert_eq!(calls, 1);
         assert_eq!(review.content_timing.len(), 2);
         let (_, _, mut stream) = fixture();

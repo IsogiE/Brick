@@ -794,7 +794,11 @@ mod tests {
         other.end_ms += 7_200_000;
         review.pulls.push(other.clone());
         assert_eq!(
-            Snapshot::default().plan(&review, 0).next.as_ref().map(|p| p.id),
+            Snapshot::default()
+                .plan(&review, 0)
+                .next
+                .as_ref()
+                .map(|p| p.id),
             Some(99)
         );
         let mut saved = Snapshot::default();

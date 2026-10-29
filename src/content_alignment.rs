@@ -1205,7 +1205,8 @@ mod tests {
             &serde_json::json!({"clock":clock,"pending":false,"conflict":false}),
         )
         .unwrap();
-        let RecordingLookup::Valid(received) = parse_recording_clock(&bytes, &key, &[]).unwrap() else {
+        let RecordingLookup::Valid(received) = parse_recording_clock(&bytes, &key, &[]).unwrap()
+        else {
             panic!("expected direct clock");
         };
         let alignment = received.alignment(&key).unwrap();
@@ -1223,24 +1224,38 @@ mod tests {
             assert!(parse_recording_clock(&bytes, &wrong, &[]).is_err());
         }
         assert!(matches!(
-            parse_recording_clock(br#"{"clock":null,"pending":false,"conflict":true}"#, &key, &[])
-                .unwrap(),
+            parse_recording_clock(
+                br#"{"clock":null,"pending":false,"conflict":true}"#,
+                &key,
+                &[]
+            )
+            .unwrap(),
             RecordingLookup::Conflict
         ));
         assert!(matches!(
-            parse_recording_clock(br#"{"clock":null,"pending":false,"conflict":false}"#, &key, &[])
-                .unwrap(),
+            parse_recording_clock(
+                br#"{"clock":null,"pending":false,"conflict":false}"#,
+                &key,
+                &[]
+            )
+            .unwrap(),
             RecordingLookup::Absent
         ));
         assert!(matches!(
-            parse_recording_clock(br#"{"clock":null,"pending":true,"conflict":false}"#, &key, &[])
-                .unwrap(),
+            parse_recording_clock(
+                br#"{"clock":null,"pending":true,"conflict":false}"#,
+                &key,
+                &[]
+            )
+            .unwrap(),
             RecordingLookup::Pending(None)
         ));
-        assert!(
-            parse_recording_clock(br#"{"clock":null,"pending":true,"conflict":true}"#, &key, &[])
-                .is_err()
-        );
+        assert!(parse_recording_clock(
+            br#"{"clock":null,"pending":true,"conflict":true}"#,
+            &key,
+            &[]
+        )
+        .is_err());
         assert!(parse_recording_clock(&vec![b' '; 256 * 1024 + 1], &key, &[]).is_err());
     }
 
@@ -1251,7 +1266,10 @@ mod tests {
         later.id += 1;
         later.start_ms += 60_000;
         later.end_ms += 60_000;
-        let keys = [Key::new(&replay, &pull, &cap, 0), Key::new(&replay, &later, &cap, 0)];
+        let keys = [
+            Key::new(&replay, &pull, &cap, 0),
+            Key::new(&replay, &later, &cap, 0),
+        ];
         let mut clock = test_recording_clock();
         clock.video_seconds = 321.73475;
         clock.uncertainty_seconds = 0.95;
@@ -1279,7 +1297,9 @@ mod tests {
         assert!(parse_recording_clock(&bytes, &shifted[0], &shifted).is_err());
         let mut mixed = response.clone();
         mixed["clock"] = serde_json::to_value(&clock).unwrap();
-        assert!(parse_recording_clock(&serde_json::to_vec(&mixed).unwrap(), &keys[0], &keys).is_err());
+        assert!(
+            parse_recording_clock(&serde_json::to_vec(&mixed).unwrap(), &keys[0], &keys).is_err()
+        );
         let legacy = serde_json::json!({"clock":clock,"pending":false,"conflict":false});
         assert!(matches!(
             parse_recording_clock(&serde_json::to_vec(&legacy).unwrap(), &keys[0], &keys).unwrap(),

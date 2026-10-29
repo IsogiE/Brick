@@ -459,7 +459,9 @@ pub(crate) fn clocks(
                 let Some(wanted) = pull_keys.iter().find(|k| k.start_ms == item.start_ms) else {
                     continue;
                 };
-                let Some(mut alignment) = clock.alignment(wanted) else { continue };
+                let Some(mut alignment) = clock.alignment(wanted) else {
+                    continue;
+                };
                 alignment.needs_read = Some(item.needs_read);
                 review
                     .content_timing
@@ -1089,12 +1091,18 @@ mod tests {
             ])
         });
         assert_eq!(asked, vec![review.pulls[0].start_ms, second.start_ms]);
-        assert!(review.content_alignment(&review.pulls[0]).is_none(), "no clock, no extrapolation");
+        assert!(
+            review.content_alignment(&review.pulls[0]).is_none(),
+            "no clock, no extrapolation"
+        );
         let placed = review.content_alignment(&second).unwrap();
         assert_eq!(placed.needs_read, Some(true));
         assert!((placed.result.video_seconds - (base.video_seconds + 60.4)).abs() < 1e-6);
         assert_eq!(clocks.len(), 1);
-        assert_eq!(clocks[0].0.pull_id, second.id, "saved per pull, not per report");
+        assert_eq!(
+            clocks[0].0.pull_id, second.id,
+            "saved per pull, not per report"
+        );
         // No clock for any pull of the report counts as an absent report.
         let none = super::clocks(&mut review, None, epoch, |_, pulls| {
             RecordingLookup::Pulls(
