@@ -1,16 +1,16 @@
 {
   "schema": 1,
-  "version": "2.54.1",
+  "version": "2.54.2",
   "distribution": "ubuntu-24.04",
   "architecture": "amd64",
-  "tag": "runtime-webkitgtk-2.54.1-ubuntu24.04-amd64-r1",
-  "fileName": "brick-webkitgtk-2.54.1-ubuntu24.04-amd64.tar.xz",
-  "url": "https://github.com/IsogiE/Brick-Releases/releases/download/runtime-webkitgtk-2.54.1-ubuntu24.04-amd64-r1/brick-webkitgtk-2.54.1-ubuntu24.04-amd64.tar.xz",
-  "sha256": "2aedf565c5e93d21e1fc867312f4f60243b436585a4dff355f87f95240e7f0c1",
-  "bytes": 44844032,
+  "tag": "runtime-webkitgtk-2.54.2-ubuntu24.04-amd64-r1",
+  "fileName": "brick-webkitgtk-2.54.2-ubuntu24.04-amd64.tar.xz",
+  "url": "https://github.com/IsogiE/Brick-Releases/releases/download/runtime-webkitgtk-2.54.2-ubuntu24.04-amd64-r1/brick-webkitgtk-2.54.2-ubuntu24.04-amd64.tar.xz",
+  "sha256": "215fb33197b663063f25a8c15f550383beb111ebb3a38d64e56da405cdc74586",
+  "bytes": 44887280,
   "source": {
-    "url": "https://webkitgtk.org/releases/webkitgtk-2.54.1.tar.xz",
-    "sha256": "ea0bbb02dbdbc596874a4e7ad35b66645b3e0a232bd0e4081de5ed92eb0a397d"
+    "url": "https://webkitgtk.org/releases/webkitgtk-2.54.2.tar.xz",
+    "sha256": "a76345b391bef6211fb5ab6cfab2e86b285d18cda17cbb9ade595f1252b86065"
   },
   "dependencies": [
     "libabsl20220623t64:amd64",

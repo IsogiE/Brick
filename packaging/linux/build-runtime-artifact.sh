@@ -1,8 +1,8 @@
 #!/bin/bash
 # Build a reusable runtime artifact separately from Brick release packaging.
 set -euo pipefail
-version=2.54.1
-sha256=ea0bbb02dbdbc596874a4e7ad35b66645b3e0a232bd0e4081de5ed92eb0a397d
+version=2.54.2
+sha256=a76345b391bef6211fb5ab6cfab2e86b285d18cda17cbb9ade595f1252b86065
 if [[ $(id -u) != 0 || $(dpkg --print-architecture) != amd64 ]]; then
   echo 'The runtime builder requires an amd64 Ubuntu build environment and root.' >&2
   exit 1
