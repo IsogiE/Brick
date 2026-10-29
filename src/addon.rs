@@ -1483,10 +1483,7 @@ fn extract_package_with_limits(
             .by_index(index)
             .map_err(|error| format!("Failed to read addon zip entry {index}: {error}"))?;
         let Some(enclosed_name) = file.enclosed_name() else {
-            return Err(format!(
-                "Addon zip entry {} has an unsafe path.",
-                file.name()
-            ));
+            return Err(format!("Addon zip entry {index} has an unsafe path."));
         };
 
         let relative_path = validate_zip_path(&enclosed_name, allowed_folders)?;
@@ -2242,6 +2239,70 @@ mod tests {
             fs::read(root.join("AdvanceRaidTools/b.lua")).unwrap(),
             b"de"
         );
+    }
+
+    #[test]
+    fn archive_symlinks_are_extracted_as_regular_data_without_touching_the_target() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let staging = root.join("staging");
+        let outside = root.join("outside.lua");
+        fs::write(&outside, b"keep").unwrap();
+        let mut zip = package(&[("AdvanceRaidTools/link.lua", b"../../outside.lua")]);
+        let central = zip
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        zip[central + 5] = 3; // Unix creator, with a symlink in external attributes.
+        zip[central + 38..central + 42].copy_from_slice(&(0o120777_u32 << 16).to_le_bytes());
+        assert_eq!(
+            ZipArchive::new(Cursor::new(&zip))
+                .unwrap()
+                .by_index(0)
+                .unwrap()
+                .unix_mode()
+                .unwrap()
+                & 0o170000,
+            0o120000
+        );
+
+        extract_package(&zip, &staging, &allowed_folders()).unwrap();
+        let extracted = staging.join("AdvanceRaidTools/link.lua");
+        assert!(fs::symlink_metadata(&extracted)
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert_eq!(fs::read(&extracted).unwrap(), b"../../outside.lua");
+        assert_eq!(fs::read(&outside).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_permissions_cannot_create_privileged_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let mut zip = package(&[("AdvanceRaidTools/a.lua", b"data")]);
+        let central = zip
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        zip[central + 5] = 3;
+        zip[central + 38..central + 42].copy_from_slice(&(0o107777_u32 << 16).to_le_bytes());
+        // zip 9 already masks setuid, setgid and sticky bits from unix_mode();
+        // the archive still carries them, and extraction must never apply them.
+        assert_eq!(
+            u32::from_le_bytes(zip[central + 38..central + 42].try_into().unwrap()) >> 16 & 0o7000,
+            0o7000
+        );
+
+        extract_package(&zip, &root, &allowed_folders()).unwrap();
+        let extracted = root.join("AdvanceRaidTools/a.lua");
+        assert_eq!(
+            fs::metadata(&extracted).unwrap().permissions().mode() & 0o7000,
+            0
+        );
+        assert_eq!(fs::read(&extracted).unwrap(), b"data");
     }
 
     #[test]

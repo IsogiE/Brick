@@ -298,12 +298,6 @@ pub(super) fn pull_key(kind: &str, pull: &Pull) -> Key {
         ),
     }
 }
-pub(super) fn master_key(pull: &Pull) -> Key {
-    Key {
-        id: digest(&serde_json::to_vec(&("master-v1", &pull.report)).expect("scalar cache key")),
-        revision: digest(&pull.report_start_ms.to_le_bytes()),
-    }
-}
 
 impl Client {
     fn data_cache(&mut self, access: &Access) -> Option<&mut Cache> {

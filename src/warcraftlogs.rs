@@ -1,10 +1,12 @@
-//! Private reports are fetched directly with the viewer's WCL authorization.
+//! Guild pulls and events come from Brick Server, which polls Warcraft Logs once
+//! per guild; the viewer's WCL authorization proves which reports they can see.
 pub(crate) mod boss_signature;
 pub(crate) mod clock_bridge;
 mod data_cache;
 mod persistent;
 pub(crate) mod prepared;
 mod rate_limit;
+mod server_live;
 use crate::{
     credential_store::Store,
     defensives::{self, DefensiveGroup},
@@ -366,17 +368,9 @@ struct Token {
     token_type: String,
 }
 
-const EVENT_QUERY: &str = "query($code:String!,$fight:Int!,$type:EventDataType!,$start:Float!,$end:Float!,$filter:String,$master:Boolean!){reportData{report(code:$code){masterData(translate:false) @include(if:$master){actors(type:\"Player\"){id name type subType} abilities{gameID name}} events(fightIDs:[$fight],dataType:$type,startTime:$start,endTime:$end,filterExpression:$filter,translate:false,includeResources:false,limit:2000){data nextPageTimestamp}}}}";
 const EVENT_TTL: Duration = Duration::from_secs(600);
 const CONFIG_TTL: Duration = Duration::from_secs(60);
 const EVENT_FETCH_BUDGET: Duration = Duration::from_secs(30);
-fn event_request_timeout(deadline: Instant, now: Instant) -> Result<Duration, String> {
-    let remaining = deadline.saturating_duration_since(now);
-    if remaining.is_zero() {
-        return Err("Warcraft Logs took too long to load these events. Try again shortly.".into());
-    }
-    Ok(remaining.min(Duration::from_secs(15)))
-}
 const MAX_CACHED_EVENTS: usize = 40_000;
 const MAX_PULL_EVENTS: usize = 20_000;
 // WCL may return more rows than the requested limit (for example 2002 for
@@ -545,19 +539,6 @@ impl MasterData {
             .collect();
         Ok(Self { actors, abilities })
     }
-    fn rows(&self) -> usize {
-        self.actors.len() + self.abilities.len()
-    }
-}
-struct CachedMaster {
-    at: Instant,
-    through_ms: i64,
-    data: Arc<MasterData>,
-}
-#[derive(Serialize, Deserialize)]
-struct SavedMaster {
-    through_ms: i64,
-    data: MasterData,
 }
 #[derive(Serialize, Deserialize)]
 struct SavedEvents {
@@ -586,31 +567,6 @@ impl SavedEvents {
         })
     }
 }
-type MasterCache = HashMap<String, CachedMaster>;
-fn cache_master(cache: &mut MasterCache, code: String, through_ms: i64, data: Arc<MasterData>) {
-    cache.remove(&code);
-    let mut rows: usize = cache.values().map(|entry| entry.data.rows()).sum();
-    while cache.len() >= 8 || rows + data.rows() > 10_000 {
-        let Some(oldest) = cache
-            .iter()
-            .min_by_key(|(_, entry)| entry.at)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        if let Some(removed) = cache.remove(&oldest) {
-            rows -= removed.data.rows();
-        }
-    }
-    cache.insert(
-        code,
-        CachedMaster {
-            at: Instant::now(),
-            through_ms,
-            data,
-        },
-    );
-}
 
 #[cfg(test)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -627,9 +583,11 @@ pub struct Client {
     query_endpoint: Option<String>,
     #[cfg(test)]
     requests: RequestCounts,
+    #[cfg(test)]
+    live_transport: Option<server_live::Transport>,
+    live_proofs: server_live::Proofs,
     config: Option<Config>,
     config_stamp: Option<ConfigStamp>,
-    masters: MasterCache,
     session: Option<Session>,
     recording_auth_epoch: u64,
     pub(crate) prepared: Arc<Mutex<prepared::Cache>>,
@@ -686,9 +644,11 @@ impl Client {
             query_endpoint: None,
             #[cfg(test)]
             requests: Default::default(),
+            #[cfg(test)]
+            live_transport: None,
+            live_proofs: Default::default(),
             config: None,
             config_stamp: None,
-            masters: HashMap::new(),
             session: None,
             recording_auth_epoch: 0,
             prepared: Default::default(),
@@ -714,6 +674,19 @@ impl Client {
 
     pub(crate) fn set_background_requests(&mut self, background: bool) {
         self.background_requests = background;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_session(&mut self, access_token: &str) {
+        self.session = Some(Session {
+            rate_budget: Default::default(),
+            cache_id: random(),
+            client_id: "fixture".into(),
+            user_id: "123".into(),
+            access_token: access_token.into(),
+            refresh_token: None,
+            expires_at: now_secs() + 3600,
+        });
     }
 
     fn configure(
@@ -751,7 +724,6 @@ impl Client {
                 self.set_session(None);
                 self.reports.clear();
                 self.events.clear();
-                self.masters.clear();
                 self.config_stamp = None;
                 self.directory = None;
             }
@@ -782,7 +754,6 @@ impl Client {
             self.set_session(None);
             self.reports.clear();
             self.events.clear();
-            self.masters.clear();
             self.config_stamp = None;
             self.directory = None;
             if let Some(bytes) = if restore {
@@ -872,7 +843,6 @@ impl Client {
         self.set_session(None);
         self.reports.clear();
         self.events.clear();
-        self.masters.clear();
         self.config_stamp = None;
         self.directory = None;
         Ok(())
@@ -1021,7 +991,6 @@ impl Client {
                 self.set_session(None);
                 self.reports.clear();
                 self.events.clear();
-                self.masters.clear();
                 self.config_stamp = None;
                 self.directory = None;
                 return Err("Please reconnect Warcraft Logs.".into());
@@ -1038,7 +1007,6 @@ impl Client {
                         self.set_session(None);
                         self.reports.clear();
                         self.events.clear();
-                        self.masters.clear();
                         self.config_stamp = None;
                         self.directory = None;
                     }
@@ -1137,7 +1105,6 @@ impl Client {
             self.set_session(None);
             self.reports.clear();
             self.events.clear();
-            self.masters.clear();
             self.config_stamp = None;
             self.directory = None;
         }
@@ -1297,7 +1264,7 @@ impl Client {
         let mut review = if let Some(code) = report_override {
             self.review_explicit_report(replay, code)?
         } else {
-            self.review_replay(replay)?
+            self.review_replay(Some(discord_token), replay)?
         };
         review.content_capability = capability;
 
@@ -1612,16 +1579,10 @@ impl Client {
         // explicitly identifies as the exact same encounter in this report.
         // Keep each response cached under its real fight ID and never borrow
         // another report's clock or another fight's events.
-        let report = if let Some((_, report)) = self.reports.get(&pull.report) {
-            report.clone()
-        } else {
-            let data = self.query_with_timeout("query($code:String!){reportData{report(code:$code){code startTime endTime fights{id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime friendlyPlayers}}}}", json!({"code":pull.report}), event_request_timeout(deadline, Instant::now())?)?;
-            let report = data["reportData"]["report"].clone();
-            check_cancelled(&self.cancel)?;
-            self.reports
-                .insert(pull.report.clone(), (Instant::now(), report.clone()));
-            report
+        let Some((_, report)) = self.reports.get(&pull.report) else {
+            return Ok(events);
         };
+        let report = report.clone();
         for alternative in exact_duplicate_pulls(&report, pull)? {
             let events = self.events_exact(discord_token, &alternative, kind, deadline)?;
             if !events.is_empty() {
@@ -1636,7 +1597,7 @@ impl Client {
         discord_token: &crate::guild::Access,
         pull: &Pull,
         kind: EventKind,
-        deadline: Instant,
+        _deadline: Instant,
     ) -> Result<Vec<RaidEvent>, String> {
         self.configure(discord_token, true)?;
         self.access_token()?;
@@ -1698,101 +1659,61 @@ impl Client {
             }
             return Ok(visible);
         }
-        // Metadata follows the fast cache path, never precedes a cache hit.
-        self.masters
-            .retain(|_, entry| entry.at.elapsed() < EVENT_TTL);
-        let mut master = self
-            .masters
-            .get(&pull.report)
-            .filter(|entry| entry.through_ms >= pull.end_ms)
-            .map(|entry| entry.data.clone());
-        let master_key = data_cache::master_key(pull);
-        if master.is_none() {
-            if let Some(saved) = self
-                .cached_data::<SavedMaster>(discord_token, &master_key)
-                .filter(|saved| {
-                    saved.through_ms >= pull.end_ms
-                        && saved.data.actors.len() <= 5000
-                        && saved.data.abilities.len() <= 5000
-                })
-            {
-                let data = Arc::new(saved.data);
-                cache_master(
-                    &mut self.masters,
-                    pull.report.clone(),
-                    saved.through_ms,
-                    data.clone(),
-                );
-                master = Some(data);
+        // Brick Server holds the pull's events (catalogue spells for everyone, plus
+        // this member's personal spells on request); this desktop never pages WCL.
+        let catalogue: BTreeSet<u64> = preferences.catalog.spells().map(|spell| spell.id).collect();
+        let personal: Vec<u64> = wanted
+            .casts
+            .union(&wanted.buffs)
+            .filter(|id| !catalogue.contains(id))
+            .copied()
+            .collect();
+        let body = self.live_events(discord_token, pull, &personal)?;
+        check_cancelled(&self.cancel)?;
+        let master = Arc::new(MasterData::parse(&body["masterData"])?);
+        let ids = |kind: &str| -> BTreeSet<u64> {
+            body["coverage"][kind]
+                .as_array()
+                .map(|ids| ids.iter().filter_map(Value::as_u64).collect())
+                .unwrap_or_default()
+        };
+        let coverage = if kind == EventKind::Deaths {
+            EventCoverage::default()
+        } else {
+            EventCoverage {
+                casts: ids("casts"),
+                buffs: ids("buffs"),
             }
+        };
+        let rows: Vec<Value> = if kind == EventKind::Deaths {
+            body["deaths"].as_array().cloned().unwrap_or_default()
+        } else {
+            ["casts", "buffs"]
+                .iter()
+                .flat_map(|kind| body[*kind].as_array().cloned().unwrap_or_default())
+                .collect()
+        };
+        if rows.len() > MAX_PULL_EVENTS {
+            return Err("This pull has too many events to display. Try Deaths.".into());
         }
-        let end = pull.end_ms - pull.report_start_ms;
-        let mut added = Vec::new();
-        let mut pages = 0;
-        for (data_type, filter) in queries {
-            let mut start = pull.start_ms - pull.report_start_ms;
-            loop {
-                check_cancelled(&self.cancel)?;
-                if pages >= 10 {
-                    return Err("This pull has too many events to display. Try Deaths.".into());
-                }
-                pages += 1;
-                let include_master = master.is_none();
-                let timeout = event_request_timeout(deadline, Instant::now())?;
-                let data = self.query_with_timeout(EVENT_QUERY, json!({"code":pull.report,"fight":pull.id,"type":data_type,"start":start,"end":end,"filter":filter,"master":include_master}), timeout)?;
-                let report = &data["reportData"]["report"];
-                if include_master {
-                    let loaded = Arc::new(MasterData::parse(&report["masterData"])?);
-                    let through = self
-                        .reports
-                        .get(&pull.report)
-                        .and_then(|(_, report)| number_ms(&report["endTime"]))
-                        .unwrap_or(pull.end_ms)
-                        .max(pull.end_ms);
-                    cache_master(
-                        &mut self.masters,
-                        pull.report.clone(),
-                        through,
-                        loaded.clone(),
-                    );
-                    // Stable map ordering makes identical metadata a no-write update.
-                    let saved = serde_json::json!({"through_ms": through, "data": loaded.as_ref()});
-                    self.cache_data(discord_token, master_key.clone(), &saved);
-                    master = Some(loaded);
-                }
-                added.extend(map_event_page(
-                    &report["events"]["data"],
-                    master.as_ref().unwrap(),
+        let raw = rows
+            .chunks(MAX_EVENT_PAGE_ROWS)
+            .map(|page| {
+                map_event_page(
+                    &Value::Array(page.to_vec()),
+                    &master,
                     pull,
                     kind,
-                    &missing,
+                    &coverage,
                     &preferences,
-                )?);
-                if added.len() + cached.as_ref().map_or(0, |entry| entry.raw.len())
-                    > MAX_PULL_EVENTS
-                {
-                    return Err("This pull has too many events to display. Try Deaths.".into());
-                }
-                let next = &report["events"]["nextPageTimestamp"];
-                if next.is_null() {
-                    break;
-                }
-                start = number_ms(next)
-                    .filter(|next| *next > start && *next <= end)
-                    .ok_or("Invalid Warcraft Logs event timing.")?;
-            }
-        }
-        check_cancelled(&self.cancel)?;
-        let mut raw = cached
-            .as_ref()
-            .map_or_else(Vec::new, |entry| (*entry.raw).clone());
-        raw.extend(added);
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .concat();
         let entry = CachedEvents {
-            at: cached.as_ref().map_or_else(Instant::now, |entry| entry.at),
+            at: Instant::now(),
             bounds,
-            coverage: cached
-                .as_ref()
-                .map_or(wanted.clone(), |entry| entry.coverage.merge(&wanted)),
+            coverage,
             raw: Arc::new(raw),
         };
         let visible = entry.render(&preferences);
@@ -1813,7 +1734,11 @@ impl Client {
         Ok(visible)
     }
 
-    fn review_replay(&mut self, replay: Replay) -> Result<Review, String> {
+    fn review_replay(
+        &mut self,
+        access: Option<&crate::guild::Access>,
+        replay: Replay,
+    ) -> Result<Review, String> {
         self.recording_match_complete = false;
         check_cancelled(&self.cancel)?;
         if replay.available_seconds == 0 || replay.available_seconds > 7 * 86400 {
@@ -1839,29 +1764,19 @@ impl Client {
             .as_ref()
             .is_some_and(|directory| directory.covers(window))
         {
-            let mut reports = Vec::new();
-            for page in 1..=5 {
-                check_cancelled(&self.cancel)?;
-                let data = self.query("query($guild:Int!,$start:Float!,$end:Float!,$page:Int!){reportData{reports(guildID:$guild,startTime:$start,endTime:$end,page:$page,limit:100){data{code startTime endTime} has_more_pages}}}",
-                    json!({"guild":self.config.as_ref().unwrap().guild_id,"start":window.0,"end":window.1,"page":page}))?;
-                let batch = &data["reportData"]["reports"];
-                let entries = batch["data"]
-                    .as_array()
-                    .ok_or("Your Warcraft Logs account could not load the guild reports.")?;
-                if entries.len() > 100 {
-                    return Err("Warcraft Logs returned too many reports.".into());
-                }
-                reports.extend(entries.iter().cloned());
-                if batch["has_more_pages"].as_bool() == Some(false) {
-                    break;
-                }
-                if page == 5 {
-                    return Err(
-                        "There are too many reports to match this broadcast automatically.".into(),
-                    );
+            let access = access.ok_or("Sign in to Brick to see this raid's pulls.")?;
+            // Brick Server answers from its archive (or fetches once for the
+            // guild); this desktop never lists or polls guild reports itself.
+            let listed = self.live_reports(access, window)?;
+            check_cancelled(&self.cancel)?;
+            let mut reports = Vec::with_capacity(listed.len());
+            for report in listed {
+                if let Some(code) = report["code"].as_str().filter(|code| report_code(code)) {
+                    reports.push(json!({"code":code,"startTime":report["startTime"],"endTime":report["endTime"]}));
+                    self.reports
+                        .insert(code.to_owned(), (Instant::now(), report.clone()));
                 }
             }
-            check_cancelled(&self.cancel)?;
             self.directory = Some(ReportDirectory {
                 window,
                 loaded_at: Instant::now(),
@@ -1909,20 +1824,9 @@ impl Client {
                 .as_str()
                 .filter(|s| report_code(s))
                 .ok_or("Invalid Warcraft Logs report.")?;
-            if !self
-                .reports
-                .get(code)
-                .is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(15))
-            {
-                let data = self.query("query($code:String!){reportData{report(code:$code){code startTime endTime fights{ id encounterID difficulty name kill lastPhase lastPhaseIsIntermission fightPercentage startTime endTime friendlyPlayers }}}}", json!({"code":code}))?;
-                let report = data["reportData"]["report"].clone();
-                if report.is_null() {
-                    complete = false;
-                    continue;
-                }
-                check_cancelled(&self.cancel)?;
-                self.reports
-                    .insert(code.to_owned(), (Instant::now(), report));
+            if !self.reports.contains_key(code) {
+                complete = false;
+                continue;
             }
             let report = &self.reports[code].1;
             let report_complete = complete_fight_list(report);
@@ -3119,7 +3023,7 @@ mod tests {
         assert!(valid_video(&replay));
         let mut client = Client::new().unwrap();
         client.configure(&token, true).unwrap();
-        let review = client.review_replay(replay).unwrap();
+        let review = client.review_replay(Some(&token), replay).unwrap();
         assert!(
             !review.pulls.is_empty(),
             "No overlapping private raid pulls found"
@@ -3263,7 +3167,6 @@ mod tests {
         assert_eq!(mapped.len(), 2002);
         assert_eq!(mapped.last().unwrap().at_ms, pull.report_start_ms + 3001);
         assert!(mapped.iter().all(|event| event.actor == "Player"));
-        assert!(EVENT_QUERY.contains("limit:2000"));
     }
 
     #[test]
@@ -3394,22 +3297,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn additional_event_pages_share_one_deadline_and_keep_the_normal_request_limit() {
-        let now = Instant::now();
-        let deadline = now + EVENT_FETCH_BUDGET;
-        assert_eq!(
-            event_request_timeout(deadline, now).unwrap(),
-            Duration::from_secs(15)
-        );
-        assert_eq!(
-            event_request_timeout(deadline, now + Duration::from_secs(27)).unwrap(),
-            Duration::from_secs(3)
-        );
-        assert!(event_request_timeout(deadline, deadline).is_err());
-        assert!(event_request_timeout(deadline, deadline + Duration::from_secs(1)).is_err());
     }
 
     #[test]
@@ -3704,13 +3591,6 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(data.actors.len(), 1);
-        let mut cache = MasterCache::new();
-        for index in 0..20 {
-            cache_master(&mut cache, index.to_string(), index, data.clone());
-        }
-        assert_eq!(cache.len(), 8);
-        assert!(cache.values().map(|entry| entry.data.rows()).sum::<usize>() <= 10_000);
-        assert!(!cache.contains_key("0"));
     }
 
     #[test]
@@ -3777,7 +3657,7 @@ mod content_metadata_tests {
         let replay:Replay=serde_json::from_value(json!({"provider":"youtube","videoId":"abcDEF_12-3","broadcastId":"abcDEF_12-3","startedAt":null,"availableSeconds":600,"timelineRevision":"b".repeat(64)})).unwrap();
         assert!(replay.start_ms().is_err());
         let mut client = Client::new().unwrap();
-        let review = client.review_replay(replay).unwrap();
+        let review = client.review_replay(None, replay).unwrap();
         assert!(review.pulls.is_empty());
         assert!(!client.recording_match_complete);
         assert_eq!(client.requests.graphql, 0);
