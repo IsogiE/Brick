@@ -368,17 +368,9 @@ struct Token {
     token_type: String,
 }
 
-const EVENT_QUERY: &str = "query($code:String!,$fight:Int!,$type:EventDataType!,$start:Float!,$end:Float!,$filter:String,$master:Boolean!){reportData{report(code:$code){masterData(translate:false) @include(if:$master){actors(type:\"Player\"){id name type subType} abilities{gameID name}} events(fightIDs:[$fight],dataType:$type,startTime:$start,endTime:$end,filterExpression:$filter,translate:false,includeResources:false,limit:2000){data nextPageTimestamp}}}}";
 const EVENT_TTL: Duration = Duration::from_secs(600);
 const CONFIG_TTL: Duration = Duration::from_secs(60);
 const EVENT_FETCH_BUDGET: Duration = Duration::from_secs(30);
-fn event_request_timeout(deadline: Instant, now: Instant) -> Result<Duration, String> {
-    let remaining = deadline.saturating_duration_since(now);
-    if remaining.is_zero() {
-        return Err("Warcraft Logs took too long to load these events. Try again shortly.".into());
-    }
-    Ok(remaining.min(Duration::from_secs(15)))
-}
 const MAX_CACHED_EVENTS: usize = 40_000;
 const MAX_PULL_EVENTS: usize = 20_000;
 // WCL may return more rows than the requested limit (for example 2002 for
@@ -3175,7 +3167,6 @@ mod tests {
         assert_eq!(mapped.len(), 2002);
         assert_eq!(mapped.last().unwrap().at_ms, pull.report_start_ms + 3001);
         assert!(mapped.iter().all(|event| event.actor == "Player"));
-        assert!(EVENT_QUERY.contains("limit:2000"));
     }
 
     #[test]
@@ -3306,22 +3297,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn additional_event_pages_share_one_deadline_and_keep_the_normal_request_limit() {
-        let now = Instant::now();
-        let deadline = now + EVENT_FETCH_BUDGET;
-        assert_eq!(
-            event_request_timeout(deadline, now).unwrap(),
-            Duration::from_secs(15)
-        );
-        assert_eq!(
-            event_request_timeout(deadline, now + Duration::from_secs(27)).unwrap(),
-            Duration::from_secs(3)
-        );
-        assert!(event_request_timeout(deadline, deadline).is_err());
-        assert!(event_request_timeout(deadline, deadline + Duration::from_secs(1)).is_err());
     }
 
     #[test]

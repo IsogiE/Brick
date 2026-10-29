@@ -2289,14 +2289,10 @@ mod tests {
             .unwrap();
         zip[central + 5] = 3;
         zip[central + 38..central + 42].copy_from_slice(&(0o107777_u32 << 16).to_le_bytes());
+        // zip 9 already masks setuid, setgid and sticky bits from unix_mode();
+        // the archive still carries them, and extraction must never apply them.
         assert_eq!(
-            ZipArchive::new(Cursor::new(&zip))
-                .unwrap()
-                .by_index(0)
-                .unwrap()
-                .unix_mode()
-                .unwrap()
-                & 0o7000,
+            u32::from_le_bytes(zip[central + 38..central + 42].try_into().unwrap()) >> 16 & 0o7000,
             0o7000
         );
 

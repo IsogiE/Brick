@@ -46,6 +46,7 @@ impl Proofs {
     }
 }
 
+#[cfg(test)]
 pub(super) type Transport =
     Box<dyn FnMut(Method, &str, Option<Value>) -> Result<(u16, Value), String> + Send>;
 
