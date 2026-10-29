@@ -13,7 +13,8 @@ const REPROVE_AFTER: Duration = Duration::from_secs(60);
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REPORTS: usize = 200;
 const UNREACHABLE: &str = "Couldn't reach Brick Server. Brick will retry shortly.";
-const UNAVAILABLE: &str = "Brick Server couldn't load these Warcraft Logs reports. Try again shortly.";
+const UNAVAILABLE: &str =
+    "Brick Server couldn't load these Warcraft Logs reports. Try again shortly.";
 const DENIED: &str = "Your Warcraft Logs account cannot access these reports.";
 
 #[derive(Default)]
@@ -91,7 +92,10 @@ impl Client {
             download::read_response(response, MAX_RESPONSE_BYTES, "Brick Server")
         })??;
         access.check()?;
-        Ok((status, serde_json::from_slice(&bytes).unwrap_or(Value::Null)))
+        Ok((
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        ))
     }
 
     /// Proves this member's Warcraft Logs access for a window. The access token is
@@ -211,7 +215,12 @@ mod tests {
     type Calls = Arc<Mutex<Vec<(Method, String, Option<Value>)>>>;
 
     fn access() -> crate::guild::Access {
-        crate::guild::Access::new("discord".into(), "1".into(), "2".into(), crate::guild::generation())
+        crate::guild::Access::new(
+            "discord".into(),
+            "1".into(),
+            "2".into(),
+            crate::guild::generation(),
+        )
     }
 
     fn client(responses: Vec<(u16, Value)>) -> (Client, Calls) {
@@ -237,7 +246,10 @@ mod tests {
         ]);
         let window = (1_000, 2_000);
         assert_eq!(client.live_reports(&access(), window).unwrap().len(), 1);
-        assert!(client.live_reports(&access(), (1_100, 1_900)).unwrap().is_empty());
+        assert!(client
+            .live_reports(&access(), (1_100, 1_900))
+            .unwrap()
+            .is_empty());
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].1, "/v1/warcraftlogs/live/proof");
@@ -245,7 +257,10 @@ mod tests {
             calls[0].2,
             Some(json!({"accessToken":"member-token","start":1_000,"end":2_000}))
         );
-        assert_eq!(calls[1].1, "/v1/warcraftlogs/live/reports?start=1000&end=2000");
+        assert_eq!(
+            calls[1].1,
+            "/v1/warcraftlogs/live/reports?start=1000&end=2000"
+        );
         assert!(calls[1].2.is_none() && calls[2].2.is_none());
     }
 
@@ -264,7 +279,10 @@ mod tests {
     }
 
     fn client_with_denial() -> (Client, Calls) {
-        client(vec![(403, json!({"error":"Warcraft Logs did not accept this sign-in."}))])
+        client(vec![(
+            403,
+            json!({"error":"Warcraft Logs did not accept this sign-in."}),
+        )])
     }
 
     #[test]
@@ -287,14 +305,23 @@ mod tests {
         };
         let (mut client, calls) = client(vec![
             (200, json!({"reports":1})),
-            (200, json!({"report":"AbCdEfGh12345678","fight":4,"deaths":[]})),
+            (
+                200,
+                json!({"report":"AbCdEfGh12345678","fight":4,"deaths":[]}),
+            ),
             (200, json!({"report":"AbCdEfGh12345678","fight":5})),
         ]);
-        assert_eq!(client.live_events(&access(), &pull, &[7, 8]).unwrap()["fight"], 4);
+        assert_eq!(
+            client.live_events(&access(), &pull, &[7, 8]).unwrap()["fight"],
+            4
+        );
         assert_eq!(
             calls.lock().unwrap()[1].1,
             "/v1/warcraftlogs/live/events?report=AbCdEfGh12345678&fight=4&spells=7,8"
         );
-        assert_eq!(client.live_events(&access(), &pull, &[]).unwrap_err(), UNAVAILABLE);
+        assert_eq!(
+            client.live_events(&access(), &pull, &[]).unwrap_err(),
+            UNAVAILABLE
+        );
     }
 }
