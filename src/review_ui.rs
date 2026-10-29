@@ -192,6 +192,8 @@ pub struct ReviewUi {
     generation: u64,
     key: String,
     last_attempt: Option<Instant>,
+    // Consecutive failed pull reads, so a slow first server fetch retries soon.
+    refresh_failures: u32,
     refresh_period: Duration,
     review: Option<Review>,
     recording_match_status: Option<(u64, bool)>,
@@ -256,6 +258,7 @@ impl Default for ReviewUi {
             generation: 0,
             key: String::new(),
             last_attempt: None,
+            refresh_failures: 0,
             refresh_period: Duration::from_secs(60),
             review: None,
             recording_match_status: None,
@@ -742,6 +745,7 @@ impl ReviewUi {
             self.replay_coverage = None;
             self.notice = None;
             self.last_attempt = None;
+            self.refresh_failures = 0;
             self.playback = None;
             self.pull = None;
             self.events.clear();
@@ -778,6 +782,7 @@ impl ReviewUi {
                         match result {
                             Ok(Data::Review(review, preferences, match_status)) => {
                                 self.recording_match_status = Some(match_status);
+                                self.refresh_failures = 0;
                                 if self.recording_housekeeping {
                                     // Housekeeping never prepares playback, enriches the
                                     // GPU timing cache or schedules verification.
@@ -855,6 +860,11 @@ impl ReviewUi {
                                 } else if matches!(action, Some(Action::SaveCooldowns(_))) {
                                     self.cooldown_notice = Some(error);
                                 } else {
+                                    if matches!(action, Some(Action::Refresh | Action::Report(..)))
+                                    {
+                                        self.refresh_failures =
+                                            self.refresh_failures.saturating_add(1);
+                                    }
                                     self.notice = Some(error);
                                 }
                             }
@@ -900,6 +910,9 @@ impl ReviewUi {
                                 self.record_event_failure(kind, message.into());
                             }
                         } else {
+                            if matches!(action, Some(Action::Refresh | Action::Report(..))) {
+                                self.refresh_failures = self.refresh_failures.saturating_add(1);
+                            }
                             self.notice = Some(message.into());
                         }
                     }
@@ -988,9 +1001,28 @@ impl ReviewUi {
             .min()
     }
 
+    /// No pulls yet and a read is running or quietly retrying a busy server.
+    fn finding_pulls(&self) -> bool {
+        self.review.is_none()
+            && (self.work.is_some()
+                || self
+                    .notice
+                    .as_deref()
+                    .is_some_and(crate::warcraftlogs::background_retry_notice))
+    }
+
     fn refresh_interval(&self) -> Duration {
         if self.notice.is_some() {
-            Duration::from_secs(60)
+            // The first read of a day can outlast the request or hit the server's
+            // burst limit while Brick Server fetches it. Retry the open view soon
+            // so the pulls appear without leaving and reopening it.
+            Duration::from_secs(match self.refresh_failures {
+                _ if self.metadata_only => 60,
+                1 => 5,
+                2 => 15,
+                3 => 30,
+                _ => 60,
+            })
         } else {
             self.refresh_period
         }
@@ -1486,7 +1518,7 @@ impl ReviewUi {
                     self.active = true;
                     changed = true;
                 }
-                if self.work.is_some() && self.review.is_none() {
+                if self.finding_pulls() {
                     ui.small("Finding pulls…");
                 }
                 let menu = ui.menu_button("…", |ui| {
@@ -1906,7 +1938,7 @@ impl ReviewUi {
                         .is_some_and(|review| review.pulls.is_empty())
                     {
                         "No raid pulls are available for this view"
-                    } else if self.work.is_some() {
+                    } else if self.work.is_some() || self.finding_pulls() {
                         "Finding pulls…"
                     } else {
                         "Choose a pull to watch"
@@ -5255,6 +5287,62 @@ mod tests {
         assert!(ui.playback.is_none());
         assert!(ui.events.is_empty());
         assert!(ui.loaded_events.is_empty());
+    }
+
+    #[test]
+    fn failed_first_pull_read_retries_soon_and_keeps_finding_pulls_visible() {
+        let (review, _, stream) = fixture();
+        let ctx = egui::Context::default();
+        let mut ui = ReviewUi::default();
+        ui.key = pov_key(&stream);
+        let fail = |ui: &mut ReviewUi, error: &str| {
+            let (tx, rx) = mpsc::channel();
+            ui.work = Some(rx);
+            ui.work_action = Some(Action::Refresh);
+            ui.last_attempt = Some(Instant::now());
+            tx.send((ui.generation, ui.key.clone(), Err(error.into()), true))
+                .unwrap();
+            ui.tick(&ctx, Some(&stream));
+            ui.work = None;
+            ui.refresh_interval()
+        };
+        let throttled = "Warcraft Logs is busy. Brick will retry shortly.";
+        assert!(crate::warcraftlogs::background_retry_notice(throttled));
+        assert_eq!(fail(&mut ui, throttled), Duration::from_secs(5));
+        assert!(ui.review.is_none() && ui.finding_pulls());
+        assert_eq!(fail(&mut ui, throttled), Duration::from_secs(15));
+        assert_eq!(
+            fail(&mut ui, "Couldn't reach Brick Server."),
+            Duration::from_secs(30)
+        );
+        assert!(
+            !ui.finding_pulls(),
+            "A visible error is not a loading state"
+        );
+        assert_eq!(fail(&mut ui, throttled), Duration::from_secs(60));
+        assert_eq!(fail(&mut ui, throttled), Duration::from_secs(60));
+
+        let (tx, rx) = mpsc::channel();
+        ui.work = Some(rx);
+        ui.work_action = Some(Action::Refresh);
+        tx.send((
+            ui.generation,
+            ui.key.clone(),
+            Ok(Data::Review(
+                review,
+                defensives::Preferences::default(),
+                (0, true),
+            )),
+            true,
+        ))
+        .unwrap();
+        ui.tick(&ctx, Some(&stream));
+        assert_eq!(ui.refresh_failures, 0);
+        assert!(ui.notice.is_none() && !ui.finding_pulls());
+
+        let mut peer = ui.metadata_peer();
+        peer.key = pov_key(&stream);
+        assert_eq!(fail(&mut peer, throttled), Duration::from_secs(60));
     }
 
     #[test]
