@@ -3618,7 +3618,7 @@ fn dropdown_indicator(ui: &egui::Ui, button: &egui::Response) {
 /// The logs in the window list their players, and none of them is the POV:
 /// these pulls may belong to another raid the guild logged that evening.
 const POV_WARNING: &str = "This streamer isn't listed in these logs, so the pulls may be \
-another raid's. They can add their characters under Settings › Your profile, or use Find a log.";
+another raid's. They can sign in with Battle.net under Settings › Your profile, or use Find a log.";
 
 fn review_outcome(pull: &Pull) -> String {
     if pull.difficulty == 10 {
