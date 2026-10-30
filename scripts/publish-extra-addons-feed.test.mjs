@@ -1,10 +1,48 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { deflateRawSync } from 'node:zlib';
 import {
   catalog, checkSourceFile, encodePath, isCurrentGitHubEntry, isCurrentSourceEntry, listingEntries,
-  mapFlavors, newestVersionTag, packageFolders, pkgmetaIgnores, sameAddons, selectPackageAsset,
-  selectRelease, tocVersion
+  mapFlavors, newestVersionTag, packageFolders, pkgmetaIgnores, readZipEntry, sameAddons,
+  selectPackageAsset, selectRelease, tocVersion, uploadReleaseAsset, zipEntries
 } from './publish-extra-addons-feed.mjs';
+
+// Builds a small zip with one stored and the rest deflated entries.
+function makeZip(files) {
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+  files.forEach(([name, text], index) => {
+    const raw = Buffer.from(text);
+    const method = index === 0 ? 0 : 8;
+    const data = method === 0 ? raw : deflateRawSync(raw);
+    const nameBytes = Buffer.from(name);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(method, 8);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(raw.length, 22);
+    local.writeUInt16LE(nameBytes.length, 26);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(method, 10);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(raw.length, 24);
+    central.writeUInt16LE(nameBytes.length, 28);
+    central.writeUInt32LE(offset, 42);
+    locals.push(local, nameBytes, data);
+    centrals.push(central, nameBytes);
+    offset += 30 + nameBytes.length + data.length;
+  });
+  const directory = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(directory.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, directory, end]);
+}
 
 const byId = (id) => catalog.find((addon) => addon.id === id);
 const asset = (name, size = 1000) => ({ name, size, browser_download_url: `https://github.com/x/y/releases/download/v1/${name}` });
@@ -97,4 +135,42 @@ test('unchanged upstream versions reuse the published entry without downloading'
   assert.equal(sameAddons(structuredClone(manifest), manifest), true);
   assert.equal(sameAddons(null, manifest), false);
   assert.equal(sameAddons({ ...manifest, addons: [] }, manifest), false);
+});
+
+test('packages are listed and their TOCs read in memory', () => {
+  const zip = makeZip([
+    ['BigWigs/BigWigs.toc', '## Version: v427.8\n'],
+    ['BigWigs_Core/BigWigs_Core.toc', '## Title: Core\n## Version: v427.8\n'],
+    ['BigWigs_Core/Core.lua', 'print("x")'.repeat(50)]
+  ]);
+  const entries = zipEntries(zip);
+  assert.deepEqual(packageFolders(entries.map((entry) => entry.name), byId('bigwigs')), ['BigWigs', 'BigWigs_Core']);
+  for (const entry of entries.filter((candidate) => candidate.name.endsWith('.toc'))) {
+    assert.equal(tocVersion(readZipEntry(zip, entry).toString('utf8')), 'v427.8');
+  }
+  assert.equal(readZipEntry(zip, entries[2]).toString(), 'print("x")'.repeat(50));
+  assert.throws(() => zipEntries(Buffer.from('not a zip at all, definitely not')));
+  assert.throws(() => zipEntries(zip.subarray(0, zip.length - 30)));
+});
+
+test('feed assets are replaced from memory without touching other assets', () => {
+  const calls = [];
+  const invoke = (args, token, stdio, input) => {
+    calls.push({ args, input });
+    if (args[1] === 'repos/IsogiE/Brick-Releases/releases/tags/addon-feed-v3') {
+      return JSON.stringify({ id: 7, assets: [
+        { id: 1, name: 'extra-addons-manifest.json' }, { id: 2, name: 'addon-manifest.json' }
+      ] });
+    }
+    return '{}';
+  };
+  uploadReleaseAsset('extra-addons-manifest.json', '{"x":1}\n', 'token', invoke);
+  assert.deepEqual(calls.map((call) => call.args.slice(0, 3)), [
+    ['api', 'repos/IsogiE/Brick-Releases/releases/tags/addon-feed-v3'],
+    ['api', '-X', 'DELETE'],
+    ['api', '-X', 'POST']
+  ]);
+  assert.equal(calls[1].args[3], 'repos/IsogiE/Brick-Releases/releases/assets/1');
+  assert.equal(calls[2].args[3], 'https://uploads.github.com/repos/IsogiE/Brick-Releases/releases/7/assets?name=extra-addons-manifest.json');
+  assert.equal(calls[2].input, '{"x":1}\n');
 });

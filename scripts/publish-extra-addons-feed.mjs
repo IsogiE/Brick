@@ -5,10 +5,9 @@
 // the manifest and its signature are uploaded to the feed release.
 import { createHash, createPrivateKey, sign } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { inflateRawSync } from 'node:zlib';
 
 import { ensureFeedRelease } from './publish-addon-feed.mjs';
 
@@ -16,7 +15,6 @@ const feedRepo = process.env.BRICK_FEED_REPO || 'IsogiE/Brick-Releases';
 const feedTag = process.env.BRICK_FEED_TAG || 'addon-feed-v3';
 const manifestName = 'extra-addons-manifest.json';
 const signatureName = `${manifestName}.sig`;
-const outputDir = resolve('.release/brick-extra-addons-feed');
 const packageMaxBytes = 16 * 1024 * 1024;
 const sourceMaxFiles = 2000;
 const curseforgeRepos = 'https://repos.curseforge.com/wow/';
@@ -203,23 +201,15 @@ export async function buildGitHubEntry(addon, release, asset) {
   if (zip.length !== asset.size) {
     throw new Error(`${asset.name} size mismatch: release says ${asset.size}, downloaded ${zip.length}.`);
   }
-  const dir = mkdtempSync(join(tmpdir(), 'brick-extra-'));
-  let folders;
-  try {
-    const zipPath = join(dir, 'package.zip');
-    writeFileSync(zipPath, zip);
-    const names = execFileSync('unzip', ['-Z1', zipPath], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
-      .split('\n').filter(Boolean);
-    folders = packageFolders(names, addon);
-    for (const folder of folders) {
-      const toc = execFileSync('unzip', ['-p', zipPath, `${folder}/${folder}.toc`], { encoding: 'utf8' });
-      const version = tocVersion(toc);
-      if (version !== release.tag_name) {
-        throw new Error(`${folder} TOC version ${version || '(none)'} does not match ${release.tag_name}.`);
-      }
+  // Inspected in memory: nothing downloaded is ever written to disk.
+  const entries = zipEntries(zip);
+  const folders = packageFolders(entries.map((entry) => entry.name), addon);
+  for (const folder of folders) {
+    const tocEntry = entries.find((entry) => entry.name === `${folder}/${folder}.toc`);
+    const version = tocEntry ? tocVersion(readZipEntry(zip, tocEntry).toString('utf8')) : '';
+    if (version !== release.tag_name) {
+      throw new Error(`${folder} TOC version ${version || '(none)'} does not match ${release.tag_name}.`);
     }
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
   }
 
   const releaseJsonAsset = (release.assets || []).find((candidate) => candidate.name === 'release.json');
@@ -337,22 +327,76 @@ export function encodePath(relative) {
   return new URL(relative, 'https://example.invalid/').pathname.slice(1);
 }
 
-function publish(manifest, ghToken) {
+function publish(manifest, ghToken, invoke = gh) {
   const privateKey = createPrivateKey({
     key: Buffer.from(requiredEnv('BRICK_ADDON_PRIVATE_KEY_B64'), 'base64'),
     format: 'der',
     type: 'pkcs8'
   });
   const manifestJson = `${JSON.stringify(manifest, null, 2)}\n`;
-  mkdirSync(outputDir, { recursive: true });
-  const manifestPath = join(outputDir, manifestName);
-  const signaturePath = join(outputDir, signatureName);
-  writeFileSync(manifestPath, manifestJson);
-  writeFileSync(signaturePath, `${sign(null, Buffer.from(manifestJson), privateKey).toString('base64')}\n`);
-
-  ensureFeedRelease(ghToken, (args, token, stdio) => gh(args, token, stdio));
-  gh(['release', 'upload', feedTag, manifestPath, signaturePath, '--repo', feedRepo, '--clobber'], ghToken, 'inherit');
+  const signature = `${sign(null, Buffer.from(manifestJson), privateKey).toString('base64')}\n`;
+  ensureFeedRelease(ghToken, (args, token, stdio) => invoke(args, token, stdio));
+  // Upload straight from memory. The manifest goes first so a client that
+  // reads between the two uploads fails verification and retries next sync.
+  uploadReleaseAsset(manifestName, manifestJson, ghToken, invoke);
+  uploadReleaseAsset(signatureName, signature, ghToken, invoke);
   console.log(`Published extra addon manifest to ${feedRepo}@${feedTag}.`);
+}
+
+export function uploadReleaseAsset(name, content, ghToken, invoke = gh) {
+  const release = JSON.parse(invoke(['api', `repos/${feedRepo}/releases/tags/${feedTag}`], ghToken));
+  for (const asset of release.assets || []) {
+    if (asset.name === name) invoke(['api', '-X', 'DELETE', `repos/${feedRepo}/releases/assets/${asset.id}`], ghToken);
+  }
+  invoke([
+    'api', '-X', 'POST',
+    `https://uploads.github.com/repos/${feedRepo}/releases/${release.id}/assets?name=${encodeURIComponent(name)}`,
+    '-H', 'Content-Type: application/octet-stream', '--input', '-'
+  ], ghToken, 'pipe', content);
+}
+
+// Minimal reader for the central directory of a non-ZIP64 archive, enough to
+// list entry names and read the TOC files of a packaged addon.
+export function zipEntries(zip) {
+  const minEnd = Math.max(0, zip.length - 22 - 0xffff);
+  let end = -1;
+  for (let offset = zip.length - 22; offset >= minEnd; offset -= 1) {
+    if (zip.readUInt32LE(offset) === 0x06054b50) {
+      end = offset;
+      break;
+    }
+  }
+  if (end < 0) throw new Error('Package is not a zip archive.');
+  const count = zip.readUInt16LE(end + 10);
+  let offset = zip.readUInt32LE(end + 16);
+  if (count === 0xffff || offset === 0xffffffff) throw new Error('ZIP64 packages are not supported.');
+  const entries = [];
+  for (let index = 0; index < count; index += 1) {
+    if (offset + 46 > zip.length || zip.readUInt32LE(offset) !== 0x02014b50) {
+      throw new Error('Package zip has a damaged central directory.');
+    }
+    const nameLength = zip.readUInt16LE(offset + 28);
+    const name = zip.toString('utf8', offset + 46, offset + 46 + nameLength);
+    entries.push({
+      name,
+      method: zip.readUInt16LE(offset + 10),
+      compressedSize: zip.readUInt32LE(offset + 20),
+      size: zip.readUInt32LE(offset + 24),
+      localOffset: zip.readUInt32LE(offset + 42)
+    });
+    offset += 46 + nameLength + zip.readUInt16LE(offset + 30) + zip.readUInt16LE(offset + 32);
+  }
+  return entries;
+}
+
+export function readZipEntry(zip, entry) {
+  const local = entry.localOffset;
+  if (zip.readUInt32LE(local) !== 0x04034b50) throw new Error(`Damaged zip entry ${entry.name}.`);
+  const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
+  const data = zip.subarray(start, start + entry.compressedSize);
+  const bytes = entry.method === 0 ? data : entry.method === 8 ? inflateRawSync(data) : null;
+  if (!bytes || bytes.length !== entry.size) throw new Error(`Unsupported zip entry ${entry.name}.`);
+  return bytes;
 }
 
 async function download(url, maxBytes) {
@@ -375,8 +419,12 @@ async function fetchExistingManifest() {
   return response.json();
 }
 
-function gh(args, ghToken, stdio = 'pipe') {
-  return execFileSync('gh', args, { encoding: 'utf8', env: { ...process.env, GH_TOKEN: ghToken }, stdio });
+function gh(args, ghToken, stdio = 'pipe', input = undefined) {
+  return execFileSync('gh', args, {
+    encoding: 'utf8',
+    env: { ...process.env, GH_TOKEN: ghToken },
+    ...(input === undefined ? { stdio } : { input })
+  });
 }
 
 function requiredEnv(name) {
