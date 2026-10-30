@@ -3934,12 +3934,7 @@ impl ReviewUi {
             .is_some_and(|review| review.pov == crate::warcraftlogs::PovMatch::Unconfirmed)
         {
             ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(POV_WARNING).small().color(WARNING),
-                )
-                .wrap(),
-            );
+            ui.add(egui::Label::new(RichText::new(POV_WARNING).small().color(WARNING)).wrap());
         }
         ui.add_space(4.0);
         ui.add(

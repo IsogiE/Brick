@@ -3777,8 +3777,16 @@ mod tests {
                 "fights":[{"id":1,"encounterID":3100,"difficulty":5,"name":boss,"kill":false,
                     "startTime":1_343_000,"endTime":1_553_000}]})
         };
-        let theirs = report("ZBMzG2Hqjan7QNxD", "Sszorak", json!([{"id":1,"name":"Lazel"},{"id":2,"name":"Ariaeon"}]));
-        let ours = report("WVZKPCF9ncw6YxkN", "The Coiled Altar", json!([{"id":1,"name":"Humisenx"},{"id":2,"name":"Terza"}]));
+        let theirs = report(
+            "ZBMzG2Hqjan7QNxD",
+            "Sszorak",
+            json!([{"id":1,"name":"Lazel"},{"id":2,"name":"Ariaeon"}]),
+        );
+        let ours = report(
+            "WVZKPCF9ncw6YxkN",
+            "The Coiled Altar",
+            json!([{"id":1,"name":"Humisenx"},{"id":2,"name":"Terza"}]),
+        );
         let unlisted = report("KwVgHNjcYmbDfpAB", "The Coiled Altar", json!([]));
         let review = |reports: &[&Value], pov: &[&str]| {
             let mut client = Client::new().unwrap();

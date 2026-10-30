@@ -620,7 +620,8 @@ mod tests {
             for _ in 0..2 {
                 output = Some(ctx.run_ui(Default::default(), |ui| {
                     ui.set_width(width);
-                    bounds = super::pull(ui, &pull, 2, false, true, super::PullTiming::Verified).rect;
+                    bounds =
+                        super::pull(ui, &pull, 2, false, true, super::PullTiming::Verified).rect;
                 }));
             }
             let output = output.unwrap();
