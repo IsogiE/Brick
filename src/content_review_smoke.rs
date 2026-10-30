@@ -535,6 +535,7 @@ pub(crate) fn run_native_content() {
         user_id: "101".into(),
         name: "Local content fixture".into(),
         raid_role: None,
+        characters: Vec::new(),
         provider: Provider::Youtube,
         channel_id: fixture.replay.video_id.clone(),
         url: fixture.replay.public_url(0),
@@ -568,6 +569,7 @@ pub(crate) fn run_native_content() {
         pulls: vec![pull.clone()],
         content_capability: Some(cap),
         content_timing: Default::default(),
+        pov: Default::default(),
     });
     viewer.select(pull);
     viewer.sync_content_selection();

@@ -2660,6 +2660,7 @@ mod tests {
         let selected = crate::streams::Stream {
             user_id: "101".into(),
             raid_role: None,
+            characters: Vec::new(),
             name: "Example player".into(),
             provider: crate::streams::Provider::Youtube,
             channel_id: "test-channel".into(),

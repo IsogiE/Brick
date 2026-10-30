@@ -18,6 +18,7 @@ use std::{
 
 const ACCENT: Color32 = Color32::from_rgb(244, 100, 56);
 const MUTED: Color32 = Color32::from_rgb(145, 155, 173);
+const WARNING: Color32 = Color32::from_rgb(230, 184, 96);
 const DEATH: Color32 = Color32::from_rgb(237, 82, 93);
 
 static PEER_METADATA_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -3614,6 +3615,11 @@ fn dropdown_indicator(ui: &egui::Ui, button: &egui::Response) {
     ));
 }
 
+/// The logs in the window list their players, and none of them is the POV:
+/// these pulls may belong to another raid the guild logged that evening.
+const POV_WARNING: &str = "This streamer isn't listed in these logs, so the pulls may be \
+another raid's. They can add their characters under Settings › Your profile, or use Find a log.";
+
 fn review_outcome(pull: &Pull) -> String {
     if pull.difficulty == 10 {
         "M+".into()
@@ -3915,6 +3921,26 @@ impl ReviewUi {
             );
             return None;
         }
+        // Verified positions come from the server's measurement of this
+        // recording; the rest are the log time against the recording's start.
+        let precise = |pull: &Pull| {
+            self.review
+                .as_ref()
+                .is_some_and(|review| review.has_precise_timing(pull))
+        };
+        if self
+            .review
+            .as_ref()
+            .is_some_and(|review| review.pov == crate::warcraftlogs::PovMatch::Unconfirmed)
+        {
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(POV_WARNING).small().color(WARNING),
+                )
+                .wrap(),
+            );
+        }
         ui.add_space(4.0);
         ui.add(
             egui::TextEdit::singleline(&mut self.pull_search)
@@ -4033,13 +4059,24 @@ impl ReviewUi {
                                             p.report == pull.report && p.id == pull.id
                                         });
                                         let is_best = best.is_some() && pull.remaining == best;
-                                        let response = crate::stream_widgets::pull(
+                                        let timing = if precise(pull) {
+                                            crate::stream_widgets::PullTiming::Verified
+                                        } else {
+                                            crate::stream_widgets::PullTiming::Estimated
+                                        };
+                                        let mut response = crate::stream_widgets::pull(
                                             ui,
                                             pull,
                                             numbers[&(pull.report.clone(), pull.id)],
                                             active,
                                             is_best,
+                                            timing,
                                         );
+                                        if timing == crate::stream_widgets::PullTiming::Estimated {
+                                            response = response.on_hover_text(
+                                                crate::stream_widgets::ESTIMATED_TIMING_HINT,
+                                            );
+                                        }
                                         if active && follow {
                                             response.scroll_to_me(Some(egui::Align::Center));
                                         }
@@ -4409,6 +4446,7 @@ mod tests {
             recording_id: None,
             user_id: "101".into(),
             raid_role: None,
+            characters: Vec::new(),
             name: "A guildmate with a long character name".into(),
             provider: Provider::Youtube,
             channel_id: replay.video_id.clone(),
@@ -4422,6 +4460,7 @@ mod tests {
                 alternative_pulls: Default::default(),
                 content_capability: None,
                 content_timing: Default::default(),
+                pov: Default::default(),
                 replay,
                 pulls: vec![pull.clone()],
             },
@@ -4460,6 +4499,7 @@ mod tests {
             pulls: vec![pull, later],
             content_capability: Some(cap),
             content_timing: Default::default(),
+            pov: Default::default(),
         };
         let mut calls = 0;
         let clocks = crate::warcraftlogs::prepared::clocks(

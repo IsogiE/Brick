@@ -328,6 +328,7 @@ mod tests {
             pulls: vec![pull.clone()],
             content_capability: Some(cap),
             content_timing: Default::default(),
+            pov: Default::default(),
         });
         ui.recording_match_status = Some((0, false));
         ui.select(pull);
@@ -513,6 +514,7 @@ mod tests {
                 recording_id: Some(secondary.replay.video_id.clone()),
                 user_id: "202".into(),
                 raid_role: None,
+                characters: Vec::new(),
                 name: "Second POV".into(),
                 provider: secondary.replay.provider.clone(),
                 channel_id: secondary.replay.video_id.clone(),

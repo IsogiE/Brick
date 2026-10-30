@@ -329,6 +329,7 @@ mod tests {
                 pulls: vec![pull],
                 content_capability: Some(capability),
                 content_timing: Default::default(),
+                pov: Default::default(),
             },
         )
     }
