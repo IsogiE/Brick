@@ -1059,6 +1059,10 @@ impl BrickApp {
         self.draw_status_panel(ui);
         ui.add_space(18.0);
         self.draw_installs_section(ui);
+        if !self.view.settings.clients.is_empty() {
+            ui.add_space(18.0);
+            self.draw_extra_addons_section(ui);
+        }
         ui.add_space(18.0);
         self.draw_settings_panel(ui);
         if privacy_links(ui) {
@@ -1578,6 +1582,32 @@ impl BrickApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if danger_button(ui, "Remove").clicked() {
                     self.remove_client(&client.id);
+                }
+            });
+        });
+    }
+
+    fn draw_extra_addons_section(&mut self, ui: &mut egui::Ui) {
+        section_title(ui, "Troubleshooting addons");
+        ui.add_space(8.0);
+
+        panel_frame().show(ui, |ui| {
+            ui.add_enabled_ui(!self.view_work.mutating(), |ui| {
+                for (index, extra) in addon::extras::CATALOG.iter().enumerate() {
+                    if index > 0 {
+                        ui.separator();
+                    }
+                    let enabled = addon::extras::is_enabled(&self.view.settings, extra.id);
+                    let version = self.view.extra_addon_versions.get(extra.id);
+                    if extra_addon_row(ui, extra, enabled, version.map(String::as_str)) {
+                        self.view_work.request(
+                            ViewRequest::ExtraAddon {
+                                id: extra.id.to_string(),
+                                enabled: !enabled,
+                            },
+                            &self.egui_ctx,
+                        );
+                    }
                 }
             });
         });
@@ -2335,6 +2365,46 @@ fn settings_toggle_row(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
             });
         },
     );
+    clicked
+}
+
+/// Returns true when the toggle was clicked.
+fn extra_addon_row(
+    ui: &mut egui::Ui,
+    extra: &addon::extras::ExtraAddon,
+    enabled: bool,
+    installed_version: Option<&str>,
+) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        let text_width = (ui.available_width() - 100.0).max(180.0);
+        ui.vertical(|ui| {
+            ui.set_width(text_width);
+            ui.horizontal(|ui| {
+                ui.hyperlink_to(
+                    RichText::new(extra.name).strong().color(primary_text()),
+                    extra.project_url,
+                );
+                let mut byline = format!("by {}", extra.author);
+                if let Some(version) = installed_version {
+                    byline.push_str(&format!(" · {version}"));
+                }
+                ui.label(RichText::new(byline).small().color(muted_text()));
+            });
+            ui.add(
+                egui::Label::new(
+                    RichText::new(extra.description)
+                        .small()
+                        .color(secondary_text()),
+                )
+                .wrap(),
+            );
+        });
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            clicked = toggle(ui, enabled);
+        });
+    });
     clicked
 }
 

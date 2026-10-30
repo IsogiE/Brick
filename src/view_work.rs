@@ -21,6 +21,7 @@ pub(crate) enum Request {
     RemoveFolder(String),
     StartupEnabled(bool),
     StartupMinimized(bool),
+    ExtraAddon { id: String, enabled: bool },
 }
 
 impl Request {
@@ -29,7 +30,12 @@ impl Request {
     }
 
     fn sync_after(&self) -> bool {
-        matches!(self, Self::Refresh { sync: true, .. } | Self::AddFolders(_))
+        matches!(
+            self,
+            Self::Refresh { sync: true, .. }
+                | Self::AddFolders(_)
+                | Self::ExtraAddon { enabled: true, .. }
+        )
     }
 }
 
@@ -254,6 +260,16 @@ fn execute_request(request: Request) -> Result<Snapshot, String> {
                 .into(),
             ),
         ),
+        Request::ExtraAddon { id, enabled } => {
+            let view = addon::set_extra_addon_enabled(&id, enabled)?;
+            let name = addon::extras::find(&id).map_or("Addon", |addon| addon.name);
+            let message = if enabled {
+                format!("Brick will keep {name} up to date.")
+            } else {
+                format!("Brick stopped updating {name}. Its files were left in place.")
+            };
+            (view, Some(message))
+        }
     };
     Ok(Snapshot {
         view,
