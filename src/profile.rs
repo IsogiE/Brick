@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -12,6 +15,11 @@ use crate::{
     discord_auth::{self, AuthorizedUser},
     presence,
 };
+
+const BATTLENET_AUTHORIZE: &str = "https://oauth.battle.net/authorize?";
+const LINK_TIMEOUT: Duration = Duration::from_secs(180);
+const LINK_POLL_INTERVAL: Duration = Duration::from_millis(750);
+const LINK_CANCELLED: &str = "Battle.net sign-in was cancelled.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -159,18 +167,65 @@ pub fn role_picker(
 pub struct Profile {
     pub custom_name: Option<String>,
     pub raid_role: Option<RaidRole>,
-    /// Character names as logged on Warcraft Logs; a broadcast is paired with
-    /// the reports that list one of them.
+    /// Character names typed by hand, as logged on Warcraft Logs. The server
+    /// pairs a broadcast with reports listing these or a synced character.
     #[serde(default)]
     pub characters: Vec<String>,
+    /// The Battle.net account's characters, imported by signing in.
+    #[serde(default)]
+    pub battlenet: Option<BattlenetLink>,
     #[serde(default)]
     pub available: bool,
+    /// The server has a Battle.net client to sign in with.
+    #[serde(default)]
+    pub battlenet_available: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BattlenetLink {
+    pub battletag: String,
+    pub synced_at: String,
+    #[serde(default)]
+    pub characters: Vec<BattlenetCharacter>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BattlenetCharacter {
+    pub name: String,
+    pub realm: String,
+    pub region: String,
+    #[serde(default)]
+    pub level: u32,
+    #[serde(default)]
+    pub class: Option<String>,
+}
+
+impl BattlenetCharacter {
+    fn summary(&self) -> String {
+        let class = self.class.as_deref().unwrap_or("");
+        format!(
+            "{} · {} ({}) · {} {}",
+            self.name,
+            self.realm,
+            self.region.to_uppercase(),
+            self.level,
+            class
+        )
+        .trim_end()
+        .to_owned()
+    }
 }
 
 enum Operation {
     Load,
     Save(String, Option<RaidRole>, Vec<String>),
     Role(String, Option<RaidRole>),
+    /// Sign in with Battle.net in the browser and wait for the server to
+    /// import the account's characters. Signing in again replaces the list.
+    Link(Arc<AtomicBool>),
+    Unlink,
 }
 
 /// The comma-separated draft as the server takes it: trimmed names, blanks dropped.
@@ -200,6 +255,7 @@ pub struct ProfileUi {
     pending: Option<mpsc::Receiver<Completed>>,
     pending_role: Option<(String, Option<RaidRole>)>,
     saving: bool,
+    link_cancel: Option<Arc<AtomicBool>>,
     queued_roles: VecDeque<(String, Option<RaidRole>)>,
     completed_role: Option<(String, Option<RaidRole>)>,
     last_fetch: Option<Instant>,
@@ -229,6 +285,7 @@ impl ProfileUi {
                 Ok(completed) => {
                     self.pending = None;
                     self.saving = false;
+                    self.link_cancel = None;
                     let role_only = self.pending_role.take().is_some();
                     match completed.result {
                         Ok(profile) => {
@@ -257,6 +314,7 @@ impl ProfileUi {
                     self.pending = None;
                     self.saving = false;
                     self.pending_role = None;
+                    self.link_cancel = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -306,6 +364,7 @@ impl ProfileUi {
         }
         // A background read must not disable a confirmed profile or interrupt a draft.
         let enabled = !self.saving;
+        let linked = value.battlenet.is_some();
         let mut save = false;
         ui.add_enabled_ui(enabled, |ui| {
             // Size the row before placing labels and icons, so later padded
@@ -321,17 +380,19 @@ impl ProfileUi {
                 );
                 save |= name.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             });
-            ui.horizontal(|ui| {
-                ui.label("Characters");
-                let characters = ui.add(
-                    egui::TextEdit::singleline(&mut self.characters)
-                        .hint_text("Humisenx, Humialt")
-                        .char_limit(8 * 13)
-                        .desired_width(190.0),
-                );
-                save |= characters.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            });
+            if !linked {
+                ui.horizontal(|ui| {
+                    ui.label("Characters");
+                    let characters = ui.add(
+                        egui::TextEdit::singleline(&mut self.characters)
+                            .hint_text("Humisenx, Humialt")
+                            .char_limit(8 * 13)
+                            .desired_width(190.0),
+                    );
+                    save |= characters.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                });
+            }
             ui.horizontal(|ui| {
                 ui.label("Raid role");
                 role_icon(ui, self.role);
@@ -355,13 +416,97 @@ impl ProfileUi {
             );
         }
         ui.label(egui::RichText::new("Leave the name empty to use your Discord name.").small());
-        ui.label(
-            egui::RichText::new(
-                "Characters pair your streams with the logs you raided in, \
-                 when the guild logs more than one raid in an evening.",
-            )
-            .small(),
-        );
+        self.draw_battlenet(ui);
+    }
+
+    /// The Battle.net row: sign in to import the account's characters, or the
+    /// linked BattleTag with its characters, a resync and an unlink.
+    fn draw_battlenet(&mut self, ui: &mut egui::Ui) {
+        let Some(value) = self.value.clone() else {
+            return;
+        };
+        if !value.battlenet_available && value.battlenet.is_none() {
+            ui.label(
+                egui::RichText::new(
+                    "Characters pair your streams with the logs you raided in, \
+                     when the guild logs more than one raid in an evening.",
+                )
+                .small(),
+            );
+            return;
+        }
+        ui.add_space(6.0);
+        if let Some(cancel) = self.link_cancel.clone() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Waiting for Battle.net in your browser…");
+                if ui.button("Cancel").clicked() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            });
+            return;
+        }
+        let busy = self.busy();
+        match &value.battlenet {
+            Some(link) => {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Battle.net").strong());
+                    ui.label(&link.battletag);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} characters, synced {}",
+                            link.characters.len(),
+                            link.synced_at.get(..10).unwrap_or(&link.synced_at)
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Sync again"))
+                        .on_hover_text("Import the account's characters again after a rename, transfer or new character.")
+                        .clicked()
+                    {
+                        self.start_link(ui.ctx());
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("Unlink")).clicked() {
+                        self.start(ui.ctx(), Operation::Unlink);
+                    }
+                });
+                egui::CollapsingHeader::new(egui::RichText::new("Characters").small())
+                    .id_salt("battlenet-characters")
+                    .show(ui, |ui| {
+                        for character in &link.characters {
+                            ui.label(egui::RichText::new(character.summary()).small());
+                        }
+                    });
+            }
+            None => {
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Sign in with Battle.net"))
+                    .clicked()
+                {
+                    self.start_link(ui.ctx());
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Imports the characters on your Battle.net account, so your \
+                         streams pair with the logs you raided in. Or list names by hand.",
+                    )
+                    .small(),
+                );
+            }
+        }
+    }
+
+    fn start_link(&mut self, ctx: &egui::Context) {
+        if self.busy() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.link_cancel = Some(cancel.clone());
+        self.start(ctx, Operation::Link(cancel));
     }
 
     pub fn set_member_role(&mut self, ctx: &egui::Context, id: String, role: Option<RaidRole>) {
@@ -411,6 +556,27 @@ impl ProfileUi {
         crate::guild::spawn(move || {
             let expected_user = own_id.clone();
             let (target, method, path, body, saved) = match operation {
+                Operation::Link(cancel) => {
+                    let result = discord_auth::current_or_refreshed_access_token()
+                        .and_then(|token| {
+                            token.ok_or_else(|| "Sign in again to link Battle.net.".to_string())
+                        })
+                        .and_then(|token| link_battlenet(&token, &expected_user, &cancel));
+                    let _ = tx.send(Completed {
+                        target: own_id,
+                        saved: true,
+                        result,
+                    });
+                    ctx.request_repaint();
+                    return;
+                }
+                Operation::Unlink => (
+                    own_id,
+                    Method::DELETE,
+                    "/v1/profile/me/battlenet".to_owned(),
+                    None,
+                    true,
+                ),
                 Operation::Load => (
                     own_id,
                     Method::GET,
@@ -452,9 +618,159 @@ impl ProfileUi {
     }
 }
 
+/// Register a state, open Battle.net consent in the browser, and poll until
+/// the server has imported the account's characters.
+fn link_battlenet(
+    token: &crate::guild::Access,
+    expected_user: &str,
+    cancel: &AtomicBool,
+) -> Result<Profile, String> {
+    let state = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let (status, body) = presence::profile_call(
+        Method::POST,
+        "/v1/profile/me/battlenet",
+        token,
+        expected_user,
+        Some(&serde_json::json!({ "state": state })),
+    )?;
+    if !status.is_success() {
+        return Err(presence::profile_error(
+            "Battle.net sign-in failed",
+            status,
+            &body,
+        ));
+    }
+    let url = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("url")?.as_str().map(str::to_owned))
+        .filter(|url| authorize_url(url, &state))
+        .ok_or("Battle.net sign-in failed: invalid server response.")?;
+    crate::browser::open(&url)?;
+    let deadline = Instant::now() + LINK_TIMEOUT;
+    while Instant::now() < deadline {
+        std::thread::sleep(LINK_POLL_INTERVAL);
+        if cancel.load(Ordering::Relaxed) {
+            return Err(LINK_CANCELLED.into());
+        }
+        let (status, body) = presence::profile_call(
+            Method::GET,
+            &format!("/v1/profile/me/battlenet?state={state}"),
+            token,
+            expected_user,
+            None,
+        )?;
+        if status == reqwest::StatusCode::ACCEPTED {
+            continue;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(LINK_CANCELLED.into());
+        }
+        if !status.is_success() {
+            return Err(presence::profile_error(
+                "Battle.net sign-in failed",
+                status,
+                &body,
+            ));
+        }
+        return serde_json::from_slice(&body)
+            .map_err(|_| "Profile service returned invalid settings.".to_string());
+    }
+    Err("Battle.net sign-in timed out. Try again.".into())
+}
+
+/// Only Battle.net's own consent page, carrying our state, is opened.
+fn authorize_url(url: &str, state: &str) -> bool {
+    url.strip_prefix(BATTLENET_AUTHORIZE)
+        .and_then(|query| url::Url::parse(url).ok().map(|parsed| (query, parsed)))
+        .is_some_and(|(query, parsed)| {
+            parsed.host_str() == Some("oauth.battle.net")
+                && query.len() <= 2048
+                && parsed
+                    .query_pairs()
+                    .any(|(key, value)| key == "state" && value == state)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_battlenet_consent_pages_with_our_state_are_opened() {
+        let state = "a".repeat(64);
+        assert!(authorize_url(
+            &format!("https://oauth.battle.net/authorize?client_id=x&response_type=code&state={state}&scope=openid+wow.profile"),
+            &state
+        ));
+        for url in [
+            format!(
+                "https://oauth.battle.net/authorize?state={}",
+                "b".repeat(64)
+            ),
+            format!("https://oauth.battle.net.evil.test/authorize?state={state}"),
+            format!("http://oauth.battle.net/authorize?state={state}"),
+            format!("https://oauth.battle.net/authorize/../x?state={state}"),
+            "https://oauth.battle.net/authorize".to_owned(),
+        ] {
+            assert!(!authorize_url(&url, &state), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_synced_link_decodes_and_summarises_characters() {
+        let profile: Profile = serde_json::from_value(serde_json::json!({
+            "customName": null, "raidRole": null, "characters": [], "available": true,
+            "battlenetAvailable": true,
+            "battlenet": { "battletag": "Humi#2345", "syncedAt": "2026-10-30T11:00:00.000Z",
+                "characters": [{ "name": "Humisenx", "realm": "Tarren Mill", "realmSlug": "tarren-mill",
+                    "region": "eu", "level": 80, "class": "Paladin" },
+                    { "name": "Humialt", "realm": "Silvermoon", "region": "eu", "level": 70 }] }
+        }))
+        .unwrap();
+        let link = profile.battlenet.as_ref().unwrap();
+        assert_eq!(link.battletag, "Humi#2345");
+        assert_eq!(
+            link.characters[0].summary(),
+            "Humisenx · Tarren Mill (EU) · 80 Paladin"
+        );
+        assert_eq!(
+            link.characters[1].summary(),
+            "Humialt · Silvermoon (EU) · 70"
+        );
+        assert!(profile.battlenet_available);
+        let legacy: Profile = serde_json::from_value(serde_json::json!({
+            "customName": null, "raidRole": null, "characters": ["Typed"], "available": true
+        }))
+        .unwrap();
+        assert!(legacy.battlenet.is_none() && !legacy.battlenet_available);
+    }
+
+    #[test]
+    fn cancelling_a_link_clears_the_waiting_state_when_the_worker_reports() {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut profile = ProfileUi {
+            user_id: "123".into(),
+            pending: Some(rx),
+            saving: true,
+            link_cancel: Some(cancel.clone()),
+            last_fetch: Some(Instant::now()),
+            ..ProfileUi::default()
+        };
+        assert!(profile.busy());
+        tx.send(Completed {
+            target: "123".into(),
+            saved: true,
+            result: Err(LINK_CANCELLED.into()),
+        })
+        .unwrap();
+        assert!(!profile.tick(&egui::Context::default(), Some(&user()), true));
+        assert!(profile.link_cancel.is_none() && !profile.busy() && !profile.saving);
+    }
 
     #[test]
     fn character_drafts_split_on_separators_and_drop_blanks() {
@@ -487,6 +803,7 @@ mod tests {
             raid_role: Some(RaidRole::Healer),
             characters: vec!["Humisenx".into()],
             available: true,
+            ..Default::default()
         };
         tx.send(Completed {
             target: "123".into(),

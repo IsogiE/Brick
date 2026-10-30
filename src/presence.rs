@@ -215,6 +215,23 @@ pub(crate) fn profile_request(
     expected_user: &str,
     body: Option<&serde_json::Value>,
 ) -> Result<crate::profile::Profile, String> {
+    let (status, bytes) = profile_call(method, path, access_token, expected_user, body)?;
+    if !status.is_success() {
+        return Err(api_error("Profile request failed", status.as_u16(), &bytes));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| "Profile service returned invalid settings.".to_string())
+}
+
+/// One profile route call with its status, for routes that answer with
+/// something other than the profile (a sign-in URL, or a pending poll).
+pub(crate) fn profile_call(
+    method: reqwest::Method,
+    path: &str,
+    access_token: &crate::guild::Access,
+    expected_user: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<(reqwest::StatusCode, Vec<u8>), String> {
     let client = http_client()?;
     for attempt in 0..2 {
         let mut request = client
@@ -246,13 +263,13 @@ pub(crate) fn profile_request(
             std::thread::sleep(Duration::from_secs(retry_after));
             continue;
         }
-        if !status.is_success() {
-            return Err(api_error("Profile request failed", status.as_u16(), &bytes));
-        }
-        return serde_json::from_slice(&bytes)
-            .map_err(|_| "Profile service returned invalid settings.".to_string());
+        return Ok((status, bytes));
     }
     unreachable!("The final profile request attempt always returns")
+}
+
+pub(crate) fn profile_error(prefix: &str, status: reqwest::StatusCode, body: &[u8]) -> String {
+    api_error(prefix, status.as_u16(), body)
 }
 
 fn expect_success(response: reqwest::blocking::Response, prefix: &str) -> Result<(), String> {
