@@ -229,8 +229,23 @@ jobs:
 
       - name: Build release binary
         env:
+          BRICK_DISCORD_CLIENT_ID: ${{ vars.BRICK_DISCORD_CLIENT_ID }}
+          BRICK_TWITCH_CLIENT_ID: ${{ vars.BRICK_TWITCH_CLIENT_ID }}
+          BRICK_DISCORD_REDIRECT_URI: ${{ vars.BRICK_DISCORD_REDIRECT_URI }}
+          BRICK_PRESENCE_API_URL: ${{ vars.BRICK_PRESENCE_API_URL }}
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo build --release --locked
+
+      # Unsigned pre-release candidate for manual testing. It is built with the
+      # release configuration but is not signed, attested or published.
+      - name: Retain unsigned Windows release binary
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: brick-windows-unsigned
+          path: target/release/brick.exe
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Build isolated Windows interactive smoke tests
         if: runner.os == 'Windows'
