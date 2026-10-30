@@ -245,8 +245,7 @@ pub(super) fn sync(settings: &Settings) -> Result<(), String> {
 }
 
 fn fetch_manifest() -> Result<Option<Manifest>, String> {
-    let Some(bytes) = fetch_signed_manifest(FEED_URL, FEED_SIG_URL, "extra addon manifest")?
-    else {
+    let Some(bytes) = fetch_signed_manifest(FEED_URL, FEED_SIG_URL, "extra addon manifest")? else {
         return Ok(None);
     };
     let manifest: Manifest = serde_json::from_slice(&bytes)
@@ -368,7 +367,10 @@ fn validate_folders(addon: &ExtraAddon, folders: &[String]) -> Result<(), String
                         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
             });
         if !allowed || !seen.insert(folder) {
-            return Err(format!("manifest folder {folder} is not part of {}", addon.name));
+            return Err(format!(
+                "manifest folder {folder} is not part of {}",
+                addon.name
+            ));
         }
     }
     Ok(())
@@ -407,7 +409,10 @@ fn validate_source_files(
         let actual =
             Url::parse(&file.url).map_err(|error| format!("invalid source URL: {error}"))?;
         if actual != expected || actual.query().is_some() || actual.fragment().is_some() {
-            return Err(format!("source URL for {} is outside the pinned tag", file.path));
+            return Err(format!(
+                "source URL for {} is outside the pinned tag",
+                file.path
+            ));
         }
         if !is_sha256_hex(&file.sha256) {
             return Err(format!("invalid SHA-256 hash for {}", file.path));
@@ -428,8 +433,8 @@ fn validate_source_files(
 /// token is filled in after each file's hash has been verified.
 fn download_source_package(entry: &ManifestAddon) -> Result<Vec<u8>, String> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for file in &entry.artifact.files {
         ensure_sync_allowed()?;
         let mut bytes = if file.size == 0 {
@@ -630,28 +635,67 @@ mod tests {
         let grabber = find("buggrabber").unwrap();
         let good = || {
             vec![
-                source_file("!BugGrabber/!BugGrabber.toc", &format!("{TAG}!BugGrabber.toc")),
-                source_file("!BugGrabber/BugGrabber.lua", &format!("{TAG}BugGrabber.lua")),
+                source_file(
+                    "!BugGrabber/!BugGrabber.toc",
+                    &format!("{TAG}!BugGrabber.toc"),
+                ),
+                source_file(
+                    "!BugGrabber/BugGrabber.lua",
+                    &format!("{TAG}BugGrabber.lua"),
+                ),
             ]
         };
         assert!(validate_entry(grabber, &grabber_entry(good())).is_ok());
 
         let bad_files = [
-            ("!BugGrabber/BugGrabber.lua", "https://repos.curseforge.com/wow/bug-grabber/trunk/BugGrabber.lua"),
-            ("!BugGrabber/BugGrabber.lua", "https://repos.curseforge.com/wow/bug-grabber/tags/v12.1.0/BugGrabber.lua"),
-            ("!BugGrabber/BugGrabber.lua", "https://repos.curseforge.com/wow/other/tags/v12.1.1/BugGrabber.lua"),
-            ("!BugGrabber/BugGrabber.lua", "http://repos.curseforge.com/wow/bug-grabber/tags/v12.1.1/BugGrabber.lua"),
-            ("!BugGrabber/BugGrabber.lua", "https://evil.example/wow/bug-grabber/tags/v12.1.1/BugGrabber.lua"),
-            ("!BugGrabber/BugGrabber.lua", "https://repos.curseforge.com/wow/bug-grabber/tags/v12.1.1/Other.lua"),
-            ("!BugGrabber/BugGrabber.lua", "https://repos.curseforge.com/wow/bug-grabber/tags/v12.1.1/BugGrabber.lua?p=1"),
-            ("AdvanceRaidTools/x.lua", "https://repos.curseforge.com/wow/bug-grabber/tags/v12.1.1/x.lua"),
-            ("!BugGrabber/../x.lua", "https://repos.curseforge.com/wow/bug-grabber/tags/v12.1.1/../x.lua"),
-            ("!BugGrabber", "https://repos.curseforge.com/wow/bug-grabber/tags/v12.1.1/"),
+            (
+                "!BugGrabber/BugGrabber.lua",
+                "https://repos.curseforge.com/wow/bug-grabber/trunk/BugGrabber.lua",
+            ),
+            (
+                "!BugGrabber/BugGrabber.lua",
+                "https://repos.curseforge.com/wow/bug-grabber/tags/v12.1.0/BugGrabber.lua",
+            ),
+            (
+                "!BugGrabber/BugGrabber.lua",
+                "https://repos.curseforge.com/wow/other/tags/v12.1.1/BugGrabber.lua",
+            ),
+            (
+                "!BugGrabber/BugGrabber.lua",
+                "http://repos.curseforge.com/wow/bug-grabber/tags/v12.1.1/BugGrabber.lua",
+            ),
+            (
+                "!BugGrabber/BugGrabber.lua",
+                "https://evil.example/wow/bug-grabber/tags/v12.1.1/BugGrabber.lua",
+            ),
+            (
+                "!BugGrabber/BugGrabber.lua",
+                "https://repos.curseforge.com/wow/bug-grabber/tags/v12.1.1/Other.lua",
+            ),
+            (
+                "!BugGrabber/BugGrabber.lua",
+                "https://repos.curseforge.com/wow/bug-grabber/tags/v12.1.1/BugGrabber.lua?p=1",
+            ),
+            (
+                "AdvanceRaidTools/x.lua",
+                "https://repos.curseforge.com/wow/bug-grabber/tags/v12.1.1/x.lua",
+            ),
+            (
+                "!BugGrabber/../x.lua",
+                "https://repos.curseforge.com/wow/bug-grabber/tags/v12.1.1/../x.lua",
+            ),
+            (
+                "!BugGrabber",
+                "https://repos.curseforge.com/wow/bug-grabber/tags/v12.1.1/",
+            ),
         ];
         for (path, url) in bad_files {
             let mut files = good();
             files.push(source_file(path, url));
-            assert!(validate_entry(grabber, &grabber_entry(files)).is_err(), "{path} {url}");
+            assert!(
+                validate_entry(grabber, &grabber_entry(files)).is_err(),
+                "{path} {url}"
+            );
         }
 
         assert!(validate_entry(grabber, &grabber_entry(good()[1..].to_vec())).is_err());
@@ -682,7 +726,10 @@ mod tests {
             &["BigWigs", "BigWigs_Core", "BigWigs_Core"][..],
             &["BigWigs", "BigWigs_../x"][..],
         ] {
-            assert!(validate_entry(bigwigs, &entry(url, folders)).is_err(), "{folders:?}");
+            assert!(
+                validate_entry(bigwigs, &entry(url, folders)).is_err(),
+                "{folders:?}"
+            );
         }
         // Other addons stay limited to their single folder.
         assert!(validate_entry(bugsack(), &entry(BUGSACK_URL, &["BugSack", "BugSack_x"])).is_err());
@@ -691,7 +738,11 @@ mod tests {
     #[test]
     fn version_token_is_filled_only_in_text_sources() {
         assert_eq!(
-            replace_all(b"## Version: @project-version@\n@project-version@", VERSION_TOKEN, b"v1"),
+            replace_all(
+                b"## Version: @project-version@\n@project-version@",
+                VERSION_TOKEN,
+                b"v1"
+            ),
             b"## Version: v1\nv1"
         );
         assert_eq!(replace_all(b"none", VERSION_TOKEN, b"v1"), b"none");
@@ -796,9 +847,17 @@ mod tests {
         let zip = writer.finish().unwrap().into_inner();
 
         install_folders(&addons, "v1.4.38", &["!!AddonProfiler".to_string()], &zip).unwrap();
-        assert!(addon_toc_matches_version(&addons, "!!AddonProfiler", "v1.4.38"));
+        assert!(addon_toc_matches_version(
+            &addons,
+            "!!AddonProfiler",
+            "v1.4.38"
+        ));
         assert!(!addons.join("!!AddonProfiler").join("stale.lua").exists());
-        assert!(addon_toc_matches_version(&addons, "AdvanceRaidTools", "v1.7.11"));
+        assert!(addon_toc_matches_version(
+            &addons,
+            "AdvanceRaidTools",
+            "v1.7.11"
+        ));
 
         // A zip that smuggles in another folder is rejected before any change.
         let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -807,8 +866,18 @@ mod tests {
             .unwrap();
         writer.write_all(b"## Version: evil\n").unwrap();
         let zip = writer.finish().unwrap().into_inner();
-        assert!(install_folders(&addons, "v1.4.39", &["!!AddonProfiler".to_string()], &zip).is_err());
-        assert!(addon_toc_matches_version(&addons, "AdvanceRaidTools", "v1.7.11"));
-        assert!(addon_toc_matches_version(&addons, "!!AddonProfiler", "v1.4.38"));
+        assert!(
+            install_folders(&addons, "v1.4.39", &["!!AddonProfiler".to_string()], &zip).is_err()
+        );
+        assert!(addon_toc_matches_version(
+            &addons,
+            "AdvanceRaidTools",
+            "v1.7.11"
+        ));
+        assert!(addon_toc_matches_version(
+            &addons,
+            "!!AddonProfiler",
+            "v1.4.38"
+        ));
     }
 }

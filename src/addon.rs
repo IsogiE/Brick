@@ -1204,11 +1204,7 @@ fn fetch_verified_manifest() -> Result<AddonManifest, String> {
 
 /// Downloads a manifest and its detached signature. `None` means the feed has
 /// not been published yet.
-fn fetch_signed_manifest(
-    url: &str,
-    sig_url: &str,
-    label: &str,
-) -> Result<Option<Vec<u8>>, String> {
+fn fetch_signed_manifest(url: &str, sig_url: &str, label: &str) -> Result<Option<Vec<u8>>, String> {
     let client = http_client()?;
     let manifest_response = client
         .get(cache_busted_url(url)?)
