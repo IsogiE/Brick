@@ -153,10 +153,10 @@ test('packages are listed and their TOCs read in memory', () => {
   assert.throws(() => zipEntries(zip.subarray(0, zip.length - 30)));
 });
 
-test('feed assets are replaced from memory without touching other assets', () => {
+test('feed assets are replaced from memory without touching other assets', async () => {
   const calls = [];
-  const invoke = (args, token, stdio, input) => {
-    calls.push({ args, input });
+  const invoke = (args) => {
+    calls.push(args);
     if (args[1] === 'repos/IsogiE/Brick-Releases/releases/tags/addon-feed-v3') {
       return JSON.stringify({ id: 7, assets: [
         { id: 1, name: 'extra-addons-manifest.json' }, { id: 2, name: 'addon-manifest.json' }
@@ -164,13 +164,25 @@ test('feed assets are replaced from memory without touching other assets', () =>
     }
     return '{}';
   };
-  uploadReleaseAsset('extra-addons-manifest.json', '{"x":1}\n', 'token', invoke);
-  assert.deepEqual(calls.map((call) => call.args.slice(0, 3)), [
+  const sent = [];
+  const send = async (url, init) => {
+    sent.push({ url, init });
+    return { ok: true, text: async () => '' };
+  };
+  await uploadReleaseAsset('extra-addons-manifest.json', '{"x":1}\n', 'token', invoke, send);
+  assert.deepEqual(calls.map((args) => args.slice(0, 4)), [
     ['api', 'repos/IsogiE/Brick-Releases/releases/tags/addon-feed-v3'],
-    ['api', '-X', 'DELETE'],
-    ['api', '-X', 'POST']
+    ['api', '-X', 'DELETE', 'repos/IsogiE/Brick-Releases/releases/assets/1']
   ]);
-  assert.equal(calls[1].args[3], 'repos/IsogiE/Brick-Releases/releases/assets/1');
-  assert.equal(calls[2].args[3], 'https://uploads.github.com/repos/IsogiE/Brick-Releases/releases/7/assets?name=extra-addons-manifest.json');
-  assert.equal(calls[2].input, '{"x":1}\n');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].url, 'https://uploads.github.com/repos/IsogiE/Brick-Releases/releases/7/assets?name=extra-addons-manifest.json');
+  assert.ok(Buffer.isBuffer(sent[0].init.body));
+  assert.equal(sent[0].init.headers.authorization, 'Bearer token');
+  assert.equal(sent[0].init.body.toString(), '{"x":1}\n');
+
+  const failing = async () => ({ ok: false, status: 400, text: async () => 'Bad Content-Length' });
+  await assert.rejects(
+    uploadReleaseAsset('extra-addons-manifest.json', '{}', 'token', invoke, failing),
+    /HTTP 400 Bad Content-Length/
+  );
 });
