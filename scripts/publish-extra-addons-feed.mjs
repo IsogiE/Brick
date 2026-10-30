@@ -68,7 +68,7 @@ async function main() {
   } else if (dryRun) {
     console.log(JSON.stringify(manifest, null, 2));
   } else {
-    publish(manifest, ghToken);
+    await publish(manifest, ghToken);
   }
   if (failures.length > 0) {
     throw new Error(`Some extra addons could not be refreshed:\n${failures.join('\n')}`);
@@ -327,7 +327,7 @@ export function encodePath(relative) {
   return new URL(relative, 'https://example.invalid/').pathname.slice(1);
 }
 
-function publish(manifest, ghToken, invoke = gh) {
+async function publish(manifest, ghToken, invoke = gh) {
   const privateKey = createPrivateKey({
     key: Buffer.from(requiredEnv('BRICK_ADDON_PRIVATE_KEY_B64'), 'base64'),
     format: 'der',
@@ -338,21 +338,35 @@ function publish(manifest, ghToken, invoke = gh) {
   ensureFeedRelease(ghToken, (args, token, stdio) => invoke(args, token, stdio));
   // Upload straight from memory. The manifest goes first so a client that
   // reads between the two uploads fails verification and retries next sync.
-  uploadReleaseAsset(manifestName, manifestJson, ghToken, invoke);
-  uploadReleaseAsset(signatureName, signature, ghToken, invoke);
+  await uploadReleaseAsset(manifestName, manifestJson, ghToken, invoke);
+  await uploadReleaseAsset(signatureName, signature, ghToken, invoke);
   console.log(`Published extra addon manifest to ${feedRepo}@${feedTag}.`);
 }
 
-export function uploadReleaseAsset(name, content, ghToken, invoke = gh) {
+export async function uploadReleaseAsset(name, content, ghToken, invoke = gh, send = fetch) {
   const release = JSON.parse(invoke(['api', `repos/${feedRepo}/releases/tags/${feedTag}`], ghToken));
   for (const asset of release.assets || []) {
     if (asset.name === name) invoke(['api', '-X', 'DELETE', `repos/${feedRepo}/releases/assets/${asset.id}`], ghToken);
   }
-  invoke([
-    'api', '-X', 'POST',
+  // fetch sends a Buffer body with an exact Content-Length; the uploads host
+  // rejects the chunked body that `gh api --input -` produces.
+  const body = Buffer.from(content);
+  const response = await send(
     `https://uploads.github.com/repos/${feedRepo}/releases/${release.id}/assets?name=${encodeURIComponent(name)}`,
-    '-H', 'Content-Type: application/octet-stream', '--input', '-'
-  ], ghToken, 'pipe', content);
+    {
+      method: 'POST',
+      headers: {
+        accept: 'application/vnd.github+json',
+        authorization: `Bearer ${ghToken}`,
+        'content-type': 'application/octet-stream',
+        'user-agent': userAgent
+      },
+      body
+    }
+  );
+  if (!response.ok) {
+    throw new Error(`Uploading ${name} failed: HTTP ${response.status} ${await response.text()}`);
+  }
 }
 
 // Minimal reader for the central directory of a non-ZIP64 archive, enough to
@@ -419,12 +433,8 @@ async function fetchExistingManifest() {
   return response.json();
 }
 
-function gh(args, ghToken, stdio = 'pipe', input = undefined) {
-  return execFileSync('gh', args, {
-    encoding: 'utf8',
-    env: { ...process.env, GH_TOKEN: ghToken },
-    ...(input === undefined ? { stdio } : { input })
-  });
+function gh(args, ghToken, stdio = 'pipe') {
+  return execFileSync('gh', args, { encoding: 'utf8', env: { ...process.env, GH_TOKEN: ghToken }, stdio });
 }
 
 function requiredEnv(name) {
