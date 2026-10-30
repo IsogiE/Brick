@@ -600,6 +600,8 @@ mod tests {
                 .collect(),
 
             content_timing: Default::default(),
+
+            pov: Default::default(),
             content_capability: Some(cap),
         }
     }

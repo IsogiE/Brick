@@ -667,6 +667,7 @@ pub(crate) fn bridge_fixture() -> (Review, Key, RecordingClock) {
             alternative_pulls: vec![],
             content_capability: Some(cap),
             content_timing: Default::default(),
+            pov: Default::default(),
             complete_reports: ["TargetReport0001".into(), "SourceReport0001".into()]
                 .into_iter()
                 .collect(),
@@ -716,6 +717,7 @@ mod tests {
             user_id: "101".into(),
             name: "Fixture".into(),
             raid_role: None,
+            characters: Vec::new(),
             provider: Provider::Youtube,
             channel_id: replay.video_id.clone(),
             url: replay.public_url(0),
@@ -733,6 +735,8 @@ mod tests {
             content_capability: Some(cap),
 
             content_timing: Default::default(),
+
+            pov: Default::default(),
         };
         (stream, review, vec![(ticket.key, test_recording_clock())])
     }

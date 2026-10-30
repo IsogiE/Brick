@@ -1056,13 +1056,15 @@ impl BrickApp {
             }
             return;
         }
-        self.draw_status_panel(ui);
-        ui.add_space(18.0);
-        self.draw_installs_section(ui);
-        if !self.view.settings.clients.is_empty() {
+        if self.display_status().is_some() {
+            self.draw_status_panel(ui);
             ui.add_space(18.0);
-            self.draw_extra_addons_section(ui);
         }
+        if !self.view.settings.clients.is_empty() {
+            self.draw_addons_section(ui);
+            ui.add_space(18.0);
+        }
+        self.draw_installs_section(ui);
         ui.add_space(18.0);
         self.draw_settings_panel(ui);
         if privacy_links(ui) {
@@ -1414,7 +1416,9 @@ impl BrickApp {
     }
 
     fn draw_status_panel(&self, ui: &mut egui::Ui) {
-        let status = self.display_status();
+        let Some(status) = self.display_status() else {
+            return;
+        };
         let row_height = if status.detail.is_empty() { 34.0 } else { 54.0 };
 
         panel_frame().show(ui, |ui| {
@@ -1587,26 +1591,54 @@ impl BrickApp {
         });
     }
 
-    fn draw_extra_addons_section(&mut self, ui: &mut egui::Ui) {
-        section_title(ui, "Troubleshooting addons");
+    /// Every addon Brick manages: ART first, then the optional addons by group.
+    fn draw_addons_section(&mut self, ui: &mut egui::Ui) {
+        section_title(ui, "Addons");
         ui.add_space(8.0);
 
         panel_frame().show(ui, |ui| {
             ui.add_enabled_ui(!self.view_work.mutating(), |ui| {
-                for (index, extra) in addon::extras::CATALOG.iter().enumerate() {
-                    if index > 0 {
+                let art_version = current_version(&self.view.settings.clients);
+                addon_row(
+                    ui,
+                    AddonRow {
+                        name: "Advance Raid Tools",
+                        author: None,
+                        url: "https://github.com/IsogiE/AdvanceRaidTools",
+                        version: art_version.as_deref(),
+                        toggle: None,
+                    },
+                );
+
+                for group in addon::extras::Group::ALL {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(group.title()).small().color(muted_text()));
+                    let addons = addon::extras::CATALOG
+                        .iter()
+                        .filter(|extra| extra.group == group);
+                    for extra in addons {
                         ui.separator();
-                    }
-                    let enabled = addon::extras::is_enabled(&self.view.settings, extra.id);
-                    let version = self.view.extra_addon_versions.get(extra.id);
-                    if extra_addon_row(ui, extra, enabled, version.map(String::as_str)) {
-                        self.view_work.request(
-                            ViewRequest::ExtraAddon {
-                                id: extra.id.to_string(),
-                                enabled: !enabled,
+                        let enabled = addon::extras::is_enabled(&self.view.settings, extra.id);
+                        let version = self.view.extra_addon_versions.get(extra.id);
+                        let clicked = addon_row(
+                            ui,
+                            AddonRow {
+                                name: extra.name,
+                                author: Some(extra.author),
+                                url: extra.project_url,
+                                version: version.map(String::as_str),
+                                toggle: Some(enabled),
                             },
-                            &self.egui_ctx,
                         );
+                        if clicked {
+                            self.view_work.request(
+                                ViewRequest::ExtraAddon {
+                                    id: extra.id.to_string(),
+                                    enabled: !enabled,
+                                },
+                                &self.egui_ctx,
+                            );
+                        }
                     }
                 }
             });
@@ -1686,7 +1718,9 @@ impl BrickApp {
         }
     }
 
-    fn display_status(&self) -> DisplayStatus {
+    /// The banner above the addons, shown only when the user has to act or
+    /// Brick is restarting. Addon updates themselves run silently.
+    fn display_status(&self) -> Option<DisplayStatus> {
         let version = current_version(&self.view.settings.clients);
 
         let settings_error = self.view_error.as_deref().or_else(|| {
@@ -1694,7 +1728,7 @@ impl BrickApp {
                 .then_some(self.status.as_str())
         });
         if let Some(error) = settings_error {
-            return DisplayStatus {
+            return Some(DisplayStatus {
                 title: "Settings need attention".to_string(),
                 detail: friendly_problem(error),
                 accent: error_accent(),
@@ -1702,7 +1736,7 @@ impl BrickApp {
                 // A failed settings save can leave the cached version behind
                 // the actual addon installation. Do not present it as current.
                 version: None,
-            };
+            });
         }
 
         if self
@@ -1710,63 +1744,26 @@ impl BrickApp {
             .to_ascii_lowercase()
             .starts_with("installing brick ")
         {
-            return DisplayStatus {
+            return Some(DisplayStatus {
                 title: "Updating Brick".to_string(),
                 detail: "Brick will restart to finish.".to_string(),
                 accent: info_accent(),
                 accent_soft: Color32::from_rgb(29, 48, 62),
                 version,
-            };
+            });
         }
 
         if self.view.setup_required || self.view.settings.clients.is_empty() {
-            return DisplayStatus {
+            return Some(DisplayStatus {
                 title: "Setup needed".to_string(),
                 detail: "Select your World of Warcraft folder.".to_string(),
                 accent: warning_accent(),
                 accent_soft: Color32::from_rgb(61, 47, 30),
                 version,
-            };
+            });
         }
 
-        if self.sync_rx.is_some() {
-            return DisplayStatus {
-                title: "Checking for updates".to_string(),
-                detail: String::new(),
-                accent: info_accent(),
-                accent_soft: Color32::from_rgb(29, 48, 62),
-                version,
-            };
-        }
-
-        if status_needs_attention(&self.status) {
-            return DisplayStatus {
-                title: "Needs attention".to_string(),
-                detail: friendly_problem(&self.status),
-                accent: error_accent(),
-                accent_soft: Color32::from_rgb(62, 32, 36),
-                version,
-            };
-        }
-
-        let status_lower = self.status.to_ascii_lowercase();
-        if status_lower.starts_with("installed ") {
-            return DisplayStatus {
-                title: "Updated".to_string(),
-                detail: String::new(),
-                accent: success_accent(),
-                accent_soft: Color32::from_rgb(26, 59, 42),
-                version,
-            };
-        }
-
-        DisplayStatus {
-            title: "Up to date".to_string(),
-            detail: String::new(),
-            accent: success_accent(),
-            accent_soft: Color32::from_rgb(26, 59, 42),
-            version,
-        }
+        None
     }
 
     fn pick_wow_folders(&mut self) {
@@ -2368,43 +2365,50 @@ fn settings_toggle_row(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
     clicked
 }
 
-/// Returns true when the toggle was clicked.
-fn extra_addon_row(
-    ui: &mut egui::Ui,
-    extra: &addon::extras::ExtraAddon,
-    enabled: bool,
-    installed_version: Option<&str>,
-) -> bool {
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        let text_width = (ui.available_width() - 100.0).max(180.0);
-        ui.vertical(|ui| {
-            ui.set_width(text_width);
-            ui.horizontal(|ui| {
-                ui.hyperlink_to(
-                    RichText::new(extra.name).strong().color(primary_text()),
-                    extra.project_url,
-                );
-                let mut byline = format!("by {}", extra.author);
-                if let Some(version) = installed_version {
-                    byline.push_str(&format!(" · {version}"));
-                }
-                ui.label(RichText::new(byline).small().color(muted_text()));
-            });
-            ui.add(
-                egui::Label::new(
-                    RichText::new(extra.description)
-                        .small()
-                        .color(secondary_text()),
-                )
-                .wrap(),
-            );
-        });
+struct AddonRow<'a> {
+    name: &'a str,
+    author: Option<&'a str>,
+    url: &'a str,
+    version: Option<&'a str>,
+    /// `None` for addons that are always installed.
+    toggle: Option<bool>,
+}
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            clicked = toggle(ui, enabled);
-        });
-    });
+/// One addon: name and author on the left; installed version and toggle on
+/// the right. Returns true when the toggle was clicked.
+fn addon_row(ui: &mut egui::Ui, row: AddonRow<'_>) -> bool {
+    let mut clicked = false;
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), 34.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.hyperlink_to(
+                RichText::new(row.name).strong().color(primary_text()),
+                row.url,
+            );
+            if let Some(author) = row.author {
+                ui.label(
+                    RichText::new(format!("by {author}"))
+                        .small()
+                        .color(muted_text()),
+                );
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                match row.toggle {
+                    Some(on) => clicked = toggle(ui, on),
+                    // Always installed: keep versions aligned with toggled rows.
+                    None => {
+                        ui.allocate_exact_size(egui::vec2(46.0, 24.0), egui::Sense::hover());
+                    }
+                }
+                if let Some(version) = row.version.filter(|_| row.toggle != Some(false)) {
+                    ui.add_space(12.0);
+                    ui.label(RichText::new(version).small().color(secondary_text()));
+                }
+            });
+        },
+    );
     clicked
 }
 
@@ -3381,7 +3385,7 @@ pub(crate) mod tests {
             "Failed to read Brick settings at settings.json: Access is denied. (os error 5)",
         ] {
             app.status = error.into();
-            let status = app.display_status();
+            let status = app.display_status().unwrap();
             assert_eq!(status.title, "Settings need attention");
             assert!(status.detail.contains("settings"));
             assert!(!status.detail.contains("Advance Raid Tools"));
@@ -3457,13 +3461,12 @@ pub(crate) mod tests {
             last_installed_sha256: Some("abc123".into()),
             last_sync_at: None,
         });
-        assert_eq!(app.display_status().title, "Up to date");
-
+        // Routine addon work never puts a banner in front of the user.
+        assert!(app.display_status().is_none());
         app.status = "Installed 1.7.1 on 1 client(s).".into();
-        assert_eq!(app.display_status().title, "Updated");
-
+        assert!(app.display_status().is_none());
         app.sync_rx = Some(mpsc::channel().1);
-        assert_eq!(app.display_status().title, "Checking for updates");
+        assert!(app.display_status().is_none());
     }
 
     #[test]
@@ -3569,9 +3572,15 @@ pub(crate) mod tests {
             "an initial failure must leave the loading state"
         );
         assert_eq!(app.status, "Unreadable settings");
-        assert_eq!(app.display_status().title, "Settings need attention");
+        assert_eq!(
+            app.display_status().unwrap().title,
+            "Settings need attention"
+        );
         app.status = "Up to date".into();
-        assert_eq!(app.display_status().title, "Settings need attention");
+        assert_eq!(
+            app.display_status().unwrap().title,
+            "Settings need attention"
+        );
         assert!(app.next_repaint_after() > Duration::from_secs(50));
         app.apply_view_refresh(Ok(AppView::default()));
         assert!(app.view_error.is_none());

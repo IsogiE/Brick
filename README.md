@@ -25,7 +25,7 @@ Run Brick, sign in with Discord, and select your World of Warcraft folder. You c
 
 Discord credentials are protected with Windows DPAPI or the Linux desktop keyring (Secret Service, such as GNOME Keyring or KWallet). Linux needs an unlocked keyring to save or restore a login.
 
-Brick also keeps a few third-party troubleshooting addons up to date: BugGrabber, BugSack and AddOn Profiler are on by default, and BigWigs is available as an opt-in. Each can be turned off under **Troubleshooting addons**. Brick never rehosts them. The `extra-addons` job in the Addon feed workflow signs a manifest that pins each author's own download by URL, size and SHA-256 (the author's GitHub release zip, or for BugGrabber the files of the newest tag in its public CurseForge repository), and Brick downloads from those sources. A copy installed by another addon manager at the same version is left alone.
+Brick also keeps a few third-party troubleshooting addons up to date: BugGrabber, BugSack and AddOn Profiler are on by default, and BigWigs is available as an opt-in. Home lists every managed addon with its version and status; each optional one has its own toggle. Brick never rehosts them. The `extra-addons` job in the Addon feed workflow signs a manifest that pins each author's own download by URL, size and SHA-256 (the author's GitHub release zip, or for BugGrabber the files of the newest tag in its public CurseForge repository), and Brick downloads from those sources. A copy installed by another addon manager at the same version is left alone.
 
 Closing or minimizing the window keeps Brick in the tray. **Open at login** controls startup; **Start minimized** keeps that login launch in the tray. Brick's own updates appear in the app when a new release is available.
 

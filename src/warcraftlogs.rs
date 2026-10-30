@@ -201,10 +201,26 @@ pub struct RaidEvent {
     pub group: Option<DefensiveGroup>,
 }
 
+/// Whether the pulls shown for a broadcast come from a report its streamer
+/// logged in. A guild can run several raids in one evening; time overlap
+/// alone cannot tell them apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PovMatch {
+    /// No report in the window carries a player list, or the POV has no names.
+    #[default]
+    Unknown,
+    /// Only reports listing one of the streamer's names are shown.
+    Confirmed,
+    /// Reports list players, but none of them is the streamer: every
+    /// overlapping report stays, and the viewer is told to check.
+    Unconfirmed,
+}
+
 #[derive(Clone)]
 pub struct Review {
     pub replay: Replay,
     pub pulls: Vec<Pull>,
+    pub pov: PovMatch,
     /// Other logger candidates remain available for their own clock lookups.
     pub alternative_pulls: Vec<Pull>,
     /// All applicable report rows were validated, including duplicate loggers.
@@ -1264,7 +1280,7 @@ impl Client {
         let mut review = if let Some(code) = report_override {
             self.review_explicit_report(replay, code)?
         } else {
-            self.review_replay(Some(discord_token), replay)?
+            self.review_replay(Some(discord_token), replay, &pov_names(stream))?
         };
         review.content_capability = capability;
 
@@ -1455,6 +1471,7 @@ impl Client {
             pulls,
             content_capability: None,
             content_timing: HashMap::new(),
+            pov: Default::default(),
         })
     }
 
@@ -1743,6 +1760,7 @@ impl Client {
         &mut self,
         access: Option<&crate::guild::Access>,
         replay: Replay,
+        pov: &[String],
     ) -> Result<Review, String> {
         self.recording_match_complete = false;
         check_cancelled(&self.cancel)?;
@@ -1757,6 +1775,7 @@ impl Client {
                 pulls: Vec::new(),
                 content_capability: None,
                 content_timing: HashMap::new(),
+                pov: Default::default(),
             });
         };
         let end = start
@@ -1777,7 +1796,8 @@ impl Client {
             let mut reports = Vec::with_capacity(listed.len());
             for report in listed {
                 if let Some(code) = report["code"].as_str().filter(|code| report_code(code)) {
-                    reports.push(json!({"code":code,"startTime":report["startTime"],"endTime":report["endTime"]}));
+                    reports.push(json!({"code":code,"startTime":report["startTime"],"endTime":report["endTime"],
+                        "players":report["players"]}));
                     self.reports
                         .insert(code.to_owned(), (Instant::now(), report.clone()));
                 }
@@ -1802,7 +1822,7 @@ impl Client {
                         .zip(number_ms(&report["endTime"]))
                         .is_some_and(|(start, end)| start > 0 && end >= start)
             });
-        let reports: Vec<_> = self
+        let mut reports: Vec<_> = self
             .directory
             .as_ref()
             .unwrap()
@@ -1814,6 +1834,12 @@ impl Client {
             })
             .cloned()
             .collect();
+        // Keep the reports the streamer logged in. Without a confirmed one,
+        // every overlapping report stays and the viewer sees the doubt.
+        let pov_match = pov_match(&reports, pov);
+        if pov_match == PovMatch::Confirmed {
+            reports.retain(|report| report_lists(report, pov) == Some(true));
+        }
         if reports.len() > 20 {
             return Err(
                 "Too many overlapping reports to match this broadcast automatically.".into(),
@@ -1849,9 +1875,70 @@ impl Client {
             alternative_pulls: Default::default(),
             content_capability: None,
             content_timing: HashMap::new(),
+            pov: pov_match,
             replay,
             pulls: unique,
         })
+    }
+}
+
+/// The names a broadcast can be recognised by in a report's player list: the
+/// member's display name (usually their Discord nickname) and the characters
+/// they listed in their profile.
+pub(crate) fn pov_names(stream: &Stream) -> Vec<String> {
+    let mut names: Vec<String> = std::iter::once(stream.name.as_str())
+        .chain(stream.characters.iter().map(String::as_str))
+        .map(str::trim)
+        .filter(|name| name.chars().count() >= 2 && name.chars().count() <= 64)
+        .map(str::to_owned)
+        .collect();
+    names.dedup();
+    names
+}
+
+fn character_key(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    // "Name-Realm" and "Name (Realm)" compare as the character's name.
+    let name = name.split(['-', '(']).next().unwrap_or("").trim();
+    name.nfc().collect::<String>().to_lowercase()
+}
+
+/// A name recognises a character when both read the same, or when one is the
+/// start of the other with at least four letters ("Humi" for "Humisenx").
+fn names_match(pov: &str, player: &str) -> bool {
+    let (pov, player) = (character_key(pov), character_key(player));
+    if pov.is_empty() || player.is_empty() {
+        return false;
+    }
+    pov == player
+        || (pov.chars().count() >= 4 && player.starts_with(&pov))
+        || (player.chars().count() >= 4 && pov.starts_with(&player))
+}
+
+/// `None` when the report carries no player list (an archive from before the
+/// server kept one); otherwise whether one of the POV's names logged in it.
+fn report_lists(report: &Value, pov: &[String]) -> Option<bool> {
+    let players = report["players"]
+        .as_array()
+        .filter(|players| !players.is_empty() && players.len() <= 500)?;
+    Some(players.iter().any(|player| {
+        player["name"]
+            .as_str()
+            .is_some_and(|name| pov.iter().any(|own| names_match(own, name)))
+    }))
+}
+
+fn pov_match(reports: &[Value], pov: &[String]) -> PovMatch {
+    let listed: Vec<_> = reports
+        .iter()
+        .map(|report| report_lists(report, pov))
+        .collect();
+    if pov.is_empty() || listed.iter().all(Option::is_none) {
+        PovMatch::Unknown
+    } else if listed.contains(&Some(true)) {
+        PovMatch::Confirmed
+    } else {
+        PovMatch::Unconfirmed
     }
 }
 
@@ -2455,6 +2542,7 @@ mod tests {
             complete_reports: Default::default(),
             content_capability: None,
             content_timing: HashMap::new(),
+            pov: Default::default(),
         };
         for _ in 0..3 {
             (review.pulls, review.alternative_pulls) =
@@ -2490,6 +2578,7 @@ mod tests {
             pulls: vec![first.clone(), second],
             content_capability: None,
             content_timing: HashMap::new(),
+            pov: Default::default(),
         };
         assert!(review.matching_pull(&selected).is_none());
         assert_eq!(review.matching_pull(&first).unwrap().id, first.id);
@@ -3028,7 +3117,7 @@ mod tests {
         assert!(valid_video(&replay));
         let mut client = Client::new().unwrap();
         client.configure(&token, true).unwrap();
-        let review = client.review_replay(Some(&token), replay).unwrap();
+        let review = client.review_replay(Some(&token), replay, &[]).unwrap();
         assert!(
             !review.pulls.is_empty(),
             "No overlapping private raid pulls found"
@@ -3646,6 +3735,99 @@ mod tests {
     }
 
     #[test]
+    fn streamer_names_recognise_their_characters_without_the_realm() {
+        assert!(names_match("Humi", "Humisenx"));
+        assert!(names_match("Humisenx", "Humi"));
+        assert!(names_match("humisenx", "Humisenx-Draenor"));
+        assert!(names_match("Sép", "Se\u{301}p"));
+        // Short names must read the same: "Hu" alone would match half the roster.
+        assert!(!names_match("Hu", "Humisenx"));
+        assert!(!names_match("Humi", "Humble"));
+        assert!(!names_match("", "Humisenx"));
+        let stream = Stream {
+            user_id: "1".into(),
+            name: " Humi ".into(),
+            raid_role: None,
+            characters: vec!["Humisenx".into(), "x".into()],
+            provider: streams::Provider::Twitch,
+            channel_id: "humisenx".into(),
+            url: "https://twitch.tv/humisenx".into(),
+            status: streams::Status::Offline,
+            broadcast_state: None,
+            recording_id: None,
+            replay_start_ms: None,
+            replay_end_ms: None,
+        };
+        assert_eq!(pov_names(&stream), vec!["Humi", "Humisenx"]);
+    }
+
+    /// Two raids of one guild logged the same evening: a POV follows the
+    /// report its streamer is in, and only falls back to both when no report
+    /// lists them (with the doubt recorded) or no report has a player list.
+    #[test]
+    fn a_broadcast_pairs_with_the_report_its_streamer_logged_in() {
+        let replay: Replay = serde_json::from_value(json!({
+            "provider":"twitch","videoId":"2909773993","broadcastId":"2909773993",
+            "startedAt":"2026-10-24T19:53:31Z","availableSeconds":11023,
+        }))
+        .unwrap();
+        let start = replay.start_ms().unwrap();
+        let report = |code: &str, boss: &str, players: Value| {
+            json!({"code":code,"startTime":start - 600_000,"endTime":start + 7_200_000,"players":players,
+                "fights":[{"id":1,"encounterID":3100,"difficulty":5,"name":boss,"kill":false,
+                    "startTime":1_343_000,"endTime":1_553_000}]})
+        };
+        let theirs = report(
+            "ZBMzG2Hqjan7QNxD",
+            "Sszorak",
+            json!([{"id":1,"name":"Lazel"},{"id":2,"name":"Ariaeon"}]),
+        );
+        let ours = report(
+            "WVZKPCF9ncw6YxkN",
+            "The Coiled Altar",
+            json!([{"id":1,"name":"Humisenx"},{"id":2,"name":"Terza"}]),
+        );
+        let unlisted = report("KwVgHNjcYmbDfpAB", "The Coiled Altar", json!([]));
+        let review = |reports: &[&Value], pov: &[&str]| {
+            let mut client = Client::new().unwrap();
+            let window = report_window(start, start + 11_023_000).unwrap();
+            client.directory = Some(ReportDirectory {
+                window,
+                loaded_at: Instant::now(),
+                reports: reports.iter().map(|r| (*r).clone()).collect(),
+            });
+            for report in reports {
+                client.reports.insert(
+                    report["code"].as_str().unwrap().to_owned(),
+                    (Instant::now(), (*report).clone()),
+                );
+            }
+            let pov: Vec<String> = pov.iter().map(|s| s.to_string()).collect();
+            client.review_replay(None, replay.clone(), &pov).unwrap()
+        };
+        let bosses = |review: &Review| {
+            review
+                .pulls
+                .iter()
+                .map(|pull| pull.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let matched = review(&[&theirs, &ours, &unlisted], &["Humi"]);
+        assert_eq!(matched.pov, PovMatch::Confirmed);
+        assert_eq!(bosses(&matched), ["The Coiled Altar"]);
+        assert_eq!(matched.pulls[0].report, "WVZKPCF9ncw6YxkN");
+        // A streamer nobody listed keeps every report, and the review says so.
+        let doubtful = review(&[&theirs, &ours], &["Stranger"]);
+        assert_eq!(doubtful.pov, PovMatch::Unconfirmed);
+        assert_eq!(doubtful.pulls.len(), 2);
+        // Archives without player lists, or a POV without names, decide nothing.
+        assert_eq!(review(&[&unlisted], &["Humi"]).pov, PovMatch::Unknown);
+        let unnamed = review(&[&theirs, &ours], &[]);
+        assert_eq!(unnamed.pov, PovMatch::Unknown);
+        assert_eq!(unnamed.pulls.len(), 2);
+    }
+
+    #[test]
     fn pkce_matches_rfc7636_vector() {
         assert_eq!(
             challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
@@ -3662,7 +3844,7 @@ mod content_metadata_tests {
         let replay:Replay=serde_json::from_value(json!({"provider":"youtube","videoId":"abcDEF_12-3","broadcastId":"abcDEF_12-3","startedAt":null,"availableSeconds":600,"timelineRevision":"b".repeat(64)})).unwrap();
         assert!(replay.start_ms().is_err());
         let mut client = Client::new().unwrap();
-        let review = client.review_replay(None, replay).unwrap();
+        let review = client.review_replay(None, replay, &[]).unwrap();
         assert!(review.pulls.is_empty());
         assert!(!client.recording_match_complete);
         assert_eq!(client.requests.graphql, 0);

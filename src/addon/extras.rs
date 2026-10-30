@@ -42,11 +42,29 @@ enum Source {
     CurseForgeTag { project: &'static str },
 }
 
+/// Which panel an addon is listed under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    Troubleshooting,
+    BossMods,
+}
+
+impl Group {
+    pub const ALL: [Group; 2] = [Group::Troubleshooting, Group::BossMods];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Troubleshooting => "Troubleshooting",
+            Self::BossMods => "Boss mods",
+        }
+    }
+}
+
 pub struct ExtraAddon {
     pub id: &'static str,
+    pub group: Group,
     pub name: &'static str,
     pub author: &'static str,
-    pub description: &'static str,
     pub project_url: &'static str,
     /// The main folder; its TOC version identifies the installed release.
     folder: &'static str,
@@ -61,9 +79,9 @@ pub struct ExtraAddon {
 pub const CATALOG: &[ExtraAddon] = &[
     ExtraAddon {
         id: "buggrabber",
+        group: Group::Troubleshooting,
         name: "BugGrabber",
         author: "Funkeh",
-        description: "Captures Lua errors. ART pull reports use it.",
         project_url: "https://www.curseforge.com/wow/addons/bug-grabber",
         folder: "!BugGrabber",
         folder_prefix: None,
@@ -75,9 +93,9 @@ pub const CATALOG: &[ExtraAddon] = &[
     },
     ExtraAddon {
         id: "bugsack",
+        group: Group::Troubleshooting,
         name: "BugSack",
         author: "Funkeh",
-        description: "Browse captured errors in game. Needs BugGrabber.",
         project_url: "https://github.com/funkydude/BugSack",
         folder: "BugSack",
         folder_prefix: None,
@@ -89,9 +107,9 @@ pub const CATALOG: &[ExtraAddon] = &[
     },
     ExtraAddon {
         id: "addon-profiler",
+        group: Group::Troubleshooting,
         name: "AddOn Profiler",
         author: "Numy",
-        description: "Shows which addons cost the most performance.",
         project_url: "https://github.com/NumyAddon/AddonProfiler",
         folder: "!!AddonProfiler",
         folder_prefix: None,
@@ -105,9 +123,9 @@ pub const CATALOG: &[ExtraAddon] = &[
     // second one.
     ExtraAddon {
         id: "bigwigs",
+        group: Group::BossMods,
         name: "BigWigs",
         author: "BigWigsMods",
-        description: "Boss mod. Follows its newest GitHub release.",
         project_url: "https://github.com/BigWigsMods/BigWigs",
         folder: "BigWigs",
         folder_prefix: Some("BigWigs_"),
@@ -709,6 +727,17 @@ mod tests {
         let mut mixed = entry(BUGSACK_URL, &["BugSack"]);
         mixed.artifact.files = good();
         assert!(validate_entry(bugsack(), &mixed).is_err());
+    }
+
+    #[test]
+    fn every_group_has_addons_and_bigwigs_is_not_a_troubleshooting_addon() {
+        for group in Group::ALL {
+            assert!(CATALOG.iter().any(|addon| addon.group == group));
+        }
+        assert_eq!(find("bigwigs").unwrap().group, Group::BossMods);
+        for id in ["buggrabber", "bugsack", "addon-profiler"] {
+            assert_eq!(find(id).unwrap().group, Group::Troubleshooting);
+        }
     }
 
     #[test]

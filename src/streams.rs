@@ -41,6 +41,10 @@ pub struct Stream {
     pub name: String,
     #[serde(default)]
     pub raid_role: Option<crate::profile::RaidRole>,
+    /// The member's character names from their profile, used only to pair a
+    /// broadcast with the Warcraft Logs reports its streamer appears in.
+    #[serde(default)]
+    pub characters: Vec<String>,
     pub provider: Provider,
     pub channel_id: String,
     pub url: String,
@@ -96,6 +100,8 @@ pub struct Vod {
     pub name: String,
     #[serde(default)]
     pub raid_role: Option<crate::profile::RaidRole>,
+    #[serde(default)]
+    pub characters: Vec<String>,
     pub provider: Provider,
     pub url: String,
     pub started_at: Option<String>,
@@ -110,6 +116,7 @@ impl Vod {
             user_id: self.user_id.clone(),
             name: self.name.clone(),
             raid_role: self.raid_role,
+            characters: self.characters.clone(),
             provider: self.provider.clone(),
             channel_id: self.id.clone(),
             url: self.url.clone(),

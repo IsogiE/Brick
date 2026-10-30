@@ -164,6 +164,7 @@ impl Cache {
 
             content_capability: capability.cloned(),
             content_timing: Default::default(),
+            pov: Default::default(),
         };
         let mut clocks = Vec::new();
         if let Some(cap) = capability {
@@ -518,6 +519,7 @@ mod tests {
             user_id: "101".into(),
             name: "Fixture".into(),
             raid_role: None,
+            characters: Vec::new(),
             provider: Provider::Twitch,
             channel_id: "123".into(),
             url: "https://www.twitch.tv/fixture".into(),
@@ -559,6 +561,7 @@ mod tests {
             pulls: vec![pull],
             content_capability: None,
             content_timing: Default::default(),
+            pov: Default::default(),
         };
         (cache, stream, review)
     }
@@ -705,6 +708,7 @@ mod tests {
             complete_reports: Default::default(),
             content_capability: Some(cap.clone()),
             content_timing: Default::default(),
+            pov: Default::default(),
         };
         let clock = crate::content_alignment::test_recording_clock();
         let clocks = prepared::clocks(&mut review, None, ticket.key.auth_epoch, |key, _| {

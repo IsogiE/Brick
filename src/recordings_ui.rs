@@ -865,6 +865,7 @@ mod tests {
             user_id: format!("{}", index % 30 + 1),
             name: format!("Player {:02}", index % 30 + 1),
             raid_role: None,
+            characters: Vec::new(),
             provider: crate::streams::Provider::Twitch,
             url: format!("https://www.twitch.tv/videos/{}", index + 1),
             started_at: Some(format!(
@@ -1659,6 +1660,7 @@ mod calendar_tests {
             user_id: user.into(),
             name: format!("Player {user}"),
             raid_role: None,
+            characters: Vec::new(),
             provider: crate::streams::Provider::Youtube,
             url: "https://www.youtube.com/watch?v=abcdefghijk".into(),
             started_at: Some(format!("{day}T19:00:00Z")),

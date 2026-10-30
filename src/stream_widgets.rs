@@ -332,12 +332,25 @@ pub fn encounter_header(
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Why a pull's video position is where it is. `Estimated` is the log time
+/// against the recording's start time only: it drifts by the stream delay
+/// (about a second) and by any gap the provider cut from the recording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullTiming {
+    Verified,
+    Estimated,
+}
+
+pub const ESTIMATED_TIMING_HINT: &str = "Position estimated from the stream's start time. \
+It can be off by a second or more until the server has measured this recording.";
+
 pub fn pull(
     ui: &mut egui::Ui,
     pull: &crate::warcraftlogs::Pull,
     number: usize,
     selected: bool,
     best: bool,
+    timing: PullTiming,
 ) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 54.0), egui::Sense::click());
@@ -410,7 +423,10 @@ pub fn pull(
     painter.text(
         egui::pos2(left, rect.top() + 34.0),
         egui::Align2::LEFT_CENTER,
-        pull_start_label(pull),
+        match timing {
+            PullTiming::Verified => pull_start_label(pull),
+            PullTiming::Estimated => format!("≈ {}", pull_start_label(pull)),
+        },
         egui::FontId::proportional(10.0),
         MUTED,
     );
@@ -604,7 +620,8 @@ mod tests {
             for _ in 0..2 {
                 output = Some(ctx.run_ui(Default::default(), |ui| {
                     ui.set_width(width);
-                    bounds = super::pull(ui, &pull, 2, false, true).rect;
+                    bounds =
+                        super::pull(ui, &pull, 2, false, true, super::PullTiming::Verified).rect;
                 }));
             }
             let output = output.unwrap();
@@ -725,7 +742,7 @@ mod tests {
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 egui::CentralPanel::default().show_inside(ui, |ui| {
                     encounter_header(ui, &dungeon, 2, Some(70.3), kill, true);
-                    super::pull(ui, &dungeon, 2, false, true);
+                    super::pull(ui, &dungeon, 2, false, true, super::PullTiming::Estimated);
                 });
             });
             let mut labels = Vec::new();

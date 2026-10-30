@@ -1211,6 +1211,7 @@ mod tests {
                 alternative_pulls: Default::default(),
                 content_capability: None,
                 content_timing: Default::default(),
+                pov: Default::default(),
                 replay,
                 pulls: vec![pull.clone()],
             }
@@ -1517,6 +1518,7 @@ mod tests {
             replay_end_ms: None,
             user_id: "101".into(),
             raid_role: None,
+            characters: Vec::new(),
             name: "Test player".into(),
             provider: streams::Provider::Youtube,
             channel_id: "test-channel".into(),
