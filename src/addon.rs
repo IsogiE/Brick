@@ -20,6 +20,8 @@ use zip::ZipArchive;
 
 use crate::{atomic_file, discord_auth, download};
 
+pub mod extras;
+
 const APP_ID: &str = "dev.isogi.brick";
 const FEED_OWNER: &str = "IsogiE";
 const FEED_REPO: &str = "Brick-Releases";
@@ -115,6 +117,9 @@ pub struct AppView {
     pub settings: Settings,
     pub setup_required: bool,
     pub logs: Vec<LogEntry>,
+    /// Installed TOC version of each extra addon found on a configured client.
+    #[serde(default)]
+    pub extra_addon_versions: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +136,10 @@ pub struct Settings {
     #[serde(default)]
     pub client_metadata_refreshed_at: Option<i64>,
     pub clients: Vec<WowClient>,
+    /// The user's choices for `extras::CATALOG` ids. Addons without a choice
+    /// follow their catalog default.
+    #[serde(default)]
+    pub extra_addons: std::collections::BTreeMap<String, bool>,
 }
 
 impl Default for Settings {
@@ -142,6 +151,7 @@ impl Default for Settings {
             startup_minimized: true,
             client_metadata_refreshed_at: None,
             clients: Vec::new(),
+            extra_addons: Default::default(),
         }
     }
 }
@@ -439,6 +449,23 @@ pub fn set_startup_minimized(enabled: bool) -> Result<AppView, String> {
     view_from_settings(settings)
 }
 
+pub fn set_extra_addon_enabled(id: &str, enabled: bool) -> Result<AppView, String> {
+    let addon = extras::find(id).ok_or_else(|| format!("Unknown extra addon {id}."))?;
+    let _guard = settings_lock()?;
+    let mut settings = load_settings()?;
+    extras::set_enabled(&mut settings.extra_addons, addon, enabled);
+    save_settings(&settings)?;
+    let _ = record_log(
+        LogLevel::Info,
+        format!(
+            "{} updates {}.",
+            addon.name,
+            if enabled { "enabled" } else { "disabled" }
+        ),
+    );
+    view_from_settings(settings)
+}
+
 pub fn record_log(level: LogLevel, message: String) -> Result<(), String> {
     let _guard = LOG_LOCK
         .lock()
@@ -557,6 +584,10 @@ fn run_sync() -> Result<SyncSummary, String> {
         };
         return Ok(summary);
     }
+
+    // Extra addons come from a separate feed. Their failures are logged and
+    // never block ART updates.
+    extras::sync(&settings)?;
 
     ensure_sync_allowed()?;
     let manifest = match fetch_verified_manifest() {
@@ -687,6 +718,7 @@ fn merge_installed_clients(settings: &mut Settings, installed: &[WowClient]) -> 
 fn view_from_settings(settings: Settings) -> Result<AppView, String> {
     Ok(AppView {
         setup_required: settings.clients.is_empty(),
+        extra_addon_versions: extras::installed_versions(&settings.clients),
         settings,
         logs: read_logs().unwrap_or_default(),
     })
@@ -1164,71 +1196,107 @@ fn same_path(a: &str, b: &str) -> bool {
 }
 
 fn fetch_verified_manifest() -> Result<AddonManifest, String> {
-    let client = http_client()?;
-    let manifest_response = client
-        .get(cache_busted_url(FEED_URL)?)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .map_err(|error| format!("Failed to download addon manifest: {error}"))?;
-    if manifest_response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(FEED_UNAVAILABLE_MESSAGE.to_string());
-    }
-    let manifest_bytes = download::read_response(
-        manifest_response
-            .error_for_status()
-            .map_err(|error| format!("Addon manifest request failed: {error}"))?,
-        download::MANIFEST_MAX_BYTES,
-        "addon manifest",
-    )?;
-
-    let sig_response = client
-        .get(cache_busted_url(FEED_SIG_URL)?)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .map_err(|error| format!("Failed to download addon manifest signature: {error}"))?;
-    if sig_response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(FEED_UNAVAILABLE_MESSAGE.to_string());
-    }
-    let sig_bytes = download::read_response(
-        sig_response
-            .error_for_status()
-            .map_err(|error| format!("Addon manifest signature request failed: {error}"))?,
-        download::SIGNATURE_MAX_BYTES,
-        "addon manifest signature",
-    )?;
-
-    verify_manifest_signature(&manifest_bytes, &sig_bytes)?;
+    let manifest_bytes = fetch_signed_manifest(FEED_URL, FEED_SIG_URL, "addon manifest")?
+        .ok_or_else(|| FEED_UNAVAILABLE_MESSAGE.to_string())?;
     serde_json::from_slice(&manifest_bytes)
         .map_err(|error| format!("Failed to parse signed addon manifest: {error}"))
 }
 
-fn fetch_verified_package(manifest: &AddonManifest) -> Result<Vec<u8>, String> {
-    validate_github_release_url(&manifest.artifact.url)?;
-    download::validate_size(manifest.artifact.size, PACKAGE_MAX_BYTES, "Addon package")?;
-    let package_url = cache_busted_url(&manifest.artifact.url)?;
-
-    let response = http_client()?
-        .get(package_url)
+/// Downloads a manifest and its detached signature. `None` means the feed has
+/// not been published yet.
+fn fetch_signed_manifest(url: &str, sig_url: &str, label: &str) -> Result<Option<Vec<u8>>, String> {
+    let client = http_client()?;
+    let manifest_response = client
+        .get(cache_busted_url(url)?)
+        .timeout(Duration::from_secs(30))
         .send()
-        .map_err(|error| format!("Failed to download addon package: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("Addon package request failed: {error}"))?;
-    let package = download::read_exact_response(
-        response,
-        manifest.artifact.size,
-        PACKAGE_MAX_BYTES,
-        "Addon package",
+        .map_err(|error| format!("Failed to download {label}: {error}"))?;
+    if manifest_response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let manifest_bytes = download::read_response(
+        manifest_response
+            .error_for_status()
+            .map_err(|error| format!("{} request failed: {error}", capitalized(label)))?,
+        download::MANIFEST_MAX_BYTES,
+        label,
     )?;
 
+    let sig_label = format!("{label} signature");
+    let sig_response = client
+        .get(cache_busted_url(sig_url)?)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .map_err(|error| format!("Failed to download {sig_label}: {error}"))?;
+    if sig_response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let sig_bytes = download::read_response(
+        sig_response
+            .error_for_status()
+            .map_err(|error| format!("{} request failed: {error}", capitalized(&sig_label)))?,
+        download::SIGNATURE_MAX_BYTES,
+        &sig_label,
+    )?;
+
+    verify_manifest_signature(&manifest_bytes, &sig_bytes)?;
+    Ok(Some(manifest_bytes))
+}
+
+fn capitalized(label: &str) -> String {
+    let mut chars = label.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+fn fetch_verified_package(manifest: &AddonManifest) -> Result<Vec<u8>, String> {
+    validate_github_release_url(&manifest.artifact.url)?;
+    download_verified(
+        &manifest.artifact.url,
+        manifest.artifact.size,
+        &manifest.artifact.sha256,
+        PACKAGE_MAX_BYTES,
+        "Addon package",
+        true,
+    )
+}
+
+/// Downloads exactly `size` bytes and checks them against a signed SHA-256.
+fn download_verified(
+    url: &str,
+    size: u64,
+    sha256: &str,
+    max_bytes: u64,
+    label: &str,
+    cache_bust: bool,
+) -> Result<Vec<u8>, String> {
+    download::validate_size(size, max_bytes, label)?;
+    let url = if cache_bust {
+        cache_busted_url(url)?
+    } else {
+        url.to_string()
+    };
+    let response = http_client()?
+        .get(url)
+        .send()
+        .map_err(|error| format!("Failed to download {}: {error}", label.to_lowercase()))?
+        .error_for_status()
+        .map_err(|error| format!("{label} request failed: {error}"))?;
+    let package = download::read_exact_response(response, size, max_bytes, label)?;
+
     let actual_hash = sha256_hex(&package);
-    if actual_hash != manifest.artifact.sha256 {
+    if actual_hash != sha256 {
         return Err(format!(
-            "Addon package SHA-256 mismatch: expected {}, got {actual_hash}.",
-            manifest.artifact.sha256
+            "{label} SHA-256 mismatch: expected {sha256}, got {actual_hash}."
         ));
     }
 
     Ok(package)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, String> {
@@ -1301,13 +1369,7 @@ fn validate_manifest(manifest: &AddonManifest) -> Result<(), String> {
         return Err("Addon manifest does not list addon folders.".to_string());
     }
     download::validate_size(manifest.artifact.size, PACKAGE_MAX_BYTES, "Addon package")?;
-    if manifest.artifact.sha256.len() != 64
-        || !manifest
-            .artifact
-            .sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
+    if !is_sha256_hex(&manifest.artifact.sha256) {
         return Err("Addon manifest contains an invalid SHA-256 hash.".to_string());
     }
     for folder in &manifest.artifact.folders {
@@ -1380,12 +1442,27 @@ fn install_package_for_client(
     manifest: &AddonManifest,
     package: &[u8],
 ) -> Result<(), String> {
+    install_folders(
+        &addons_dir_for_client(client),
+        &manifest.version,
+        &manifest.artifact.folders,
+        package,
+    )
+}
+
+/// Replaces `folders` in `addons_dir` with the package contents after every
+/// folder's TOC matches `version`. Other addon folders are never touched.
+fn install_folders(
+    addons_dir: &Path,
+    version: &str,
+    folders: &[String],
+    package: &[u8],
+) -> Result<(), String> {
     ensure_sync_allowed()?;
-    let addons_dir = addons_dir_for_client(client);
-    fs::create_dir_all(&addons_dir)
+    fs::create_dir_all(addons_dir)
         .map_err(|error| format!("Failed to create {}: {error}", addons_dir.display()))?;
 
-    let tx_id = format!("{}-{}", safe_version(&manifest.version), Uuid::new_v4());
+    let tx_id = format!("{}-{}", safe_version(version), Uuid::new_v4());
     let staging_dir = addons_dir.join(".brick-staging").join(&tx_id);
     if staging_dir.exists() {
         fs::remove_dir_all(&staging_dir)
@@ -1395,17 +1472,17 @@ fn install_package_for_client(
         .map_err(|error| format!("Failed to create {}: {error}", staging_dir.display()))?;
     let _staging_cleanup = StagingCleanup(&staging_dir);
 
-    extract_package(package, &staging_dir, &manifest.artifact.folders)?;
+    extract_package(package, &staging_dir, folders)?;
 
-    for folder in &manifest.artifact.folders {
+    for folder in folders {
         if !staging_dir.join(folder).is_dir() {
             let _ = fs::remove_dir_all(&staging_dir);
             return Err(format!("Addon package did not contain folder {folder}."));
         }
-        if !addon_toc_matches_version(&staging_dir, folder, &manifest.version) {
+        if !addon_toc_matches_version(&staging_dir, folder, version) {
             return Err(format!(
                 "Addon package TOC version mismatch for {folder}; expected {}.",
-                manifest.version.trim()
+                version.trim()
             ));
         }
     }
@@ -1413,7 +1490,7 @@ fn install_package_for_client(
     // Cancellation before destructive replacement leaves the old addon intact.
     // After this boundary, the admission guard drains the complete replacement.
     ensure_sync_allowed()?;
-    for folder in &manifest.artifact.folders {
+    for folder in folders {
         let target = addons_dir.join(folder);
         if target.exists() {
             fs::remove_dir_all(&target)
@@ -1421,7 +1498,7 @@ fn install_package_for_client(
         }
     }
 
-    for folder in &manifest.artifact.folders {
+    for folder in folders {
         let source = staging_dir.join(folder);
         let target = addons_dir.join(folder);
         move_dir(&source, &target).map_err(|error| {

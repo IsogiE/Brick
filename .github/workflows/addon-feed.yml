@@ -98,3 +98,30 @@ jobs:
           BRICK_PACKAGER_COMMIT: 20a3713ec537df54db5c0d8b4822d88ee63c70e8
           BRICK_PACKAGER_SCRIPT_SHA256: 49bcf94d977478a6f18ead7f0285f193853bf1f9a23ba7d84d08b979d802a734
         run: node scripts/publish-addon-feed.mjs
+
+  # Optional third-party addons. Nothing is rehosted: the signed manifest
+  # pins each author's own download by URL, size and SHA-256.
+  extra-addons:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Brick source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+          package-manager-cache: false
+
+      - name: Publish signed extra addon manifest
+        env:
+          BRICK_ADDON_PRIVATE_KEY_B64: ${{ secrets.BRICK_ADDON_V2_PRIVATE_KEY_B64 }}
+          GH_TOKEN: ${{ secrets.BRICK_RELEASE_TOKEN }}
+          BRICK_FEED_REPO: IsogiE/Brick-Releases
+          BRICK_FEED_TAG: addon-feed-v3
+        run: node scripts/publish-extra-addons-feed.mjs
