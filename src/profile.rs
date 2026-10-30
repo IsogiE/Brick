@@ -167,11 +167,8 @@ pub fn role_picker(
 pub struct Profile {
     pub custom_name: Option<String>,
     pub raid_role: Option<RaidRole>,
-    /// Character names typed by hand, as logged on Warcraft Logs. The server
-    /// pairs a broadcast with reports listing these or a synced character.
-    #[serde(default)]
-    pub characters: Vec<String>,
-    /// The Battle.net account's characters, imported by signing in.
+    /// The Battle.net account's characters, imported by signing in. The server
+    /// pairs a broadcast with the reports that list one of them.
     #[serde(default)]
     pub battlenet: Option<BattlenetLink>,
     #[serde(default)]
@@ -220,7 +217,7 @@ impl BattlenetCharacter {
 
 enum Operation {
     Load,
-    Save(String, Option<RaidRole>, Vec<String>),
+    Save(String, Option<RaidRole>),
     Role(String, Option<RaidRole>),
     /// Sign in with Battle.net in the browser and wait for the server to
     /// import the account's characters. Signing in again replaces the list.
@@ -228,15 +225,6 @@ enum Operation {
     Unlink,
 }
 
-/// The comma-separated draft as the server takes it: trimmed names, blanks dropped.
-pub(crate) fn character_names(draft: &str) -> Vec<String> {
-    draft
-        .split([',', ';', '\n'])
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
 struct Completed {
     target: String,
     saved: bool,
@@ -251,7 +239,6 @@ pub struct ProfileUi {
     value: Option<Profile>,
     name: String,
     role: Option<RaidRole>,
-    characters: String,
     pending: Option<mpsc::Receiver<Completed>>,
     pending_role: Option<(String, Option<RaidRole>)>,
     saving: bool,
@@ -298,7 +285,6 @@ impl ProfileUi {
                                 if (completed.saved && !role_only) || !self.dirty() {
                                     self.name = profile.custom_name.clone().unwrap_or_default();
                                     self.role = profile.raid_role;
-                                    self.characters = profile.characters.join(", ");
                                 } else if role_only {
                                     self.role = profile.raid_role;
                                 }
@@ -364,7 +350,6 @@ impl ProfileUi {
         }
         // A background read must not disable a confirmed profile or interrupt a draft.
         let enabled = !self.saving;
-        let linked = value.battlenet.is_some();
         let mut save = false;
         ui.add_enabled_ui(enabled, |ui| {
             // Size the row before placing labels and icons, so later padded
@@ -380,19 +365,6 @@ impl ProfileUi {
                 );
                 save |= name.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             });
-            if !linked {
-                ui.horizontal(|ui| {
-                    ui.label("Characters");
-                    let characters = ui.add(
-                        egui::TextEdit::singleline(&mut self.characters)
-                            .hint_text("Humisenx, Humialt")
-                            .char_limit(8 * 13)
-                            .desired_width(190.0),
-                    );
-                    save |= characters.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                });
-            }
             ui.horizontal(|ui| {
                 ui.label("Raid role");
                 role_icon(ui, self.role);
@@ -406,14 +378,7 @@ impl ProfileUi {
             });
         });
         if enabled && !self.busy() && self.dirty() && save {
-            self.start(
-                ui.ctx(),
-                Operation::Save(
-                    self.name.clone(),
-                    self.role,
-                    character_names(&self.characters),
-                ),
-            );
+            self.start(ui.ctx(), Operation::Save(self.name.clone(), self.role));
         }
         ui.label(egui::RichText::new("Leave the name empty to use your Discord name.").small());
         self.draw_battlenet(ui);
@@ -427,11 +392,9 @@ impl ProfileUi {
         };
         if !value.battlenet_available && value.battlenet.is_none() {
             ui.label(
-                egui::RichText::new(
-                    "Characters pair your streams with the logs you raided in, \
-                     when the guild logs more than one raid in an evening.",
-                )
-                .small(),
+                egui::RichText::new("Battle.net sign-in isn't available yet.")
+                    .small()
+                    .weak(),
             );
             return;
         }
@@ -533,9 +496,7 @@ impl ProfileUi {
 
     fn dirty(&self) -> bool {
         self.value.as_ref().is_some_and(|value| {
-            self.name != value.custom_name.as_deref().unwrap_or("")
-                || self.role != value.raid_role
-                || character_names(&self.characters) != value.characters
+            self.name != value.custom_name.as_deref().unwrap_or("") || self.role != value.raid_role
         })
     }
 
@@ -584,12 +545,14 @@ impl ProfileUi {
                     None,
                     false,
                 ),
-                Operation::Save(name, role, characters) => (
+                // Characters come from the Battle.net sign-in only; a save clears
+                // any list typed by hand in an earlier version.
+                Operation::Save(name, role) => (
                     own_id,
                     Method::PUT,
                     "/v1/profile/me".to_owned(),
                     Some(serde_json::json!({
-                        "customName": name, "raidRole": role, "characters": characters,
+                        "customName": name, "raidRole": role, "characters": [],
                     })),
                     true,
                 ),
@@ -772,15 +735,6 @@ mod tests {
         assert!(profile.link_cancel.is_none() && !profile.busy() && !profile.saving);
     }
 
-    #[test]
-    fn character_drafts_split_on_separators_and_drop_blanks() {
-        assert_eq!(
-            character_names(" Humisenx, Humialt;;\nThird , "),
-            vec!["Humisenx", "Humialt", "Third"]
-        );
-        assert!(character_names("  ").is_empty());
-    }
-
     fn user() -> AuthorizedUser {
         AuthorizedUser {
             user_id: "123".into(),
@@ -801,7 +755,6 @@ mod tests {
         let loaded = Profile {
             custom_name: Some("Raid Name".into()),
             raid_role: Some(RaidRole::Healer),
-            characters: vec!["Humisenx".into()],
             available: true,
             ..Default::default()
         };
@@ -821,16 +774,7 @@ mod tests {
         assert!(!profile.tick(&ctx, Some(&user()), false));
         assert_eq!(profile.name, "Raid Name");
         assert_eq!(profile.role, Some(RaidRole::Healer));
-        assert_eq!(profile.characters, "Humisenx");
         assert!(!profile.dirty());
-        // Reformatting the list is not an edit; a new name is.
-        profile.characters = " humisenx ,".into();
-        assert!(profile.dirty());
-        profile.characters = "Humisenx".into();
-        assert!(!profile.dirty());
-        profile.characters = "Humisenx, Humialt".into();
-        assert!(profile.dirty());
-        profile.characters = "Humisenx".into();
         profile.name = "Unsaved Name".into();
         let (tx, rx) = mpsc::channel();
         profile.pending = Some(rx);
