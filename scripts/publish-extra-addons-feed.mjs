@@ -21,7 +21,9 @@ const curseforgeRepos = 'https://repos.curseforge.com/wow/';
 const userAgent = 'Brick extra addon feed publisher';
 export const manifestKind = 'brick-extra-addons';
 
-// Keep in sync with CATALOG in src/addon/extras.rs.
+// Keep in sync with CATALOG in src/addon/extras.rs. The bigwigs entry only
+// serves Brick 0.8.4 and older; newer clients install AdvanceWigs from the
+// Brick API instead.
 export const catalog = [
   { id: 'buggrabber', source: 'curseforge-tag', project: 'bug-grabber', folder: '!BugGrabber' },
   { id: 'bugsack', source: 'github-release', repo: 'funkydude/BugSack', folder: 'BugSack' },

@@ -1,10 +1,15 @@
-//! Optional third-party troubleshooting addons.
+//! Optional addons.
 //!
-//! These addons belong to their authors and are not redistributed by Brick.
-//! CI signs a small manifest that pins each addon's official download by URL,
-//! size and SHA-256: the author's GitHub release zip, or the files of the
-//! newest tag in the author's public CurseForge repository. Brick downloads
-//! from those sources and installs only after the bytes match.
+//! Third-party addons belong to their authors and are not redistributed by
+//! Brick. CI signs a small manifest that pins each addon's official download
+//! by URL, size and SHA-256: the author's GitHub release zip, or the files of
+//! the newest tag in the author's public CurseForge repository. Brick
+//! downloads from those sources and installs only after the bytes match.
+//!
+//! AdvanceWigs, the guild's own BigWigs build, is private to the guild and
+//! never appears in the public manifest. The Brick API serves it to signed-in
+//! members, and Brick installs it only after the bytes match the hash the API
+//! announced.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -17,8 +22,8 @@ use url::Url;
 
 use super::{
     addon_toc_matches_version, addons_dir_for_client, download_verified, ensure_sync_allowed,
-    fetch_signed_manifest, install_folders, is_sha256_hex, record_log, validate_zip_path, Flavor,
-    LogLevel, Settings, WowClient,
+    fetch_signed_manifest, http_client, install_folders, is_sha256_hex, record_log, sha256_hex,
+    validate_zip_path, Flavor, LogLevel, Settings, WowClient,
 };
 
 const FEED_URL: &str =
@@ -40,7 +45,14 @@ enum Source {
     /// The files of the newest version tag in the author's CurseForge
     /// Subversion repository, which is readable without an API key.
     CurseForgeTag { project: &'static str },
+    /// A private build served by the Brick API under the selected guild to
+    /// signed-in members, at `path` and `{path}/package`.
+    Guild { path: &'static str },
 }
+
+/// Guild builds are made for the current retail raids.
+const GUILD_FLAVORS: &[Flavor] = &[Flavor::Retail, Flavor::Ptr, Flavor::Xptr, Flavor::Beta];
+const GUILD_STATUS_MAX_BYTES: u64 = 64 * 1024;
 
 /// Which panel an addon is listed under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +86,8 @@ pub struct ExtraAddon {
     source: Source,
     requires: &'static [&'static str],
     default_enabled: bool,
+    /// A retired catalog id whose saved choice carries over to this addon.
+    replaces: Option<&'static str>,
 }
 
 pub const CATALOG: &[ExtraAddon] = &[
@@ -90,6 +104,7 @@ pub const CATALOG: &[ExtraAddon] = &[
         },
         requires: &[],
         default_enabled: true,
+        replaces: None,
     },
     ExtraAddon {
         id: "bugsack",
@@ -104,6 +119,7 @@ pub const CATALOG: &[ExtraAddon] = &[
         },
         requires: &["buggrabber"],
         default_enabled: true,
+        replaces: None,
     },
     ExtraAddon {
         id: "addon-profiler",
@@ -118,22 +134,24 @@ pub const CATALOG: &[ExtraAddon] = &[
         },
         requires: &[],
         default_enabled: true,
+        replaces: None,
     },
     // Off by default: raiders who use another boss mod should not get a
     // second one.
     ExtraAddon {
-        id: "bigwigs",
+        id: "advancewigs",
         group: Group::BossMods,
-        name: "BigWigs",
-        author: "BigWigsMods",
-        project_url: "https://github.com/BigWigsMods/BigWigs",
+        name: "AdvanceWigs",
+        author: "Advance",
+        project_url: "https://forge.lusaggo.com",
         folder: "BigWigs",
         folder_prefix: Some("BigWigs_"),
-        source: Source::GitHubRelease {
-            repo: "BigWigsMods/BigWigs",
+        source: Source::Guild {
+            path: "/v1/addons/advancewigs",
         },
         requires: &[],
         default_enabled: false,
+        replaces: Some("bigwigs"),
     },
 ];
 
@@ -142,12 +160,26 @@ pub fn find(id: &str) -> Option<&'static ExtraAddon> {
 }
 
 pub fn is_enabled(settings: &Settings, id: &str) -> bool {
-    let default = find(id).is_some_and(|addon| addon.default_enabled);
-    settings.extra_addons.get(id).copied().unwrap_or(default)
+    let Some(addon) = find(id) else {
+        return false;
+    };
+    saved_choice(&settings.extra_addons, addon).unwrap_or(addon.default_enabled)
+}
+
+fn saved_choice(choices: &BTreeMap<String, bool>, addon: &ExtraAddon) -> Option<bool> {
+    choices
+        .get(addon.id)
+        .or_else(|| addon.replaces.and_then(|old| choices.get(old)))
+        .copied()
 }
 
 /// Turning an addon on also turns its dependencies on.
 pub(super) fn set_enabled(choices: &mut BTreeMap<String, bool>, addon: &ExtraAddon, enabled: bool) {
+    for other in CATALOG {
+        if let Some(choice) = saved_choice(choices, other) {
+            choices.insert(other.id.to_string(), choice);
+        }
+    }
     choices.insert(addon.id.to_string(), enabled);
     if enabled {
         for id in addon.requires {
@@ -166,7 +198,7 @@ struct Manifest {
     addons: Vec<ManifestAddon>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManifestAddon {
     id: String,
@@ -174,7 +206,7 @@ struct ManifestAddon {
     artifact: Artifact,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Artifact {
     /// Set for a release zip.
@@ -214,23 +246,46 @@ pub(super) fn sync(settings: &Settings) -> Result<(), String> {
     }
 
     ensure_sync_allowed()?;
-    let manifest = match fetch_manifest() {
-        Ok(Some(manifest)) => manifest,
-        Ok(None) => return Ok(()),
-        Err(error) => {
-            ensure_sync_allowed()?;
-            let _ = record_log(LogLevel::Warn, format!("Extra addons: {error}"));
-            return Ok(());
+    let manifest = if wanted
+        .iter()
+        .any(|addon| !matches!(addon.source, Source::Guild { .. }))
+    {
+        match fetch_manifest() {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                ensure_sync_allowed()?;
+                let _ = record_log(LogLevel::Warn, format!("Extra addons: {error}"));
+                None
+            }
         }
+    } else {
+        None
     };
 
     let mut errors = Vec::new();
     let mut installed = Vec::new();
     for addon in wanted {
         ensure_sync_allowed()?;
-        let Some(entry) = manifest.addons.iter().find(|entry| entry.id == addon.id) else {
-            continue;
+        let entry = match addon.source {
+            Source::Guild { path } => match fetch_guild_entry(addon, path) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => continue,
+                Err(error) => {
+                    errors.push(format!("{}: {error}", addon.name));
+                    continue;
+                }
+            },
+            _ => {
+                let Some(entry) = manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.addons.iter().find(|entry| entry.id == addon.id))
+                else {
+                    continue;
+                };
+                entry.clone()
+            }
         };
+        let entry = &entry;
         if let Err(error) = validate_entry(addon, entry) {
             errors.push(format!("{}: {error}", addon.name));
             continue;
@@ -301,6 +356,7 @@ fn sync_addon(
             true,
         ),
         Source::CurseForgeTag { .. } => download_source_package(entry),
+        Source::Guild { path } => download_guild_package(addon, path, entry),
     }
     .map_err(|error| format!("{}: {error}", addon.name))?;
 
@@ -341,9 +397,9 @@ fn validate_entry(addon: &ExtraAddon, entry: &ManifestAddon) -> Result<(), Strin
     if version.is_empty()
         || version != entry.version
         || version.len() > 64
-        || !version
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '+'))
+        || !version.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '+' | ' ' | '(' | ')')
+        })
     {
         return Err(format!("invalid version {:?}", entry.version));
     }
@@ -364,6 +420,15 @@ fn validate_entry(addon: &ExtraAddon, entry: &ManifestAddon) -> Result<(), Strin
                 return Err("source entries cannot point at a package".into());
             }
             validate_source_files(addon.folder, project, &entry.version, &entry.artifact.files)
+        }
+        Source::Guild { .. } => {
+            if !entry.artifact.url.is_empty() || !entry.artifact.files.is_empty() {
+                return Err("guild builds come only from the Brick API".into());
+            }
+            if !is_sha256_hex(&entry.artifact.sha256) {
+                return Err("invalid SHA-256 hash".into());
+            }
+            crate::download::validate_size(entry.artifact.size, PACKAGE_MAX_BYTES, "package")
         }
     }
 }
@@ -392,6 +457,95 @@ fn validate_folders(addon: &ExtraAddon, folders: &[String]) -> Result<(), String
         }
     }
     Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuildStatus {
+    build: Option<GuildBuild>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GuildBuild {
+    version: String,
+    sha256: String,
+    size: u64,
+    folders: Vec<String>,
+}
+
+/// Asks the Brick API for the guild's current build. `None` means the guild
+/// has none, or nothing has been published yet.
+fn fetch_guild_entry(addon: &ExtraAddon, path: &str) -> Result<Option<ManifestAddon>, String> {
+    let Some(access) = crate::discord_auth::current_or_refreshed_access_token()? else {
+        return Ok(None);
+    };
+    let response = http_client()?
+        .get(access.endpoint(path)?)
+        .bearer_auth(access.secret())
+        .send()
+        .map_err(|error| format!("request failed: {error}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let response = response
+        .error_for_status()
+        .map_err(|error| format!("request failed: {error}"))?;
+    let bytes = crate::download::read_response(response, GUILD_STATUS_MAX_BYTES, "build status")?;
+    access.check()?;
+    guild_entry(addon, &bytes)
+}
+
+fn guild_entry(addon: &ExtraAddon, bytes: &[u8]) -> Result<Option<ManifestAddon>, String> {
+    let status: GuildStatus =
+        serde_json::from_slice(bytes).map_err(|error| format!("invalid build status: {error}"))?;
+    Ok(status.build.map(|build| ManifestAddon {
+        id: addon.id.to_string(),
+        version: build.version,
+        artifact: Artifact {
+            url: String::new(),
+            sha256: build.sha256.to_ascii_lowercase(),
+            size: build.size,
+            files: Vec::new(),
+            folders: build.folders,
+            flavors: GUILD_FLAVORS.to_vec(),
+        },
+    }))
+}
+
+fn download_guild_package(
+    addon: &ExtraAddon,
+    path: &str,
+    entry: &ManifestAddon,
+) -> Result<Vec<u8>, String> {
+    let label = format!("{} package", addon.name);
+    let access = crate::discord_auth::current_or_refreshed_access_token()?
+        .ok_or("Please sign in with Discord.")?;
+    let mut url = access.endpoint(&format!("{path}/package"))?;
+    url.query_pairs_mut()
+        .append_pair("sha256", &entry.artifact.sha256);
+    let response = http_client()?
+        .get(url)
+        .bearer_auth(access.secret())
+        .send()
+        .map_err(|error| format!("Failed to download {}: {error}", label.to_lowercase()))?
+        .error_for_status()
+        .map_err(|error| format!("{label} request failed: {error}"))?;
+    let package = crate::download::read_exact_response(
+        response,
+        entry.artifact.size,
+        PACKAGE_MAX_BYTES,
+        &label,
+    )?;
+    access.check()?;
+    let actual = sha256_hex(&package);
+    if actual != entry.artifact.sha256 {
+        return Err(format!(
+            "{label} SHA-256 mismatch: expected {}, got {actual}.",
+            entry.artifact.sha256
+        ));
+    }
+    Ok(package)
 }
 
 /// Every file must come from the pinned tag of the author's repository and
@@ -730,35 +884,61 @@ mod tests {
     }
 
     #[test]
-    fn every_group_has_addons_and_bigwigs_is_not_a_troubleshooting_addon() {
+    fn every_group_has_addons_and_advancewigs_is_not_a_troubleshooting_addon() {
         for group in Group::ALL {
             assert!(CATALOG.iter().any(|addon| addon.group == group));
         }
-        assert_eq!(find("bigwigs").unwrap().group, Group::BossMods);
+        assert_eq!(find("advancewigs").unwrap().group, Group::BossMods);
+        assert!(find("bigwigs").is_none());
         for id in ["buggrabber", "bugsack", "addon-profiler"] {
             assert_eq!(find(id).unwrap().group, Group::Troubleshooting);
         }
     }
 
+    fn advancewigs(body: &str) -> Result<Option<ManifestAddon>, String> {
+        guild_entry(find("advancewigs").unwrap(), body.as_bytes())
+    }
+
+    const ADVANCEWIGS_BUILD: &str = r#"{"build":{"version":"v427.8 AdvanceWigs 2 (3355cf8)","release":2,"sha256":"ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB","size":4096,"folders":["BigWigs","BigWigs_Core","BigWigs_VenomousAbyss"]}}"#;
+
     #[test]
-    fn bigwigs_may_ship_its_own_module_folders_but_nothing_else() {
-        let bigwigs = find("bigwigs").unwrap();
-        let url =
-            "https://github.com/BigWigsMods/BigWigs/releases/download/v427.8/BigWigs-v427.8.zip";
-        let mut ok = entry(url, &["BigWigs", "BigWigs_Core", "BigWigs_TheVoidspire"]);
-        ok.id = "bigwigs".into();
-        assert!(validate_entry(bigwigs, &ok).is_ok());
+    fn advancewigs_comes_only_from_the_guild_api_and_its_own_folders() {
+        let addon = find("advancewigs").unwrap();
+        assert!(advancewigs(r#"{"build":null}"#).unwrap().is_none());
+        assert!(advancewigs(r#"{"build":null,"url":"https://x"}"#).is_err());
+        let build = advancewigs(ADVANCEWIGS_BUILD).unwrap().unwrap();
+        assert_eq!(build.artifact.sha256, "ab".repeat(32));
+        assert!(build.artifact.flavors.contains(&Flavor::Retail));
+        assert!(!build.artifact.flavors.contains(&Flavor::ClassicEra));
+        assert!(validate_entry(addon, &build).is_ok());
+
+        let mut with_url = build.clone();
+        with_url.artifact.url =
+            "https://github.com/BigWigsMods/BigWigs/releases/download/v427.8/BigWigs-v427.8.zip"
+                .into();
+        assert!(validate_entry(addon, &with_url).is_err());
+        let mut bad_hash = build.clone();
+        bad_hash.artifact.sha256 = "zz".repeat(32);
+        assert!(validate_entry(addon, &bad_hash).is_err());
+        let mut too_big = build.clone();
+        too_big.artifact.size = PACKAGE_MAX_BYTES + 1;
+        assert!(validate_entry(addon, &too_big).is_err());
+        for version in ["", " v1", "v1;x", "v1/../x", &"v".repeat(65)] {
+            let mut bad = build.clone();
+            bad.version = version.into();
+            assert!(validate_entry(addon, &bad).is_err(), "{version:?}");
+        }
         for folders in [
             &["BigWigs_Core"][..],
             &["BigWigs", "BigWigs_"][..],
             &["BigWigs", "LittleWigs"][..],
+            &["BigWigs", "AdvanceRaidTools"][..],
             &["BigWigs", "BigWigs_Core", "BigWigs_Core"][..],
             &["BigWigs", "BigWigs_../x"][..],
         ] {
-            assert!(
-                validate_entry(bigwigs, &entry(url, folders)).is_err(),
-                "{folders:?}"
-            );
+            let mut bad = build.clone();
+            bad.artifact.folders = folders.iter().map(|folder| folder.to_string()).collect();
+            assert!(validate_entry(addon, &bad).is_err(), "{folders:?}");
         }
         // Other addons stay limited to their single folder.
         assert!(validate_entry(bugsack(), &entry(BUGSACK_URL, &["BugSack", "BugSack_x"])).is_err());
@@ -786,12 +966,16 @@ mod tests {
         let legacy: Settings =
             serde_json::from_str(r#"{"schema":1,"startupEnabled":true,"clients":[]}"#).unwrap();
         for addon in CATALOG {
-            let expected = addon.id != "bigwigs";
+            let expected = addon.id != "advancewigs";
             assert_eq!(is_enabled(&settings, addon.id), expected, "{}", addon.id);
             assert_eq!(is_enabled(&legacy, addon.id), expected, "{}", addon.id);
         }
-        set_enabled(&mut settings.extra_addons, find("bigwigs").unwrap(), true);
-        assert!(is_enabled(&settings, "bigwigs"));
+        set_enabled(
+            &mut settings.extra_addons,
+            find("advancewigs").unwrap(),
+            true,
+        );
+        assert!(is_enabled(&settings, "advancewigs"));
 
         let choices = &mut settings.extra_addons;
         choices.insert("retired-addon".into(), true);
@@ -803,6 +987,22 @@ mod tests {
         set_enabled(&mut settings.extra_addons, bugsack(), true);
         assert!(is_enabled(&settings, "buggrabber"));
         assert!(is_enabled(&settings, "bugsack"));
+    }
+
+    #[test]
+    fn a_bigwigs_choice_carries_over_to_advancewigs() {
+        for choice in [true, false] {
+            let mut settings = Settings::default();
+            settings.extra_addons.insert("bigwigs".into(), choice);
+            assert_eq!(is_enabled(&settings, "advancewigs"), choice);
+            set_enabled(&mut settings.extra_addons, bugsack(), false);
+            assert!(!settings.extra_addons.contains_key("bigwigs"));
+            assert_eq!(is_enabled(&settings, "advancewigs"), choice);
+        }
+        let mut settings = Settings::default();
+        settings.extra_addons.insert("bigwigs".into(), true);
+        settings.extra_addons.insert("advancewigs".into(), false);
+        assert!(!is_enabled(&settings, "advancewigs"));
     }
 
     #[test]
