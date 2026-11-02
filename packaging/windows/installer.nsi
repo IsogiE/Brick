@@ -541,33 +541,58 @@ SectionEnd
 {{/if}}
 
 !macro CheckIfAppIsRunning
-  nsis_tauri_utils::FindProcess "${MAINBINARYNAME}.exe"
-  Pop $R0
-  ${If} $R0 = 0
-      IfSilent kill 0
-      ${IfThen} $PassiveMode != 1 ${|} MessageBox MB_OKCANCEL "$(appRunningOkKill)" IDOK kill IDCANCEL cancel ${|}
-      kill:
-        nsis_tauri_utils::KillProcess "${MAINBINARYNAME}.exe"
-        Pop $R0
+  ; Brick starts its own update installer and then closes. A slow shutdown
+  ; must not look like a Brick that cannot be closed, so silent and passive
+  ; installs give it up to ten seconds to exit before closing it, and check
+  ; again after each attempt to close it.
+  StrCpy $R2 0
+  app_check_wait:
+    nsis_tauri_utils::FindProcess "${MAINBINARYNAME}.exe"
+    Pop $R0
+    ${If} $R0 != 0
+      Goto app_check_done
+    ${EndIf}
+    IfSilent app_check_may_wait 0
+    ${IfThen} $PassiveMode != 1 ${|} Goto app_check_running ${|}
+    app_check_may_wait:
+      ${If} $R2 < 20
+        IntOp $R2 $R2 + 1
         Sleep 500
-        ${If} $R0 = 0
-          Goto app_check_done
-        ${Else}
-          IfSilent silent ui
-          silent:
-            System::Call 'kernel32::AttachConsole(i -1)i.r0'
-            ${If} $0 != 0
-              System::Call 'kernel32::GetStdHandle(i -11)i.r0'
-              System::call 'kernel32::SetConsoleTextAttribute(i r0, i 0x0004)' ; set red color
-              FileWrite $0 "$(appRunning)$\n"
-            ${EndIf}
-            Abort
-          ui:
-            Abort "$(failedToKillApp)"
+        Goto app_check_wait
+      ${EndIf}
+  app_check_running:
+    IfSilent kill 0
+    ${IfThen} $PassiveMode != 1 ${|} MessageBox MB_OKCANCEL "$(appRunningOkKill)" IDOK kill IDCANCEL cancel ${|}
+    kill:
+      StrCpy $R2 0
+    kill_retry:
+      nsis_tauri_utils::KillProcess "${MAINBINARYNAME}.exe"
+      Pop $R0
+      Sleep 500
+      ; A process that is already exiting can refuse to be ended, so trust
+      ; whether it is still there rather than the result of the kill.
+      nsis_tauri_utils::FindProcess "${MAINBINARYNAME}.exe"
+      Pop $R0
+      ${If} $R0 != 0
+        Goto app_check_done
+      ${EndIf}
+      ${If} $R2 < 5
+        IntOp $R2 $R2 + 1
+        Goto kill_retry
+      ${EndIf}
+      IfSilent silent ui
+      silent:
+        System::Call 'kernel32::AttachConsole(i -1)i.r0'
+        ${If} $0 != 0
+          System::Call 'kernel32::GetStdHandle(i -11)i.r0'
+          System::call 'kernel32::SetConsoleTextAttribute(i r0, i 0x0004)' ; set red color
+          FileWrite $0 "$(appRunning)$\n"
         ${EndIf}
-      cancel:
-        Abort "$(appRunning)"
-  ${EndIf}
+        Abort
+      ui:
+        Abort "$(failedToKillApp)"
+    cancel:
+      Abort "$(appRunning)"
   app_check_done:
 !macroend
 
