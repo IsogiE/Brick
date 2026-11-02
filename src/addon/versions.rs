@@ -78,7 +78,8 @@ pub(super) fn spawn(wake: impl Fn() + Send + 'static) {
             }
             let pause = match check() {
                 Ok(Outcome::Answer(scope, versions)) => {
-                    if tracker.observe(scope, versions) && !crate::account_erasure::requests_blocked()
+                    if tracker.observe(scope, versions)
+                        && !crate::account_erasure::requests_blocked()
                     {
                         wake();
                     }
@@ -183,8 +184,17 @@ mod tests {
             b = "b".repeat(64)
         ))
         .unwrap();
-        assert_eq!(full.advancewigs.unwrap().version, "v427.8 AdvanceWigs 8 (3355cf8)");
+        assert_eq!(
+            full.advancewigs.unwrap().version,
+            "v427.8 AdvanceWigs 8 (3355cf8)"
+        );
         let plain: Versions = serde_json::from_str(r#"{"art":null,"advancewigs":null}"#).unwrap();
-        assert_eq!(plain, Versions { art: None, advancewigs: None });
+        assert_eq!(
+            plain,
+            Versions {
+                art: None,
+                advancewigs: None
+            }
+        );
     }
 }
