@@ -34,6 +34,9 @@ if ($content -notmatch 'MUI_FINISHPAGE_RUN_FUNCTION RunBrickAsUser' -or
     $content -notmatch '--launch-as-user') {
     throw 'Brick must restart as the desktop user after interactive installs and automatic updates.'
 }
+if ($content -notmatch '(?s)!macro CheckIfAppIsRunning.*?app_check_may_wait.*?Sleep 500.*?kill_retry.*?!macroend') {
+    throw 'Silent updates must wait for the closing Brick and retry closing it before giving up.'
+}
 if ($content -notmatch 'QuietUninstallString') {
     throw 'The installer did not register QuietUninstallString.'
 }
