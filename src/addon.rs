@@ -5,7 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex, MutexGuard},
+    sync::{mpsc, Arc, LazyLock, Mutex, MutexGuard},
     thread,
     time::Duration,
 };
@@ -21,6 +21,7 @@ use zip::ZipArchive;
 use crate::{atomic_file, discord_auth, download};
 
 pub mod extras;
+mod versions;
 
 const APP_ID: &str = "dev.isogi.brick";
 const FEED_OWNER: &str = "IsogiE";
@@ -535,8 +536,20 @@ pub fn run_sync_with_lock(sync_lock: &Arc<Mutex<()>>) -> Result<SyncSummary, Str
 }
 
 pub fn spawn_watcher(sync_lock: Arc<Mutex<()>>) {
+    // A one-slot channel: wakes that arrive during a sync collapse into one
+    // follow-up sync instead of queueing.
+    let (wake, woken) = mpsc::sync_channel::<()>(1);
+    versions::spawn(move || {
+        let _ = wake.try_send(());
+    });
     thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(SYNC_INTERVAL_SECS));
+        // The minute check stays as the fallback when the quick version check
+        // is unavailable.
+        let interval = Duration::from_secs(SYNC_INTERVAL_SECS);
+        if let Err(mpsc::RecvTimeoutError::Disconnected) = woken.recv_timeout(interval) {
+            // No quick checker runs (for example without a Brick API).
+            thread::sleep(interval);
+        }
 
         if crate::account_erasure::requests_blocked() {
             return;
