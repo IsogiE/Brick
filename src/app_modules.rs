@@ -14,6 +14,7 @@ mod defensives;
 mod discord_auth;
 mod download;
 mod guild;
+mod guild_ui;
 mod local_erasure;
 mod presence;
 mod profile;

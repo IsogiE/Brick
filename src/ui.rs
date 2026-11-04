@@ -12,8 +12,9 @@ use crate::{
     addon::{self, AppView, LogLevel, SyncSummary, WowClient},
     app_update::{self, AvailableAppUpdate},
     discord_auth::{self, AuthorizedUser, RefreshError, SessionStatus},
+    guild_ui::GuildUi,
     presence::{self, Roster, RosterMember},
-    profile::{self, ProfileUi, RaidRole},
+    profile::{ProfileUi, RaidRole},
     single_instance,
     streams_ui::StreamsUi,
     tray,
@@ -41,6 +42,7 @@ pub struct BrickApp {
     presence_state: PresenceUiState,
     streams: StreamsUi,
     profile: ProfileUi,
+    guild: GuildUi,
     active_tab: MainTab,
     sync_rx: Option<mpsc::Receiver<Result<SyncSummary, String>>>,
     auth_rx: Option<mpsc::Receiver<Result<AuthorizedUser, RefreshError>>>,
@@ -91,7 +93,7 @@ impl AuthUiState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MainTab {
     Home,
-    Roster,
+    Guild,
     Streams,
 }
 
@@ -162,6 +164,7 @@ impl BrickApp {
             presence_state: initial_presence_state(),
             streams: StreamsUi::default(),
             profile: ProfileUi::default(),
+            guild: GuildUi::default(),
             active_tab: MainTab::Home,
             sync_rx: None,
             auth_rx: None,
@@ -485,6 +488,7 @@ impl BrickApp {
 
     fn reset_guild_panel_fields(&mut self) {
         self.profile = ProfileUi::default();
+        self.guild = GuildUi::default();
         self.roster_rx = None;
         self.presence_state = initial_presence_state();
         self.roster_notice = None;
@@ -627,6 +631,7 @@ impl BrickApp {
                 self.presence_state = initial_presence_state();
                 self.roster_notice = None;
                 self.profile = ProfileUi::default();
+                self.guild = GuildUi::default();
                 self.status = "Signed out of Discord.".to_string();
             }
             Err(error) => {
@@ -681,12 +686,13 @@ impl BrickApp {
         });
         self.roster_rx = Some(rx);
         self.last_roster_refresh = Instant::now();
+        self.guild.refresh(&self.egui_ctx, false);
     }
 
     fn roster_refresh_enabled(&self) -> bool {
         self.window_visible
             && self.auth_state.is_authorized()
-            && self.active_tab == MainTab::Roster
+            && self.active_tab == MainTab::Guild
             && self.roster_rx.is_none()
             && !matches!(self.presence_state, PresenceUiState::Unavailable(_))
     }
@@ -1025,7 +1031,7 @@ impl BrickApp {
         }
         match self.active_tab {
             MainTab::Home => self.draw_scrollable_updates_tab(ui),
-            MainTab::Roster => self.draw_roster_tab(ui),
+            MainTab::Guild => self.draw_guild_tab(ui),
             MainTab::Streams => self.streams.draw(ui),
         }
     }
@@ -1085,8 +1091,8 @@ impl BrickApp {
         if tab_button(ui, "Home", self.active_tab == MainTab::Home).clicked() {
             self.active_tab = MainTab::Home;
         }
-        if tab_button(ui, "Roster", self.active_tab == MainTab::Roster).clicked() {
-            self.active_tab = MainTab::Roster;
+        if tab_button(ui, "Guild", self.active_tab == MainTab::Guild).clicked() {
+            self.active_tab = MainTab::Guild;
             self.start_roster_refresh_if_stale();
         }
         if tab_button(ui, "Streams", self.active_tab == MainTab::Streams).clicked() {
@@ -1163,7 +1169,31 @@ impl BrickApp {
         );
     }
 
-    fn draw_roster_tab(&mut self, ui: &mut egui::Ui) {
+    fn draw_guild_tab(&mut self, ui: &mut egui::Ui) {
+        if let PresenceUiState::Ready(roster) = &self.presence_state {
+            let own_id = match &self.auth_state {
+                AuthUiState::Authorized(user) => user.user_id.as_str(),
+                _ => "",
+            };
+            let mut role_change = None;
+            let refresh = self.guild.draw(
+                ui,
+                roster,
+                own_id,
+                self.roster_notice.as_deref(),
+                &self.profile,
+                &mut role_change,
+            );
+            if let Some((id, role)) = role_change {
+                self.profile.set_member_role(ui.ctx(), id, role);
+            }
+            if refresh {
+                self.start_roster_refresh();
+                self.guild.refresh(ui.ctx(), true);
+            }
+            return;
+        }
+
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if secondary_button(ui, "Refresh").clicked() {
@@ -1176,13 +1206,14 @@ impl BrickApp {
         });
         ui.add_space(8.0);
 
-        let state = &self.presence_state;
-        let mut role_change = None;
-        panel_frame().show(ui, |ui| match state {
+        panel_frame().show(ui, |ui| match &self.presence_state {
             PresenceUiState::Unavailable(error) => {
-                empty_panel_message(ui, "Roster unavailable", &friendly_roster_problem(&error));
+                empty_panel_message(ui, "Roster unavailable", &friendly_roster_problem(error));
             }
-            PresenceUiState::Idle | PresenceUiState::Loading => {
+            PresenceUiState::Error(error) => {
+                empty_panel_message(ui, "Roster unavailable", error);
+            }
+            _ => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(18.0);
                     busy_indicator(ui, 24.0, info_accent());
@@ -1195,57 +1226,7 @@ impl BrickApp {
                     ui.add_space(18.0);
                 });
             }
-            PresenceUiState::Error(error) => {
-                empty_panel_message(ui, "Roster unavailable", &error);
-            }
-            PresenceUiState::Ready(roster) => {
-                let max_height = ui.available_height().max(0.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("guild-roster")
-                    .auto_shrink([false, true])
-                    .max_height(max_height)
-                    .min_scrolled_height(0.0)
-                    .show(ui, |ui| {
-                        let content_width = (ui.available_width() - 18.0).max(260.0);
-                        ui.set_width(content_width);
-
-                        if let Some(notice) = self.roster_notice.as_deref() {
-                            roster_notice(ui, notice);
-                            ui.add_space(14.0);
-                        }
-                        let can_edit = roster.can_edit_roles;
-                        draw_roster_group(
-                            ui,
-                            "Officers",
-                            &roster.officers,
-                            can_edit,
-                            &self.profile,
-                            &mut role_change,
-                        );
-                        ui.add_space(18.0);
-                        draw_roster_group(
-                            ui,
-                            "Raiders",
-                            &roster.raiders,
-                            can_edit,
-                            &self.profile,
-                            &mut role_change,
-                        );
-                        ui.add_space(12.0);
-                        ui.label(
-                            RichText::new(roster_refresh_label(
-                                &roster.generated_at,
-                                roster.online_window_seconds,
-                            ))
-                            .small()
-                            .color(muted_text()),
-                        );
-                    });
-            }
         });
-        if let Some((id, role)) = role_change {
-            self.profile.set_member_role(ui.ctx(), id, role);
-        }
     }
 
     fn draw_login_screen(&mut self, ui: &mut egui::Ui) {
@@ -1902,6 +1883,7 @@ impl eframe::App for BrickApp {
             }
             self.poll_sync();
             self.poll_roster();
+            self.guild.poll();
             self.start_roster_refresh_if_stale();
             self.refresh_view_if_stale();
         }
@@ -1956,6 +1938,7 @@ impl eframe::App for BrickApp {
             self.roster_rx = None;
             self.sync_rx = None;
             self.profile = ProfileUi::default();
+            self.guild = GuildUi::default();
             self.auth_state = AuthUiState::SignedOut;
             self.presence_state = initial_presence_state();
             self.roster_notice = None;
@@ -2099,7 +2082,7 @@ pub(crate) fn panel_frame() -> egui::Frame {
         .inner_margin(egui::Margin::same(18))
 }
 
-fn section_title(ui: &mut egui::Ui, text: &str) {
+pub(crate) fn section_title(ui: &mut egui::Ui, text: &str) {
     ui.label(
         RichText::new(text)
             .small()
@@ -2222,7 +2205,7 @@ pub(crate) fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     )
 }
 
-fn capsule(ui: &mut egui::Ui, text: &str, text_color: Color32, fill: Color32) {
+pub(crate) fn capsule(ui: &mut egui::Ui, text: &str, text_color: Color32, fill: Color32) {
     egui::Frame::NONE
         .fill(fill)
         .corner_radius(egui::CornerRadius::same(8))
@@ -2233,7 +2216,7 @@ fn capsule(ui: &mut egui::Ui, text: &str, text_color: Color32, fill: Color32) {
 }
 
 // A network wait does not need an animation or a continuous render loop.
-fn busy_indicator(ui: &mut egui::Ui, size: f32, color: Color32) {
+pub(crate) fn busy_indicator(ui: &mut egui::Ui, size: f32, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     if ui.is_rect_visible(rect) {
         for offset in [-0.3, 0.0, 0.3] {
@@ -2446,7 +2429,7 @@ fn tab_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     )
 }
 
-fn empty_panel_message(ui: &mut egui::Ui, title: &str, detail: &str) {
+pub(crate) fn empty_panel_message(ui: &mut egui::Ui, title: &str, detail: &str) {
     ui.vertical_centered(|ui| {
         ui.add_space(18.0);
         ui.label(
@@ -2460,7 +2443,7 @@ fn empty_panel_message(ui: &mut egui::Ui, title: &str, detail: &str) {
     });
 }
 
-fn roster_notice(ui: &mut egui::Ui, detail: &str) {
+pub(crate) fn roster_notice(ui: &mut egui::Ui, detail: &str) {
     egui::Frame::NONE
         .fill(Color32::from_rgb(45, 39, 31))
         .stroke(Stroke::new(1.0_f32, Color32::from_rgb(73, 61, 43)))
@@ -2471,158 +2454,7 @@ fn roster_notice(ui: &mut egui::Ui, detail: &str) {
         });
 }
 
-fn draw_roster_group(
-    ui: &mut egui::Ui,
-    title: &str,
-    members: &[RosterMember],
-    can_edit: bool,
-    profile: &ProfileUi,
-    change: &mut Option<(String, Option<RaidRole>)>,
-) {
-    let online_count = members.iter().filter(|member| member.online).count();
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(title)
-                .size(18.0)
-                .strong()
-                .color(primary_text()),
-        );
-        capsule(
-            ui,
-            &format!("{online_count}/{} online", members.len()),
-            secondary_text(),
-            Color32::from_rgb(38, 42, 50),
-        );
-    });
-    ui.add_space(8.0);
-
-    if members.is_empty() {
-        ui.label(
-            RichText::new(format!("No {} found.", title.to_ascii_lowercase())).color(muted_text()),
-        );
-        return;
-    }
-
-    for (index, member) in members.iter().enumerate() {
-        if index > 0 {
-            ui.separator();
-        }
-        ui.push_id(&member.user_id, |ui| {
-            draw_roster_member_row(ui, member, can_edit, profile, change);
-        });
-    }
-}
-
-fn draw_roster_member_row(
-    ui: &mut egui::Ui,
-    member: &RosterMember,
-    can_edit: bool,
-    profile: &ProfileUi,
-    change: &mut Option<(String, Option<RaidRole>)>,
-) {
-    let row_height = 36.0;
-    let row_width = ui.available_width().max(260.0);
-    let (row_rect, _) =
-        ui.allocate_exact_size(egui::vec2(row_width, row_height), egui::Sense::hover());
-    if !ui.is_rect_visible(row_rect) {
-        return;
-    }
-
-    let dot_color = if member.online {
-        success_accent()
-    } else {
-        Color32::from_rgb(87, 95, 108)
-    };
-    let dot_center = egui::pos2(row_rect.left() + 8.0, row_rect.center().y);
-    if ui.is_rect_visible(row_rect) {
-        let painter = ui.painter_at(row_rect);
-        painter.circle_filled(dot_center, 6.0, dot_color);
-        painter.circle_stroke(
-            dot_center,
-            7.0,
-            Stroke::new(
-                1.0_f32,
-                Color32::from_rgba_unmultiplied(dot_color.r(), dot_color.g(), dot_color.b(), 70),
-            ),
-        );
-    }
-
-    let name_left = row_rect.left() + 34.0;
-    let role_width = if can_edit { 106.0 } else { 0.0 };
-    let status_width = if row_width < 520.0 { 148.0 } else { 220.0 };
-    let status_rect = egui::Rect::from_min_max(
-        egui::pos2(row_rect.right() - status_width - role_width, row_rect.top()),
-        row_rect.right_bottom() - egui::vec2(role_width, 0.0),
-    );
-    let name_rect = egui::Rect::from_min_max(
-        egui::pos2(name_left, row_rect.top()),
-        egui::pos2(
-            (status_rect.left() - 16.0).max(name_left),
-            row_rect.bottom(),
-        ),
-    );
-
-    ui.scope_builder(
-        egui::UiBuilder::new()
-            .max_rect(name_rect)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-        |ui| {
-            ui.shrink_clip_rect(name_rect);
-            profile::role_icon(ui, member.raid_role);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(member.name.as_str())
-                        .strong()
-                        .color(primary_text()),
-                )
-                .truncate(),
-            )
-            .on_hover_text(format!("{} - {}", member.role, member.user_id));
-        },
-    );
-
-    let status = roster_member_status(member);
-    ui.scope_builder(
-        egui::UiBuilder::new()
-            .max_rect(status_rect)
-            .layout(egui::Layout::right_to_left(egui::Align::Center)),
-        |ui| {
-            ui.shrink_clip_rect(status_rect);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(status.as_str())
-                        .small()
-                        .color(if member.online {
-                            secondary_text()
-                        } else {
-                            muted_text()
-                        }),
-                )
-                .truncate(),
-            )
-            .on_hover_text(status);
-        },
-    );
-    if can_edit {
-        let rect = egui::Rect::from_min_max(
-            egui::pos2(row_rect.right() - role_width + 6.0, row_rect.top()),
-            row_rect.right_bottom(),
-        );
-        ui.scope_builder(
-            egui::UiBuilder::new()
-                .max_rect(rect)
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            |ui| {
-                let mut role = profile.role_for_member(&member.user_id, member.raid_role);
-                if profile::role_picker(ui, ("roster-role", &member.user_id), &mut role) {
-                    *change = Some((member.user_id.clone(), role));
-                }
-            },
-        );
-    }
-}
-
-fn roster_member_status(member: &RosterMember) -> String {
+pub(crate) fn roster_member_status(member: &RosterMember) -> String {
     if member.online {
         let version = member
             .app_version
@@ -2646,7 +2478,7 @@ fn roster_member_status(member: &RosterMember) -> String {
     }
 }
 
-fn roster_refresh_label(generated_at: &str, online_window_seconds: u64) -> String {
+pub(crate) fn roster_refresh_label(generated_at: &str, online_window_seconds: u64) -> String {
     format!(
         "Updated {generated_at}. Online means seen in the last {}.",
         duration_label(online_window_seconds)
@@ -2740,7 +2572,7 @@ fn friendly_auth_problem(status: &str) -> String {
     }
 }
 
-fn friendly_roster_problem(status: &str) -> String {
+pub(crate) fn friendly_roster_problem(status: &str) -> String {
     let lower = status.to_ascii_lowercase();
     if lower.contains("built without") || lower.contains("configured") {
         "Roster service is not configured for this Brick build.".to_string()
@@ -2860,39 +2692,39 @@ fn app_background() -> Color32 {
     Color32::from_rgb(21, 23, 28)
 }
 
-fn panel_background() -> Color32 {
+pub(crate) fn panel_background() -> Color32 {
     Color32::from_rgb(29, 32, 38)
 }
 
-fn panel_stroke() -> Color32 {
+pub(crate) fn panel_stroke() -> Color32 {
     Color32::from_rgb(47, 52, 61)
 }
 
-fn primary_text() -> Color32 {
+pub(crate) fn primary_text() -> Color32 {
     Color32::from_rgb(241, 244, 248)
 }
 
-fn secondary_text() -> Color32 {
+pub(crate) fn secondary_text() -> Color32 {
     Color32::from_rgb(183, 194, 208)
 }
 
-fn muted_text() -> Color32 {
+pub(crate) fn muted_text() -> Color32 {
     Color32::from_rgb(130, 142, 158)
 }
 
-fn success_accent() -> Color32 {
+pub(crate) fn success_accent() -> Color32 {
     Color32::from_rgb(69, 211, 127)
 }
 
-fn warning_accent() -> Color32 {
+pub(crate) fn warning_accent() -> Color32 {
     Color32::from_rgb(236, 178, 80)
 }
 
-fn error_accent() -> Color32 {
+pub(crate) fn error_accent() -> Color32 {
     Color32::from_rgb(244, 91, 102)
 }
 
-fn info_accent() -> Color32 {
+pub(crate) fn info_accent() -> Color32 {
     Color32::from_rgb(94, 168, 224)
 }
 
@@ -2929,6 +2761,7 @@ pub(crate) mod tests {
             presence_state: PresenceUiState::Idle,
             streams: StreamsUi::default(),
             profile: ProfileUi::default(),
+            guild: GuildUi::default(),
             active_tab: MainTab::Home,
             sync_rx: None,
             auth_rx: None,
@@ -3297,7 +3130,7 @@ pub(crate) mod tests {
                 } else {
                     "Check for updates"
                 };
-                assert_static_button_hover(&["Home", "Roster", "Streams", label], |ui| {
+                assert_static_button_hover(&["Home", "Guild", "Streams", label], |ui| {
                     if review {
                         app.draw_review_header(ui);
                     } else {
@@ -3523,7 +3356,7 @@ pub(crate) mod tests {
         app.sync_rx = Some(mpsc::channel().1);
         app.auth_rx = Some(mpsc::channel().1);
         app.roster_rx = Some(mpsc::channel().1);
-        app.active_tab = MainTab::Roster;
+        app.active_tab = MainTab::Guild;
         app.last_app_update_check = overdue();
         app.last_view_refresh = overdue();
         app.last_auth_check = overdue();
@@ -3553,7 +3386,7 @@ pub(crate) mod tests {
     #[test]
     fn unavailable_roster_does_not_retry_on_every_frame() {
         let mut app = app();
-        app.active_tab = MainTab::Roster;
+        app.active_tab = MainTab::Guild;
         app.presence_state = PresenceUiState::Unavailable("Not configured".into());
         app.last_roster_refresh = overdue();
         app.start_roster_refresh_if_stale();
@@ -3590,7 +3423,7 @@ pub(crate) mod tests {
     fn hidden_window_skips_roster_and_filesystem_refreshes() {
         let mut app = app();
         app.window_visible = false;
-        app.active_tab = MainTab::Roster;
+        app.active_tab = MainTab::Guild;
         app.last_roster_refresh = overdue();
         app.last_view_refresh = overdue();
         app.start_roster_refresh_if_stale();
