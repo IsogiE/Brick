@@ -68,6 +68,7 @@ Releases are automatic. Merge a version bump (`npm run version:release` with `BR
 | `src/addon/extras.rs` | Optional addons (BugGrabber, BugSack, AddOn Profiler, AdvanceWigs) |
 | `src/app_update.rs`, `src/download.rs` | App updates and bounded downloads |
 | `src/discord_auth.rs`, `src/presence.rs` | Discord login and roster client |
+| `src/guild_ui.rs` | Guild tab and character pages, from the server's Battle.net character sync |
 | `scripts/`, `packaging/` | Build tooling, installer template, and build checks |
 
 Run the checks before opening a pull request:
