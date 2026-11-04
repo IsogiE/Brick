@@ -14,7 +14,7 @@ use crate::{
     ui::{
         busy_indicator, capsule, empty_panel_message, muted_text, panel_background, panel_frame,
         panel_stroke, primary_text, roster_member_status, roster_notice, roster_refresh_label,
-        secondary_button, secondary_text, section_title, success_accent, warning_accent,
+        secondary_text, section_title, success_accent, warning_accent,
     },
 };
 
@@ -42,6 +42,25 @@ pub struct CharactersView {
 pub struct RaidInstance {
     pub id: u64,
     pub name: String,
+    pub encounters: Vec<serde_json::Value>,
+    pub tier: bool,
+}
+
+impl CharactersView {
+    /// The current tier's raids. Servers before the tier picker sent none.
+    fn tier(&self) -> HashSet<u64> {
+        let tier: HashSet<u64> = self
+            .raids
+            .iter()
+            .filter(|raid| raid.tier)
+            .map(|raid| raid.id)
+            .collect();
+        if tier.is_empty() {
+            self.raids.iter().map(|raid| raid.id).collect()
+        } else {
+            tier
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -203,6 +222,7 @@ pub struct GuildUi {
     detail_rx: Option<(String, Reply<CharacterDetail>)>,
     detail_error: Option<(String, String)>,
     main_rx: Option<(String, Reply<Option<String>>)>,
+    tier_rx: Option<Reply<CharactersView>>,
     main_error: Option<String>,
 }
 
@@ -272,6 +292,27 @@ impl GuildUi {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        if let Some(rx) = &self.tier_rx {
+            match rx.try_recv() {
+                Ok(Ok(mut view)) => {
+                    for member in &mut view.members {
+                        sort_characters(&mut member.characters);
+                    }
+                    self.view = Some(view);
+                    self.view_error = None;
+                    self.tier_rx = None;
+                }
+                Ok(Err(error)) => {
+                    self.view_error = Some(friendly_problem(&error));
+                    self.tier_rx = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.view_error = Some("The tier could not be saved.".into());
+                    self.tier_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some((user_id, rx)) = &self.main_rx {
             match rx.try_recv() {
                 Ok(Ok(main)) => {
@@ -315,7 +356,9 @@ impl GuildUi {
     }
 
     fn member(&self, user_id: &str) -> Option<&MemberCharacters> {
-        self.members().iter().find(|member| member.user_id == user_id)
+        self.members()
+            .iter()
+            .find(|member| member.user_id == user_id)
     }
 
     fn open_page(&mut self, user_id: &str, key: &str) {
@@ -328,7 +371,10 @@ impl GuildUi {
 
     fn request_detail(&mut self, ctx: &egui::Context, key: &str) {
         if self.details.contains_key(key)
-            || self.detail_rx.as_ref().is_some_and(|(pending, _)| pending == key)
+            || self
+                .detail_rx
+                .as_ref()
+                .is_some_and(|(pending, _)| pending == key)
             || self
                 .detail_error
                 .as_ref()
@@ -368,6 +414,19 @@ impl GuildUi {
         self.main_error = None;
     }
 
+    fn set_tier(&mut self, ctx: &egui::Context, raids: Vec<u64>) {
+        if self.tier_rx.is_some() || raids.is_empty() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        crate::guild::spawn(move || {
+            let _ = tx.send(save_tier(&raids));
+            ctx.request_repaint();
+        });
+        self.tier_rx = Some(rx);
+    }
+
     /// The Guild tab once the roster has loaded. Returns true when the user
     /// asked for a refresh.
     pub fn draw(
@@ -394,26 +453,29 @@ impl GuildUi {
             && members
                 .iter()
                 .all(|member| self.expanded.contains(&member.user_id));
-        ui.horizontal(|ui| {
+        let mut tier_pick = None;
+        control_row(ui, |ui| {
             ui.label(
                 RichText::new("Roster")
                     .size(18.0)
                     .strong()
                     .color(primary_text()),
             );
-            capsule(
-                ui,
-                &format!("{online}/{} online", members.len()),
-                secondary_text(),
-                Color32::from_rgb(38, 42, 50),
-            );
+            pill(ui, &format!("{online}/{} online", members.len()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if secondary_button(ui, "Refresh").clicked() {
+                if bar_button(ui, "Refresh").clicked() {
                     refresh = true;
                 }
                 if self.view.is_some()
-                    && secondary_button(ui, if all_open { "Collapse all" } else { "Expand all" })
-                        .clicked()
+                    && bar_button(
+                        ui,
+                        if all_open {
+                            "Collapse all"
+                        } else {
+                            "Expand all"
+                        },
+                    )
+                    .clicked()
                 {
                     if all_open {
                         self.expanded.clear();
@@ -421,16 +483,31 @@ impl GuildUi {
                         self.expanded = members.iter().map(|m| m.user_id.clone()).collect();
                     }
                 }
-                if self.view_rx.is_some() {
+                if let Some(view) = self
+                    .view
+                    .as_ref()
+                    .filter(|view| view.can_edit_mains && !view.raids.is_empty())
+                {
+                    tier_pick = tier_picker(ui, view);
+                }
+                if self.view_rx.is_some() || self.tier_rx.is_some() {
                     busy_indicator(ui, 16.0, crate::ui::info_accent());
                 }
             });
         });
+        if let Some(raids) = tier_pick {
+            self.set_tier(ui.ctx(), raids);
+        }
         ui.add_space(10.0);
 
         let max_height = ui.available_height().max(0.0);
         let mut open = None;
         let mut toggle = None;
+        let tier = self
+            .view
+            .as_ref()
+            .map(CharactersView::tier)
+            .unwrap_or_default();
         egui::ScrollArea::vertical()
             .id_salt("guild-roster")
             .auto_shrink([false, true])
@@ -473,10 +550,12 @@ impl GuildUi {
                                 }
                                 if expanded {
                                     let ready = self.view.as_ref().and_then(|view| view.ready_ilvl);
-                                    for character in characters.map_or(&[][..], |c| &c.characters)
-                                    {
-                                        if draw_character_row(ui, character, ready) {
-                                            open = Some((member.user_id.clone(), character.key.clone()));
+                                    for character in characters.map_or(&[][..], |c| &c.characters) {
+                                        if draw_character_row(ui, character, ready, &tier) {
+                                            open = Some((
+                                                member.user_id.clone(),
+                                                character.key.clone(),
+                                            ));
                                         }
                                     }
                                 }
@@ -523,28 +602,28 @@ impl GuildUi {
             self.page = None;
             return false;
         };
-        let can_edit = own_id == member.user_id
-            || self.view.as_ref().is_some_and(|view| view.can_edit_mains);
+        let can_edit =
+            own_id == member.user_id || self.view.as_ref().is_some_and(|view| view.can_edit_mains);
         let ready_ilvl = self.view.as_ref().and_then(|view| view.ready_ilvl);
         let mut refresh = false;
         let mut back = false;
         let mut chosen = None;
         let mut make_main = false;
 
-        ui.horizontal(|ui| {
-            let button = secondary_button(ui, "     Guild");
-            arrow(ui, button.rect.left_center() + egui::vec2(16.0, 0.0), -1.0);
+        control_row(ui, |ui| {
+            let button = bar_button(ui, "     Guild");
+            arrow(ui, button.rect.left_center() + egui::vec2(18.0, 0.0), -1.0);
             if button.clicked() {
                 back = true;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if secondary_button(ui, "Refresh").clicked() {
+                if bar_button(ui, "Refresh").clicked() {
                     refresh = true;
                 }
                 if can_edit && !character.main {
                     let busy = self.main_rx.is_some();
                     if ui
-                        .add_enabled_ui(!busy, |ui| secondary_button(ui, "Set as main"))
+                        .add_enabled_ui(!busy, |ui| bar_button(ui, "Set as main"))
                         .inner
                         .clicked()
                     {
@@ -554,19 +633,25 @@ impl GuildUi {
                         busy_indicator(ui, 16.0, crate::ui::info_accent());
                     }
                 }
-                egui::ComboBox::from_id_salt("guild-character")
-                    .width(300.0)
-                    .selected_text(character_label(&character))
-                    .show_ui(ui, |ui| {
+                bar_combo(
+                    ui,
+                    "guild-character",
+                    300.0,
+                    character_label(&character),
+                    |ui| {
                         for option in &member.characters {
                             if ui
-                                .selectable_label(option.key == character.key, character_label(option))
+                                .selectable_label(
+                                    option.key == character.key,
+                                    character_label(option),
+                                )
                                 .clicked()
                             {
                                 chosen = Some(option.key.clone());
                             }
                         }
-                    });
+                    },
+                );
             });
         });
         if let Some(error) = &self.main_error {
@@ -644,6 +729,117 @@ impl GuildUi {
     }
 }
 
+const CONTROL_HEIGHT: f32 = 34.0;
+// The scroll areas below keep 18 px for their bar; controls above them stop at
+// the same right edge as the panels.
+const SCROLL_GUTTER: f32 = 18.0;
+
+fn control_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let width = (ui.available_width() - SCROLL_GUTTER).max(300.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, CONTROL_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_size(egui::vec2(width, CONTROL_HEIGHT));
+            add(ui);
+        },
+    );
+}
+
+fn bar_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(text).strong().color(primary_text()))
+            .corner_radius(egui::CornerRadius::same(8))
+            .fill(Color32::from_rgb(38, 42, 50))
+            .min_size(egui::vec2(0.0, CONTROL_HEIGHT)),
+    )
+}
+
+/// A dropdown the height of the buttons beside it.
+fn bar_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    width: f32,
+    selected: RichText,
+    menu: impl FnOnce(&mut egui::Ui),
+) {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = CONTROL_HEIGHT;
+        egui::ComboBox::from_id_salt(id)
+            .width(width)
+            .height(420.0)
+            .selected_text(selected)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show_ui(ui, menu);
+    });
+}
+
+/// A fixed-height count beside a title.
+fn pill(ui: &mut egui::Ui, text: &str) {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(11.0),
+        secondary_text(),
+    );
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(galley.size().x + 18.0, 22.0),
+        egui::Sense::hover(),
+    );
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(8), line_color());
+    ui.painter().galley(
+        rect.center() - galley.size() / 2.0,
+        galley,
+        secondary_text(),
+    );
+}
+
+/// Officers pick the current tier's raids. Returns the new list when it changed.
+fn tier_picker(ui: &mut egui::Ui, view: &CharactersView) -> Option<Vec<u64>> {
+    let tier = view.tier();
+    let names: Vec<&str> = view
+        .raids
+        .iter()
+        .filter(|raid| tier.contains(&raid.id))
+        .map(|raid| short_raid(&raid.name))
+        .collect();
+    let mut picked = None;
+    bar_combo(
+        ui,
+        "guild-tier",
+        260.0,
+        RichText::new(names.join(" · ")).color(primary_text()),
+        |ui| {
+            for raid in &view.raids {
+                let mut on = tier.contains(&raid.id);
+                if ui.checkbox(&mut on, &raid.name).changed() {
+                    let next: Vec<u64> = view
+                        .raids
+                        .iter()
+                        .map(|known| known.id)
+                        .filter(|id| {
+                            if *id == raid.id {
+                                on
+                            } else {
+                                tier.contains(id)
+                            }
+                        })
+                        .collect();
+                    if !next.is_empty() {
+                        picked = Some(next);
+                    }
+                }
+            }
+        },
+    );
+    picked
+}
+
+/// "The Unbinding of Kith'ix" reads "Unbinding of Kith'ix" where space is short.
+fn short_raid(name: &str) -> &str {
+    name.strip_prefix("The ").unwrap_or(name)
+}
+
 fn sort_characters(characters: &mut [CharacterRow]) {
     characters.sort_by(|a, b| {
         b.main
@@ -664,7 +860,12 @@ fn friendly_problem(error: &str) -> String {
     }
 }
 
-fn get(access: &crate::guild::Access, path: &str, max: u64, prefix: &str) -> Result<Vec<u8>, String> {
+fn get(
+    access: &crate::guild::Access,
+    path: &str,
+    max: u64,
+    prefix: &str,
+) -> Result<Vec<u8>, String> {
     let client = presence::http_client()?;
     let response = client
         .get(access.endpoint(path)?)
@@ -720,6 +921,30 @@ fn save_main(own_id: &str, user_id: &str, key: &str) -> Result<Option<String>, S
     serde_json::from_slice::<Saved>(&body)
         .map(|saved| saved.main)
         .map_err(|_| "Main: the server sent an invalid response.".to_string())
+}
+
+/// The answer is the whole Guild tab list, so it reads with the list's limit.
+fn save_tier(raids: &[u64]) -> Result<CharactersView, String> {
+    let token = discord_auth::current_or_refreshed_access_token()?
+        .ok_or_else(|| "Sign in again to set the tier.".to_string())?;
+    let response = presence::http_client()?
+        .put(token.endpoint("/v1/characters/tier")?)
+        .bearer_auth(token.secret())
+        .json(&serde_json::json!({ "raids": raids }))
+        .send()
+        .map_err(|_| "Tier: the server could not be reached.".to_string())?;
+    let status = response.status();
+    let limit = if status.is_success() {
+        MAX_VIEW_BYTES
+    } else {
+        MAX_ERROR_BYTES
+    };
+    let body = download::read_response(response, limit, "Tier")?;
+    if !status.is_success() {
+        return Err(presence::profile_error("Tier", status, &body));
+    }
+    serde_json::from_slice(&body)
+        .map_err(|_| "Tier: the server sent an invalid response.".to_string())
 }
 
 /// "eu:draenor:lucas" reads /v1/characters/eu/draenor/lucas. The server encodes
@@ -878,6 +1103,11 @@ impl Columns {
     const VAULT_WIDTH: f32 = 6.0 * 14.0;
     const LOCKOUT_WIDTH: f32 = 96.0;
 
+    /// Right edge of the normal, heroic or mythic count.
+    fn lockout_digit(&self, index: usize) -> f32 {
+        self.lockout + 22.0 + index as f32 * 32.0
+    }
+
     fn new(rect: egui::Rect) -> Self {
         let wide = rect.width() >= 820.0;
         let mut x = rect.right() - 8.0;
@@ -916,17 +1146,29 @@ impl Columns {
 }
 
 fn draw_column_titles(ui: &mut egui::Ui, columns: &Columns) {
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 30.0),
-        egui::Sense::hover(),
-    );
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
     let y = rect.center().y;
     let color = muted_text();
     let left = |x: f32, text: &str| {
-        text_at(ui, egui::pos2(x, y), egui::Align2::LEFT_CENTER, text, 12.0, color);
+        text_at(
+            ui,
+            egui::pos2(x, y),
+            egui::Align2::LEFT_CENTER,
+            text,
+            12.0,
+            color,
+        );
     };
     let right = |x: f32, text: &str| {
-        text_at(ui, egui::pos2(x, y), egui::Align2::RIGHT_CENTER, text, 12.0, color);
+        text_at(
+            ui,
+            egui::pos2(x, y),
+            egui::Align2::RIGHT_CENTER,
+            text,
+            12.0,
+            color,
+        );
     };
     left(columns.name, "Character");
     if let Some(x) = columns.race {
@@ -937,7 +1179,9 @@ fn draw_column_titles(ui: &mut egui::Ui, columns: &Columns) {
     if let Some(x) = columns.vault {
         left(x, "Vault");
     }
-    left(columns.lockout, "Lockout N · H · M");
+    for (index, label) in ["N", "H", "M"].into_iter().enumerate() {
+        right(columns.lockout_digit(index), label);
+    }
     right(columns.keys, "Keys");
     right(columns.myth, "Myth");
     ui.painter().hline(
@@ -987,49 +1231,37 @@ fn draw_tiles(ui: &mut egui::Ui, view: &CharactersView, member_count: usize) {
         ui.spacing_mut().item_spacing.x = gap;
         for (label, value, detail) in &tiles {
             tile(ui, tile_width, label, |ui, rect| {
-                let value_rect = text_at(
-                    ui,
-                    rect.left_bottom() + egui::vec2(0.0, -2.0),
-                    egui::Align2::LEFT_BOTTOM,
-                    value,
-                    24.0,
-                    primary_text(),
-                );
+                // One layout per line keeps the value and its detail on one baseline.
+                let mut line = single(value, TILE_VALUE, primary_text());
                 if !detail.is_empty() {
-                    text_at(
-                        ui,
-                        egui::pos2(value_rect.right() + 8.0, value_rect.bottom() - 5.0),
-                        egui::Align2::LEFT_BOTTOM,
-                        detail,
-                        12.0,
-                        muted_text(),
-                    );
+                    append(&mut line, &format!("  {detail}"), 12.0, muted_text());
                 }
+                paint_bottom_left(ui, line, rect.left_bottom(), rect.width());
             });
         }
         tile(ui, tile_width, "READY PER TOKEN", |ui, rect| {
             let step = rect.width() / 4.0;
             for (index, short) in ["Dre", "Mys", "Ven", "Zen"].iter().enumerate() {
-                let x = rect.left() + step * index as f32;
-                let label = text_at(
-                    ui,
-                    egui::pos2(x, rect.bottom() - 7.0),
-                    egui::Align2::LEFT_BOTTOM,
-                    short,
-                    12.0,
-                    muted_text(),
-                );
-                text_at(
-                    ui,
-                    egui::pos2(label.right() + 6.0, rect.bottom() - 2.0),
-                    egui::Align2::LEFT_BOTTOM,
+                let mut line = single(&format!("{short} "), 12.0, muted_text());
+                append(
+                    &mut line,
                     &tokens[index].to_string(),
-                    20.0,
+                    TILE_VALUE,
                     primary_text(),
                 );
+                let left = rect.left_bottom() + egui::vec2(step * index as f32, 0.0);
+                paint_bottom_left(ui, line, left, step);
             }
         });
     });
+}
+
+const TILE_VALUE: f32 = 22.0;
+
+fn paint_bottom_left(ui: &egui::Ui, job: egui::text::LayoutJob, at: egui::Pos2, width: f32) {
+    let galley = clipped(ui, job, width);
+    let pos = at - egui::vec2(0.0, galley.size().y);
+    ui.painter().galley(pos, galley, primary_text());
 }
 
 fn tile(ui: &mut egui::Ui, width: f32, label: &str, body: impl FnOnce(&egui::Ui, egui::Rect)) {
@@ -1100,8 +1332,20 @@ fn draw_member_row(
     let avatar = Color32::from(egui::ecolor::Hsva::new(hue as f32 / 360.0, 0.55, 0.62, 1.0));
     let center = egui::pos2(rect.left() + 20.0, y);
     ui.painter().circle_filled(center, 16.0, avatar);
-    let initials: String = member.name.chars().take(2).collect::<String>().to_uppercase();
-    text_at(ui, center, egui::Align2::CENTER_CENTER, &initials, 12.0, Color32::WHITE);
+    let initials: String = member
+        .name
+        .chars()
+        .take(2)
+        .collect::<String>()
+        .to_uppercase();
+    text_at(
+        ui,
+        center,
+        egui::Align2::CENTER_CENTER,
+        &initials,
+        12.0,
+        Color32::WHITE,
+    );
 
     let chevron_width = if count > 0 { 52.0 } else { 0.0 };
     let role_width = if can_edit_roles { 106.0 } else { 0.0 };
@@ -1126,12 +1370,9 @@ fn draw_member_row(
         append(&mut job, &format!("   {summary}"), 12.0, muted_text());
     }
     let galley = clipped(ui, job, name_right - x);
-    let name_rect = egui::Rect::from_min_size(
-        egui::pos2(x, y - galley.size().y / 2.0),
-        galley.size(),
-    );
-    ui.painter()
-        .galley(name_rect.min, galley, primary_text());
+    let name_rect =
+        egui::Rect::from_min_size(egui::pos2(x, y - galley.size().y / 2.0), galley.size());
+    ui.painter().galley(name_rect.min, galley, primary_text());
     ui.interact(name_rect, ui.id().with("name"), egui::Sense::hover())
         .on_hover_text(format!("{} - {}", member.role, member.user_id));
 
@@ -1220,7 +1461,11 @@ fn arrow(ui: &egui::Ui, center: egui::Pos2, direction: f32) {
 fn member_summary(characters: &MemberCharacters) -> Option<String> {
     let first = characters.characters.first()?;
     let count = characters.characters.len();
-    let noun = if count == 1 { "character" } else { "characters" };
+    let noun = if count == 1 {
+        "character"
+    } else {
+        "characters"
+    };
     let role = [first.spec.as_deref(), first.class.as_deref()]
         .into_iter()
         .flatten()
@@ -1234,7 +1479,12 @@ fn member_summary(characters: &MemberCharacters) -> Option<String> {
 }
 
 /// One character under its member. Returns true when it was clicked.
-fn draw_character_row(ui: &mut egui::Ui, character: &CharacterRow, ready_ilvl: Option<u32>) -> bool {
+fn draw_character_row(
+    ui: &mut egui::Ui,
+    character: &CharacterRow,
+    ready_ilvl: Option<u32>,
+    tier: &HashSet<u64>,
+) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
     if !ui.is_rect_visible(rect) {
@@ -1264,8 +1514,11 @@ fn draw_character_row(ui: &mut egui::Ui, character: &CharacterRow, ready_ilvl: O
         columns.name_end - name_left - tag_width,
     );
     let name_width = galley.size().x;
-    ui.painter()
-        .galley(egui::pos2(name_left, y - galley.size().y / 2.0), galley, color);
+    ui.painter().galley(
+        egui::pos2(name_left, y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
     if character.main {
         let tag = egui::Rect::from_min_size(
             egui::pos2(name_left + name_width + 8.0, y - 9.0),
@@ -1277,24 +1530,41 @@ fn draw_character_row(ui: &mut egui::Ui, character: &CharacterRow, ready_ilvl: O
             Stroke::new(1.0_f32, Color32::from_rgb(74, 80, 92)),
             egui::StrokeKind::Inside,
         );
-        text_at(ui, tag.center(), egui::Align2::CENTER_CENTER, "Main", 10.0, secondary_text());
+        text_at(
+            ui,
+            tag.center(),
+            egui::Align2::CENTER_CENTER,
+            "Main",
+            10.0,
+            secondary_text(),
+        );
     }
 
     let dash = |x: f32| {
-        text_at(ui, egui::pos2(x, y), egui::Align2::RIGHT_CENTER, "–", 13.0, dim());
+        text_at(
+            ui,
+            egui::pos2(x, y),
+            egui::Align2::RIGHT_CENTER,
+            "–",
+            13.0,
+            dim(),
+        );
     };
     if let Some(x) = columns.race {
         if let Some(race) = &character.race {
             let galley = clipped(ui, single(race, 13.0, secondary_text()), 116.0);
-            ui.painter()
-                .galley(egui::pos2(x, y - galley.size().y / 2.0), galley, secondary_text());
+            ui.painter().galley(
+                egui::pos2(x, y - galley.size().y / 2.0),
+                galley,
+                secondary_text(),
+            );
         }
     }
     if !character.synced() {
         for x in [columns.ilvl, columns.tier, columns.keys, columns.myth] {
             dash(x);
         }
-        dash(columns.lockout + Columns::LOCKOUT_WIDTH);
+        dash(columns.lockout_digit(1));
         return response.clicked();
     }
 
@@ -1353,7 +1623,7 @@ fn draw_character_row(ui: &mut egui::Ui, character: &CharacterRow, ready_ilvl: O
         character
             .saved
             .iter()
-            .filter(|raid| pick(raid) > 0)
+            .filter(|raid| tier.contains(&raid.id) && pick(raid) > 0)
             .map(|raid| raid.total)
             .sum()
     };
@@ -1375,7 +1645,7 @@ fn draw_character_row(ui: &mut egui::Ui, character: &CharacterRow, ready_ilvl: O
         };
         text_at(
             ui,
-            egui::pos2(columns.lockout + 22.0 + index as f32 * 32.0, y),
+            egui::pos2(columns.lockout_digit(index), y),
             egui::Align2::RIGHT_CENTER,
             &value.to_string(),
             13.0,
@@ -1418,12 +1688,12 @@ fn draw_character_row(ui: &mut egui::Ui, character: &CharacterRow, ready_ilvl: O
 }
 
 fn updated_label(synced_at: Option<&str>) -> Option<String> {
-    let at = time::OffsetDateTime::parse(
-        synced_at?,
-        &time::format_description::well_known::Rfc3339,
-    )
-    .ok()?;
-    let minutes = (time::OffsetDateTime::now_utc() - at).whole_minutes().max(0);
+    let at =
+        time::OffsetDateTime::parse(synced_at?, &time::format_description::well_known::Rfc3339)
+            .ok()?;
+    let minutes = (time::OffsetDateTime::now_utc() - at)
+        .whole_minutes()
+        .max(0);
     Some(match minutes {
         0 => "Updated just now".into(),
         1..=59 => format!("Updated {minutes} min ago"),
@@ -1445,7 +1715,12 @@ fn draw_header(ui: &mut egui::Ui, character: &CharacterRow, ready_ilvl: Option<u
                         .color(class_color(character.class_name())),
                 );
                 if character.main {
-                    ui.label(RichText::new("MAIN").small().strong().color(secondary_text()));
+                    ui.label(
+                        RichText::new("MAIN")
+                            .small()
+                            .strong()
+                            .color(secondary_text()),
+                    );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(updated) = updated_label(character.synced_at.as_deref()) {
@@ -1505,7 +1780,10 @@ fn draw_header(ui: &mut egui::Ui, character: &CharacterRow, ready_ilvl: Option<u
                 ),
                 (
                     "RAID",
-                    format!("{} · {} · {}", lockout.normal, lockout.heroic, lockout.mythic),
+                    format!(
+                        "{} · {} · {}",
+                        lockout.normal, lockout.heroic, lockout.mythic
+                    ),
                     "N · H · M this reset".to_string(),
                     primary_text(),
                 ),
@@ -1555,6 +1833,13 @@ fn draw_header(ui: &mut egui::Ui, character: &CharacterRow, ready_ilvl: Option<u
 }
 
 fn draw_vault_and_lockouts(ui: &mut egui::Ui, character: &CharacterRow, raids: &[RaidInstance]) {
+    let flagged: Vec<&RaidInstance> = raids.iter().filter(|raid| raid.tier).collect();
+    let tier: Vec<&RaidInstance> = if flagged.is_empty() {
+        raids.iter().collect()
+    } else {
+        flagged
+    };
+    let saved = |id: u64| character.saved.iter().find(|raid| raid.id == id);
     let gap = 14.0;
     let wide = ui.available_width() >= 760.0;
     let width = if wide {
@@ -1562,34 +1847,54 @@ fn draw_vault_and_lockouts(ui: &mut egui::Ui, character: &CharacterRow, raids: &
     } else {
         ui.available_width()
     };
+    // Side by side, both cards take the taller one's height.
+    let vault_height: f32 = 194.0;
+    let lockouts_height = 26.0 + 30.0 * tier.len().max(1) as f32;
+    let height = if wide {
+        vault_height.max(lockouts_height)
+    } else {
+        0.0
+    };
     let vault = |ui: &mut egui::Ui| {
-        card(ui, width, "GREAT VAULT", |ui| {
-            let bosses = character
-                .saved
+        card(ui, width, height.max(vault_height), "GREAT VAULT", |ui| {
+            let bosses = tier
                 .iter()
+                .filter_map(|raid| saved(raid.id))
                 .flat_map(|raid| raid.normal.iter().chain(&raid.heroic).chain(&raid.mythic))
                 .collect::<HashSet<_>>()
                 .len() as u32;
             vault_track(ui, "Raid", bosses, [2, 4, 6], ("boss", "bosses"));
             ui.add_space(10.0);
-            vault_track(ui, "Mythic+", character.keys.runs, [1, 4, 8], ("run", "runs"));
+            vault_track(
+                ui,
+                "Mythic+",
+                character.keys.runs,
+                [1, 4, 8],
+                ("run", "runs"),
+            );
         });
     };
     let lockouts = |ui: &mut egui::Ui| {
-        card(ui, width, "LOCKOUTS", |ui| {
-            let mut saved: Vec<&SavedRaid> = character.saved.iter().collect();
-            // Journal order, so the current raids read the same on every page.
-            saved.sort_by_key(|raid| {
-                raids
-                    .iter()
-                    .position(|known| known.id == raid.id)
-                    .unwrap_or(usize::MAX)
-            });
-            if saved.is_empty() {
-                ui.label(RichText::new("No kills this reset").color(muted_text()));
-            }
-            for raid in saved {
-                lockout_line(ui, raid);
+        card(ui, width, height.max(lockouts_height), "LOCKOUTS", |ui| {
+            for raid in &tier {
+                let kills = saved(raid.id);
+                let total = if raid.encounters.is_empty() {
+                    kills.map_or(0, |kills| kills.total)
+                } else {
+                    raid.encounters.len() as u32
+                };
+                let count =
+                    |pick: fn(&SavedRaid) -> &Vec<u64>| kills.map_or(0, |k| pick(k).len() as u32);
+                lockout_line(
+                    ui,
+                    &raid.name,
+                    [
+                        count(|k| &k.normal),
+                        count(|k| &k.heroic),
+                        count(|k| &k.mythic),
+                    ],
+                    total,
+                );
             }
         });
     };
@@ -1606,16 +1911,17 @@ fn draw_vault_and_lockouts(ui: &mut egui::Ui, character: &CharacterRow, raids: &
     }
 }
 
-fn card(ui: &mut egui::Ui, width: f32, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+fn card(ui: &mut egui::Ui, width: f32, height: f32, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui.allocate_ui_with_layout(
-        egui::vec2(width, 0.0),
+        egui::vec2(width, height),
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
             panel_frame()
                 .inner_margin(egui::Margin::same(16))
                 .show(ui, |ui| {
+                    // The frame adds its margin and stroke around this.
                     ui.set_width(width - 34.0);
-                    ui.set_min_height(132.0);
+                    ui.set_min_height(height - 34.0);
                     section_title(ui, title);
                     ui.add_space(8.0);
                     body(ui);
@@ -1656,26 +1962,39 @@ fn vault_track(
             };
             ui.painter()
                 .rect_filled(rect, egui::CornerRadius::same(5), fill);
-            text_at(ui, rect.center(), egui::Align2::CENTER_CENTER, &text, 13.0, color);
+            text_at(
+                ui,
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                &text,
+                13.0,
+                color,
+            );
         }
     });
 }
 
-fn lockout_line(ui: &mut egui::Ui, raid: &SavedRaid) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::hover());
+fn lockout_line(ui: &mut egui::Ui, name: &str, kills: [u32; 3], total: u32) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
     let y = rect.center().y;
-    let difficulties = [("N", &raid.normal), ("H", &raid.heroic), ("M", &raid.mythic)];
     let column = 64.0;
     let names_end = rect.right() - column * 3.0 - 8.0;
-    let galley = clipped(ui, single(&raid.name, 13.0, primary_text()), names_end - rect.left());
-    ui.painter()
-        .galley(egui::pos2(rect.left(), y - galley.size().y / 2.0), galley, primary_text());
-    for (index, (label, kills)) in difficulties.iter().enumerate() {
+    let galley = clipped(
+        ui,
+        single(name, 13.0, primary_text()),
+        names_end - rect.left(),
+    );
+    ui.painter().galley(
+        egui::pos2(rect.left(), y - galley.size().y / 2.0),
+        galley,
+        primary_text(),
+    );
+    for (index, (label, count)) in ["N", "H", "M"].into_iter().zip(kills).enumerate() {
         let right = rect.right() - column * (2 - index) as f32;
-        let count = kills.len() as u32;
         let color = if count == 0 {
             dim()
-        } else if count >= raid.total {
+        } else if count >= total {
             secondary_text()
         } else {
             warning_accent()
@@ -1684,7 +2003,7 @@ fn lockout_line(ui: &mut egui::Ui, raid: &SavedRaid) {
             ui,
             egui::pos2(right, y),
             egui::Align2::RIGHT_CENTER,
-            &format!("{label} {count}/{}", raid.total),
+            &format!("{label} {count}/{total}"),
             13.0,
             color,
         );
@@ -1710,7 +2029,10 @@ fn draw_checks(ui: &mut egui::Ui, checks: &Checks) {
                 ui.add_space(6.0);
                 check_chip(
                     ui,
-                    &format!("Enchants {}/{}", checks.enchants.done, checks.enchants.total),
+                    &format!(
+                        "Enchants {}/{}",
+                        checks.enchants.done, checks.enchants.total
+                    ),
                     checks.enchants.done >= checks.enchants.total,
                 );
                 check_chip(
@@ -1770,7 +2092,14 @@ fn gear_card(ui: &mut egui::Ui, item: &Gear, width: f32) {
     );
     let inner = rect.shrink2(egui::vec2(14.0, 12.0));
     let ilvl = item.ilvl.map_or("–".into(), |ilvl| ilvl.to_string());
-    text_at(ui, inner.left_top(), egui::Align2::LEFT_TOP, &ilvl, 18.0, primary_text());
+    text_at(
+        ui,
+        inner.left_top(),
+        egui::Align2::LEFT_TOP,
+        &ilvl,
+        18.0,
+        primary_text(),
+    );
     if let Some(track) = &item.track {
         let behind = track.level < track.max;
         text_at(
@@ -1894,6 +2223,23 @@ mod tests {
     }
 
     #[test]
+    fn the_tier_is_the_flagged_raids_or_every_raid_from_older_servers() {
+        let mut view = view();
+        assert_eq!(view.tier(), HashSet::from([1307]));
+        view.raids.push(RaidInstance {
+            id: 1324,
+            name: "The Unbinding of Kith'ix".into(),
+            encounters: Vec::new(),
+            tier: true,
+        });
+        assert_eq!(view.tier(), HashSet::from([1324]));
+        assert_eq!(
+            short_raid("The Unbinding of Kith'ix"),
+            "Unbinding of Kith'ix"
+        );
+    }
+
+    #[test]
     fn a_new_main_moves_to_the_top() {
         let mut guild = GuildUi {
             view: Some(view()),
@@ -1982,4 +2328,3 @@ mod tests {
         }
     }
 }
-

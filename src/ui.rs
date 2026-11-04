@@ -631,7 +631,7 @@ impl BrickApp {
                 self.presence_state = initial_presence_state();
                 self.roster_notice = None;
                 self.profile = ProfileUi::default();
-        self.guild = GuildUi::default();
+                self.guild = GuildUi::default();
                 self.status = "Signed out of Discord.".to_string();
             }
             Err(error) => {
@@ -1938,7 +1938,7 @@ impl eframe::App for BrickApp {
             self.roster_rx = None;
             self.sync_rx = None;
             self.profile = ProfileUi::default();
-        self.guild = GuildUi::default();
+            self.guild = GuildUi::default();
             self.auth_state = AuthUiState::SignedOut;
             self.presence_state = initial_presence_state();
             self.roster_notice = None;
@@ -2735,7 +2735,6 @@ pub(crate) mod tests {
     }
     use super::*;
     use eframe::App as _;
-
 
     // No disk, network, tray, or saved user session is needed to exercise scheduling.
     fn app() -> BrickApp {
