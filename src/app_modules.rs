@@ -5,6 +5,7 @@ mod app_update;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod appimage_environment;
 mod atomic_file;
+mod attendance_ui;
 mod autostart;
 mod browser;
 mod cache_maintenance;
