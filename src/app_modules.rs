@@ -4,6 +4,7 @@ mod addon;
 mod app_update;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod appimage_environment;
+mod art_ui;
 mod atomic_file;
 mod attendance_ui;
 mod autostart;

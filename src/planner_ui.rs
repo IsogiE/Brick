@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use time::Date;
 
 use crate::{
+    art_ui::{self, ArtUi},
     attendance_ui::{
         draw_name_cell, first_absence, format_date, grouped, month_name, paint_cross, parse_date,
         weekday_short, AttendanceUi, Kind, Line, GROUP_HEIGHT, LATE_TEXT, NAME_WIDTH, OUT_TEXT,
@@ -35,11 +36,12 @@ const MAX_RAIDS: usize = 6;
 const RAID_WIDTH: f32 = 210.0;
 const RAID_GAP: f32 = 10.0;
 const HEADER_HEIGHT: f32 = 80.0;
-const EDIT_HEADER_HEIGHT: f32 = 132.0;
+const EDIT_HEADER_HEIGHT: f32 = 170.0;
 const TOTALS_HEIGHT: f32 = 64.0;
 const SMALL_HEIGHT: f32 = 26.0;
 const FIELD_FILL: Color32 = Color32::from_rgb(38, 42, 50);
 const SAVED: Color32 = Color32::from_rgb(232, 112, 112);
+const SEND: Color32 = Color32::from_rgb(203, 85, 48);
 
 // Raid buffs and the classes that bring them.
 const BUFFS: [(&str, &[&str]); 11] = [
@@ -71,7 +73,7 @@ pub enum Difficulty {
 impl Difficulty {
     const ALL: [Self; 3] = [Self::Normal, Self::Heroic, Self::Mythic];
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Normal => "Normal",
             Self::Heroic => "Heroic",
@@ -100,7 +102,7 @@ pub enum Mode {
 impl Mode {
     const ALL: [Self; 3] = [Self::Splits, Self::Prog, Self::Farm];
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Splits => "splits",
             Self::Prog => "prog",
@@ -120,14 +122,17 @@ pub struct PlannedRaid {
     pub instances: Vec<u64>,
     #[serde(default)]
     pub picks: BTreeMap<String, Option<String>>,
+    /// Per boss, the members slot by slot in groups of five.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub groups: BTreeMap<String, Vec<Option<String>>>,
 }
 
 impl PlannedRaid {
-    fn pick(&self, user_id: &str) -> Option<&str> {
+    pub(crate) fn pick(&self, user_id: &str) -> Option<&str> {
         self.picks.get(user_id).and_then(|key| key.as_deref())
     }
 
-    fn night(&self, week: Date) -> Date {
+    pub(crate) fn night(&self, week: Date) -> Date {
         let offset = NIGHTS.iter().position(|day| *day == self.day).unwrap_or(0);
         week + time::Duration::days(offset as i64)
     }
@@ -165,19 +170,48 @@ pub struct PlannerUi {
     dirty_at: Option<Instant>,
     save_rx: Option<mpsc::Receiver<Result<PlanView, SaveError>>>,
     save_error: Option<String>,
+    art: Option<ArtUi>,
 }
 
 /// Everything a raid column reads besides the plan itself.
-struct Context<'a> {
+pub(crate) struct Context<'a> {
     characters: HashMap<&'a str, &'a MemberCharacters>,
     raid_names: HashMap<u64, &'a str>,
     attendance: &'a AttendanceUi,
-    week: Option<Date>,
+    pub week: Option<Date>,
     current: bool,
 }
 
-impl Context<'_> {
-    fn character(&self, user_id: &str, key: &str) -> Option<&CharacterRow> {
+impl<'a> Context<'a> {
+    fn new(
+        view: &PlanView,
+        characters: Option<&'a CharactersView>,
+        attendance: &'a AttendanceUi,
+    ) -> Self {
+        Self {
+            characters: characters
+                .map(|view| {
+                    view.members
+                        .iter()
+                        .map(|member| (member.user_id.as_str(), member))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            raid_names: characters
+                .map(|view| {
+                    view.raids
+                        .iter()
+                        .map(|raid| (raid.id, raid.name.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            attendance,
+            week: parse_date(&view.week),
+            current: view.week == view.current_week,
+        }
+    }
+
+    pub(crate) fn character(&self, user_id: &str, key: &str) -> Option<&CharacterRow> {
         self.characters
             .get(user_id)?
             .characters
@@ -185,7 +219,7 @@ impl Context<'_> {
             .find(|character| character.key == key)
     }
 
-    fn absence(&self, user_id: &str, raid: &PlannedRaid) -> Option<Kind> {
+    pub(crate) fn absence(&self, user_id: &str, raid: &PlannedRaid) -> Option<Kind> {
         let night = format_date(raid.night(self.week?));
         first_absence(self.attendance.absences_of(user_id), &night).map(|absence| absence.kind)
     }
@@ -196,7 +230,7 @@ impl Context<'_> {
     }
 
     /// Saved to one of the raid's instances on its difficulty this reset.
-    fn saved(&self, character: &CharacterRow, raid: &PlannedRaid) -> bool {
+    pub(crate) fn saved(&self, character: &CharacterRow, raid: &PlannedRaid) -> bool {
         self.current
             && character.saved.iter().any(|saved| {
                 raid.instances.contains(&saved.id)
@@ -286,6 +320,7 @@ impl PlannerUi {
                     self.view = Some(view);
                     self.view_error = None;
                     self.view_rx = None;
+                    self.close_lost_art();
                 }
                 Ok(Err(error)) => {
                     self.view_error = Some(friendly_problem(&error));
@@ -353,12 +388,27 @@ impl PlannerUi {
         self.save_rx = Some(rx);
     }
 
+    fn close_lost_art(&mut self) {
+        let editable = self
+            .view
+            .as_ref()
+            .is_some_and(|view| view.can_edit && view.available);
+        if self
+            .art
+            .as_ref()
+            .is_some_and(|art| !editable || art.raid >= self.raids.len())
+        {
+            self.art = None;
+        }
+    }
+
     fn change_week(&mut self, ctx: &egui::Context, delta: i64) {
         let Some(week) = self.view.as_ref().and_then(|view| parse_date(&view.week)) else {
             return;
         };
         self.week = Some(format_date(week + time::Duration::days(7 * delta)));
         self.save_error = None;
+        self.art = None;
         self.refresh(ctx, true);
     }
 
@@ -379,6 +429,11 @@ impl PlannerUi {
             .view
             .as_ref()
             .is_some_and(|view| view.can_edit && view.available);
+        self.close_lost_art();
+        if self.art.is_some() {
+            self.draw_art(ui, roster, characters, attendance);
+            return false;
+        }
         let settled = self.settled();
         control_row(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
@@ -447,6 +502,7 @@ impl PlannerUi {
 
         let max_height = ui.available_height().max(0.0);
         let mut changed = false;
+        let mut open_art = None;
         egui::ScrollArea::vertical()
             .id_salt("planner")
             .auto_shrink([false, true])
@@ -483,27 +539,7 @@ impl PlannerUi {
                     });
                     return;
                 }
-                let context = Context {
-                    characters: characters
-                        .map(|view| {
-                            view.members
-                                .iter()
-                                .map(|member| (member.user_id.as_str(), member))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    raid_names: characters
-                        .map(|view| {
-                            view.raids
-                                .iter()
-                                .map(|raid| (raid.id, raid.name.as_str()))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    attendance,
-                    week: parse_date(&view.week),
-                    current: view.week == view.current_week,
-                };
+                let context = Context::new(&view, characters, attendance);
                 let members: Vec<&RosterMember> =
                     roster.officers.iter().chain(&roster.raiders).collect();
                 let editing = self.editing && can_edit;
@@ -515,13 +551,72 @@ impl PlannerUi {
                     &context,
                     characters,
                     editing,
+                    &mut open_art,
                 );
             });
+        if let Some(raid) = open_art {
+            self.art = Some(ArtUi::new(raid));
+        }
         if changed {
             self.dirty_at = Some(Instant::now());
             self.save_error = None;
         }
         refresh
+    }
+
+    fn draw_art(
+        &mut self,
+        ui: &mut egui::Ui,
+        roster: &Roster,
+        characters: Option<&CharactersView>,
+        attendance: &AttendanceUi,
+    ) {
+        let (Some(view), Some(art)) = (self.view.clone(), self.art.as_mut()) else {
+            return;
+        };
+        let index = art.raid;
+        let context = Context::new(&view, characters, attendance);
+        let members: Vec<&RosterMember> = roster.officers.iter().chain(&roster.raiders).collect();
+        let mut raid = self.raids[index].clone();
+        let others: Vec<&PlannedRaid> = self
+            .raids
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .map(|(_, raid)| raid)
+            .collect();
+        let max_height = ui.available_height().max(0.0);
+        let mut outcome = art_ui::Outcome::default();
+        egui::ScrollArea::vertical()
+            .id_salt("send-to-art")
+            .auto_shrink([false, true])
+            .max_height(max_height)
+            .min_scrolled_height(0.0)
+            .show(ui, |ui| {
+                ui.set_width((ui.available_width() - 18.0).max(300.0));
+                if let Some(problem) = self.save_error.as_deref() {
+                    roster_notice(ui, problem);
+                    ui.add_space(12.0);
+                }
+                outcome = art_ui::draw(
+                    ui,
+                    art,
+                    &mut raid,
+                    Some(index + 1),
+                    &others,
+                    &members,
+                    &context,
+                    characters,
+                );
+            });
+        if outcome.changed {
+            self.raids[index] = raid;
+            self.dirty_at = Some(Instant::now());
+            self.save_error = None;
+        }
+        if outcome.back {
+            self.art = None;
+        }
     }
 
     fn new_raid(&self, characters: Option<&CharactersView>) -> PlannedRaid {
@@ -545,12 +640,14 @@ impl PlannerUi {
             start: view.and_then(|view| view.raid_time.clone()),
             instances,
             picks: BTreeMap::new(),
+            groups: BTreeMap::new(),
         }
     }
 }
 
 /// Columns of raids beside a fixed column of names. Returns true when an
 /// officer changed anything.
+#[allow(clippy::too_many_arguments)]
 fn draw_plan(
     ui: &mut egui::Ui,
     raids: &mut Vec<PlannedRaid>,
@@ -559,6 +656,7 @@ fn draw_plan(
     context: &Context,
     characters: Option<&CharactersView>,
     editing: bool,
+    open_art: &mut Option<usize>,
 ) -> bool {
     let header = if editing {
         EDIT_HEADER_HEIGHT
@@ -645,11 +743,14 @@ fn draw_plan(
                                 );
                                 ui.push_id(("raid", index), |ui| match line {
                                     Line::Header if editing => {
-                                        let (edited, removed) =
+                                        let header =
                                             edit_header(ui, cell, index, raid, context, characters);
-                                        changed |= edited;
-                                        if removed {
+                                        changed |= header.changed;
+                                        if header.removed {
                                             remove = Some(index);
+                                        }
+                                        if header.send {
+                                            *open_art = Some(index);
                                         }
                                     }
                                     Line::Header => draw_header(ui, cell, index, raid, context),
@@ -760,7 +861,15 @@ fn draw_header(
         .galley(egui::pos2(x, cell.top() + 60.0), galley, muted_text());
 }
 
-/// An officer's header: difficulty, mode, night, start and instances.
+#[derive(Default)]
+struct HeaderEdit {
+    changed: bool,
+    removed: bool,
+    send: bool,
+}
+
+/// An officer's header: difficulty, mode, night, start, instances and the way
+/// to Send to ART.
 fn edit_header(
     ui: &mut egui::Ui,
     cell: egui::Rect,
@@ -768,9 +877,10 @@ fn edit_header(
     raid: &mut PlannedRaid,
     context: &Context,
     characters: Option<&CharactersView>,
-) -> (bool, bool) {
+) -> HeaderEdit {
     let mut changed = false;
     let mut removed = false;
+    let mut send = false;
     let half = (cell.width() - 6.0) / 2.0;
     ui.scope_builder(
         egui::UiBuilder::new()
@@ -884,9 +994,26 @@ fn edit_header(
                         }
                     }
                 });
+            send = ui
+                .add_sized(
+                    [cell.width(), SMALL_HEIGHT],
+                    egui::Button::new(
+                        RichText::new("Send to ART")
+                            .size(12.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .fill(SEND),
+                )
+                .clicked();
         },
     );
-    (changed, removed)
+    HeaderEdit {
+        changed,
+        removed,
+        send,
+    }
 }
 
 fn draw_totals(ui: &egui::Ui, cell: egui::Rect, totals: &Totals) {
@@ -1148,7 +1275,7 @@ fn start_times() -> Vec<String> {
         .collect()
 }
 
-fn night_name(day: &str) -> &'static str {
+pub(crate) fn night_name(day: &str) -> &'static str {
     match day {
         "wed" => "Wed",
         "thu" => "Thu",
@@ -1168,7 +1295,7 @@ fn night_label(raid: &PlannedRaid) -> String {
     }
 }
 
-fn long_date(day: Date) -> String {
+pub(crate) fn long_date(day: Date) -> String {
     format!(
         "{} {} {}",
         weekday_short(day.weekday()),
@@ -1274,6 +1401,7 @@ mod tests {
             start: None,
             instances: Vec::new(),
             picks: BTreeMap::new(),
+            groups: BTreeMap::new(),
         };
         assert_eq!(
             format_date(raid.night(parse_date("2026-11-04").unwrap())),
