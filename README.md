@@ -70,6 +70,7 @@ Releases are automatic. Merge a version bump (`npm run version:release` with `BR
 | `src/discord_auth.rs`, `src/presence.rs` | Discord login and roster client |
 | `src/guild_ui.rs` | Guild tab and character pages, from the server's Battle.net character sync |
 | `src/attendance_ui.rs` | Attendance tab: your out and late dates, and who is missing each raid night |
+| `src/planner_ui.rs` | Raids tab: each reset's raids, who brings which character, and officer planning |
 | `scripts/`, `packaging/` | Build tooling, installer template, and build checks |
 
 Run the checks before opening a pull request:

@@ -48,7 +48,7 @@ pub struct RaidInstance {
 
 impl CharactersView {
     /// The current tier's raids. Servers before the tier picker sent none.
-    fn tier(&self) -> HashSet<u64> {
+    pub(crate) fn tier(&self) -> HashSet<u64> {
         let tier: HashSet<u64> = self
             .raids
             .iter()
@@ -347,6 +347,10 @@ impl GuildUi {
         }
         member.main = main;
         sort_characters(&mut member.characters);
+    }
+
+    pub(crate) fn characters_view(&self) -> Option<&CharactersView> {
+        self.view.as_ref()
     }
 
     fn members(&self) -> &[MemberCharacters] {
@@ -836,7 +840,7 @@ fn tier_picker(ui: &mut egui::Ui, view: &CharactersView) -> Option<Vec<u64>> {
 }
 
 /// "The Unbinding of Kith'ix" reads "Unbinding of Kith'ix" where space is short.
-fn short_raid(name: &str) -> &str {
+pub(crate) fn short_raid(name: &str) -> &str {
     name.strip_prefix("The ").unwrap_or(name)
 }
 
@@ -982,7 +986,7 @@ pub fn class_color(class: &str) -> Color32 {
 }
 
 /// Tier tokens: Dreadful, Mystic, Venerated and Zenith.
-fn token(class: &str) -> Option<usize> {
+pub(crate) fn token(class: &str) -> Option<usize> {
     match class {
         "Death Knight" | "Demon Hunter" | "Warlock" => Some(0),
         "Druid" | "Hunter" | "Mage" => Some(1),

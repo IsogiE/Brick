@@ -28,21 +28,21 @@ const SAVE_DELAY: Duration = Duration::from_millis(1200);
 const MAX_ABSENCES: usize = 40;
 const MAX_NOTE: usize = 60;
 
-const NAME_WIDTH: f32 = 176.0;
+pub(crate) const NAME_WIDTH: f32 = 176.0;
 const CELL_WIDTH: f32 = 108.0;
 const CELL_GAP: f32 = 6.0;
 const HEADER_HEIGHT: f32 = 54.0;
 const SUMMARY_HEIGHT: f32 = 30.0;
-const GROUP_HEIGHT: f32 = 30.0;
-const ROW_HEIGHT: f32 = 34.0;
+pub(crate) const GROUP_HEIGHT: f32 = 30.0;
+pub(crate) const ROW_HEIGHT: f32 = 34.0;
 const KIND_WIDTH: f32 = 84.0;
 const DATE_WIDTH: f32 = 128.0;
 
-const OUT_FILL: Color32 = Color32::from_rgb(29, 48, 62);
-const OUT_TEXT: Color32 = Color32::from_rgb(124, 186, 236);
-const LATE_FILL: Color32 = Color32::from_rgb(58, 46, 26);
-const LATE_TEXT: Color32 = Color32::from_rgb(236, 178, 80);
-const OWN_ROW: Color32 = Color32::from_rgb(33, 37, 44);
+pub(crate) const OUT_FILL: Color32 = Color32::from_rgb(29, 48, 62);
+pub(crate) const OUT_TEXT: Color32 = Color32::from_rgb(124, 186, 236);
+pub(crate) const LATE_FILL: Color32 = Color32::from_rgb(58, 46, 26);
+pub(crate) const LATE_TEXT: Color32 = Color32::from_rgb(236, 178, 80);
+pub(crate) const OWN_ROW: Color32 = Color32::from_rgb(33, 37, 44);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,7 +52,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Out => "Out",
             Self::Late => "Late",
@@ -88,7 +88,7 @@ impl Absence {
         self.from.as_str() <= day && day <= self.to.as_str()
     }
 
-    fn cell(&self) -> String {
+    pub(crate) fn cell(&self) -> String {
         let note = self.note.trim();
         if note.is_empty() {
             self.kind.label().to_owned()
@@ -145,6 +145,17 @@ pub struct AttendanceUi {
 }
 
 impl AttendanceUi {
+    /// One member's out and late dates; your own come from your edits.
+    pub(crate) fn absences_of(&self, user_id: &str) -> &[Absence] {
+        if user_id == self.own_id {
+            &self.mine
+        } else {
+            self.view
+                .as_ref()
+                .map_or(&[][..], |view| view.absences(user_id))
+        }
+    }
+
     pub fn refresh(&mut self, ctx: &egui::Context, force: bool) {
         if self.view_rx.is_some() || !presence::configured() {
             return;
@@ -478,7 +489,12 @@ fn absence_row(ui: &mut egui::Ui, entry: &mut Absence, today: Date) -> (bool, bo
     (changed, removed)
 }
 
-fn field_button(ui: &mut egui::Ui, text: &str, width: f32, color: Color32) -> egui::Response {
+pub(crate) fn field_button(
+    ui: &mut egui::Ui,
+    text: &str,
+    width: f32,
+    color: Color32,
+) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).strong().color(color))
             .corner_radius(egui::CornerRadius::same(8))
@@ -487,7 +503,7 @@ fn field_button(ui: &mut egui::Ui, text: &str, width: f32, color: Color32) -> eg
     )
 }
 
-fn paint_cross(ui: &egui::Ui, center: egui::Pos2, color: Color32) {
+pub(crate) fn paint_cross(ui: &egui::Ui, center: egui::Pos2, color: Color32) {
     let stroke = Stroke::new(1.6_f32, color);
     let r = 4.5;
     ui.painter().line_segment(
@@ -651,7 +667,7 @@ fn calendar(ui: &mut egui::Ui, month: Date, selected: Date, min: Option<Date>) -
     pick
 }
 
-enum Line<'a> {
+pub(crate) enum Line<'a> {
     Header,
     Summary,
     Group(&'static str),
@@ -669,7 +685,7 @@ impl Line<'_> {
     }
 }
 
-fn grouped<'a>(members: &[&'a RosterMember]) -> Vec<Line<'a>> {
+pub(crate) fn grouped<'a>(members: &[&'a RosterMember]) -> Vec<Line<'a>> {
     let mut lines = vec![Line::Header, Line::Summary];
     for (label, role) in [
         ("TANKS", Some(RaidRole::Tank)),
@@ -707,7 +723,7 @@ fn raid_nights(raid_days: &[String], today: Date) -> Vec<Date> {
         .collect()
 }
 
-fn first_absence<'a>(absences: &'a [Absence], day: &str) -> Option<&'a Absence> {
+pub(crate) fn first_absence<'a>(absences: &'a [Absence], day: &str) -> Option<&'a Absence> {
     absences
         .iter()
         .filter(|absence| absence.covers(day))
@@ -827,7 +843,7 @@ fn draw_grid(
         });
 }
 
-fn draw_name_cell(ui: &egui::Ui, rect: egui::Rect, line: &Line, own_id: &str) {
+pub(crate) fn draw_name_cell(ui: &egui::Ui, rect: egui::Rect, line: &Line, own_id: &str) {
     let y = rect.center().y;
     match line {
         Line::Header => {}
@@ -1022,11 +1038,11 @@ fn friendly_problem(error: &str) -> String {
     }
 }
 
-fn today() -> Date {
+pub(crate) fn today() -> Date {
     time::OffsetDateTime::now_utc().date()
 }
 
-fn format_date(day: Date) -> String {
+pub(crate) fn format_date(day: Date) -> String {
     format!(
         "{:04}-{:02}-{:02}",
         day.year(),
@@ -1035,7 +1051,7 @@ fn format_date(day: Date) -> String {
     )
 }
 
-fn parse_date(text: &str) -> Option<Date> {
+pub(crate) fn parse_date(text: &str) -> Option<Date> {
     let mut parts = text.splitn(3, '-');
     let year = parts.next()?.parse().ok()?;
     let month = Month::try_from(parts.next()?.parse::<u8>().ok()?).ok()?;
@@ -1066,7 +1082,7 @@ fn short_date(day: Date) -> String {
     )
 }
 
-fn month_name(month: Month) -> &'static str {
+pub(crate) fn month_name(month: Month) -> &'static str {
     match month {
         Month::January => "January",
         Month::February => "February",
@@ -1083,7 +1099,7 @@ fn month_name(month: Month) -> &'static str {
     }
 }
 
-fn weekday_short(day: Weekday) -> &'static str {
+pub(crate) fn weekday_short(day: Weekday) -> &'static str {
     match day {
         Weekday::Monday => "Mon",
         Weekday::Tuesday => "Tue",
@@ -1095,7 +1111,7 @@ fn weekday_short(day: Weekday) -> &'static str {
     }
 }
 
-fn weekday_key(day: Weekday) -> &'static str {
+pub(crate) fn weekday_key(day: Weekday) -> &'static str {
     match day {
         Weekday::Monday => "mon",
         Weekday::Tuesday => "tue",

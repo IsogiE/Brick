@@ -17,6 +17,7 @@ mod download;
 mod guild;
 mod guild_ui;
 mod local_erasure;
+mod planner_ui;
 mod presence;
 mod profile;
 mod protected_cache;
