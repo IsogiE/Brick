@@ -20,7 +20,7 @@ use crate::{
 
 const MAX_VIEW_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DETAIL_BYTES: u64 = 512 * 1024;
-const MAX_ERROR_BYTES: u64 = 16 * 1024;
+pub(crate) const MAX_ERROR_BYTES: u64 = 16 * 1024;
 // The server reads Battle.net every 15 minutes; the roster cadence is plenty.
 const VIEW_REFRESH_SECS: u64 = 60;
 const TIER_PIECES: u8 = 5;
@@ -729,12 +729,12 @@ impl GuildUi {
     }
 }
 
-const CONTROL_HEIGHT: f32 = 34.0;
+pub(crate) const CONTROL_HEIGHT: f32 = 34.0;
 // The scroll areas below keep 18 px for their bar; controls above them stop at
 // the same right edge as the panels.
-const SCROLL_GUTTER: f32 = 18.0;
+pub(crate) const SCROLL_GUTTER: f32 = 18.0;
 
-fn control_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+pub(crate) fn control_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     let width = (ui.available_width() - SCROLL_GUTTER).max(300.0);
     ui.allocate_ui_with_layout(
         egui::vec2(width, CONTROL_HEIGHT),
@@ -746,7 +746,7 @@ fn control_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     );
 }
 
-fn bar_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+pub(crate) fn bar_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).strong().color(primary_text()))
             .corner_radius(egui::CornerRadius::same(8))
@@ -756,7 +756,7 @@ fn bar_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 }
 
 /// A dropdown the height of the buttons beside it.
-fn bar_combo(
+pub(crate) fn bar_combo(
     ui: &mut egui::Ui,
     id: &str,
     width: f32,
@@ -775,7 +775,7 @@ fn bar_combo(
 }
 
 /// A fixed-height count beside a title.
-fn pill(ui: &mut egui::Ui, text: &str) {
+pub(crate) fn pill(ui: &mut egui::Ui, text: &str) {
     let galley = ui.painter().layout_no_wrap(
         text.to_owned(),
         egui::FontId::proportional(11.0),
@@ -860,7 +860,7 @@ fn friendly_problem(error: &str) -> String {
     }
 }
 
-fn get(
+pub(crate) fn get(
     access: &crate::guild::Access,
     path: &str,
     max: u64,
@@ -1042,11 +1042,11 @@ fn dim() -> Color32 {
     Color32::from_rgb(94, 102, 116)
 }
 
-fn line_color() -> Color32 {
+pub(crate) fn line_color() -> Color32 {
     Color32::from_rgb(38, 42, 50)
 }
 
-fn text_at(
+pub(crate) fn text_at(
     ui: &egui::Ui,
     pos: egui::Pos2,
     align: egui::Align2,
@@ -1059,7 +1059,7 @@ fn text_at(
 }
 
 /// One line of text cut to `width`, ending in an ellipsis.
-fn clipped(ui: &egui::Ui, job: egui::text::LayoutJob, width: f32) -> Arc<egui::Galley> {
+pub(crate) fn clipped(ui: &egui::Ui, job: egui::text::LayoutJob, width: f32) -> Arc<egui::Galley> {
     let mut job = job;
     job.wrap.max_width = width.max(1.0);
     job.wrap.max_rows = 1;
@@ -1068,13 +1068,13 @@ fn clipped(ui: &egui::Ui, job: egui::text::LayoutJob, width: f32) -> Arc<egui::G
     ui.fonts_mut(|fonts| fonts.layout_job(job))
 }
 
-fn single(text: &str, size: f32, color: Color32) -> egui::text::LayoutJob {
+pub(crate) fn single(text: &str, size: f32, color: Color32) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     append(&mut job, text, size, color);
     job
 }
 
-fn append(job: &mut egui::text::LayoutJob, text: &str, size: f32, color: Color32) {
+pub(crate) fn append(job: &mut egui::text::LayoutJob, text: &str, size: f32, color: Color32) {
     job.append(
         text,
         0.0,
@@ -1449,7 +1449,7 @@ fn chevron(ui: &egui::Ui, center: egui::Pos2, open: bool) {
 }
 
 /// A left (-1) or right (1) arrow for buttons.
-fn arrow(ui: &egui::Ui, center: egui::Pos2, direction: f32) {
+pub(crate) fn arrow(ui: &egui::Ui, center: egui::Pos2, direction: f32) {
     let stroke = Stroke::new(1.6_f32, primary_text());
     let tip = center + egui::vec2(5.0 * direction, 0.0);
     let painter = ui.painter();

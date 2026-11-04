@@ -11,6 +11,7 @@ use eframe::egui::{self, Color32, RichText, Stroke, TextureHandle};
 use crate::{
     addon::{self, AppView, LogLevel, SyncSummary, WowClient},
     app_update::{self, AvailableAppUpdate},
+    attendance_ui::AttendanceUi,
     discord_auth::{self, AuthorizedUser, RefreshError, SessionStatus},
     guild_ui::GuildUi,
     presence::{self, Roster, RosterMember},
@@ -43,6 +44,7 @@ pub struct BrickApp {
     streams: StreamsUi,
     profile: ProfileUi,
     guild: GuildUi,
+    attendance: AttendanceUi,
     active_tab: MainTab,
     sync_rx: Option<mpsc::Receiver<Result<SyncSummary, String>>>,
     auth_rx: Option<mpsc::Receiver<Result<AuthorizedUser, RefreshError>>>,
@@ -94,6 +96,7 @@ impl AuthUiState {
 enum MainTab {
     Home,
     Guild,
+    Attendance,
     Streams,
 }
 
@@ -165,6 +168,7 @@ impl BrickApp {
             streams: StreamsUi::default(),
             profile: ProfileUi::default(),
             guild: GuildUi::default(),
+            attendance: AttendanceUi::default(),
             active_tab: MainTab::Home,
             sync_rx: None,
             auth_rx: None,
@@ -489,6 +493,7 @@ impl BrickApp {
     fn reset_guild_panel_fields(&mut self) {
         self.profile = ProfileUi::default();
         self.guild = GuildUi::default();
+        self.attendance = AttendanceUi::default();
         self.roster_rx = None;
         self.presence_state = initial_presence_state();
         self.roster_notice = None;
@@ -687,12 +692,13 @@ impl BrickApp {
         self.roster_rx = Some(rx);
         self.last_roster_refresh = Instant::now();
         self.guild.refresh(&self.egui_ctx, false);
+        self.attendance.refresh(&self.egui_ctx, false);
     }
 
     fn roster_refresh_enabled(&self) -> bool {
         self.window_visible
             && self.auth_state.is_authorized()
-            && self.active_tab == MainTab::Guild
+            && matches!(self.active_tab, MainTab::Guild | MainTab::Attendance)
             && self.roster_rx.is_none()
             && !matches!(self.presence_state, PresenceUiState::Unavailable(_))
     }
@@ -1032,6 +1038,7 @@ impl BrickApp {
         match self.active_tab {
             MainTab::Home => self.draw_scrollable_updates_tab(ui),
             MainTab::Guild => self.draw_guild_tab(ui),
+            MainTab::Attendance => self.draw_attendance_tab(ui),
             MainTab::Streams => self.streams.draw(ui),
         }
     }
@@ -1080,22 +1087,33 @@ impl BrickApp {
 
     fn draw_tab_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            self.draw_tab_buttons(ui);
+            self.draw_tab_buttons(ui, 106.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.draw_guild_selector(ui);
             });
         });
     }
 
-    fn draw_tab_buttons(&mut self, ui: &mut egui::Ui) {
-        if tab_button(ui, "Home", self.active_tab == MainTab::Home).clicked() {
+    fn draw_tab_buttons(&mut self, ui: &mut egui::Ui, width: f32) {
+        if tab_button(ui, "Home", self.active_tab == MainTab::Home, width).clicked() {
             self.active_tab = MainTab::Home;
         }
-        if tab_button(ui, "Guild", self.active_tab == MainTab::Guild).clicked() {
+        if tab_button(ui, "Guild", self.active_tab == MainTab::Guild, width).clicked() {
             self.active_tab = MainTab::Guild;
             self.start_roster_refresh_if_stale();
         }
-        if tab_button(ui, "Streams", self.active_tab == MainTab::Streams).clicked() {
+        if tab_button(
+            ui,
+            "Attendance",
+            self.active_tab == MainTab::Attendance,
+            width,
+        )
+        .clicked()
+        {
+            self.active_tab = MainTab::Attendance;
+            self.start_roster_refresh_if_stale();
+        }
+        if tab_button(ui, "Streams", self.active_tab == MainTab::Streams, width).clicked() {
             self.active_tab = MainTab::Streams;
         }
     }
@@ -1127,7 +1145,7 @@ impl BrickApp {
                     );
                 }
                 ui.add_space(10.0);
-                self.draw_tab_buttons(ui);
+                self.draw_tab_buttons(ui, if compact { 92.0 } else { 106.0 });
                 self.draw_guild_selector(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let available = matches!(self.app_update_state, AppUpdateUiState::Available(_));
@@ -1193,7 +1211,29 @@ impl BrickApp {
             }
             return;
         }
+        self.draw_roster_pending(ui);
+    }
 
+    fn draw_attendance_tab(&mut self, ui: &mut egui::Ui) {
+        if let PresenceUiState::Ready(roster) = &self.presence_state {
+            let own_id = match &self.auth_state {
+                AuthUiState::Authorized(user) => user.user_id.as_str(),
+                _ => "",
+            };
+            if self
+                .attendance
+                .draw(ui, roster, own_id, self.roster_notice.as_deref())
+            {
+                self.start_roster_refresh();
+                self.attendance.refresh(ui.ctx(), true);
+            }
+            return;
+        }
+        self.draw_roster_pending(ui);
+    }
+
+    /// The Guild and Attendance tabs before the roster has loaded.
+    fn draw_roster_pending(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if secondary_button(ui, "Refresh").clicked() {
@@ -1884,6 +1924,7 @@ impl eframe::App for BrickApp {
             self.poll_sync();
             self.poll_roster();
             self.guild.poll();
+            self.attendance.poll(&self.egui_ctx);
             self.start_roster_refresh_if_stale();
             self.refresh_view_if_stale();
         }
@@ -2403,7 +2444,7 @@ fn initial_presence_state() -> PresenceUiState {
     }
 }
 
-fn tab_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+fn tab_button(ui: &mut egui::Ui, text: &str, selected: bool, width: f32) -> egui::Response {
     let fill = if selected {
         Color32::from_rgb(38, 42, 50)
     } else {
@@ -2421,7 +2462,7 @@ fn tab_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     };
 
     ui.add_sized(
-        egui::vec2(106.0, 34.0),
+        egui::vec2(width, 34.0),
         egui::Button::new(RichText::new(text).strong().color(color))
             .corner_radius(egui::CornerRadius::same(8))
             .fill(fill)
@@ -2762,6 +2803,7 @@ pub(crate) mod tests {
             streams: StreamsUi::default(),
             profile: ProfileUi::default(),
             guild: GuildUi::default(),
+            attendance: AttendanceUi::default(),
             active_tab: MainTab::Home,
             sync_rx: None,
             auth_rx: None,
