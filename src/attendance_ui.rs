@@ -15,8 +15,8 @@ use crate::{
     presence::{self, Roster, RosterMember},
     profile::RaidRole,
     ui::{
-        busy_indicator, info_accent, muted_text, panel_frame, primary_text, roster_notice,
-        secondary_text,
+        busy_indicator, info_accent, muted_text, panel_background, panel_frame, primary_text,
+        roster_notice, secondary_text,
     },
 };
 
@@ -32,6 +32,7 @@ pub(crate) const NAME_WIDTH: f32 = 176.0;
 const DAY_WIDTH: f32 = 40.0;
 const HEADER_HEIGHT: f32 = 54.0;
 const SUMMARY_HEIGHT: f32 = 30.0;
+const PINNED_HEIGHT: f32 = HEADER_HEIGHT + SUMMARY_HEIGHT;
 pub(crate) const GROUP_HEIGHT: f32 = 30.0;
 pub(crate) const ROW_HEIGHT: f32 = 34.0;
 const KIND_WIDTH: f32 = 84.0;
@@ -520,12 +521,23 @@ pub(crate) fn paint_cross(ui: &egui::Ui, center: egui::Pos2, color: Color32) {
 /// A date button with a month calendar. Returns the picked day.
 fn date_field(ui: &mut egui::Ui, id: &str, value: Date, min: Option<Date>) -> Option<Date> {
     let button = field_button(ui, &short_date(value), DATE_WIDTH, primary_text());
+    calendar_popup(ui, &button, id, value, min)
+}
+
+/// A month calendar under `button`; returns the day picked.
+pub(crate) fn calendar_popup(
+    ui: &mut egui::Ui,
+    button: &egui::Response,
+    id: &str,
+    value: Date,
+    min: Option<Date>,
+) -> Option<Date> {
     let month_id = ui.id().with(id).with("month");
     if button.clicked() {
         ui.data_mut(|data| data.insert_temp(month_id, first_of_month(value)));
     }
     let mut picked = None;
-    egui::Popup::from_toggle_button_response(&button)
+    egui::Popup::from_toggle_button_response(button)
         .id(ui.id().with(id).with("calendar"))
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
@@ -807,6 +819,25 @@ fn draw_grid(
                     draw_name_cell(ui, rect, line, own_id);
                     y += line.height();
                 }
+                let pinned = pinned_offset(ui, names, height);
+                if pinned > 0.0 {
+                    let top = names.top() + pinned;
+                    let band = egui::Rect::from_min_size(
+                        egui::pos2(names.left(), top),
+                        egui::vec2(NAME_WIDTH, PINNED_HEIGHT),
+                    );
+                    ui.painter().rect_filled(band, 0.0, panel_background());
+                    let summary = egui::Rect::from_min_size(
+                        egui::pos2(names.left(), top + HEADER_HEIGHT),
+                        egui::vec2(NAME_WIDTH, SUMMARY_HEIGHT),
+                    );
+                    draw_name_cell(ui, summary, &Line::Summary, own_id);
+                    ui.painter().hline(
+                        band.x_range(),
+                        band.bottom(),
+                        Stroke::new(1.0_f32, line_color()),
+                    );
+                }
 
                 egui::ScrollArea::horizontal()
                     .id_salt("attendance-grid")
@@ -848,6 +879,12 @@ fn draw_grid(
                                 );
                             }
                         }
+                        let pinned = pinned_offset(ui, grid, height);
+                        let hidden_above = if pinned > 0.0 {
+                            grid.top() + pinned + PINNED_HEIGHT
+                        } else {
+                            f32::NEG_INFINITY
+                        };
                         let mut y = grid.top();
                         for line in &lines {
                             let row = egui::Rect::from_min_size(
@@ -861,27 +898,7 @@ fn draw_grid(
                                 )
                             };
                             match line {
-                                Line::Header => {
-                                    let shown = ((ui.clip_rect().left() - grid.left()) / DAY_WIDTH)
-                                        .ceil()
-                                        .max(0.0)
-                                        as usize;
-                                    for (index, day) in days.iter().enumerate() {
-                                        draw_day_header(
-                                            ui,
-                                            cell(index),
-                                            *day,
-                                            index == shown,
-                                            raid[index],
-                                            today,
-                                        );
-                                    }
-                                }
-                                Line::Summary => {
-                                    for index in 0..days.len() {
-                                        draw_total(ui, cell(index), totals[index], raid[index]);
-                                    }
-                                }
+                                Line::Header | Line::Summary => {}
                                 Line::Group(_) => {}
                                 Line::Member(member) => {
                                     if member.user_id == own_id {
@@ -894,11 +911,70 @@ fn draw_grid(
                                     );
                                     for (first, last, absence) in runs(absences_of(member), &keys) {
                                         let span = cell(first).union(cell(last));
-                                        draw_absence(ui, span, absence, &member.user_id);
+                                        draw_absence(
+                                            ui,
+                                            span,
+                                            absence,
+                                            &member.user_id,
+                                            hidden_above,
+                                        );
                                     }
                                 }
                             }
                             y += line.height();
+                        }
+
+                        // The dates and totals stay at the top while the rows scroll.
+                        let top = grid.top() + pinned;
+                        let cell = |index: usize, y: f32, h: f32| {
+                            egui::Rect::from_min_size(
+                                egui::pos2(grid.left() + index as f32 * DAY_WIDTH, y),
+                                egui::vec2(DAY_WIDTH, h),
+                            )
+                        };
+                        if pinned > 0.0 {
+                            let band = egui::Rect::from_min_size(
+                                egui::pos2(grid.left(), top),
+                                egui::vec2(width, PINNED_HEIGHT),
+                            );
+                            ui.painter().rect_filled(band, 0.0, panel_background());
+                            for (index, day) in days.iter().enumerate() {
+                                let column = cell(index, top, PINNED_HEIGHT);
+                                if raid[index] {
+                                    ui.painter().rect_filled(column, 0.0, RAID_NIGHT);
+                                }
+                                if index > 0 && day.weekday() == Weekday::Wednesday {
+                                    ui.painter().vline(
+                                        column.left(),
+                                        column.y_range(),
+                                        Stroke::new(1.0_f32, line_color()),
+                                    );
+                                }
+                            }
+                            ui.painter().hline(
+                                band.x_range(),
+                                band.bottom(),
+                                Stroke::new(1.0_f32, line_color()),
+                            );
+                        }
+                        let shown = ((ui.clip_rect().left() - grid.left()) / DAY_WIDTH)
+                            .ceil()
+                            .max(0.0) as usize;
+                        for (index, day) in days.iter().enumerate() {
+                            draw_day_header(
+                                ui,
+                                cell(index, top, HEADER_HEIGHT),
+                                *day,
+                                index == shown,
+                                raid[index],
+                                today,
+                            );
+                            draw_total(
+                                ui,
+                                cell(index, top + HEADER_HEIGHT, SUMMARY_HEIGHT),
+                                totals[index],
+                                raid[index],
+                            );
                         }
                     });
             });
@@ -968,6 +1044,11 @@ pub(crate) fn draw_name_cell(ui: &egui::Ui, rect: egui::Rect, line: &Line, own_i
     }
 }
 
+/// How far the dates and totals sit below the grid's top so they stay in view.
+fn pinned_offset(ui: &egui::Ui, area: egui::Rect, height: f32) -> f32 {
+    (ui.clip_rect().top() - area.top()).clamp(0.0, (height - PINNED_HEIGHT).max(0.0))
+}
+
 fn draw_day_header(
     ui: &egui::Ui,
     cell: egui::Rect,
@@ -1034,7 +1115,13 @@ fn draw_total(ui: &egui::Ui, cell: egui::Rect, (out, late): (usize, usize), raid
 }
 
 /// One absence as a bar across the days it covers.
-fn draw_absence(ui: &egui::Ui, span: egui::Rect, absence: &Absence, user_id: &str) {
+fn draw_absence(
+    ui: &egui::Ui,
+    span: egui::Rect,
+    absence: &Absence,
+    user_id: &str,
+    hidden_above: f32,
+) {
     let rect = egui::Rect::from_center_size(span.center(), egui::vec2(span.width() - 4.0, 26.0));
     ui.painter()
         .rect_filled(rect, egui::CornerRadius::same(4), absence.kind.fill());
@@ -1063,6 +1150,9 @@ fn draw_absence(ui: &egui::Ui, span: egui::Rect, absence: &Absence, user_id: &st
         (Some(from), Some(to)) => format!("{} – {}", short_date(from), short_date(to)),
         _ => String::new(),
     };
+    if rect.center().y < hidden_above {
+        return;
+    }
     let id = ui.id().with(("absence", user_id, span.left() as i32));
     ui.interact(rect, id, egui::Sense::hover())
         .on_hover_text(format!("{text}\n{dates}"));
