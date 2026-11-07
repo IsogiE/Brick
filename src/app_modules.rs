@@ -8,6 +8,7 @@ mod art_ui;
 mod atomic_file;
 mod attendance_ui;
 mod autostart;
+mod avatars;
 mod browser;
 mod cache_maintenance;
 mod content_alignment;

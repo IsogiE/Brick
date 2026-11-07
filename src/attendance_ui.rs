@@ -877,27 +877,14 @@ pub(crate) fn draw_name_cell(ui: &egui::Ui, rect: egui::Rect, line: &Line, own_i
                 rect.top(),
                 Stroke::new(1.0_f32, line_color()),
             );
-            let hue = member
-                .name
-                .chars()
-                .fold(7u32, |hash, ch| (hash * 31 + ch as u32) % 360);
-            let avatar =
-                Color32::from(egui::ecolor::Hsva::new(hue as f32 / 360.0, 0.55, 0.62, 1.0));
             let center = egui::pos2(rect.left() + 16.0, y);
-            ui.painter().circle_filled(center, 12.0, avatar);
-            let initials: String = member
-                .name
-                .chars()
-                .take(2)
-                .collect::<String>()
-                .to_uppercase();
-            text_at(
+            crate::avatars::draw(
                 ui,
+                &member.name,
+                member.avatar.as_deref(),
                 center,
-                egui::Align2::CENTER_CENTER,
-                &initials,
+                12.0,
                 10.0,
-                Color32::WHITE,
             );
             let galley = clipped(
                 ui,
