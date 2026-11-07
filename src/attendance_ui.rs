@@ -105,6 +105,9 @@ pub struct AttendanceView {
     pub available: bool,
     #[serde(default)]
     pub raid_days: Vec<String>,
+    /// The nights officers planned, as dates; older servers send only raid_days.
+    #[serde(default)]
+    pub raid_nights: Option<Vec<String>>,
     #[serde(default)]
     pub members: Vec<MemberAbsences>,
 }
@@ -758,7 +761,11 @@ fn draw_grid(
     let keys: Vec<String> = days.iter().copied().map(format_date).collect();
     let raid: Vec<bool> = days
         .iter()
-        .map(|day| is_raid_night(&view.raid_days, *day))
+        .zip(&keys)
+        .map(|(day, key)| match &view.raid_nights {
+            Some(nights) => nights.contains(key),
+            None => is_raid_night(&view.raid_days, *day),
+        })
         .collect();
     let lines = grouped(members);
     let absences_of = |member: &RosterMember| -> &[Absence] {
@@ -1197,10 +1204,11 @@ mod tests {
     fn the_view_reads_the_server_shape() {
         let view: AttendanceView = serde_json::from_str(
             r#"{"generatedAt":"2026-11-04T18:00:00.000Z","available":true,"raidDays":["wed","thu"],"raidTime":"19:30",
-            "members":[{"userId":"1","absences":[{"kind":"late","from":"2026-11-05","to":"2026-11-05","note":"20:00"}]}]}"#,
+            "raidNights":["2026-11-05","2026-11-07"],"members":[{"userId":"1","absences":[{"kind":"late","from":"2026-11-05","to":"2026-11-05","note":"20:00"}]}]}"#,
         )
         .unwrap();
         assert!(view.available);
+        assert_eq!(view.raid_nights.as_deref().map(<[String]>::len), Some(2));
         assert_eq!(view.absences("1")[0].cell(), "Late · 20:00");
         assert!(view.absences("2").is_empty());
         let saved = serde_json::to_value(&view.absences("1")[0]).unwrap();
