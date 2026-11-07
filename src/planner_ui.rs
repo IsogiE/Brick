@@ -11,9 +11,9 @@ use time::Date;
 use crate::{
     art_ui::{self, ArtUi},
     attendance_ui::{
-        draw_name_cell, first_absence, format_date, grouped, month_name, paint_cross, parse_date,
-        weekday_short, AttendanceUi, Kind, Line, GROUP_HEIGHT, LATE_TEXT, NAME_WIDTH, OUT_TEXT,
-        OWN_ROW, ROW_HEIGHT,
+        calendar_popup, draw_name_cell, first_absence, format_date, grouped, month_name,
+        paint_cross, parse_date, weekday_short, AttendanceUi, Kind, Line, GROUP_HEIGHT, LATE_TEXT,
+        NAME_WIDTH, OUT_TEXT, OWN_ROW, ROW_HEIGHT,
     },
     discord_auth, download,
     guild_ui::{
@@ -32,6 +32,14 @@ const MAX_VIEW_BYTES: u64 = 256 * 1024;
 const REFRESH_SECS: u64 = 60;
 const SAVE_DELAY: Duration = Duration::from_millis(1200);
 const MAX_RAIDS: usize = 6;
+const MAX_NAME: usize = 32;
+// The character picker is wider than its cell to fit saved lockouts.
+const PICKER_EXTRA: f32 = 70.0;
+const STRIP_CHIP: egui::Vec2 = egui::vec2(124.0, 46.0);
+const STRIP_ARROW: egui::Vec2 = egui::vec2(28.0, 46.0);
+const GRID_ARROW: egui::Vec2 = egui::vec2(28.0, 28.0);
+// The planner keeps resets from this one through twelve ahead.
+const WEEKS_AHEAD: i64 = 12;
 
 const RAID_WIDTH: f32 = 210.0;
 const RAID_GAP: f32 = 10.0;
@@ -113,11 +121,15 @@ impl Mode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PlannedRaid {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub difficulty: Difficulty,
     pub mode: Mode,
     pub day: String,
     #[serde(default)]
     pub start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
     #[serde(default)]
     pub instances: Vec<u64>,
     #[serde(default)]
@@ -136,6 +148,35 @@ impl PlannedRaid {
         let offset = NIGHTS.iter().position(|day| *day == self.day).unwrap_or(0);
         week + time::Duration::days(offset as i64)
     }
+
+    fn title(&self, index: usize) -> String {
+        self.name
+            .clone()
+            .unwrap_or_else(|| format!("Raid {}", index + 1))
+    }
+}
+
+/// One reset's raids in the strip above the plan.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ScheduledWeek {
+    pub week: String,
+    pub raids: Vec<ScheduledRaid>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ScheduledRaid {
+    pub difficulty: Difficulty,
+    pub day: String,
+}
+
+/// The Wednesday reset that holds `day`.
+fn reset_of(day: Date) -> Date {
+    let since = (day.weekday().number_days_from_monday() + 7
+        - time::Weekday::Wednesday.number_days_from_monday())
+        % 7;
+    day - time::Duration::days(since as i64)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -149,6 +190,7 @@ pub struct PlanView {
     pub available: bool,
     pub raid_days: Vec<String>,
     pub raid_time: Option<String>,
+    pub schedule: Vec<ScheduledWeek>,
 }
 
 type Reply<T> = mpsc::Receiver<Result<T, String>>;
@@ -156,6 +198,14 @@ type Reply<T> = mpsc::Receiver<Result<T, String>>;
 enum SaveError {
     Conflict(String),
     Failed(String),
+}
+
+impl SaveError {
+    fn message(self) -> String {
+        match self {
+            Self::Conflict(message) | Self::Failed(message) => message,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -171,6 +221,13 @@ pub struct PlannerUi {
     save_rx: Option<mpsc::Receiver<Result<PlanView, SaveError>>>,
     save_error: Option<String>,
     art: Option<ArtUi>,
+    // A raid whose date moved it to another reset: its index and new night.
+    pending_move: Option<(usize, Date)>,
+    move_rx: Option<Reply<String>>,
+    strip_week: Option<String>,
+    /// Pages to scroll the reset strip by next frame, and how far it can go.
+    strip_nudge: f32,
+    strip_room: (bool, bool),
 }
 
 /// Everything a raid column reads besides the plan itself.
@@ -180,6 +237,7 @@ pub(crate) struct Context<'a> {
     attendance: &'a AttendanceUi,
     pub week: Option<Date>,
     current: bool,
+    first_week: Option<Date>,
 }
 
 impl<'a> Context<'a> {
@@ -208,6 +266,7 @@ impl<'a> Context<'a> {
             attendance,
             week: parse_date(&view.week),
             current: view.week == view.current_week,
+            first_week: parse_date(&view.current_week),
         }
     }
 
@@ -241,6 +300,38 @@ impl<'a> Context<'a> {
                     }
                     .is_empty()
             })
+    }
+
+    /// Bosses killed this reset in the raid's instances, per difficulty.
+    fn lockouts(&self, character: &CharacterRow, raid: &PlannedRaid) -> Vec<(String, Color32)> {
+        if !self.current {
+            return Vec::new();
+        }
+        let saved: Vec<_> = character
+            .saved
+            .iter()
+            .filter(|saved| raid.instances.contains(&saved.id))
+            .collect();
+        let total: u32 = saved.iter().map(|saved| saved.total).sum();
+        Difficulty::ALL
+            .iter()
+            .filter_map(|difficulty| {
+                let kills: usize = saved
+                    .iter()
+                    .map(|saved| match difficulty {
+                        Difficulty::Normal => saved.normal.len(),
+                        Difficulty::Heroic => saved.heroic.len(),
+                        Difficulty::Mythic => saved.mythic.len(),
+                    })
+                    .sum();
+                (kills > 0).then(|| {
+                    (
+                        format!("{} {kills}/{total}", &difficulty.label()[..1]),
+                        difficulty.color(),
+                    )
+                })
+            })
+            .collect()
     }
 
     fn instances(&self, raid: &PlannedRaid) -> String {
@@ -299,7 +390,10 @@ impl PlannerUi {
     }
 
     fn settled(&self) -> bool {
-        self.dirty_at.is_none() && self.save_rx.is_none()
+        self.dirty_at.is_none()
+            && self.save_rx.is_none()
+            && self.pending_move.is_none()
+            && self.move_rx.is_none()
     }
 
     /// Runs every frame, so an edit saves even after leaving the tab.
@@ -360,6 +454,28 @@ impl PlannerUi {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        if let Some(rx) = &self.move_rx {
+            match rx.try_recv() {
+                Ok(Ok(week)) => {
+                    self.move_rx = None;
+                    self.week = Some(week);
+                    self.refresh(ctx, true);
+                }
+                Ok(Err(message)) => {
+                    self.move_rx = None;
+                    self.save_error = Some(friendly_problem(&message));
+                    self.refresh(ctx, true);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.move_rx = None;
+                    self.save_error = Some("The raid could not be moved.".into());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.pending_move.is_some() && self.save_rx.is_none() && self.move_rx.is_none() {
+            self.start_move(ctx);
+        }
         let Some(changed) = self.dirty_at else {
             return;
         };
@@ -386,6 +502,196 @@ impl PlannerUi {
             ctx.request_repaint();
         });
         self.save_rx = Some(rx);
+    }
+
+    /// Every reset the planner keeps, with the nights planned in each, coloured
+    /// by difficulty. Returns the week clicked.
+    fn draw_strip(&mut self, ui: &mut egui::Ui, enabled: bool) -> Option<String> {
+        let view = self.view.as_ref()?;
+        let shown = view.week.clone();
+        let current = view.current_week.clone();
+        let schedule = view.schedule.clone();
+        let mut clicked = None;
+        let follow = self.strip_week.as_deref() != Some(shown.as_str());
+        let nudge = std::mem::take(&mut self.strip_nudge);
+        let (can_back, can_forward) = self.strip_room;
+        let mut step = 0.0;
+        let (row, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), STRIP_CHIP.y),
+            egui::Sense::hover(),
+        );
+        let back = egui::Rect::from_min_size(row.min, STRIP_ARROW);
+        let forward = egui::Rect::from_min_size(
+            row.right_top() - egui::vec2(STRIP_ARROW.x, 0.0),
+            STRIP_ARROW,
+        );
+        let middle = egui::Rect::from_min_max(
+            egui::pos2(back.right() + 6.0, row.top()),
+            egui::pos2(forward.left() - 6.0, row.bottom()),
+        );
+        if strip_arrow(ui, back, -1.0, can_back) {
+            step = -1.0;
+        }
+        if strip_arrow(ui, forward, 1.0, can_forward) {
+            step = 1.0;
+        }
+        {
+            let output = ui
+                .scope_builder(egui::UiBuilder::new().max_rect(middle), |ui| {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("planner-resets")
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            if nudge != 0.0 {
+                                let page =
+                                    (ui.clip_rect().width() - STRIP_CHIP.x).max(STRIP_CHIP.x);
+                                ui.scroll_with_delta(egui::vec2(-nudge * page, 0.0));
+                            }
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                for entry in &schedule {
+                                    let Some(week) = parse_date(&entry.week) else {
+                                        continue;
+                                    };
+                                    let (rect, response) =
+                                        ui.allocate_exact_size(STRIP_CHIP, egui::Sense::click());
+                                    let selected = entry.week == shown;
+                                    let fill = if selected {
+                                        Color32::from_rgb(48, 54, 64)
+                                    } else if response.hovered() && enabled {
+                                        Color32::from_rgb(44, 49, 58)
+                                    } else {
+                                        FIELD_FILL
+                                    };
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        egui::CornerRadius::same(8),
+                                        fill,
+                                    );
+                                    if selected {
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            egui::CornerRadius::same(8),
+                                            Stroke::new(1.0_f32, info_accent()),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    }
+                                    let past = entry.week < current;
+                                    let color = if entry.week == current {
+                                        info_accent()
+                                    } else if past {
+                                        muted_text()
+                                    } else {
+                                        primary_text()
+                                    };
+                                    text_at(
+                                        ui,
+                                        egui::pos2(rect.left() + 10.0, rect.top() + 8.0),
+                                        egui::Align2::LEFT_TOP,
+                                        &reset_range(week),
+                                        13.0,
+                                        color,
+                                    );
+                                    let counts = difficulty_counts(&entry.raids);
+                                    let job = if counts.is_empty() {
+                                        single("No raids", 11.0, muted_text())
+                                    } else {
+                                        let mut job = single("", 11.0, muted_text());
+                                        for (index, (difficulty, count)) in
+                                            counts.into_iter().enumerate()
+                                        {
+                                            if index > 0 {
+                                                append(&mut job, " · ", 11.0, muted_text());
+                                            }
+                                            let color = if past {
+                                                muted_text()
+                                            } else {
+                                                difficulty.color()
+                                            };
+                                            let letter = &difficulty.label()[..1];
+                                            append(
+                                                &mut job,
+                                                &format!("{count} {letter}"),
+                                                11.0,
+                                                color,
+                                            );
+                                        }
+                                        job
+                                    };
+                                    let galley = clipped(ui, job, rect.width() - 20.0);
+                                    ui.painter().galley(
+                                        egui::pos2(rect.left() + 10.0, rect.top() + 27.0),
+                                        galley,
+                                        muted_text(),
+                                    );
+                                    if selected && follow {
+                                        response.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                    if enabled && !selected && response.clicked() {
+                                        clicked = Some(entry.week.clone());
+                                    }
+                                }
+                            });
+                        })
+                })
+                .inner;
+            let offset = output.state.offset.x;
+            let end = (output.content_size.x - output.inner_rect.width()).max(0.0);
+            self.strip_room = (offset > 0.5, offset < end - 0.5);
+        }
+        if step != 0.0 {
+            self.strip_nudge = step;
+            ui.ctx().request_repaint();
+        }
+        self.strip_week = Some(shown);
+        clicked
+    }
+
+    /// Adds the raid to its new reset, then saves this reset without it, so
+    /// a failure part way leaves the raid in both rather than in neither.
+    fn start_move(&mut self, ctx: &egui::Context) {
+        let Some((index, day)) = self.pending_move.take() else {
+            return;
+        };
+        let Some(view) = &self.view else {
+            return;
+        };
+        if index >= self.raids.len() {
+            return;
+        }
+        let mut raid = self.raids.remove(index);
+        let target = reset_of(day);
+        raid.day = NIGHTS[(day - target).whole_days() as usize].to_owned();
+        let (week, revision, remaining) = (view.week.clone(), view.revision, self.raids.clone());
+        let target = format_date(target);
+        self.dirty_at = None;
+        self.art = None;
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        crate::guild::spawn(move || {
+            let path = format!("/v1/plans?week={target}");
+            let result = discord_auth::current_access_token()
+                .and_then(|access| get(&access, &path, MAX_VIEW_BYTES, "Planner"))
+                .and_then(|body| {
+                    serde_json::from_slice::<PlanView>(&body)
+                        .map_err(|_| "Planner: the server sent an invalid response.".to_string())
+                })
+                .and_then(|plan| {
+                    let mut raids = plan.raids;
+                    if raids.len() >= MAX_RAIDS {
+                        return Err(format!(
+                            "Planner: that reset already has {MAX_RAIDS} raids."
+                        ));
+                    }
+                    raids.push(raid);
+                    save_plan(&target, plan.revision, &raids).map_err(SaveError::message)
+                })
+                .and_then(|_| save_plan(&week, revision, &remaining).map_err(SaveError::message))
+                .map(|_| target);
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        self.move_rx = Some(rx);
     }
 
     fn close_lost_art(&mut self) {
@@ -435,39 +741,52 @@ impl PlannerUi {
             return false;
         }
         let settled = self.settled();
+        let has_strip = self
+            .view
+            .as_ref()
+            .is_some_and(|view| !view.schedule.is_empty());
         control_row(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let enabled = settled && self.view_rx.is_none() && self.view.is_some();
-            let previous = ui.add_enabled_ui(enabled, square_button).inner;
-            arrow(ui, previous.rect.center(), -1.0);
-            if previous.clicked() {
-                step = -1;
-            }
-            let title = self
-                .view
-                .as_ref()
-                .and_then(|view| parse_date(&view.week))
-                .map_or_else(
-                    || "Raids".to_owned(),
-                    |week| format!("Reset of {}", long_date(week)),
+            if has_strip {
+                ui.label(
+                    RichText::new("Raids")
+                        .size(18.0)
+                        .strong()
+                        .color(primary_text()),
                 );
-            ui.label(
-                RichText::new(title)
-                    .size(18.0)
-                    .strong()
-                    .color(primary_text()),
-            );
-            let next = ui.add_enabled_ui(enabled, square_button).inner;
-            arrow(ui, next.rect.center(), 1.0);
-            if next.clicked() {
-                step = 1;
-            }
-            if self
-                .view
-                .as_ref()
-                .is_some_and(|view| view.week == view.current_week)
-            {
-                pill(ui, "This reset");
+            } else {
+                let previous = ui.add_enabled_ui(enabled, square_button).inner;
+                arrow(ui, previous.rect.center(), -1.0);
+                if previous.clicked() {
+                    step = -1;
+                }
+                let title = self
+                    .view
+                    .as_ref()
+                    .and_then(|view| parse_date(&view.week))
+                    .map_or_else(
+                        || "Raids".to_owned(),
+                        |week| format!("Reset of {}", long_date(week)),
+                    );
+                ui.label(
+                    RichText::new(title)
+                        .size(18.0)
+                        .strong()
+                        .color(primary_text()),
+                );
+                let next = ui.add_enabled_ui(enabled, square_button).inner;
+                arrow(ui, next.rect.center(), 1.0);
+                if next.clicked() {
+                    step = 1;
+                }
+                if self
+                    .view
+                    .as_ref()
+                    .is_some_and(|view| view.week == view.current_week)
+                {
+                    pill(ui, "This reset");
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if bar_button(ui, "Refresh").clicked() {
@@ -490,7 +809,7 @@ impl PlannerUi {
                         self.dirty_at = Some(Instant::now());
                     }
                 }
-                if self.view_rx.is_some() || self.save_rx.is_some() {
+                if self.view_rx.is_some() || self.save_rx.is_some() || self.move_rx.is_some() {
                     busy_indicator(ui, 16.0, info_accent());
                 }
             });
@@ -498,11 +817,22 @@ impl PlannerUi {
         if step != 0 {
             self.change_week(ui.ctx(), step);
         }
+        if has_strip {
+            ui.add_space(10.0);
+            let enabled = settled && self.view_rx.is_none();
+            if let Some(week) = self.draw_strip(ui, enabled) {
+                self.week = Some(week);
+                self.save_error = None;
+                self.art = None;
+                self.refresh(ui.ctx(), true);
+            }
+        }
         ui.add_space(10.0);
 
         let max_height = ui.available_height().max(0.0);
         let mut changed = false;
         let mut open_art = None;
+        let mut moved = None;
         egui::ScrollArea::vertical()
             .id_salt("planner")
             .auto_shrink([false, true])
@@ -552,6 +882,7 @@ impl PlannerUi {
                     characters,
                     editing,
                     &mut open_art,
+                    &mut moved,
                 );
             });
         if let Some(raid) = open_art {
@@ -560,6 +891,19 @@ impl PlannerUi {
         if changed {
             self.dirty_at = Some(Instant::now());
             self.save_error = None;
+        }
+        if let Some((index, day)) = moved {
+            let last = self
+                .view
+                .as_ref()
+                .and_then(|view| parse_date(&view.current_week))
+                .map(|week| week + time::Duration::days(7 * WEEKS_AHEAD + 6));
+            if last.is_some_and(|last| day > last) {
+                self.save_error = Some("That date is too far ahead to plan.".into());
+            } else {
+                self.pending_move = Some((index, day));
+                self.save_error = None;
+            }
         }
         refresh
     }
@@ -634,6 +978,8 @@ impl PlannerUi {
             .unwrap_or_default();
         instances.sort_unstable();
         PlannedRaid {
+            name: None,
+            end: None,
             difficulty: Difficulty::Heroic,
             mode: Mode::Splits,
             day,
@@ -657,6 +1003,7 @@ fn draw_plan(
     characters: Option<&CharactersView>,
     editing: bool,
     open_art: &mut Option<usize>,
+    moved: &mut Option<(usize, Date)>,
 ) -> bool {
     let header = if editing {
         EDIT_HEADER_HEIGHT
@@ -686,6 +1033,29 @@ fn draw_plan(
                 ui.spacing_mut().item_spacing.x = 0.0;
                 let (names, _) =
                     ui.allocate_exact_size(egui::vec2(NAME_WIDTH, height), egui::Sense::hover());
+                // Page arrows above the names once the raids run off the side.
+                let arrows_id = egui::Id::new("planner-grid-arrows");
+                let (can_back, can_forward) = ui
+                    .data(|data| data.get_temp::<(bool, bool)>(arrows_id))
+                    .unwrap_or_default();
+                let nudge = ui
+                    .data_mut(|data| data.remove_temp::<f32>(arrows_id.with("nudge")))
+                    .unwrap_or_default();
+                if can_back || can_forward {
+                    let back = egui::Rect::from_min_size(names.min, GRID_ARROW);
+                    let forward = back.translate(egui::vec2(GRID_ARROW.x + 6.0, 0.0));
+                    let step: f32 = if strip_arrow(ui, back, -1.0, can_back) {
+                        -1.0
+                    } else if strip_arrow(ui, forward, 1.0, can_forward) {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    if step != 0.0 {
+                        ui.data_mut(|data| data.insert_temp(arrows_id.with("nudge"), step));
+                        ui.ctx().request_repaint();
+                    }
+                }
                 let mut y = names.top();
                 for line in &lines {
                     let rect = egui::Rect::from_min_size(
@@ -708,10 +1078,15 @@ fn draw_plan(
                     y += height_of(line);
                 }
 
-                egui::ScrollArea::horizontal()
+                let output = egui::ScrollArea::horizontal()
                     .id_salt("planner-grid")
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
+                        if nudge != 0.0 {
+                            let column = RAID_WIDTH + RAID_GAP;
+                            let page = (ui.clip_rect().width() / column).floor().max(1.0) * column;
+                            ui.scroll_with_delta(egui::vec2(-nudge * page, 0.0));
+                        }
                         // Rows run the panel's full width even with one raid.
                         let width = (raids.len() as f32 * (RAID_WIDTH + RAID_GAP))
                             .max(ui.available_width());
@@ -752,6 +1127,9 @@ fn draw_plan(
                                         if header.send {
                                             *open_art = Some(index);
                                         }
+                                        if let Some(day) = header.moved {
+                                            *moved = Some((index, day));
+                                        }
                                     }
                                     Line::Header => draw_header(ui, cell, index, raid, context),
                                     Line::Summary => draw_totals(ui, cell, &totals[index]),
@@ -765,6 +1143,11 @@ fn draw_plan(
                             y += height_of(line);
                         }
                     });
+                let offset = output.state.offset.x;
+                let end = (output.content_size.x - output.inner_rect.width()).max(0.0);
+                ui.data_mut(|data| {
+                    data.insert_temp(arrows_id, (offset > 0.5, offset < end - 0.5));
+                });
             });
         });
     if let Some(index) = remove {
@@ -830,7 +1213,7 @@ fn draw_header(
         ui,
         egui::pos2(x, cell.top() + 4.0),
         egui::Align2::LEFT_TOP,
-        &format!("Raid {}", index + 1),
+        &raid.title(index),
         14.0,
         primary_text(),
     );
@@ -848,7 +1231,7 @@ fn draw_header(
         ui,
         egui::pos2(x, cell.top() + 42.0),
         egui::Align2::LEFT_TOP,
-        &night_label(raid),
+        &night_label(raid, context.week),
         12.0,
         secondary_text(),
     );
@@ -866,6 +1249,7 @@ struct HeaderEdit {
     changed: bool,
     removed: bool,
     send: bool,
+    moved: Option<Date>,
 }
 
 /// An officer's header: difficulty, mode, night, start, instances and the way
@@ -881,7 +1265,9 @@ fn edit_header(
     let mut changed = false;
     let mut removed = false;
     let mut send = false;
+    let mut moved = None;
     let half = (cell.width() - 6.0) / 2.0;
+    let quarter = (half - 6.0) / 2.0;
     ui.scope_builder(
         egui::UiBuilder::new()
             .max_rect(cell.shrink2(egui::vec2(0.0, 4.0)))
@@ -892,11 +1278,24 @@ fn edit_header(
                 egui::vec2(cell.width(), 22.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    ui.label(
-                        RichText::new(format!("Raid {}", index + 1))
-                            .size(14.0)
-                            .color(primary_text()),
+                    let mut name = raid.name.clone().unwrap_or_default();
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut name)
+                            .id_salt("name")
+                            .frame(egui::Frame::NONE)
+                            .char_limit(MAX_NAME)
+                            .font(egui::FontId::proportional(14.0))
+                            .text_color(primary_text())
+                            .hint_text(
+                                RichText::new(format!("Raid {}", index + 1))
+                                    .color(secondary_text()),
+                            )
+                            .desired_width(cell.width() - 34.0),
                     );
+                    if edit.changed() {
+                        raid.name = (!name.trim().is_empty()).then_some(name);
+                        changed = true;
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let close = ui.add(
                             egui::Button::new("")
@@ -943,40 +1342,57 @@ fn edit_header(
                 }
             });
             ui.horizontal(|ui| {
-                let labels: Vec<(String, Color32)> = NIGHTS
-                    .iter()
-                    .map(|day| (night_name(day).to_owned(), primary_text()))
-                    .collect();
-                if let Some(pick) = choice(
-                    ui,
-                    "day",
-                    half,
-                    night_name(&raid.day),
-                    primary_text(),
-                    &labels,
-                ) {
-                    raid.day = NIGHTS[pick].to_owned();
-                    changed = true;
+                if let Some(week) = context.week {
+                    let night = raid.night(week);
+                    let button = small_field(ui, half, &long_date(night), primary_text());
+                    if let Some(day) =
+                        calendar_popup(ui, &button, "night", night, context.first_week)
+                    {
+                        if reset_of(day) == week {
+                            raid.day = NIGHTS[(day - week).whole_days() as usize].to_owned();
+                            changed = true;
+                        } else {
+                            moved = Some(day);
+                        }
+                    }
                 }
                 let times = start_times();
-                let mut labels = vec![("No time".to_owned(), muted_text())];
+                let mut labels = vec![("Start".to_owned(), muted_text())];
                 labels.extend(times.iter().map(|time| (time.clone(), primary_text())));
-                let shown = raid.start.clone().unwrap_or_else(|| "No time".into());
-                if let Some(pick) = choice(ui, "start", half, &shown, primary_text(), &labels) {
+                let shown = raid.start.clone().unwrap_or_else(|| "Start".into());
+                let color = if raid.start.is_some() {
+                    primary_text()
+                } else {
+                    muted_text()
+                };
+                if let Some(pick) = choice(ui, "start", quarter, &shown, color, &labels) {
                     raid.start = (pick > 0).then(|| times[pick - 1].clone());
                     changed = true;
                 }
-            });
-            let button = small_field(
-                ui,
-                cell.width(),
-                &context.instances(raid),
-                if raid.instances.is_empty() {
-                    muted_text()
+                let ends = end_times();
+                let mut labels = vec![("End".to_owned(), muted_text())];
+                labels.extend(ends.iter().map(|time| (time.clone(), primary_text())));
+                let shown = raid.end.clone().unwrap_or_else(|| "End".into());
+                let color = if raid.end.is_some() {
+                    primary_text()
                 } else {
-                    secondary_text()
-                },
-            );
+                    muted_text()
+                };
+                if let Some(pick) = choice(ui, "end", quarter, &shown, color, &labels) {
+                    raid.end = (pick > 0).then(|| ends[pick - 1].clone());
+                    changed = true;
+                }
+            });
+            let button = if raid.instances.is_empty() {
+                small_field(
+                    ui,
+                    cell.width(),
+                    "Pick instances to see who is saved",
+                    warning_accent(),
+                )
+            } else {
+                small_field(ui, cell.width(), &context.instances(raid), secondary_text())
+            };
             egui::Popup::menu(&button)
                 .width(cell.width())
                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
@@ -1013,6 +1429,7 @@ fn edit_header(
         changed,
         removed,
         send,
+        moved,
     }
 }
 
@@ -1117,15 +1534,10 @@ fn draw_pick(
     // Right side first, so the name is cut to what is left.
     let mut right = field.right() - 8.0;
     let tag = |ui: &egui::Ui, right: &mut f32, text: &str, size: f32, color: Color32| {
-        let rect = text_at(
-            ui,
-            egui::pos2(*right, field.center().y),
-            egui::Align2::RIGHT_CENTER,
-            text,
-            size,
-            color,
-        );
-        *right = rect.left() - 6.0;
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(single(text, size, color)));
+        let pos = egui::pos2(*right - galley.size().x, cap_centred(&galley, size, field));
+        *right = pos.x - 6.0;
+        ui.painter().galley(pos, galley, color);
     };
     if let Some(ilvl) = pick.and_then(|character| character.ilvl) {
         tag(ui, &mut right, &ilvl.to_string(), 12.0, muted_text());
@@ -1152,11 +1564,9 @@ fn draw_pick(
         single(&name, 13.0, color),
         (right - field.left() - 10.0).max(20.0),
     );
-    ui.painter().galley(
-        egui::pos2(field.left() + 8.0, field.center().y - galley.size().y / 2.0),
-        galley,
-        color,
-    );
+    let top = cap_centred(&galley, 13.0, field);
+    ui.painter()
+        .galley(egui::pos2(field.left() + 8.0, top), galley, color);
 
     let Some(response) = response else {
         return false;
@@ -1168,10 +1578,10 @@ fn draw_pick(
         .get(member.user_id.as_str())
         .map_or(&[][..], |member| member.characters.as_slice());
     egui::Popup::menu(&response)
-        .width(cell.width())
+        .width(cell.width() + PICKER_EXTRA)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
-            ui.set_min_width(cell.width() - 12.0);
+            ui.set_min_width(cell.width() + PICKER_EXTRA - 12.0);
             if ui
                 .selectable_label(
                     raid.pick(&member.user_id).is_none(),
@@ -1181,6 +1591,7 @@ fn draw_pick(
             {
                 raid.picks.remove(&member.user_id);
                 changed = true;
+                ui.close();
             }
             for character in options {
                 let color = character
@@ -1191,14 +1602,17 @@ fn draw_pick(
                 if let Some(ilvl) = character.ilvl {
                     append(&mut job, &format!("  {ilvl}"), 12.0, muted_text());
                 }
-                if context.saved(character, raid) {
-                    append(&mut job, "  Saved", 11.0, SAVED);
+                for (text, color) in context.lockouts(character, raid) {
+                    append(&mut job, &format!("  {text}"), 11.0, color);
                 }
                 let selected = raid.pick(&member.user_id) == Some(character.key.as_str());
-                if ui.selectable_label(selected, job).clicked() && !selected {
-                    raid.picks
-                        .insert(member.user_id.clone(), Some(character.key.clone()));
-                    changed = true;
+                if ui.selectable_label(selected, job).clicked() {
+                    if !selected {
+                        raid.picks
+                            .insert(member.user_id.clone(), Some(character.key.clone()));
+                        changed = true;
+                    }
+                    ui.close();
                 }
             }
         });
@@ -1275,6 +1689,13 @@ fn start_times() -> Vec<String> {
         .collect()
 }
 
+/// Start times through the evening, then past midnight until 02:00.
+fn end_times() -> Vec<String> {
+    (16 * 4..26 * 4 + 1)
+        .map(|quarter| format!("{:02}:{:02}", quarter / 4 % 24, quarter % 4 * 15))
+        .collect()
+}
+
 pub(crate) fn night_name(day: &str) -> &'static str {
     match day {
         "wed" => "Wed",
@@ -1288,10 +1709,52 @@ pub(crate) fn night_name(day: &str) -> &'static str {
     }
 }
 
-fn night_label(raid: &PlannedRaid) -> String {
-    match &raid.start {
-        Some(start) => format!("{} {start}", night_name(&raid.day)),
-        None => night_name(&raid.day).to_owned(),
+/// The top for a single line whose capitals sit in the middle of `rect`, so
+/// text of different sizes lines up.
+fn cap_centred(galley: &egui::Galley, size: f32, rect: egui::Rect) -> f32 {
+    let baseline = galley
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first().map(|glyph| row.pos.y + glyph.pos.y))
+        .unwrap_or(galley.size().y * 0.8);
+    rect.center().y + size * 0.35 - baseline
+}
+
+/// One of the arrows either side of the reset strip.
+fn strip_arrow(ui: &egui::Ui, rect: egui::Rect, direction: f32, active: bool) -> bool {
+    let sense = if active {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let response = ui.interact(rect, ui.id().with(("strip-arrow", direction as i32)), sense);
+    let fill = if active && response.hovered() {
+        Color32::from_rgb(44, 49, 58)
+    } else {
+        FIELD_FILL
+    };
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(8), fill);
+    let color = if active { primary_text() } else { muted_text() };
+    let stroke = Stroke::new(1.6_f32, color);
+    let tip = rect.center() + egui::vec2(3.0 * direction, 0.0);
+    ui.painter()
+        .line_segment([tip, tip + egui::vec2(-5.0 * direction, -5.0)], stroke);
+    ui.painter()
+        .line_segment([tip, tip + egui::vec2(-5.0 * direction, 5.0)], stroke);
+    active && response.clicked()
+}
+
+fn night_label(raid: &PlannedRaid, week: Option<Date>) -> String {
+    let night = week.map_or_else(
+        || night_name(&raid.day).to_owned(),
+        |week| long_date(raid.night(week)),
+    );
+    match (&raid.start, &raid.end) {
+        (Some(start), Some(end)) => format!("{night} · {start}–{end}"),
+        (Some(start), None) => format!("{night} · {start}"),
+        (None, Some(end)) => format!("{night} · until {end}"),
+        (None, None) => night,
     }
 }
 
@@ -1302,6 +1765,38 @@ pub(crate) fn long_date(day: Date) -> String {
         day.day(),
         &month_name(day.month())[..3]
     )
+}
+
+/// How many raids of each difficulty a reset holds, easiest first.
+fn difficulty_counts(raids: &[ScheduledRaid]) -> Vec<(Difficulty, usize)> {
+    [Difficulty::Normal, Difficulty::Heroic, Difficulty::Mythic]
+        .into_iter()
+        .map(|difficulty| {
+            let count = raids
+                .iter()
+                .filter(|raid| raid.difficulty == difficulty)
+                .count();
+            (difficulty, count)
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
+
+/// The days a reset covers, such as "4 – 10 Nov" or "28 Oct – 3 Nov".
+fn reset_range(week: Date) -> String {
+    let last = week + time::Duration::days(6);
+    let month = |day: Date| &month_name(day.month())[..3];
+    if week.month() == last.month() {
+        format!("{} – {} {}", week.day(), last.day(), month(last))
+    } else {
+        format!(
+            "{} {} – {} {}",
+            week.day(),
+            month(week),
+            last.day(),
+            month(last)
+        )
+    }
 }
 
 fn valid_week(week: &str) -> bool {
@@ -1394,7 +1889,9 @@ mod tests {
 
     #[test]
     fn a_tuesday_raid_falls_on_the_last_night_of_the_reset() {
-        let raid = PlannedRaid {
+        let mut raid = PlannedRaid {
+            name: None,
+            end: None,
             difficulty: Difficulty::Heroic,
             mode: Mode::Farm,
             day: "tue".into(),
@@ -1407,7 +1904,22 @@ mod tests {
             format_date(raid.night(parse_date("2026-11-04").unwrap())),
             "2026-11-10"
         );
-        assert_eq!(night_label(&raid), "Tue");
+        assert_eq!(night_label(&raid, None), "Tue");
+        let week = parse_date("2026-11-04");
+        assert_eq!(night_label(&raid, week), "Tue 10 Nov");
+        raid.start = Some("19:30".into());
+        raid.end = Some("23:00".into());
+        assert_eq!(night_label(&raid, week), "Tue 10 Nov · 19:30–23:00");
+        assert_eq!(raid.title(1), "Raid 2");
+        raid.name = Some("Prog".into());
+        assert_eq!(raid.title(1), "Prog");
+        for (day, reset) in [
+            ("2026-11-04", "2026-11-04"),
+            ("2026-11-10", "2026-11-04"),
+            ("2026-11-11", "2026-11-11"),
+        ] {
+            assert_eq!(format_date(reset_of(parse_date(day).unwrap())), reset);
+        }
         assert_eq!(long_date(parse_date("2026-11-04").unwrap()), "Wed 4 Nov");
     }
 
@@ -1417,7 +1929,37 @@ mod tests {
         assert_eq!(times.first().map(String::as_str), Some("16:00"));
         assert_eq!(times.last().map(String::as_str), Some("23:45"));
         assert!(times.contains(&"19:15".to_string()));
+        let ends = end_times();
+        assert_eq!(ends.last().map(String::as_str), Some("02:00"));
+        assert!(ends.contains(&"00:30".to_string()));
         assert!(!valid_week("2026-11-4"));
         assert!(valid_week("2026-11-04"));
+    }
+
+    #[test]
+    fn reset_range_spans_the_week() {
+        assert_eq!(reset_range(parse_date("2026-11-04").unwrap()), "4 – 10 Nov");
+        assert_eq!(
+            reset_range(parse_date("2026-10-28").unwrap()),
+            "28 Oct – 3 Nov"
+        );
+    }
+
+    #[test]
+    fn difficulty_counts_skip_missing_difficulties() {
+        let raid = |difficulty| ScheduledRaid {
+            difficulty,
+            day: "2026-11-04".into(),
+        };
+        let raids = [
+            raid(Difficulty::Mythic),
+            raid(Difficulty::Heroic),
+            raid(Difficulty::Heroic),
+        ];
+        assert_eq!(
+            difficulty_counts(&raids),
+            vec![(Difficulty::Heroic, 2), (Difficulty::Mythic, 1)]
+        );
+        assert!(difficulty_counts(&[]).is_empty());
     }
 }
