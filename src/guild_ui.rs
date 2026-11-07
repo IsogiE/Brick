@@ -528,16 +528,18 @@ impl GuildUi {
                     roster_notice(ui, error);
                     ui.add_space(12.0);
                 }
-                if let Some(view) = self.view.as_ref().filter(|view| view.available) {
-                    draw_tiles(ui, view, members.len());
-                    ui.add_space(14.0);
-                }
                 panel_frame()
                     .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {
                         let columns = Columns::new(ui.available_rect_before_wrap());
                         draw_column_titles(ui, &columns);
+                        let mut group = None;
                         for member in &members {
+                            let role = profile::role_order(member.raid_role);
+                            if group != Some(role) {
+                                group = Some(role);
+                                draw_group(ui, member.raid_role);
+                            }
                             ui.push_id(&member.user_id, |ui| {
                                 let characters = self.member(&member.user_id);
                                 let expanded = self.expanded.contains(&member.user_id);
@@ -1216,102 +1218,26 @@ fn draw_column_titles(ui: &mut egui::Ui, columns: &Columns) {
     );
 }
 
-fn draw_tiles(ui: &mut egui::Ui, view: &CharactersView, member_count: usize) {
-    let characters: Vec<&CharacterRow> = view
-        .members
-        .iter()
-        .flat_map(|member| &member.characters)
-        .collect();
-    let ready: Vec<&&CharacterRow> = characters
-        .iter()
-        .filter(|character| character.ready(view.ready_ilvl))
-        .collect();
-    let unused = characters
-        .iter()
-        .filter(|character| character.synced() && character.lockout.heroic == 0)
-        .count();
-    let mut tokens = [0usize; 4];
-    for character in &ready {
-        if let Some(index) = token(character.class_name()) {
-            tokens[index] += 1;
-        }
-    }
-    let ready_rule = match view.ready_ilvl {
-        Some(ilvl) => format!("≥ {ilvl} · 4 tier"),
-        None => "4 tier".to_string(),
+/// The role divider above each group, as on Attendance.
+fn draw_group(ui: &mut egui::Ui, role: Option<RaidRole>) {
+    let label = match role {
+        Some(RaidRole::Tank) => "TANKS",
+        Some(RaidRole::Healer) => "HEALERS",
+        Some(RaidRole::Dps) => "DPS",
+        None => "NO ROLE",
     };
-    let tiles = [
-        (
-            "CHARACTERS",
-            characters.len().to_string(),
-            format!("{member_count} members"),
-        ),
-        ("SPLIT-READY", ready.len().to_string(), ready_rule),
-        ("HEROIC LOCKOUTS UNUSED", unused.to_string(), String::new()),
-    ];
-    let gap = 12.0;
-    let width = ui.available_width();
-    let tile_width = ((width - gap * 3.0) / 4.0).max(60.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        for (label, value, detail) in &tiles {
-            tile(ui, tile_width, label, |ui, rect| {
-                // One layout per line keeps the value and its detail on one baseline.
-                let mut line = single(value, TILE_VALUE, primary_text());
-                if !detail.is_empty() {
-                    append(&mut line, &format!("  {detail}"), 12.0, muted_text());
-                }
-                paint_bottom_left(ui, line, rect.left_bottom(), rect.width());
-            });
-        }
-        tile(ui, tile_width, "READY PER TOKEN", |ui, rect| {
-            let step = rect.width() / 4.0;
-            for (index, short) in ["Dre", "Mys", "Ven", "Zen"].iter().enumerate() {
-                let mut line = single(&format!("{short} "), 12.0, muted_text());
-                append(
-                    &mut line,
-                    &tokens[index].to_string(),
-                    TILE_VALUE,
-                    primary_text(),
-                );
-                let left = rect.left_bottom() + egui::vec2(step * index as f32, 0.0);
-                paint_bottom_left(ui, line, left, step);
-            }
-        });
-    });
-}
-
-const TILE_VALUE: f32 = 22.0;
-
-fn paint_bottom_left(ui: &egui::Ui, job: egui::text::LayoutJob, at: egui::Pos2, width: f32) {
-    let galley = clipped(ui, job, width);
-    let pos = at - egui::vec2(0.0, galley.size().y);
-    ui.painter().galley(pos, galley, primary_text());
-}
-
-fn tile(ui: &mut egui::Ui, width: f32, label: &str, body: impl FnOnce(&egui::Ui, egui::Rect)) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 78.0), egui::Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return;
-    }
-    let painter = ui.painter();
-    painter.rect_filled(rect, egui::CornerRadius::same(8), panel_background());
-    painter.rect_stroke(
-        rect,
-        egui::CornerRadius::same(8),
-        Stroke::new(1.0_f32, panel_stroke()),
-        egui::StrokeKind::Inside,
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), crate::attendance_ui::GROUP_HEIGHT),
+        egui::Sense::hover(),
     );
-    let inner = rect.shrink2(egui::vec2(16.0, 14.0));
     text_at(
         ui,
-        inner.left_top(),
-        egui::Align2::LEFT_TOP,
+        egui::pos2(rect.left() + 4.0, rect.bottom() - 8.0),
+        egui::Align2::LEFT_BOTTOM,
         label,
         11.0,
         Color32::from_rgb(164, 176, 193),
     );
-    body(ui, inner);
 }
 
 /// The member line: avatar, name, characters and presence. Returns true when
