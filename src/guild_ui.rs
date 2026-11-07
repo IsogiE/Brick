@@ -32,7 +32,6 @@ const EMBELLISHMENTS: u8 = 2;
 pub struct CharactersView {
     pub can_edit_mains: bool,
     pub available: bool,
-    pub ready_ilvl: Option<u32>,
     pub raids: Vec<RaidInstance>,
     pub members: Vec<MemberCharacters>,
 }
@@ -95,14 +94,6 @@ pub struct CharacterRow {
 impl CharacterRow {
     fn synced(&self) -> bool {
         self.status == "ok"
-    }
-
-    fn ready(&self, ready_ilvl: Option<u32>) -> bool {
-        self.synced()
-            && self.tier >= 4
-            && self
-                .ilvl
-                .is_some_and(|ilvl| ilvl >= ready_ilvl.unwrap_or(0))
     }
 
     fn class_name(&self) -> &str {
@@ -507,11 +498,6 @@ impl GuildUi {
         let max_height = ui.available_height().max(0.0);
         let mut open = None;
         let mut toggle = None;
-        let tier = self
-            .view
-            .as_ref()
-            .map(CharactersView::tier)
-            .unwrap_or_default();
         egui::ScrollArea::vertical()
             .id_salt("guild-roster")
             .auto_shrink([false, true])
@@ -555,9 +541,8 @@ impl GuildUi {
                                     toggle = Some(member.user_id.clone());
                                 }
                                 if expanded {
-                                    let ready = self.view.as_ref().and_then(|view| view.ready_ilvl);
                                     for character in characters.map_or(&[][..], |c| &c.characters) {
-                                        if draw_character_row(ui, character, ready, &tier) {
+                                        if draw_character_row(ui, character) {
                                             open = Some((
                                                 member.user_id.clone(),
                                                 character.key.clone(),
@@ -610,7 +595,6 @@ impl GuildUi {
         };
         let can_edit =
             own_id == member.user_id || self.view.as_ref().is_some_and(|view| view.can_edit_mains);
-        let ready_ilvl = self.view.as_ref().and_then(|view| view.ready_ilvl);
         let mut refresh = false;
         let mut back = false;
         let mut chosen = None;
@@ -692,7 +676,7 @@ impl GuildUi {
             .show(ui, |ui| {
                 let width = (ui.available_width() - 18.0).max(300.0);
                 ui.set_width(width);
-                draw_header(ui, &character, ready_ilvl);
+                draw_header(ui, &character);
                 if !character.synced() {
                     return;
                 }
@@ -1121,19 +1105,12 @@ struct Columns {
     ilvl: f32,
     tier: f32,
     vault: Option<f32>,
-    lockout: f32,
     keys: f32,
     myth: f32,
 }
 
 impl Columns {
     const VAULT_WIDTH: f32 = 6.0 * 14.0;
-    const LOCKOUT_WIDTH: f32 = 96.0;
-
-    /// Right edge of the normal, heroic or mythic count.
-    fn lockout_digit(&self, index: usize) -> f32 {
-        self.lockout + 22.0 + index as f32 * 32.0
-    }
 
     fn new(rect: egui::Rect) -> Self {
         let wide = rect.width() >= 820.0;
@@ -1142,8 +1119,6 @@ impl Columns {
         x -= 56.0 + 14.0;
         let keys = x;
         x -= 40.0 + 22.0;
-        let lockout = x - Self::LOCKOUT_WIDTH;
-        x = lockout - 22.0;
         let vault = wide.then(|| {
             let left = x - Self::VAULT_WIDTH;
             x = left - 22.0;
@@ -1165,7 +1140,6 @@ impl Columns {
             ilvl,
             tier,
             vault,
-            lockout,
             keys,
             myth,
         }
@@ -1205,9 +1179,6 @@ fn draw_column_titles(ui: &mut egui::Ui, columns: &Columns) {
     right(columns.tier, "Tier");
     if let Some(x) = columns.vault {
         left(x, "Vault");
-    }
-    for (index, label) in ["N", "H", "M"].into_iter().enumerate() {
-        right(columns.lockout_digit(index), label);
     }
     right(columns.keys, "Keys");
     right(columns.myth, "Myth");
@@ -1418,12 +1389,7 @@ fn member_summary(characters: &MemberCharacters) -> Option<String> {
 }
 
 /// One character under its member. Returns true when it was clicked.
-fn draw_character_row(
-    ui: &mut egui::Ui,
-    character: &CharacterRow,
-    ready_ilvl: Option<u32>,
-    tier: &HashSet<u64>,
-) -> bool {
+fn draw_character_row(ui: &mut egui::Ui, character: &CharacterRow) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
     if !ui.is_rect_visible(rect) {
@@ -1503,15 +1469,9 @@ fn draw_character_row(
         for x in [columns.ilvl, columns.tier, columns.keys, columns.myth] {
             dash(x);
         }
-        dash(columns.lockout_digit(1));
         return response.clicked();
     }
 
-    let ilvl_color = if character.ready(ready_ilvl) {
-        success_accent()
-    } else {
-        primary_text()
-    };
     match character.ilvl {
         Some(ilvl) => {
             text_at(
@@ -1520,7 +1480,7 @@ fn draw_character_row(
                 egui::Align2::RIGHT_CENTER,
                 &ilvl.to_string(),
                 14.0,
-                ilvl_color,
+                primary_text(),
             );
         }
         None => dash(columns.ilvl),
@@ -1556,40 +1516,6 @@ fn draw_character_row(
                 );
             }
         }
-    }
-    let lockout = character.lockout;
-    let cleared = |pick: fn(&SavedRaid) -> usize| -> u32 {
-        character
-            .saved
-            .iter()
-            .filter(|raid| tier.contains(&raid.id) && pick(raid) > 0)
-            .map(|raid| raid.total)
-            .sum()
-    };
-    let full = [
-        cleared(|raid| raid.normal.len()),
-        cleared(|raid| raid.heroic.len()),
-        cleared(|raid| raid.mythic.len()),
-    ];
-    for (index, value) in [lockout.normal, lockout.heroic, lockout.mythic]
-        .into_iter()
-        .enumerate()
-    {
-        let color = if value == 0 {
-            dim()
-        } else if value >= full[index] {
-            secondary_text()
-        } else {
-            warning_accent()
-        };
-        text_at(
-            ui,
-            egui::pos2(columns.lockout_digit(index), y),
-            egui::Align2::RIGHT_CENTER,
-            &value.to_string(),
-            13.0,
-            color,
-        );
     }
     text_at(
         ui,
@@ -1641,7 +1567,7 @@ fn updated_label(synced_at: Option<&str>) -> Option<String> {
     })
 }
 
-fn draw_header(ui: &mut egui::Ui, character: &CharacterRow, ready_ilvl: Option<u32>) {
+fn draw_header(ui: &mut egui::Ui, character: &CharacterRow) {
     panel_frame()
         .inner_margin(egui::Margin::symmetric(22, 18))
         .show(ui, |ui| {
@@ -1696,7 +1622,6 @@ fn draw_header(ui: &mut egui::Ui, character: &CharacterRow, ready_ilvl: Option<u
                 return;
             }
             ui.add_space(16.0);
-            let lockout = character.lockout;
             let tier_detail = match character.tier {
                 4.. => "4-set active",
                 2..=3 => "2-set active",
@@ -1711,19 +1636,6 @@ fn draw_header(ui: &mut egui::Ui, character: &CharacterRow, ready_ilvl: Option<u
                     "ITEM LEVEL",
                     character.ilvl.map_or("–".into(), |ilvl| ilvl.to_string()),
                     "equipped".to_string(),
-                    if character.ready(ready_ilvl) {
-                        success_accent()
-                    } else {
-                        primary_text()
-                    },
-                ),
-                (
-                    "RAID",
-                    format!(
-                        "{} · {} · {}",
-                        lockout.normal, lockout.heroic, lockout.mythic
-                    ),
-                    "N · H · M this reset".to_string(),
                     primary_text(),
                 ),
                 (
@@ -2192,9 +2104,7 @@ mod tests {
         }
         let characters = &view.members[0].characters;
         assert_eq!(characters[0].name, "Isogi");
-        assert!(characters[0].ready(view.ready_ilvl));
         assert!(!characters[1].synced());
-        assert!(!characters[1].ready(None));
         assert_eq!(characters[0].checks.unwrap().myth, Some(9));
         assert_eq!(
             member_summary(&view.members[0]).as_deref(),
