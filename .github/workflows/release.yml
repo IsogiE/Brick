@@ -151,7 +151,7 @@ jobs:
           dist/packages/*.tar.gz
           dist/packages/PKGBUILD
         if-no-files-found: error
-        retention-days: 14
+        retention-days: 1
   build-windows:
     needs: plan
     if: needs.plan.outputs.release == 'true'
@@ -303,7 +303,7 @@ jobs:
         name: brick-Windows
         path: dist/packages/*-setup.exe
         if-no-files-found: error
-        retention-days: 14
+        retention-days: 1
   publish:
     needs: [plan, build-linux, build-windows]
     runs-on: ubuntu-24.04
