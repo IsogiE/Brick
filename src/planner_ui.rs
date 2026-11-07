@@ -35,7 +35,7 @@ const MAX_RAIDS: usize = 6;
 const MAX_NAME: usize = 32;
 // The character picker is wider than its cell to fit saved lockouts.
 const PICKER_EXTRA: f32 = 70.0;
-const STRIP_CHIP: egui::Vec2 = egui::vec2(112.0, 46.0);
+const STRIP_CHIP: egui::Vec2 = egui::vec2(124.0, 46.0);
 const STRIP_ARROW: egui::Vec2 = egui::vec2(28.0, 46.0);
 // The planner keeps resets from this one through twelve ahead.
 const WEEKS_AHEAD: i64 = 12;
@@ -587,31 +587,33 @@ impl PlannerUi {
                                         ui,
                                         egui::pos2(rect.left() + 10.0, rect.top() + 8.0),
                                         egui::Align2::LEFT_TOP,
-                                        &long_date(week),
+                                        &reset_range(week),
                                         13.0,
                                         color,
                                     );
-                                    let mut raids: Vec<&ScheduledRaid> =
-                                        entry.raids.iter().collect();
-                                    raids.sort_by_key(|raid| {
-                                        NIGHTS.iter().position(|day| *day == raid.day)
-                                    });
-                                    let job = if raids.is_empty() {
-                                        single("–", 11.0, muted_text())
+                                    let counts = difficulty_counts(&entry.raids);
+                                    let job = if counts.is_empty() {
+                                        single("No raids", 11.0, muted_text())
                                     } else {
                                         let mut job = single("", 11.0, muted_text());
-                                        for (index, raid) in raids.iter().enumerate() {
-                                            let text = if index == 0 {
-                                                night_name(&raid.day).to_owned()
-                                            } else {
-                                                format!(" {}", night_name(&raid.day))
-                                            };
+                                        for (index, (difficulty, count)) in
+                                            counts.into_iter().enumerate()
+                                        {
+                                            if index > 0 {
+                                                append(&mut job, " · ", 11.0, muted_text());
+                                            }
                                             let color = if past {
                                                 muted_text()
                                             } else {
-                                                raid.difficulty.color()
+                                                difficulty.color()
                                             };
-                                            append(&mut job, &text, 11.0, color);
+                                            let letter = &difficulty.label()[..1];
+                                            append(
+                                                &mut job,
+                                                &format!("{count} {letter}"),
+                                                11.0,
+                                                color,
+                                            );
                                         }
                                         job
                                     };
@@ -1731,6 +1733,38 @@ pub(crate) fn long_date(day: Date) -> String {
     )
 }
 
+/// How many raids of each difficulty a reset holds, easiest first.
+fn difficulty_counts(raids: &[ScheduledRaid]) -> Vec<(Difficulty, usize)> {
+    [Difficulty::Normal, Difficulty::Heroic, Difficulty::Mythic]
+        .into_iter()
+        .map(|difficulty| {
+            let count = raids
+                .iter()
+                .filter(|raid| raid.difficulty == difficulty)
+                .count();
+            (difficulty, count)
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
+
+/// The days a reset covers, such as "4 – 10 Nov" or "28 Oct – 3 Nov".
+fn reset_range(week: Date) -> String {
+    let last = week + time::Duration::days(6);
+    let month = |day: Date| &month_name(day.month())[..3];
+    if week.month() == last.month() {
+        format!("{} – {} {}", week.day(), last.day(), month(last))
+    } else {
+        format!(
+            "{} {} – {} {}",
+            week.day(),
+            month(week),
+            last.day(),
+            month(last)
+        )
+    }
+}
+
 fn valid_week(week: &str) -> bool {
     parse_date(week).is_some_and(|day| format_date(day) == week)
 }
@@ -1866,5 +1900,32 @@ mod tests {
         assert!(ends.contains(&"00:30".to_string()));
         assert!(!valid_week("2026-11-4"));
         assert!(valid_week("2026-11-04"));
+    }
+
+    #[test]
+    fn reset_range_spans_the_week() {
+        assert_eq!(reset_range(parse_date("2026-11-04").unwrap()), "4 – 10 Nov");
+        assert_eq!(
+            reset_range(parse_date("2026-10-28").unwrap()),
+            "28 Oct – 3 Nov"
+        );
+    }
+
+    #[test]
+    fn difficulty_counts_skip_missing_difficulties() {
+        let raid = |difficulty| ScheduledRaid {
+            difficulty,
+            day: "2026-11-04".into(),
+        };
+        let raids = [
+            raid(Difficulty::Mythic),
+            raid(Difficulty::Heroic),
+            raid(Difficulty::Heroic),
+        ];
+        assert_eq!(
+            difficulty_counts(&raids),
+            vec![(Difficulty::Heroic, 2), (Difficulty::Mythic, 1)]
+        );
+        assert!(difficulty_counts(&[]).is_empty());
     }
 }
