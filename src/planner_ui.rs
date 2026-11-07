@@ -37,6 +37,7 @@ const MAX_NAME: usize = 32;
 const PICKER_EXTRA: f32 = 70.0;
 const STRIP_CHIP: egui::Vec2 = egui::vec2(124.0, 46.0);
 const STRIP_ARROW: egui::Vec2 = egui::vec2(28.0, 46.0);
+const GRID_ARROW: egui::Vec2 = egui::vec2(28.0, 28.0);
 // The planner keeps resets from this one through twelve ahead.
 const WEEKS_AHEAD: i64 = 12;
 
@@ -1032,6 +1033,29 @@ fn draw_plan(
                 ui.spacing_mut().item_spacing.x = 0.0;
                 let (names, _) =
                     ui.allocate_exact_size(egui::vec2(NAME_WIDTH, height), egui::Sense::hover());
+                // Page arrows above the names once the raids run off the side.
+                let arrows_id = egui::Id::new("planner-grid-arrows");
+                let (can_back, can_forward) = ui
+                    .data(|data| data.get_temp::<(bool, bool)>(arrows_id))
+                    .unwrap_or_default();
+                let nudge = ui
+                    .data_mut(|data| data.remove_temp::<f32>(arrows_id.with("nudge")))
+                    .unwrap_or_default();
+                if can_back || can_forward {
+                    let back = egui::Rect::from_min_size(names.min, GRID_ARROW);
+                    let forward = back.translate(egui::vec2(GRID_ARROW.x + 6.0, 0.0));
+                    let step: f32 = if strip_arrow(ui, back, -1.0, can_back) {
+                        -1.0
+                    } else if strip_arrow(ui, forward, 1.0, can_forward) {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    if step != 0.0 {
+                        ui.data_mut(|data| data.insert_temp(arrows_id.with("nudge"), step));
+                        ui.ctx().request_repaint();
+                    }
+                }
                 let mut y = names.top();
                 for line in &lines {
                     let rect = egui::Rect::from_min_size(
@@ -1054,10 +1078,15 @@ fn draw_plan(
                     y += height_of(line);
                 }
 
-                egui::ScrollArea::horizontal()
+                let output = egui::ScrollArea::horizontal()
                     .id_salt("planner-grid")
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
+                        if nudge != 0.0 {
+                            let column = RAID_WIDTH + RAID_GAP;
+                            let page = (ui.clip_rect().width() / column).floor().max(1.0) * column;
+                            ui.scroll_with_delta(egui::vec2(-nudge * page, 0.0));
+                        }
                         // Rows run the panel's full width even with one raid.
                         let width = (raids.len() as f32 * (RAID_WIDTH + RAID_GAP))
                             .max(ui.available_width());
@@ -1114,6 +1143,11 @@ fn draw_plan(
                             y += height_of(line);
                         }
                     });
+                let offset = output.state.offset.x;
+                let end = (output.content_size.x - output.inner_rect.width()).max(0.0);
+                ui.data_mut(|data| {
+                    data.insert_temp(arrows_id, (offset > 0.5, offset < end - 0.5));
+                });
             });
         });
     if let Some(index) = remove {
