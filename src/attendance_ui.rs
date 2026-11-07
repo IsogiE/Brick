@@ -22,15 +22,14 @@ use crate::{
 
 const MAX_VIEW_BYTES: u64 = 1024 * 1024;
 const REFRESH_SECS: u64 = 60;
-// The grid starts at this week's Wednesday reset and runs twelve weeks.
+// The grid shows every day from this week's Wednesday reset, twelve weeks out.
 const WEEKS: i64 = 12;
 const SAVE_DELAY: Duration = Duration::from_millis(1200);
 const MAX_ABSENCES: usize = 40;
 const MAX_NOTE: usize = 60;
 
 pub(crate) const NAME_WIDTH: f32 = 176.0;
-const CELL_WIDTH: f32 = 108.0;
-const CELL_GAP: f32 = 6.0;
+const DAY_WIDTH: f32 = 40.0;
 const HEADER_HEIGHT: f32 = 54.0;
 const SUMMARY_HEIGHT: f32 = 30.0;
 pub(crate) const GROUP_HEIGHT: f32 = 30.0;
@@ -43,6 +42,7 @@ pub(crate) const OUT_TEXT: Color32 = Color32::from_rgb(124, 186, 236);
 pub(crate) const LATE_FILL: Color32 = Color32::from_rgb(58, 46, 26);
 pub(crate) const LATE_TEXT: Color32 = Color32::from_rgb(236, 178, 80);
 pub(crate) const OWN_ROW: Color32 = Color32::from_rgb(33, 37, 44);
+const RAID_NIGHT: Color32 = Color32::from_rgba_premultiplied(5, 6, 7, 7);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -105,8 +105,6 @@ pub struct AttendanceView {
     pub available: bool,
     #[serde(default)]
     pub raid_days: Vec<String>,
-    #[serde(default)]
-    pub raid_time: Option<String>,
     #[serde(default)]
     pub members: Vec<MemberAbsences>,
 }
@@ -707,20 +705,21 @@ pub(crate) fn grouped<'a>(members: &[&'a RosterMember]) -> Vec<Line<'a>> {
     lines
 }
 
-/// Raid nights from this week's reset, twelve weeks out.
-fn raid_nights(raid_days: &[String], today: Date) -> Vec<Date> {
+/// Every day from this week's reset, twelve weeks out.
+fn grid_days(today: Date) -> Vec<Date> {
     let since_reset = (today.weekday().number_days_from_monday() + 7
         - Weekday::Wednesday.number_days_from_monday())
         % 7;
     let start = today - time::Duration::days(since_reset as i64);
     (0..WEEKS * 7)
         .map(|offset| start + time::Duration::days(offset))
-        .filter(|day| {
-            raid_days
-                .iter()
-                .any(|name| *name == weekday_key(day.weekday()))
-        })
         .collect()
+}
+
+fn is_raid_night(raid_days: &[String], day: Date) -> bool {
+    raid_days
+        .iter()
+        .any(|name| *name == weekday_key(day.weekday()))
 }
 
 pub(crate) fn first_absence<'a>(absences: &'a [Absence], day: &str) -> Option<&'a Absence> {
@@ -728,6 +727,23 @@ pub(crate) fn first_absence<'a>(absences: &'a [Absence], day: &str) -> Option<&'
         .iter()
         .filter(|absence| absence.covers(day))
         .min_by_key(|absence| absence.kind == Kind::Late)
+}
+
+/// Consecutive days that show the same absence, as (first, last, absence).
+fn runs<'a>(absences: &'a [Absence], keys: &[String]) -> Vec<(usize, usize, &'a Absence)> {
+    let mut runs: Vec<(usize, usize, &Absence)> = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        let Some(absence) = first_absence(absences, key) else {
+            continue;
+        };
+        match runs.last_mut() {
+            Some((_, last, shown)) if *last + 1 == index && std::ptr::eq(*shown, absence) => {
+                *last = index;
+            }
+            _ => runs.push((index, index, absence)),
+        }
+    }
+    runs
 }
 
 fn draw_grid(
@@ -738,8 +754,12 @@ fn draw_grid(
     mine: &[Absence],
     today: Date,
 ) {
-    let nights = raid_nights(&view.raid_days, today);
-    let keys: Vec<String> = nights.iter().copied().map(format_date).collect();
+    let days = grid_days(today);
+    let keys: Vec<String> = days.iter().copied().map(format_date).collect();
+    let raid: Vec<bool> = days
+        .iter()
+        .map(|day| is_raid_night(&view.raid_days, *day))
+        .collect();
     let lines = grouped(members);
     let absences_of = |member: &RosterMember| -> &[Absence] {
         if member.user_id == own_id {
@@ -761,6 +781,7 @@ fn draw_grid(
         })
         .collect();
     let height: f32 = lines.iter().map(Line::height).sum();
+    let mut pan_y = 0.0;
 
     panel_frame()
         .inner_margin(egui::Margin::symmetric(12, 8))
@@ -783,56 +804,90 @@ fn draw_grid(
                 egui::ScrollArea::horizontal()
                     .id_salt("attendance-grid")
                     .auto_shrink([false, true])
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: false,
+                        ..Default::default()
+                    })
                     .show(ui, |ui| {
-                        let width = nights.len() as f32 * (CELL_WIDTH + CELL_GAP);
-                        let (grid, _) =
-                            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+                        let width = days.len() as f32 * DAY_WIDTH;
+                        let (grid, response) =
+                            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::drag());
+                        let drag = response.drag_delta();
+                        if drag != egui::Vec2::ZERO {
+                            ui.scroll_with_delta_animation(
+                                egui::vec2(drag.x, 0.0),
+                                egui::style::ScrollAnimation::none(),
+                            );
+                            pan_y = drag.y;
+                        }
+                        if response.dragged() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                        }
+                        let column = |index: usize| {
+                            egui::Rect::from_min_size(
+                                egui::pos2(grid.left() + index as f32 * DAY_WIDTH, grid.top()),
+                                egui::vec2(DAY_WIDTH, height),
+                            )
+                        };
+                        for (index, day) in days.iter().enumerate() {
+                            if raid[index] {
+                                ui.painter().rect_filled(column(index), 0.0, RAID_NIGHT);
+                            }
+                            if index > 0 && day.weekday() == Weekday::Wednesday {
+                                ui.painter().vline(
+                                    column(index).left(),
+                                    grid.y_range(),
+                                    Stroke::new(1.0_f32, line_color()),
+                                );
+                            }
+                        }
                         let mut y = grid.top();
                         for line in &lines {
                             let row = egui::Rect::from_min_size(
                                 egui::pos2(grid.left(), y),
                                 egui::vec2(width, line.height()),
                             );
-                            if let Line::Member(member) = line {
-                                if member.user_id == own_id {
-                                    ui.painter().rect_filled(row, 0.0, OWN_ROW);
-                                }
-                                ui.painter().hline(
-                                    row.x_range(),
-                                    row.top(),
-                                    Stroke::new(1.0_f32, line_color()),
-                                );
-                            }
-                            let mut previous_month = None;
-                            for (index, night) in nights.iter().enumerate() {
-                                let cell = egui::Rect::from_min_size(
-                                    egui::pos2(
-                                        grid.left() + index as f32 * (CELL_WIDTH + CELL_GAP),
-                                        y,
-                                    ),
-                                    egui::vec2(CELL_WIDTH, line.height()),
-                                );
-                                match line {
-                                    Line::Header => {
-                                        let first = previous_month != Some(night.month());
-                                        previous_month = Some(night.month());
-                                        draw_night_header(
+                            let cell = |index: usize| {
+                                egui::Rect::from_min_size(
+                                    egui::pos2(row.left() + index as f32 * DAY_WIDTH, row.top()),
+                                    egui::vec2(DAY_WIDTH, row.height()),
+                                )
+                            };
+                            match line {
+                                Line::Header => {
+                                    let shown = ((ui.clip_rect().left() - grid.left()) / DAY_WIDTH)
+                                        .ceil()
+                                        .max(0.0)
+                                        as usize;
+                                    for (index, day) in days.iter().enumerate() {
+                                        draw_day_header(
                                             ui,
-                                            cell,
-                                            *night,
-                                            first,
-                                            view.raid_time.as_deref(),
+                                            cell(index),
+                                            *day,
+                                            index == shown,
+                                            raid[index],
                                             today,
                                         );
                                     }
-                                    Line::Summary => draw_total(ui, cell, totals[index]),
-                                    Line::Group(_) => {}
-                                    Line::Member(member) => {
-                                        if let Some(absence) =
-                                            first_absence(absences_of(member), &keys[index])
-                                        {
-                                            draw_absence_cell(ui, cell, absence, &member.user_id);
-                                        }
+                                }
+                                Line::Summary => {
+                                    for index in 0..days.len() {
+                                        draw_total(ui, cell(index), totals[index], raid[index]);
+                                    }
+                                }
+                                Line::Group(_) => {}
+                                Line::Member(member) => {
+                                    if member.user_id == own_id {
+                                        ui.painter().rect_filled(row, 0.0, OWN_ROW);
+                                    }
+                                    ui.painter().hline(
+                                        row.x_range(),
+                                        row.top(),
+                                        Stroke::new(1.0_f32, line_color()),
+                                    );
+                                    for (first, last, absence) in runs(absences_of(member), &keys) {
+                                        let span = cell(first).union(cell(last));
+                                        draw_absence(ui, span, absence, &member.user_id);
                                     }
                                 }
                             }
@@ -841,6 +896,12 @@ fn draw_grid(
                     });
             });
         });
+    if pan_y != 0.0 {
+        ui.scroll_with_delta_animation(
+            egui::vec2(0.0, pan_y),
+            egui::style::ScrollAnimation::none(),
+        );
+    }
 }
 
 pub(crate) fn draw_name_cell(ui: &egui::Ui, rect: egui::Rect, line: &Line, own_id: &str) {
@@ -900,90 +961,104 @@ pub(crate) fn draw_name_cell(ui: &egui::Ui, rect: egui::Rect, line: &Line, own_i
     }
 }
 
-fn draw_night_header(
+fn draw_day_header(
     ui: &egui::Ui,
     cell: egui::Rect,
-    night: Date,
-    first_of_month: bool,
-    raid_time: Option<&str>,
+    day: Date,
+    first: bool,
+    raid_night: bool,
     today: Date,
 ) {
-    let x = cell.left() + 7.0;
-    if first_of_month {
+    if first || day.day() == 1 {
         text_at(
             ui,
-            egui::pos2(x, cell.top() + 4.0),
+            egui::pos2(cell.left() + 6.0, cell.top() + 4.0),
             egui::Align2::LEFT_TOP,
-            &month_name(night.month())[..3],
+            &month_name(day.month())[..3],
             11.0,
             muted_text(),
         );
     }
-    let color = if night == today {
+    let color = if day == today {
         info_accent()
-    } else if night < today {
+    } else if day < today || !raid_night {
         muted_text()
     } else {
         primary_text()
     };
+    let x = cell.center().x;
     text_at(
         ui,
-        egui::pos2(x, cell.top() + 19.0),
-        egui::Align2::LEFT_TOP,
-        &format!("{} {}", weekday_short(night.weekday()), night.day()),
+        egui::pos2(x, cell.top() + 20.0),
+        egui::Align2::CENTER_TOP,
+        weekday_short(day.weekday()),
+        11.0,
+        color,
+    );
+    text_at(
+        ui,
+        egui::pos2(x, cell.top() + 34.0),
+        egui::Align2::CENTER_TOP,
+        &day.day().to_string(),
         13.0,
         color,
     );
-    if let Some(time) = raid_time {
-        text_at(
-            ui,
-            egui::pos2(x, cell.top() + 37.0),
-            egui::Align2::LEFT_TOP,
-            time,
-            11.0,
-            muted_text(),
-        );
-    }
 }
 
-fn draw_total(ui: &egui::Ui, cell: egui::Rect, (out, late): (usize, usize)) {
-    let job = if out + late == 0 {
-        single("–", 12.0, muted_text())
-    } else {
-        let mut job = single(&out.to_string(), 12.0, OUT_TEXT);
-        append(&mut job, " · ", 12.0, muted_text());
-        append(&mut job, &late.to_string(), 12.0, LATE_TEXT);
-        job
+fn draw_total(ui: &egui::Ui, cell: egui::Rect, (out, late): (usize, usize), raid_night: bool) {
+    let job = match (out, late) {
+        (0, 0) if raid_night => single("–", 12.0, muted_text()),
+        (0, 0) => return,
+        (out, 0) => single(&out.to_string(), 12.0, OUT_TEXT),
+        (0, late) => single(&late.to_string(), 12.0, LATE_TEXT),
+        (out, late) => {
+            let mut job = single(&out.to_string(), 12.0, OUT_TEXT);
+            append(&mut job, "·", 12.0, muted_text());
+            append(&mut job, &late.to_string(), 12.0, LATE_TEXT);
+            job
+        }
     };
     let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
     ui.painter().galley(
-        egui::pos2(cell.left() + 7.0, cell.center().y - galley.size().y / 2.0),
+        cell.center() - galley.size() / 2.0,
         galley,
         secondary_text(),
     );
 }
 
-fn draw_absence_cell(ui: &egui::Ui, cell: egui::Rect, absence: &Absence, user_id: &str) {
-    let rect = egui::Rect::from_center_size(cell.center(), egui::vec2(cell.width(), 26.0));
+/// One absence as a bar across the days it covers.
+fn draw_absence(ui: &egui::Ui, span: egui::Rect, absence: &Absence, user_id: &str) {
+    let rect = egui::Rect::from_center_size(span.center(), egui::vec2(span.width() - 4.0, 26.0));
     ui.painter()
         .rect_filled(rect, egui::CornerRadius::same(4), absence.kind.fill());
     let text = absence.cell();
-    let galley = clipped(
-        ui,
-        single(&text, 12.0, absence.kind.text()),
-        rect.width() - 14.0,
-    );
-    let cut = galley.size().x >= rect.width() - 15.0;
-    ui.painter().galley(
-        egui::pos2(rect.left() + 7.0, rect.center().y - galley.size().y / 2.0),
-        galley,
-        absence.kind.text(),
-    );
-    if cut {
-        let id = ui.id().with(("absence", user_id, cell.left() as i32));
-        ui.interact(rect, id, egui::Sense::hover())
-            .on_hover_text(text);
+    let color = absence.kind.text();
+    let full = ui.fonts_mut(|fonts| fonts.layout_job(single(&text, 12.0, color)));
+    let y = rect.center().y - full.size().y / 2.0;
+    if full.size().x <= rect.width() - 12.0 {
+        ui.painter()
+            .galley(egui::pos2(rect.left() + 6.0, y), full, color);
+    } else if rect.width() < 2.0 * DAY_WIDTH {
+        let short =
+            ui.fonts_mut(|fonts| fonts.layout_job(single(absence.kind.label(), 12.0, color)));
+        ui.painter().galley(
+            egui::pos2(rect.center().x - short.size().x / 2.0, y),
+            short,
+            color,
+        );
+    } else {
+        let galley = clipped(ui, single(&text, 12.0, color), rect.width() - 12.0);
+        ui.painter()
+            .galley(egui::pos2(rect.left() + 6.0, y), galley, color);
     }
+    let dates = match (parse_date(&absence.from), parse_date(&absence.to)) {
+        (Some(from), Some(to)) if from == to => short_date(from),
+        (Some(from), Some(to)) => format!("{} – {}", short_date(from), short_date(to)),
+        _ => String::new(),
+    };
+    let id = ui.id().with(("absence", user_id, span.left() as i32));
+    ui.interact(rect, id, egui::Sense::hover())
+        .on_hover_text(format!("{text}\n{dates}"));
 }
 
 fn fetch_absences(access: &crate::guild::Access) -> Result<AttendanceView, String> {
@@ -1126,7 +1201,6 @@ mod tests {
         )
         .unwrap();
         assert!(view.available);
-        assert_eq!(view.raid_time.as_deref(), Some("19:30"));
         assert_eq!(view.absences("1")[0].cell(), "Late · 20:00");
         assert!(view.absences("2").is_empty());
         let saved = serde_json::to_value(&view.absences("1")[0]).unwrap();
@@ -1137,14 +1211,39 @@ mod tests {
     }
 
     #[test]
-    fn raid_nights_start_at_this_weeks_reset() {
-        let days = vec!["wed".to_string(), "thu".to_string()];
-        let nights = raid_nights(&days, day("2026-11-10"));
-        assert_eq!(format_date(nights[0]), "2026-11-04");
-        assert_eq!(format_date(nights[1]), "2026-11-05");
-        assert_eq!(nights.len(), 24);
-        let nights = raid_nights(&days, day("2026-11-04"));
-        assert_eq!(format_date(nights[0]), "2026-11-04");
+    fn the_grid_starts_at_this_weeks_reset_and_shows_every_day() {
+        let days = grid_days(day("2026-11-10"));
+        assert_eq!(format_date(days[0]), "2026-11-04");
+        assert_eq!(format_date(days[3]), "2026-11-07");
+        assert_eq!(days.len(), 84);
+        assert_eq!(format_date(grid_days(day("2026-11-04"))[0]), "2026-11-04");
+        let raid = vec!["wed".to_string(), "thu".to_string()];
+        assert!(is_raid_night(&raid, day("2026-11-05")));
+        assert!(!is_raid_night(&raid, day("2026-11-07")));
+    }
+
+    #[test]
+    fn an_absence_shows_as_one_bar_across_its_days() {
+        let absence = |kind, from: &str, to: &str| Absence {
+            kind,
+            from: from.into(),
+            to: to.into(),
+            note: String::new(),
+        };
+        let absences = vec![
+            absence(Kind::Out, "2026-11-05", "2026-11-08"),
+            absence(Kind::Late, "2026-11-06", "2026-11-06"),
+            absence(Kind::Late, "2026-11-10", "2026-11-10"),
+        ];
+        let keys: Vec<String> = grid_days(day("2026-11-04"))
+            .into_iter()
+            .map(format_date)
+            .collect();
+        let spans: Vec<(usize, usize, Kind)> = runs(&absences, &keys)
+            .into_iter()
+            .map(|(first, last, absence)| (first, last, absence.kind))
+            .collect();
+        assert_eq!(spans, vec![(1, 4, Kind::Out), (6, 6, Kind::Late)]);
     }
 
     #[test]

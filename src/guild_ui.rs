@@ -507,11 +507,6 @@ impl GuildUi {
         let max_height = ui.available_height().max(0.0);
         let mut open = None;
         let mut toggle = None;
-        let tier = self
-            .view
-            .as_ref()
-            .map(CharactersView::tier)
-            .unwrap_or_default();
         egui::ScrollArea::vertical()
             .id_salt("guild-roster")
             .auto_shrink([false, true])
@@ -557,7 +552,7 @@ impl GuildUi {
                                 if expanded {
                                     let ready = self.view.as_ref().and_then(|view| view.ready_ilvl);
                                     for character in characters.map_or(&[][..], |c| &c.characters) {
-                                        if draw_character_row(ui, character, ready, &tier) {
+                                        if draw_character_row(ui, character, ready) {
                                             open = Some((
                                                 member.user_id.clone(),
                                                 character.key.clone(),
@@ -1121,19 +1116,12 @@ struct Columns {
     ilvl: f32,
     tier: f32,
     vault: Option<f32>,
-    lockout: f32,
     keys: f32,
     myth: f32,
 }
 
 impl Columns {
     const VAULT_WIDTH: f32 = 6.0 * 14.0;
-    const LOCKOUT_WIDTH: f32 = 96.0;
-
-    /// Right edge of the normal, heroic or mythic count.
-    fn lockout_digit(&self, index: usize) -> f32 {
-        self.lockout + 22.0 + index as f32 * 32.0
-    }
 
     fn new(rect: egui::Rect) -> Self {
         let wide = rect.width() >= 820.0;
@@ -1142,8 +1130,6 @@ impl Columns {
         x -= 56.0 + 14.0;
         let keys = x;
         x -= 40.0 + 22.0;
-        let lockout = x - Self::LOCKOUT_WIDTH;
-        x = lockout - 22.0;
         let vault = wide.then(|| {
             let left = x - Self::VAULT_WIDTH;
             x = left - 22.0;
@@ -1165,7 +1151,6 @@ impl Columns {
             ilvl,
             tier,
             vault,
-            lockout,
             keys,
             myth,
         }
@@ -1205,9 +1190,6 @@ fn draw_column_titles(ui: &mut egui::Ui, columns: &Columns) {
     right(columns.tier, "Tier");
     if let Some(x) = columns.vault {
         left(x, "Vault");
-    }
-    for (index, label) in ["N", "H", "M"].into_iter().enumerate() {
-        right(columns.lockout_digit(index), label);
     }
     right(columns.keys, "Keys");
     right(columns.myth, "Myth");
@@ -1422,7 +1404,6 @@ fn draw_character_row(
     ui: &mut egui::Ui,
     character: &CharacterRow,
     ready_ilvl: Option<u32>,
-    tier: &HashSet<u64>,
 ) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
@@ -1503,7 +1484,6 @@ fn draw_character_row(
         for x in [columns.ilvl, columns.tier, columns.keys, columns.myth] {
             dash(x);
         }
-        dash(columns.lockout_digit(1));
         return response.clicked();
     }
 
@@ -1556,40 +1536,6 @@ fn draw_character_row(
                 );
             }
         }
-    }
-    let lockout = character.lockout;
-    let cleared = |pick: fn(&SavedRaid) -> usize| -> u32 {
-        character
-            .saved
-            .iter()
-            .filter(|raid| tier.contains(&raid.id) && pick(raid) > 0)
-            .map(|raid| raid.total)
-            .sum()
-    };
-    let full = [
-        cleared(|raid| raid.normal.len()),
-        cleared(|raid| raid.heroic.len()),
-        cleared(|raid| raid.mythic.len()),
-    ];
-    for (index, value) in [lockout.normal, lockout.heroic, lockout.mythic]
-        .into_iter()
-        .enumerate()
-    {
-        let color = if value == 0 {
-            dim()
-        } else if value >= full[index] {
-            secondary_text()
-        } else {
-            warning_accent()
-        };
-        text_at(
-            ui,
-            egui::pos2(columns.lockout_digit(index), y),
-            egui::Align2::RIGHT_CENTER,
-            &value.to_string(),
-            13.0,
-            color,
-        );
     }
     text_at(
         ui,
