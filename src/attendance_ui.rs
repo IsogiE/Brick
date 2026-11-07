@@ -839,6 +839,8 @@ fn draw_grid(
                     );
                 }
 
+                // A bar of its own below the rows, not one over the last row.
+                ui.spacing_mut().scroll.floating = false;
                 egui::ScrollArea::horizontal()
                     .id_salt("attendance-grid")
                     .auto_shrink([false, true])
