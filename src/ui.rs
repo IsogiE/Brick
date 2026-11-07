@@ -14,6 +14,7 @@ use crate::{
     attendance_ui::AttendanceUi,
     discord_auth::{self, AuthorizedUser, RefreshError, SessionStatus},
     guild_ui::GuildUi,
+    planner_ui::PlannerUi,
     presence::{self, Roster, RosterMember},
     profile::{ProfileUi, RaidRole},
     single_instance,
@@ -45,6 +46,7 @@ pub struct BrickApp {
     profile: ProfileUi,
     guild: GuildUi,
     attendance: AttendanceUi,
+    planner: PlannerUi,
     active_tab: MainTab,
     sync_rx: Option<mpsc::Receiver<Result<SyncSummary, String>>>,
     auth_rx: Option<mpsc::Receiver<Result<AuthorizedUser, RefreshError>>>,
@@ -96,6 +98,7 @@ impl AuthUiState {
 enum MainTab {
     Home,
     Guild,
+    Raids,
     Attendance,
     Streams,
 }
@@ -169,6 +172,7 @@ impl BrickApp {
             profile: ProfileUi::default(),
             guild: GuildUi::default(),
             attendance: AttendanceUi::default(),
+            planner: PlannerUi::default(),
             active_tab: MainTab::Home,
             sync_rx: None,
             auth_rx: None,
@@ -494,6 +498,7 @@ impl BrickApp {
         self.profile = ProfileUi::default();
         self.guild = GuildUi::default();
         self.attendance = AttendanceUi::default();
+        self.planner = PlannerUi::default();
         self.roster_rx = None;
         self.presence_state = initial_presence_state();
         self.roster_notice = None;
@@ -589,7 +594,7 @@ impl BrickApp {
         }
     }
 
-    fn draw_guild_selector(&mut self, ui: &mut egui::Ui) {
+    fn draw_guild_selector(&mut self, ui: &mut egui::Ui, width: f32) {
         let AuthUiState::Authorized(user) = &self.auth_state else {
             return;
         };
@@ -598,11 +603,11 @@ impl BrickApp {
         }
         let mut selected = user.guild_id.clone();
         ui.add_enabled_ui(self.guild_rx.is_none() && self.auth_rx.is_none(), |ui| {
-            ui.set_max_width(135.0);
+            ui.set_max_width(width);
             ui.spacing_mut().button_padding.y = 4.0;
             egui::ComboBox::from_id_salt("guild-selector")
                 .selected_text(&user.guild_name)
-                .width(135.0)
+                .width(width)
                 .truncate()
                 .show_ui(ui, |ui| {
                     for guild in &user.guilds {
@@ -693,12 +698,16 @@ impl BrickApp {
         self.last_roster_refresh = Instant::now();
         self.guild.refresh(&self.egui_ctx, false);
         self.attendance.refresh(&self.egui_ctx, false);
+        self.planner.refresh(&self.egui_ctx, false);
     }
 
     fn roster_refresh_enabled(&self) -> bool {
         self.window_visible
             && self.auth_state.is_authorized()
-            && matches!(self.active_tab, MainTab::Guild | MainTab::Attendance)
+            && matches!(
+                self.active_tab,
+                MainTab::Guild | MainTab::Raids | MainTab::Attendance
+            )
             && self.roster_rx.is_none()
             && !matches!(self.presence_state, PresenceUiState::Unavailable(_))
     }
@@ -1038,6 +1047,7 @@ impl BrickApp {
         match self.active_tab {
             MainTab::Home => self.draw_scrollable_updates_tab(ui),
             MainTab::Guild => self.draw_guild_tab(ui),
+            MainTab::Raids => self.draw_raids_tab(ui),
             MainTab::Attendance => self.draw_attendance_tab(ui),
             MainTab::Streams => self.streams.draw(ui),
         }
@@ -1089,7 +1099,7 @@ impl BrickApp {
         ui.horizontal(|ui| {
             self.draw_tab_buttons(ui, 106.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.draw_guild_selector(ui);
+                self.draw_guild_selector(ui, 135.0);
             });
         });
     }
@@ -1100,6 +1110,10 @@ impl BrickApp {
         }
         if tab_button(ui, "Guild", self.active_tab == MainTab::Guild, width).clicked() {
             self.active_tab = MainTab::Guild;
+            self.start_roster_refresh_if_stale();
+        }
+        if tab_button(ui, "Raids", self.active_tab == MainTab::Raids, width).clicked() {
+            self.active_tab = MainTab::Raids;
             self.start_roster_refresh_if_stale();
         }
         if tab_button(
@@ -1145,8 +1159,8 @@ impl BrickApp {
                     );
                 }
                 ui.add_space(10.0);
-                self.draw_tab_buttons(ui, if compact { 92.0 } else { 106.0 });
-                self.draw_guild_selector(ui);
+                self.draw_tab_buttons(ui, if compact { 82.0 } else { 106.0 });
+                self.draw_guild_selector(ui, if compact { 96.0 } else { 135.0 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let available = matches!(self.app_update_state, AppUpdateUiState::Available(_));
                     let busy = self.app_update_rx.is_some() || self.app_update_install_rx.is_some();
@@ -1208,6 +1222,30 @@ impl BrickApp {
             if refresh {
                 self.start_roster_refresh();
                 self.guild.refresh(ui.ctx(), true);
+            }
+            return;
+        }
+        self.draw_roster_pending(ui);
+    }
+
+    fn draw_raids_tab(&mut self, ui: &mut egui::Ui) {
+        if let PresenceUiState::Ready(roster) = &self.presence_state {
+            let own_id = match &self.auth_state {
+                AuthUiState::Authorized(user) => user.user_id.as_str(),
+                _ => "",
+            };
+            if self.planner.draw(
+                ui,
+                roster,
+                own_id,
+                self.roster_notice.as_deref(),
+                self.guild.characters_view(),
+                &self.attendance,
+            ) {
+                self.start_roster_refresh();
+                self.guild.refresh(ui.ctx(), true);
+                self.attendance.refresh(ui.ctx(), true);
+                self.planner.refresh(ui.ctx(), true);
             }
             return;
         }
@@ -1925,6 +1963,7 @@ impl eframe::App for BrickApp {
             self.poll_roster();
             self.guild.poll();
             self.attendance.poll(&self.egui_ctx);
+            self.planner.poll(&self.egui_ctx);
             self.start_roster_refresh_if_stale();
             self.refresh_view_if_stale();
         }
@@ -2804,6 +2843,7 @@ pub(crate) mod tests {
             profile: ProfileUi::default(),
             guild: GuildUi::default(),
             attendance: AttendanceUi::default(),
+            planner: PlannerUi::default(),
             active_tab: MainTab::Home,
             sync_rx: None,
             auth_rx: None,
