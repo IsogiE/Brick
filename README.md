@@ -70,7 +70,7 @@ Releases are automatic. Merge a version bump (`npm run version:release` with `BR
 | `src/discord_auth.rs`, `src/presence.rs` | Discord login and roster client |
 | `src/guild_ui.rs` | Guild tab and character pages, from the server's Battle.net character sync |
 | `src/attendance_ui.rs` | Attendance tab: your out and late dates, and who is missing each raid night |
-| `src/avatars.rs` | Discord profile pictures for member rows, with coloured initials as the fallback |
+| `src/avatars.rs` | Discord profile pictures for member rows, kept in the encrypted cache, with coloured initials as the fallback |
 | `src/planner_ui.rs` | Raids tab: each reset's raids, who brings which character, and officer planning |
 | `src/art_ui.rs` | Send to ART: a planned raid's groups boss by boss, copied as an ART Raid Groups import |
 | `scripts/`, `packaging/` | Build tooling, installer template, and build checks |
