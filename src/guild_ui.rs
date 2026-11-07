@@ -445,7 +445,7 @@ impl GuildUi {
         if self.page.is_some() {
             return self.draw_page(ui, own_id);
         }
-        let members: Vec<&RosterMember> = roster.officers.iter().chain(&roster.raiders).collect();
+        let members = roster_order(roster);
         if !self.seeded && self.view.is_some() {
             self.expanded.insert(own_id.to_owned());
             self.seeded = true;
@@ -842,6 +842,27 @@ fn tier_picker(ui: &mut egui::Ui, view: &CharactersView) -> Option<Vec<u64>> {
 /// "The Unbinding of Kith'ix" reads "Unbinding of Kith'ix" where space is short.
 pub(crate) fn short_raid(name: &str) -> &str {
     name.strip_prefix("The ").unwrap_or(name)
+}
+
+/// Tanks, healers, DPS, then no role; online before offline before not reporting; then by name.
+fn roster_order(roster: &Roster) -> Vec<&RosterMember> {
+    let mut members: Vec<&RosterMember> = roster.officers.iter().chain(&roster.raiders).collect();
+    members.sort_by_cached_key(|member| {
+        let presence = if member.online {
+            0
+        } else if member.last_seen_at.is_some() {
+            1
+        } else {
+            2
+        };
+        (
+            profile::role_order(member.raid_role),
+            presence,
+            member.name.to_lowercase(),
+            member.user_id.clone(),
+        )
+    });
+    members
 }
 
 fn sort_characters(characters: &mut [CharacterRow]) {
@@ -2206,6 +2227,46 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn roster_sorts_by_role_then_presence_then_name() {
+        let member =
+            |id: &str, name: &str, role: Option<RaidRole>, online: bool, seen: bool| RosterMember {
+                user_id: id.to_owned(),
+                name: name.to_owned(),
+                raid_role: role,
+                role: "Raider".to_owned(),
+                online,
+                last_seen_at: seen.then(|| "2026-11-07T10:00:00.000Z".to_owned()),
+                app_version: None,
+                platform: None,
+            };
+        let roster = Roster {
+            generated_at: String::new(),
+            online_window_seconds: 120,
+            officers: vec![
+                member("1", "Sep", Some(RaidRole::Healer), false, true),
+                member("2", "Luml", None, true, true),
+                member("3", "wolsku", Some(RaidRole::Dps), false, true),
+            ],
+            raiders: vec![
+                member("4", "muko", Some(RaidRole::Healer), false, false),
+                member("5", "Isogi", Some(RaidRole::Healer), true, true),
+                member("6", "Andy", Some(RaidRole::Tank), false, false),
+                member("7", "Aery", Some(RaidRole::Dps), false, true),
+                member("8", "ViklunD", Some(RaidRole::Dps), true, true),
+            ],
+            can_edit_roles: false,
+        };
+        let names: Vec<&str> = roster_order(&roster)
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["Andy", "Isogi", "Sep", "muko", "ViklunD", "Aery", "wolsku", "Luml"]
+        );
     }
 
     #[test]
