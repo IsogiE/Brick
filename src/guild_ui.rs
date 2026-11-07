@@ -1276,26 +1276,14 @@ fn draw_member_row(
         );
     }
     let y = rect.center().y;
-    let hue = member
-        .name
-        .chars()
-        .fold(7u32, |hash, ch| (hash * 31 + ch as u32) % 360);
-    let avatar = Color32::from(egui::ecolor::Hsva::new(hue as f32 / 360.0, 0.55, 0.62, 1.0));
     let center = egui::pos2(rect.left() + 20.0, y);
-    ui.painter().circle_filled(center, 16.0, avatar);
-    let initials: String = member
-        .name
-        .chars()
-        .take(2)
-        .collect::<String>()
-        .to_uppercase();
-    text_at(
+    crate::avatars::draw(
         ui,
+        &member.name,
+        member.avatar.as_deref(),
         center,
-        egui::Align2::CENTER_CENTER,
-        &initials,
+        16.0,
         12.0,
-        Color32::WHITE,
     );
 
     let chevron_width = if count > 0 { 52.0 } else { 0.0 };
@@ -2161,6 +2149,7 @@ mod tests {
             |id: &str, name: &str, role: Option<RaidRole>, online: bool, seen: bool| RosterMember {
                 user_id: id.to_owned(),
                 name: name.to_owned(),
+                avatar: None,
                 raid_role: role,
                 role: "Raider".to_owned(),
                 online,

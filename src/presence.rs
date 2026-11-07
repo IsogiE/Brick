@@ -61,6 +61,8 @@ pub struct RosterMember {
     pub user_id: String,
     pub name: String,
     #[serde(default)]
+    pub avatar: Option<String>,
+    #[serde(default)]
     pub raid_role: Option<crate::profile::RaidRole>,
     pub role: String,
     pub online: bool,
