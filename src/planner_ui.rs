@@ -538,9 +538,11 @@ impl PlannerUi {
         {
             let output = ui
                 .scope_builder(egui::UiBuilder::new().max_rect(middle), |ui| {
+                    // The arrows do the scrolling, and a bar would cover the chips.
                     egui::ScrollArea::horizontal()
                         .id_salt("planner-resets")
                         .auto_shrink([false, true])
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
                             if nudge != 0.0 {
                                 let page =
@@ -1078,6 +1080,8 @@ fn draw_plan(
                     y += height_of(line);
                 }
 
+                // A bar of its own below the rows, not one over the last row.
+                ui.spacing_mut().scroll.floating = false;
                 let output = egui::ScrollArea::horizontal()
                     .id_salt("planner-grid")
                     .auto_shrink([false, true])
