@@ -245,7 +245,7 @@ jobs:
           name: brick-windows-unsigned
           path: target/release/brick.exe
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
       - name: Build isolated Windows interactive smoke tests
         if: runner.os == 'Windows'
@@ -271,4 +271,4 @@ jobs:
             target/debug/deps/native_rendering-*.exe
             target/debug/deps/native_window_geometry-*.exe
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
