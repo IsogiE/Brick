@@ -16,6 +16,9 @@ const REQUEST_TIMEOUT_SECS: u64 = 20;
 const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 const MAX_ROSTER_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_STATUS_RESPONSE_BYTES: u64 = 16 * 1024;
+/// A profile carries its Battle.net link, which the server allows up to
+/// 48 KiB (200 characters), plus absences and settings.
+const MAX_PROFILE_RESPONSE_BYTES: u64 = 128 * 1024;
 const PRESENCE_API_URL: &str = match option_env!("BRICK_PRESENCE_API_URL") {
     Some(value) => value,
     None => "",
@@ -256,7 +259,7 @@ pub(crate) fn profile_call(
             .clamp(1, 10);
         let bytes = download::read_response(
             response,
-            MAX_STATUS_RESPONSE_BYTES,
+            MAX_PROFILE_RESPONSE_BYTES,
             "Profile request failed",
         )?;
         // Officer edits share a server-side burst limit. One bounded retry runs
@@ -470,5 +473,48 @@ mod tests {
             api_error("Roster refresh failed", 403, &body),
             "Roster refresh failed: nope"
         );
+    }
+
+    #[test]
+    fn a_profile_with_the_most_battlenet_characters_fits() {
+        let characters: Vec<_> = (0..200)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("Abcdefghij{index:02}"),
+                    "realm": "Twisting Nether ".repeat(4),
+                    "realmSlug": "twisting-nether",
+                    "region": "eu",
+                    "level": 90,
+                    "class": "Demon Hunter",
+                })
+            })
+            .collect();
+        let absences: Vec<_> = (0..40)
+            .map(|_| {
+                serde_json::json!({
+                    "kind": "out", "from": "2026-11-04", "to": "2026-11-10",
+                    "note": "x".repeat(60),
+                })
+            })
+            .collect();
+        let profile = serde_json::json!({
+            "customName": "Strike",
+            "raidRole": "dps",
+            "characters": [],
+            "main": null,
+            "absences": absences,
+            "battlenet": {
+                "battletag": "Strike#1234",
+                "syncedAt": "2026-11-07T18:00:00.000Z",
+                "characters": characters,
+            },
+            "available": true,
+            "battlenetAvailable": true,
+        });
+        let bytes = serde_json::to_vec(&profile).unwrap();
+        assert!(bytes.len() as u64 > super::MAX_STATUS_RESPONSE_BYTES);
+        assert!((bytes.len() as u64) < super::MAX_PROFILE_RESPONSE_BYTES);
+        let parsed: crate::profile::Profile = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.battlenet.unwrap().characters.len(), 200);
     }
 }
