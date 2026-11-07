@@ -36,6 +36,7 @@ const MAX_NAME: usize = 32;
 // The character picker is wider than its cell to fit saved lockouts.
 const PICKER_EXTRA: f32 = 70.0;
 const STRIP_CHIP: egui::Vec2 = egui::vec2(112.0, 46.0);
+const STRIP_ARROW: egui::Vec2 = egui::vec2(28.0, 46.0);
 // The planner keeps resets from this one through twelve ahead.
 const WEEKS_AHEAD: i64 = 12;
 
@@ -223,6 +224,9 @@ pub struct PlannerUi {
     pending_move: Option<(usize, Date)>,
     move_rx: Option<Reply<String>>,
     strip_week: Option<String>,
+    /// Pages to scroll the reset strip by next frame, and how far it can go.
+    strip_nudge: f32,
+    strip_room: (bool, bool),
 }
 
 /// Everything a raid column reads besides the plan itself.
@@ -508,88 +512,134 @@ impl PlannerUi {
         let schedule = view.schedule.clone();
         let mut clicked = None;
         let follow = self.strip_week.as_deref() != Some(shown.as_str());
-        egui::ScrollArea::horizontal()
-            .id_salt("planner-resets")
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    for entry in &schedule {
-                        let Some(week) = parse_date(&entry.week) else {
-                            continue;
-                        };
-                        let (rect, response) =
-                            ui.allocate_exact_size(STRIP_CHIP, egui::Sense::click());
-                        let selected = entry.week == shown;
-                        let fill = if selected {
-                            Color32::from_rgb(48, 54, 64)
-                        } else if response.hovered() && enabled {
-                            Color32::from_rgb(44, 49, 58)
-                        } else {
-                            FIELD_FILL
-                        };
-                        ui.painter()
-                            .rect_filled(rect, egui::CornerRadius::same(8), fill);
-                        if selected {
-                            ui.painter().rect_stroke(
-                                rect,
-                                egui::CornerRadius::same(8),
-                                Stroke::new(1.0_f32, info_accent()),
-                                egui::StrokeKind::Inside,
-                            );
-                        }
-                        let past = entry.week < current;
-                        let color = if entry.week == current {
-                            info_accent()
-                        } else if past {
-                            muted_text()
-                        } else {
-                            primary_text()
-                        };
-                        text_at(
-                            ui,
-                            egui::pos2(rect.left() + 10.0, rect.top() + 8.0),
-                            egui::Align2::LEFT_TOP,
-                            &long_date(week),
-                            13.0,
-                            color,
-                        );
-                        let mut raids: Vec<&ScheduledRaid> = entry.raids.iter().collect();
-                        raids.sort_by_key(|raid| NIGHTS.iter().position(|day| *day == raid.day));
-                        let job = if raids.is_empty() {
-                            single("–", 11.0, muted_text())
-                        } else {
-                            let mut job = single("", 11.0, muted_text());
-                            for (index, raid) in raids.iter().enumerate() {
-                                let text = if index == 0 {
-                                    night_name(&raid.day).to_owned()
-                                } else {
-                                    format!(" {}", night_name(&raid.day))
-                                };
-                                let color = if past {
-                                    muted_text()
-                                } else {
-                                    raid.difficulty.color()
-                                };
-                                append(&mut job, &text, 11.0, color);
+        let nudge = std::mem::take(&mut self.strip_nudge);
+        let (can_back, can_forward) = self.strip_room;
+        let mut step = 0.0;
+        let (row, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), STRIP_CHIP.y),
+            egui::Sense::hover(),
+        );
+        let back = egui::Rect::from_min_size(row.min, STRIP_ARROW);
+        let forward = egui::Rect::from_min_size(
+            row.right_top() - egui::vec2(STRIP_ARROW.x, 0.0),
+            STRIP_ARROW,
+        );
+        let middle = egui::Rect::from_min_max(
+            egui::pos2(back.right() + 6.0, row.top()),
+            egui::pos2(forward.left() - 6.0, row.bottom()),
+        );
+        if strip_arrow(ui, back, -1.0, can_back) {
+            step = -1.0;
+        }
+        if strip_arrow(ui, forward, 1.0, can_forward) {
+            step = 1.0;
+        }
+        {
+            let output = ui
+                .scope_builder(egui::UiBuilder::new().max_rect(middle), |ui| {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("planner-resets")
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            if nudge != 0.0 {
+                                let page =
+                                    (ui.clip_rect().width() - STRIP_CHIP.x).max(STRIP_CHIP.x);
+                                ui.scroll_with_delta(egui::vec2(-nudge * page, 0.0));
                             }
-                            job
-                        };
-                        let galley = clipped(ui, job, rect.width() - 20.0);
-                        ui.painter().galley(
-                            egui::pos2(rect.left() + 10.0, rect.top() + 27.0),
-                            galley,
-                            muted_text(),
-                        );
-                        if selected && follow {
-                            response.scroll_to_me(Some(egui::Align::Center));
-                        }
-                        if enabled && !selected && response.clicked() {
-                            clicked = Some(entry.week.clone());
-                        }
-                    }
-                });
-            });
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                for entry in &schedule {
+                                    let Some(week) = parse_date(&entry.week) else {
+                                        continue;
+                                    };
+                                    let (rect, response) =
+                                        ui.allocate_exact_size(STRIP_CHIP, egui::Sense::click());
+                                    let selected = entry.week == shown;
+                                    let fill = if selected {
+                                        Color32::from_rgb(48, 54, 64)
+                                    } else if response.hovered() && enabled {
+                                        Color32::from_rgb(44, 49, 58)
+                                    } else {
+                                        FIELD_FILL
+                                    };
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        egui::CornerRadius::same(8),
+                                        fill,
+                                    );
+                                    if selected {
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            egui::CornerRadius::same(8),
+                                            Stroke::new(1.0_f32, info_accent()),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    }
+                                    let past = entry.week < current;
+                                    let color = if entry.week == current {
+                                        info_accent()
+                                    } else if past {
+                                        muted_text()
+                                    } else {
+                                        primary_text()
+                                    };
+                                    text_at(
+                                        ui,
+                                        egui::pos2(rect.left() + 10.0, rect.top() + 8.0),
+                                        egui::Align2::LEFT_TOP,
+                                        &long_date(week),
+                                        13.0,
+                                        color,
+                                    );
+                                    let mut raids: Vec<&ScheduledRaid> =
+                                        entry.raids.iter().collect();
+                                    raids.sort_by_key(|raid| {
+                                        NIGHTS.iter().position(|day| *day == raid.day)
+                                    });
+                                    let job = if raids.is_empty() {
+                                        single("–", 11.0, muted_text())
+                                    } else {
+                                        let mut job = single("", 11.0, muted_text());
+                                        for (index, raid) in raids.iter().enumerate() {
+                                            let text = if index == 0 {
+                                                night_name(&raid.day).to_owned()
+                                            } else {
+                                                format!(" {}", night_name(&raid.day))
+                                            };
+                                            let color = if past {
+                                                muted_text()
+                                            } else {
+                                                raid.difficulty.color()
+                                            };
+                                            append(&mut job, &text, 11.0, color);
+                                        }
+                                        job
+                                    };
+                                    let galley = clipped(ui, job, rect.width() - 20.0);
+                                    ui.painter().galley(
+                                        egui::pos2(rect.left() + 10.0, rect.top() + 27.0),
+                                        galley,
+                                        muted_text(),
+                                    );
+                                    if selected && follow {
+                                        response.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                    if enabled && !selected && response.clicked() {
+                                        clicked = Some(entry.week.clone());
+                                    }
+                                }
+                            });
+                        })
+                })
+                .inner;
+            let offset = output.state.offset.x;
+            let end = (output.content_size.x - output.inner_rect.width()).max(0.0);
+            self.strip_room = (offset > 0.5, offset < end - 0.5);
+        }
+        if step != 0.0 {
+            self.strip_nudge = step;
+            ui.ctx().request_repaint();
+        }
         self.strip_week = Some(shown);
         clicked
     }
@@ -1448,15 +1498,10 @@ fn draw_pick(
     // Right side first, so the name is cut to what is left.
     let mut right = field.right() - 8.0;
     let tag = |ui: &egui::Ui, right: &mut f32, text: &str, size: f32, color: Color32| {
-        let rect = text_at(
-            ui,
-            egui::pos2(*right, field.center().y),
-            egui::Align2::RIGHT_CENTER,
-            text,
-            size,
-            color,
-        );
-        *right = rect.left() - 6.0;
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(single(text, size, color)));
+        let pos = egui::pos2(*right - galley.size().x, cap_centred(&galley, size, field));
+        *right = pos.x - 6.0;
+        ui.painter().galley(pos, galley, color);
     };
     if let Some(ilvl) = pick.and_then(|character| character.ilvl) {
         tag(ui, &mut right, &ilvl.to_string(), 12.0, muted_text());
@@ -1483,11 +1528,9 @@ fn draw_pick(
         single(&name, 13.0, color),
         (right - field.left() - 10.0).max(20.0),
     );
-    ui.painter().galley(
-        egui::pos2(field.left() + 8.0, field.center().y - galley.size().y / 2.0),
-        galley,
-        color,
-    );
+    let top = cap_centred(&galley, 13.0, field);
+    ui.painter()
+        .galley(egui::pos2(field.left() + 8.0, top), galley, color);
 
     let Some(response) = response else {
         return false;
@@ -1628,6 +1671,42 @@ pub(crate) fn night_name(day: &str) -> &'static str {
         "tue" => "Tue",
         _ => "–",
     }
+}
+
+/// The top for a single line whose capitals sit in the middle of `rect`, so
+/// text of different sizes lines up.
+fn cap_centred(galley: &egui::Galley, size: f32, rect: egui::Rect) -> f32 {
+    let baseline = galley
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first().map(|glyph| row.pos.y + glyph.pos.y))
+        .unwrap_or(galley.size().y * 0.8);
+    rect.center().y + size * 0.35 - baseline
+}
+
+/// One of the arrows either side of the reset strip.
+fn strip_arrow(ui: &egui::Ui, rect: egui::Rect, direction: f32, active: bool) -> bool {
+    let sense = if active {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let response = ui.interact(rect, ui.id().with(("strip-arrow", direction as i32)), sense);
+    let fill = if active && response.hovered() {
+        Color32::from_rgb(44, 49, 58)
+    } else {
+        FIELD_FILL
+    };
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(8), fill);
+    let color = if active { primary_text() } else { muted_text() };
+    let stroke = Stroke::new(1.6_f32, color);
+    let tip = rect.center() + egui::vec2(3.0 * direction, 0.0);
+    ui.painter()
+        .line_segment([tip, tip + egui::vec2(-5.0 * direction, -5.0)], stroke);
+    ui.painter()
+        .line_segment([tip, tip + egui::vec2(-5.0 * direction, 5.0)], stroke);
+    active && response.clicked()
 }
 
 fn night_label(raid: &PlannedRaid, week: Option<Date>) -> String {
