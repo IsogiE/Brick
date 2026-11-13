@@ -3,7 +3,7 @@ import test from 'node:test';
 import { deflateRawSync } from 'node:zlib';
 import {
   catalog, checkSourceFile, encodePath, isCurrentGitHubEntry, isCurrentSourceEntry, listingEntries,
-  mapFlavors, newestVersionTag, packageFolders, pkgmetaIgnores, readZipEntry, sameAddons,
+  mapAdditionalFlavors, mapFlavors, newestVersionTag, packageFolders, pkgmetaIgnores, readZipEntry, sameAddons,
   selectPackageAsset, selectRelease, tocVersion, uploadReleaseAsset, zipEntries
 } from './publish-extra-addons-feed.mjs';
 
@@ -83,6 +83,11 @@ test('reads TOC versions and maps packager flavors', () => {
   assert.deepEqual(mapFlavors({ releases: [{ metadata: [{ flavor: 'mainline' }] }] }), ['retail', 'ptr', 'xptr', 'beta']);
   assert.equal(mapFlavors({ releases: [{ metadata: [{ flavor: 'mainline' }, { flavor: 'mists' }] }] }).length, 8);
   assert.deepEqual(mapFlavors(null), []);
+  const bugSack = { releases: [{ metadata: [{ flavor: 'mainline' }, { flavor: 'classic' }, { flavor: 'forever' }] }] };
+  assert.equal(mapFlavors(bugSack).includes('forever'), false);
+  assert.deepEqual(mapAdditionalFlavors(bugSack), ['forever']);
+  assert.throws(() => mapFlavors({ releases: [{ metadata: [{ flavor: 'forever' }] }] }));
+  assert.deepEqual(mapAdditionalFlavors({ releases: [{ metadata: [{ flavor: 'mainline' }] }] }), []);
 });
 
 test('parses Subversion listings and picks the newest numeric tag', () => {
@@ -116,9 +121,11 @@ test('unchanged upstream versions reuse the published entry without downloading'
   const url = 'https://github.com/funkydude/BugSack/releases/download/v12.1.9/BugSack-v12.1.9.zip';
   const entry = {
     id: 'bugsack', version: 'v12.1.9', source: { provider: 'github-release', repo: bugsack.repo },
-    artifact: { url, sha256: 'a'.repeat(64), size: 10 }
+    artifact: { url, sha256: 'a'.repeat(64), size: 10, additionalFlavors: [] }
   };
   assert.equal(isCurrentGitHubEntry(entry, bugsack, 'v12.1.9', url), true);
+  const beforeAdditionalFlavors = { ...entry, artifact: { url, sha256: 'a'.repeat(64), size: 10 } };
+  assert.equal(isCurrentGitHubEntry(beforeAdditionalFlavors, bugsack, 'v12.1.9', url), false);
   assert.equal(isCurrentGitHubEntry(entry, bugsack, 'v12.2.0', url), false);
   assert.equal(isCurrentGitHubEntry(entry, byId('bigwigs'), 'v12.1.9', url), false);
 

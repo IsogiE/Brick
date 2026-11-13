@@ -222,6 +222,9 @@ struct Artifact {
     folders: Vec<String>,
     #[serde(default)]
     flavors: Vec<Flavor>,
+    /// Flavors 0.8.16 and older cannot parse in `flavors`, as plain names.
+    #[serde(default)]
+    additional_flavors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -384,8 +387,13 @@ fn sync_addon(
 /// A copy from another addon manager at the same version is left alone, so
 /// Brick and that manager never take turns replacing each other's files.
 fn needs_install(client: &WowClient, entry: &ManifestAddon) -> bool {
-    let supported =
-        entry.artifact.flavors.is_empty() || entry.artifact.flavors.contains(&client.flavor);
+    let artifact = &entry.artifact;
+    let supported = artifact.flavors.is_empty()
+        || artifact.flavors.contains(&client.flavor)
+        || artifact
+            .additional_flavors
+            .iter()
+            .any(|flavor| flavor == client.flavor.as_str());
     supported
         && !entry.artifact.folders.iter().all(|folder| {
             addon_toc_matches_version(&addons_dir_for_client(client), folder, &entry.version)
@@ -509,6 +517,7 @@ fn guild_entry(addon: &ExtraAddon, bytes: &[u8]) -> Result<Option<ManifestAddon>
             files: Vec::new(),
             folders: build.folders,
             flavors: GUILD_FLAVORS.to_vec(),
+            additional_flavors: Vec::new(),
         },
     }))
 }
@@ -736,6 +745,7 @@ mod tests {
                 files: vec![],
                 folders: folders.iter().map(|folder| folder.to_string()).collect(),
                 flavors: vec![],
+                additional_flavors: vec![],
             },
         }
     }
@@ -787,6 +797,7 @@ mod tests {
                 files,
                 folders: vec!["!BugGrabber".into()],
                 flavors: vec![],
+                additional_flavors: vec![],
             },
         }
     }
@@ -1049,6 +1060,14 @@ mod tests {
         classic_only.artifact.flavors = vec![Flavor::ClassicEra];
         write_toc(&addons, "BugSack", "v12.1.8");
         assert!(!needs_install(&client, &classic_only));
+
+        let mut forever = client.clone();
+        forever.flavor = Flavor::Forever;
+        let mut entry = classic_only;
+        entry.artifact.flavors = vec![Flavor::Retail, Flavor::Classic];
+        assert!(!needs_install(&forever, &entry));
+        entry.artifact.additional_flavors = vec!["forever".into()];
+        assert!(needs_install(&forever, &entry));
     }
 
     #[test]

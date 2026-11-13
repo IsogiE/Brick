@@ -791,6 +791,7 @@ fn load_settings_from(path: &Path) -> Result<(Settings, Option<String>), String>
     if settings.schema == 0 {
         settings.schema = 1;
     }
+    repair_client_paths(&mut settings);
     Ok((settings, None))
 }
 
@@ -1210,7 +1211,37 @@ fn short_game_version(value: &str) -> Option<String> {
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    PathBuf::from(without_verbatim_prefix(&canonical.to_string_lossy()))
+}
+
+/// Windows canonicalization returns `\\?\C:\...` paths. They work, but show
+/// the prefix to users and never compare equal to the same folder saved
+/// without it, so keep the ordinary form.
+fn without_verbatim_prefix(path: &str) -> String {
+    if let Some(share) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{share}");
+    }
+    match path.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_string(),
+        _ => path.to_string(),
+    }
+}
+
+/// Clients added by 0.8.16 and older may be saved with the verbatim prefix,
+/// possibly next to the same folder without it.
+fn repair_client_paths(settings: &mut Settings) {
+    let mut kept: Vec<WowClient> = Vec::with_capacity(settings.clients.len());
+    for mut client in settings.clients.drain(..) {
+        client.path = without_verbatim_prefix(&client.path);
+        if !kept
+            .iter()
+            .any(|existing| same_path(&existing.path, &client.path))
+        {
+            kept.push(client);
+        }
+    }
+    settings.clients = kept;
 }
 
 fn same_path(a: &str, b: &str) -> bool {
@@ -1877,6 +1908,50 @@ mod tests {
         assert_eq!(saved, Flavor::Forever);
     }
 
+    #[test]
+    fn verbatim_windows_paths_are_shown_and_matched_in_their_ordinary_form() {
+        let forever = r"C:\Program Files (x86)\World of Warcraft\_forever_";
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\C:\Program Files (x86)\World of Warcraft\_forever_"),
+            forever
+        );
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\UNC\nas\games\World of Warcraft\_retail_"),
+            r"\\nas\games\World of Warcraft\_retail_"
+        );
+        for unchanged in [
+            forever,
+            "/home/user/Games/_retail_",
+            r"\\?\Volume{abc}\_retail_",
+        ] {
+            assert_eq!(without_verbatim_prefix(unchanged), unchanged);
+        }
+
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let path = root.join(SETTINGS_FILE);
+        let retail = r"C:\Program Files (x86)\World of Warcraft\_retail_";
+        let settings = serde_json::json!({
+            "schema": 1,
+            "startupEnabled": true,
+            "clients": [
+                { "id": "retail-a", "flavor": "retail", "path": retail },
+                { "id": "forever-b", "flavor": "forever", "path": format!(r"\\?\{forever}") },
+                { "id": "retail-c", "flavor": "retail", "path": format!(r"\\?\{retail}") }
+            ]
+        });
+        fs::write(&path, settings.to_string()).unwrap();
+        let (settings, warning) = load_settings_from(&path).unwrap();
+        assert!(warning.is_none(), "{warning:?}");
+        let paths: Vec<_> = settings
+            .clients
+            .iter()
+            .map(|client| client.path.as_str())
+            .collect();
+        assert_eq!(paths, vec![retail, forever]);
+        assert_eq!(settings.clients[1].id, "forever-b");
+    }
+
     fn allowed_folders() -> Vec<String> {
         vec!["AdvanceRaidTools".to_string()]
     }
@@ -2098,7 +2173,7 @@ mod tests {
             fs::write(&path, contents).unwrap();
             let (settings, warning) = load_settings_from(&path).unwrap();
             assert_eq!(serde_json::to_value(settings).unwrap(), defaults);
-            assert!(warning.is_none());
+            assert!(warning.is_none(), "{warning:?}");
             save_settings_to(&path, &Settings::default()).unwrap();
             assert_eq!(
                 serde_json::to_value(load_settings_from(&path).unwrap().0).unwrap(),
