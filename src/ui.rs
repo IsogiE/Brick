@@ -2734,6 +2734,9 @@ fn friendly_problem(status: &str) -> String {
         || lower.contains("no space left")
         || lower.contains("disk full")
         || lower.contains("storage full");
+    if lower.contains("could not find a supported wow client folder") {
+        return "Brick did not recognize that folder as a WoW game folder. Select the World of Warcraft folder or a game folder such as _retail_.".to_string();
+    }
     if settings_problem(status) {
         if disk_full {
             "Brick could not save its settings because the disk is full. Free some space; Brick will retry automatically.".to_string()
@@ -3315,6 +3318,11 @@ pub(crate) mod tests {
             "Failed to save Brick settings: No space left on device (os error 28)"
         )
         .contains("disk is full"));
+        let folder = friendly_problem(
+            "C:\\Program Files (x86)\\World of Warcraft\\_foo_: Could not find a supported WoW client folder. Select the World of Warcraft folder or a _retail_/_ptr_ client folder.",
+        );
+        assert!(folder.contains("WoW game folder"));
+        assert!(!folder.contains("Advance Raid Tools"));
     }
 
     #[test]

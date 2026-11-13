@@ -195,6 +195,7 @@ pub enum Flavor {
     ClassicEra,
     ClassicPtr,
     ClassicBeta,
+    Forever,
 }
 
 impl Flavor {
@@ -208,6 +209,7 @@ impl Flavor {
             Self::ClassicEra => "Classic Era",
             Self::ClassicPtr => "Classic PTR",
             Self::ClassicBeta => "Classic Beta",
+            Self::Forever => "Forever",
         }
     }
 
@@ -221,6 +223,7 @@ impl Flavor {
             Self::ClassicEra => "classic-era",
             Self::ClassicPtr => "classic-ptr",
             Self::ClassicBeta => "classic-beta",
+            Self::Forever => "forever",
         }
     }
 
@@ -270,6 +273,10 @@ const FLAVOR_INFOS: &[FlavorInfo] = &[
         flavor: Flavor::ClassicBeta,
         directory: "_classic_beta_",
     },
+    FlavorInfo {
+        flavor: Flavor::Forever,
+        directory: "_forever_",
+    },
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +324,11 @@ struct ManifestArtifact {
     folders: Vec<String>,
     #[serde(default)]
     flavors: Vec<Flavor>,
+    /// Flavors added after `flavors` was frozen, as plain names. Releases up
+    /// to 0.8.15 reject an unknown name in `flavors`, so a newer flavor such
+    /// as `forever` is published here, where they ignore it.
+    #[serde(default)]
+    additional_flavors: Vec<String>,
 }
 
 pub fn load_view() -> Result<AppView, String> {
@@ -1179,6 +1191,7 @@ fn product_candidates(flavor: Flavor) -> &'static [&'static str] {
         Flavor::ClassicEra => &["wow_classic_era", "wow_classic_era_ptr"],
         Flavor::ClassicPtr => &["wow_classic_ptr"],
         Flavor::ClassicBeta => &["wow_classic_beta"],
+        Flavor::Forever => &["wowf"],
     }
 }
 
@@ -1441,7 +1454,13 @@ fn installed_addons_match_version(client: &WowClient, manifest: &AddonManifest) 
 }
 
 fn client_supported_by_manifest(client: &WowClient, manifest: &AddonManifest) -> bool {
-    manifest.artifact.flavors.is_empty() || manifest.artifact.flavors.contains(&client.flavor)
+    let artifact = &manifest.artifact;
+    artifact.flavors.is_empty()
+        || artifact.flavors.contains(&client.flavor)
+        || artifact
+            .additional_flavors
+            .iter()
+            .any(|flavor| flavor == client.flavor.as_str())
 }
 
 fn client_needs_install(client: &WowClient, manifest: &AddonManifest) -> bool {
@@ -1818,6 +1837,46 @@ mod tests {
         path
     }
 
+    #[test]
+    fn forever_client_folder_is_recognized_with_its_game_version() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let forever = root.join("_forever_");
+        fs::create_dir_all(forever.join("Interface").join("AddOns")).unwrap();
+        fs::create_dir_all(root.join("_retail_")).unwrap();
+        fs::write(
+            forever.join(".flavor.info"),
+            "Product Flavor!STRING:0\nwowf\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".build.info"),
+            "Branch!STRING:0|Version!STRING:0|Product!STRING:0\n\
+             eu|12.1.5.70783|wow\n\
+             eu|1.60.1.70938|wowf\n",
+        )
+        .unwrap();
+
+        for selected in [
+            forever.clone(),
+            forever.join("Interface"),
+            forever.join("Interface").join("AddOns"),
+        ] {
+            let clients = resolve_wow_clients(&selected).unwrap();
+            assert_eq!(clients.len(), 1, "{}", selected.display());
+            assert_eq!(clients[0].flavor, Flavor::Forever);
+            assert_eq!(clients[0].game_version.as_deref(), Some("1.60.1.70938"));
+            assert!(clients[0].id.starts_with("forever-"));
+        }
+
+        let clients = resolve_wow_clients(&root).unwrap();
+        let flavors: Vec<_> = clients.iter().map(|client| client.flavor).collect();
+        assert_eq!(flavors, vec![Flavor::Retail, Flavor::Forever]);
+
+        let saved: Flavor = serde_json::from_str("\"forever\"").unwrap();
+        assert_eq!(saved, Flavor::Forever);
+    }
+
     fn allowed_folders() -> Vec<String> {
         vec!["AdvanceRaidTools".to_string()]
     }
@@ -1853,6 +1912,7 @@ mod tests {
                     .map(|folder| folder.to_string())
                     .collect(),
                 flavors: vec![Flavor::Retail, Flavor::Ptr],
+                additional_flavors: Vec::new(),
             },
         };
         let mut client = client_from_flavor_dir(&FLAVOR_INFOS[0], root);
@@ -1942,7 +2002,7 @@ mod tests {
     fn matching_tocs_skip_install_but_still_require_saved_hash_and_supported_flavor() {
         let root = test_directory();
         let _cleanup = StagingCleanup(&root);
-        let (mut client, manifest, _) = installed_addon_fixture(&root);
+        let (mut client, mut manifest, _) = installed_addon_fixture(&root);
         for folder in &manifest.artifact.folders {
             fs::write(
                 addons_dir_for_client(&client)
@@ -1962,6 +2022,26 @@ mod tests {
         assert!(client_needs_install(&client, &manifest));
         client.flavor = Flavor::Classic;
         assert!(!client_needs_install(&client, &manifest));
+        client.flavor = Flavor::Forever;
+        assert!(!client_needs_install(&client, &manifest));
+        manifest.artifact.additional_flavors = vec!["future".into(), "forever".into()];
+        assert!(client_needs_install(&client, &manifest));
+    }
+
+    #[test]
+    fn manifest_names_forever_where_older_releases_ignore_it() {
+        let json = r#"{"url":"u","sha256":"s","size":1,"folders":[],
+            "flavors":["retail","classic"],"additionalFlavors":["forever","not-yet-known"]}"#;
+        let artifact: ManifestArtifact = serde_json::from_str(json).unwrap();
+        assert_eq!(artifact.flavors, vec![Flavor::Retail, Flavor::Classic]);
+        assert_eq!(
+            artifact.additional_flavors,
+            vec!["forever", "not-yet-known"]
+        );
+        // The frozen field still rejects names a release does not know, which
+        // is why newer flavors must not be published there.
+        let strict = r#"{"url":"u","sha256":"s","size":1,"folders":[],"flavors":["forever","x"]}"#;
+        assert!(serde_json::from_str::<ManifestArtifact>(strict).is_err());
     }
 
     #[test]
@@ -2458,6 +2538,7 @@ mod tests {
                 size: zip.len() as u64,
                 folders: allowed_folders(),
                 flavors: Vec::new(),
+                additional_flavors: Vec::new(),
             },
         };
 
