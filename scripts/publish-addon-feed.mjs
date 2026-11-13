@@ -31,6 +31,9 @@ const supportedFlavors = [
   'classic-ptr',
   'classic-beta'
 ];
+// Brick 0.8.15 and older reject unknown names in `flavors`, so newer flavors
+// are published separately; those releases ignore this field.
+const additionalFlavors = ['forever'];
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   main().catch((error) => {
@@ -94,7 +97,8 @@ async function main() {
       sha256,
       size: zip.length,
       folders: allowedFolders,
-      flavors: supportedFlavors
+      flavors: supportedFlavors,
+      additionalFlavors
     }
   };
 
