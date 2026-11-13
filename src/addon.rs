@@ -1844,7 +1844,11 @@ mod tests {
         let forever = root.join("_forever_");
         fs::create_dir_all(forever.join("Interface").join("AddOns")).unwrap();
         fs::create_dir_all(root.join("_retail_")).unwrap();
-        fs::write(forever.join(".flavor.info"), "Product Flavor!STRING:0\nwowf\n").unwrap();
+        fs::write(
+            forever.join(".flavor.info"),
+            "Product Flavor!STRING:0\nwowf\n",
+        )
+        .unwrap();
         fs::write(
             root.join(".build.info"),
             "Branch!STRING:0|Version!STRING:0|Product!STRING:0\n\
@@ -2030,7 +2034,10 @@ mod tests {
             "flavors":["retail","classic"],"additionalFlavors":["forever","not-yet-known"]}"#;
         let artifact: ManifestArtifact = serde_json::from_str(json).unwrap();
         assert_eq!(artifact.flavors, vec![Flavor::Retail, Flavor::Classic]);
-        assert_eq!(artifact.additional_flavors, vec!["forever", "not-yet-known"]);
+        assert_eq!(
+            artifact.additional_flavors,
+            vec!["forever", "not-yet-known"]
+        );
         // The frozen field still rejects names a release does not know, which
         // is why newer flavors must not be published there.
         let strict = r#"{"url":"u","sha256":"s","size":1,"folders":[],"flavors":["forever","x"]}"#;
