@@ -195,6 +195,7 @@ pub enum Flavor {
     ClassicEra,
     ClassicPtr,
     ClassicBeta,
+    Forever,
 }
 
 impl Flavor {
@@ -208,6 +209,7 @@ impl Flavor {
             Self::ClassicEra => "Classic Era",
             Self::ClassicPtr => "Classic PTR",
             Self::ClassicBeta => "Classic Beta",
+            Self::Forever => "Forever",
         }
     }
 
@@ -221,6 +223,7 @@ impl Flavor {
             Self::ClassicEra => "classic-era",
             Self::ClassicPtr => "classic-ptr",
             Self::ClassicBeta => "classic-beta",
+            Self::Forever => "forever",
         }
     }
 
@@ -269,6 +272,10 @@ const FLAVOR_INFOS: &[FlavorInfo] = &[
     FlavorInfo {
         flavor: Flavor::ClassicBeta,
         directory: "_classic_beta_",
+    },
+    FlavorInfo {
+        flavor: Flavor::Forever,
+        directory: "_forever_",
     },
 ];
 
@@ -1179,6 +1186,7 @@ fn product_candidates(flavor: Flavor) -> &'static [&'static str] {
         Flavor::ClassicEra => &["wow_classic_era", "wow_classic_era_ptr"],
         Flavor::ClassicPtr => &["wow_classic_ptr"],
         Flavor::ClassicBeta => &["wow_classic_beta"],
+        Flavor::Forever => &["wowf"],
     }
 }
 
@@ -1816,6 +1824,42 @@ mod tests {
         let path = env::temp_dir().join(format!("brick-archive-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn forever_client_folder_is_recognized_with_its_game_version() {
+        let root = test_directory();
+        let _cleanup = StagingCleanup(&root);
+        let forever = root.join("_forever_");
+        fs::create_dir_all(forever.join("Interface").join("AddOns")).unwrap();
+        fs::create_dir_all(root.join("_retail_")).unwrap();
+        fs::write(forever.join(".flavor.info"), "Product Flavor!STRING:0\nwowf\n").unwrap();
+        fs::write(
+            root.join(".build.info"),
+            "Branch!STRING:0|Version!STRING:0|Product!STRING:0\n\
+             eu|12.1.5.70783|wow\n\
+             eu|1.60.1.70938|wowf\n",
+        )
+        .unwrap();
+
+        for selected in [
+            forever.clone(),
+            forever.join("Interface"),
+            forever.join("Interface").join("AddOns"),
+        ] {
+            let clients = resolve_wow_clients(&selected).unwrap();
+            assert_eq!(clients.len(), 1, "{}", selected.display());
+            assert_eq!(clients[0].flavor, Flavor::Forever);
+            assert_eq!(clients[0].game_version.as_deref(), Some("1.60.1.70938"));
+            assert!(clients[0].id.starts_with("forever-"));
+        }
+
+        let clients = resolve_wow_clients(&root).unwrap();
+        let flavors: Vec<_> = clients.iter().map(|client| client.flavor).collect();
+        assert_eq!(flavors, vec![Flavor::Retail, Flavor::Forever]);
+
+        let saved: Flavor = serde_json::from_str("\"forever\"").unwrap();
+        assert_eq!(saved, Flavor::Forever);
     }
 
     fn allowed_folders() -> Vec<String> {
