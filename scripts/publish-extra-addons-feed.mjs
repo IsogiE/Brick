@@ -135,6 +135,8 @@ export function isCurrentGitHubEntry(entry, addon, version, url) {
       && entry.artifact?.url === url
       && /^[a-f0-9]{64}$/.test(entry.artifact.sha256)
       && entry.artifact.size > 0
+      // Entries published before additionalFlavors existed are rebuilt once.
+      && Array.isArray(entry.artifact.additionalFlavors)
   );
 }
 
@@ -164,8 +166,24 @@ export function mapFlavors(releaseJson) {
   if (flavors.size === 0) return [];
   const mapped = [];
   if (flavors.has('mainline')) mapped.push(...retailFlavors);
-  if ([...flavors].some((flavor) => flavor !== 'mainline')) mapped.push(...classicFlavors);
+  if ([...flavors].some((flavor) => flavor !== 'mainline' && !additionalPackagerFlavors.has(flavor))) {
+    mapped.push(...classicFlavors);
+  }
+  // An empty list means every flavor, so an addon made only for newer flavors
+  // cannot be described to older clients.
+  if (mapped.length === 0) throw new Error('Release only supports flavors that older Brick clients cannot filter.');
   return mapped;
+}
+
+// Brick 0.8.16 and older reject unknown names in `flavors`, so flavors added
+// later go in `additionalFlavors`, which those releases ignore.
+const additionalPackagerFlavors = new Map([['forever', 'forever']]);
+
+export function mapAdditionalFlavors(releaseJson) {
+  const flavors = new Set(
+    (releaseJson?.releases || []).flatMap((entry) => (entry.metadata || []).map((meta) => meta.flavor))
+  );
+  return [...additionalPackagerFlavors].filter(([packager]) => flavors.has(packager)).map(([, brick]) => brick);
 }
 
 export function folderAllowed(addon, folder) {
@@ -228,7 +246,8 @@ export async function buildGitHubEntry(addon, release, asset) {
       sha256: createHash('sha256').update(zip).digest('hex'),
       size: zip.length,
       folders,
-      flavors: mapFlavors(releaseJson)
+      flavors: mapFlavors(releaseJson),
+      additionalFlavors: mapAdditionalFlavors(releaseJson)
     }
   };
 }
